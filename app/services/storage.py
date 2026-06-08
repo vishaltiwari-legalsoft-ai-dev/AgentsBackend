@@ -11,11 +11,14 @@ import re
 from datetime import timedelta
 from typing import Optional
 
+from google.auth import compute_engine, default as google_auth_default
+from google.auth.transport import requests as google_auth_requests
 from google.cloud import storage
 
 from app.config import settings
 
 _client: Optional[storage.Client] = None
+_signing_credentials = None
 
 
 def _storage() -> storage.Client:
@@ -23,6 +26,29 @@ def _storage() -> storage.Client:
     if _client is None:
         _client = storage.Client(project=settings.require("gcp_project_id"))
     return _client
+
+
+def _signing_kwargs() -> dict:
+    """Extra args so `generate_signed_url` works on Cloud Run.
+
+    Cloud Run's attached service account authenticates with a token but has no
+    local private key, so v4 signing must go through the IAM signBlob API. We
+    detect that case and pass `service_account_email` + `access_token`. With a
+    local JSON key (dev), no extra args are needed and signing happens locally.
+    Requires the service account to have `roles/iam.serviceAccountTokenCreator`.
+    """
+    global _signing_credentials
+    if _signing_credentials is None:
+        _signing_credentials, _ = google_auth_default()
+    creds = _signing_credentials
+    if isinstance(creds, compute_engine.Credentials):
+        if not creds.valid:
+            creds.refresh(google_auth_requests.Request())
+        return {
+            "service_account_email": creds.service_account_email,
+            "access_token": creds.token,
+        }
+    return {}
 
 
 def is_configured() -> bool:
@@ -50,7 +76,7 @@ def _upload(object_path: str, data: bytes, content_type: str) -> tuple[str, str]
         blob = _storage().bucket(bucket_name).blob(object_path)
         blob.upload_from_string(data, content_type=content_type)
         signed_url = blob.generate_signed_url(
-            version="v4", expiration=timedelta(hours=1), method="GET"
+            version="v4", expiration=timedelta(hours=1), method="GET", **_signing_kwargs()
         )
         return f"gs://{bucket_name}/{object_path}", signed_url
     except Exception as exc:  # noqa: BLE001 - surface storage errors with context
@@ -98,6 +124,7 @@ def signed_url_for_gs_uri(gs_uri: str, expires_in_hours: int = 1) -> str:
         version="v4",
         expiration=timedelta(hours=expires_in_hours),
         method="GET",
+        **_signing_kwargs(),
     )
 
 
