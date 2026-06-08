@@ -39,10 +39,26 @@ app.add_middleware(
 
 
 @app.exception_handler(Exception)
-async def unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
-    """Log full context server-side; return a sanitized message to the client."""
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Return a 500 that still carries CORS headers.
+
+    The catch-all handler runs in Starlette's outer error middleware (outside
+    CORSMiddleware), so without this the browser sees a CORS failure ("Failed to
+    fetch") instead of the actual error. We echo the allowed Origin so the
+    frontend can read the real message, and include the detail to aid debugging.
+    """
     logging.getLogger("agentos").exception("unhandled error: %s", exc)
-    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+    headers: dict[str, str] = {}
+    origin = request.headers.get("origin")
+    if origin and origin in settings.cors_origin_list:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+        headers["Vary"] = "Origin"
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {exc}"},
+        headers=headers,
+    )
 
 
 for router in (
