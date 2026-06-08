@@ -1,0 +1,785 @@
+Brand,Document 1 Content (Rules / Brand Identity / Master Prompts),Document 2 Content (Sales / Visual / Copy Ideology),Quick Reference Matrix Data
+Universal House Rules & Shared Info,"Brand Master Prompts - One Definitive Prompt Per Brand
+Purpose: One copy-paste-ready master prompt per brand that, with a few bracketed swaps, will generate any creative (Meta/IG/LinkedIn ad, story, flyer, business card, blog header, conference banner, merch mockup) on-brand for that brand.
+This file consolidates the two source docs into a single canonical reference:
+AD_CREATIVE_MASTER_PROMPTS.md ad ideology pulled from LS DESIGN PRODUCTIONS/
+brand-kits/BRAND KIT MASTER PROMPTS.md-brand-identity ideology pulled from Brand Kits/
+Each section gives identity, palette, type, photo direction, layout rules, headline & CTA patterns, and one comprehensive master prompt.
+
+Universal house rules (applied beneath every brand below)
+• Aspect ratios shipped per asset: Feed 1:1, Instagram 4:5, Story 9:16, YouTube/Google 16:9, display 300x250 / 370x300, flyer US Letter 8.5x11, business card 3.5x2 in.
+• Layout grammar: Logo top-left or top-center -> bold left-stacked headline -> 1-2 line sub-headline -> coloured CTA pill-> photographic subject occupying the right 40-50% (or bottom-right third).
+• Typography: Bold geometric sans for headlines (Causten on Legal Soft brands, Clash Display on Practice 360, brand-specific sans elsewhere). Two-tone headline trick: brand-accent colour on the most important 2-3 words, white or near-black on the rest.
+• Photography rule: Al-generated or stock photos of professional Filipino / Latina / Caucasian / multi-ethnic remote workers wearing business attire and slim black headsets, lit warm but cool-toned, smiling gently, with direct eye contact, cleanly cut out or composited over the brand-colour gradient.
+• Persona-led headlines: Most ads open with a vocative - Lawyers: Attorneys:, Law Firm Owners: followed by a pain question or value statement.
+• Offer/price highlight: Dollar amounts ($10/hr, Save up to 80%, $500 Off) are always the largest in-image text and sit inside a coloured pill.
+• Sub-brand lockup rule: Every Legal Soft sub-brand carries a small powered by LEGAL SOFT micro-line beneath its own wordmark.
+• Export filename pattern: <seq>_Image_<bgColor>_<textColor>_<intentTag>_<brand>_<MMDDYY>.png where intentTag {ValueProp, Offer, EventAttendees, Promo, Discount}.","LS Design Productions - Ad Creative Master Prompts
+Reverse-engineered visual and copy ideology of every brand under LS Design Productions, written as ready-to-use master prompts for an image generator (Midjourney / DALL-E / Sora / Stable Diffusion) so you can replicate the exact ad style for each brand.
+Each section gives:
+1. Brand identity - what the brand is and who it sells to
+2. Visual ideology - what every ad does the same way
+3. Copy ideology - voice, structure, and call-to-action style
+4. Master Prompt - copy-paste prompt template with bracketed slots
+5. Reference assets observed in this library
+
+Universal house style (applies to every Legal/VA brand below)
+These rules are visible across every Legal Soft sub-brand. Start here, then layer the brand-specific overrides below.
+• Aspect ratios shipped per ad: Feed 1:1, Instagram 4:5, Story 9:16, YouTube/Google 16:9, plus 300x250/370x300 display banners.
+• Layout grammar: Logo top-center or top-left -> punchy headline left-aligned -> 1-2 line sub-headline in lighter weight -> pill-shaped CTA button -> photographic subject occupying the right or bottom-right third.
+• Typography: Bold sans-serif for headlines (Causten / similar geometric sans). The most important 2-3 words are colored in the brand accent; the rest is white or near-black depending on background brightness.
+• Photography rule: Al-generated or stock photos of professional Filipino/Latina/Caucasian remote workers wearing business attire and headsets, lit warm but cool-toned, in modern offices or against soft brand-color gradients. Subjects make direct eye contact and smile gently.
+• Persona-led headlines: Most ads open with a vocative - ""Lawyers:"", ""Attorneys:"", ""Law Firm Owners:"" - followed by a pain question or a value proposition.
+• Offer/price highlight: Dollar amounts (e.g. $12/hr, Save up to 80%, $1,000 OFF) are always the largest in-image text apart from the headline and sit inside a colored pill.
+• CTA labels: Book a Demo, Get Started, See Candidates, Explore Our Talent, Save Your Spot. Always inside a high-contrast pill (orange/ dark navy/black).
+• Brand footprint: Logo always at top or bottom; never both. White when over a dark/colored background, full color when over a light background.
+• Naming convention encoded in filenames: <n>_Image_<bgColor>_<textColor>_<intentTag>_<brand>_<MMDDYY>.png where intentTag E ValueProp | Offer | EventAttendees | ScaleBookkeeping50PercentOff. Use the same scheme when exporting.",
+1. Legal Soft - Flagship virtual legal staffing,"Identity: End-to-end virtual legal staff (paralegals, intake, case managers, attorneys, lien negotiators) for U.S. law firms.
+Palette: Deep navy #0A2B6B #1E55D6 #2A6DF4 on white; orange #FF7A1A reserved for CTA pills; optional warm orange light-leak top-left on event creatives.
+Type: Causten Font Family (LS new Brand Kit/Causten Font Family/).
+Logo: LEGAL SOFT wordmark with an upward bar-chart icon between the two words. White on dark, navy on light.
+Photography: Smiling professional (woman in royal-blue blazer + headset OR business-casual professional at a laptop) cut out on the right; or 4-up grid of diverse remote-staff headshots floating over a blue gradient panel.
+Headline patterns: Lawyers: ..., Attorneys: Hire Virtual Legal Staff For Your Firm!, Have an influx of cases?, Already have another virtual staff provider? We'll match or beat their price., conference variant Legal Soft goes to [EVENT NAME].
+CTA labels: Book a Demo, Get a Quote, Month-to-month, cancel any time, Visit Us at Booth [N].
+Decorative motifs: Dotted halftone arcs in the lower-right corner; faint X / arrow pattern in event backgrounds.
+Master prompt
+A [ASPECT 1:1 | 4:5 | 9:16 | 16:9] Legal Soft creative for [USE CASE Meta feed ad | IG story | conference IG square | save-the-date post | display banner | business card].
+Background: deep navy gradient (#0A2B6B center #1E55D6 edges) on white panels, with a subtle blue mesh/halftone texture and a small cluster of dotted halftone arcs in the bottom-right corner. For event/conference creatives, replace the gradient with a duotone architectural photograph of the event city ([NYC skyscrapers shot looking up / San Diego marina with the curved Marriott towers / Denver mountains]) in deep navy with a soft warm orange light leak top-left.
+Top-left logo: small white-or-navy ""LEGAL SOFT"" wordmark with the rising bar-chart icon between the two words; on conference creatives, add the partner event lockup top-right (e.g. ""TBI MED LEGAL CONFERENCE"", ""PILMMA SUPER SUMMIT"", ""ALM | LAW.COM LEGALWEEK 2025"" in white outline) and add the white connector word ""goes to"" centred between them.
+Headline (left-stacked, bold Causten / geometric sans, deep navy on white or white on navy, -64pt, 3-4 short lines): ""[QUESTION OR HOOK HEADLINE -e.g 'Have an influx of cases?' or 'Hire Virtual Legal Staff For Your Firm!']"".
+Sub-headline (lighter weight, smaller, dark gray on white or light-blue on navy): ""[ONE-LINE SOLUTION e.g. 'Instantly hire more legal staff trained in your practice area and tech stack.']"" (for event creatives, replace with ""Visit Us at Booth [NUMBER]"").
+Offer pill (vibrant orange #FF7A1A, rounded, white sans text, bottom-left or bottom-right): ""[$ AMOUNT Off ROLE NAME]"" e.g. ""$500 Off PI Trained Case Manager"", or ""Month-to-month, cancel any time"".
+Hero visual (right 40-50%):
+Option A single photoreal smiling professional [woman in royal-blue blazer with white shirt and a black headset / Latina in tan blouse working on a silver MacBook], cut out, soft cinematic rim light.
+Option B 4-up cluster of floating rounded-square cards, each containing a photoreal portrait of a diverse remote legal staff worker (Asian woman, Latino man, Caucasian woman, Filipino man all in dark blazers + slim black headsets, gently smiling), arranged over a solid bright blue (#2A6DF4) rounded panel.
+For business cards (3.5x2 in, 600 dpi, front+back artboards): solid black ground; front gold (#C9A861) Causten name + light-gray italic title + thin white sans contact stack; back: centred white Legal Soft arrow logomark with ""LEGALSOFT.COM"" beneath. Bleed marks included.
+For the bottom: thin white divider + small caption ""[DATE RANGE] | [VENUE]"" on event creatives; ""LEGALSOFT.COM"" on transactional. Style: clean modern B2B SaaS / legal marketing, premium, slightly conversion-focused.","What they sell: End-to-end virtual legal staff (paralegals, intake, case managers, attorneys, lien negotiators) for U.S. law firms.
+Visual ideology
+Primary palette: Legal Soft Blue (#1E55D6 - #2A6DF4) on white, with subtle blue mesh/halftone background patterns.
+• 4-up ""team grid"" of Al-generated headshots - diverse, headset-wearing remote staff arranged as floating rounded-square cards over a blue gradient panel.
+• Headlines pose a question (""Have an influx of cases?"") then sub-headline solves it.
+Orange (#FF7A1A) is reserved exclusively for the CTA pill (""Month-to-month, cancel any time."", ""Get a Quote"").
+• Decorative dotted halftone arcs in the lower-right corner - a recurring brand motif.
+Logo lockup: LEGAL SOFT with the upward-bar-graph mark between the two words.
+Copy ideology
+• Voice: confident, problem-aware, slightly conversational (""Already have another virtual staff provider? We'll match or beat their price."").
+• Always promises speed + cost saving + cancel anytime.
+• Persona prefix common: Lawyers: or Attorneys:.
+Master Prompt
+A 1:1/4:5 / 9:16 Facebook+Instagram ad for ""Legal Soft"" a U.S. virtual legal staffing company. Clean modern flat layout, light blue-to-white gradient background with subtle dotted halftone arcs in the bottom-right corner. Top-left: small horizontal ""LEGAL SOFT"" wordmark with rising bar-chart icon between the words, in deep navy blue.
+Headline (top-left, bold geometric sans-serif, deep navy #15347A, ~64pt): ""[QUESTION HEADLINE e.g. 'Have an influx of cases?']""
+Sub-headline (smaller, dark gray): ""[ONE-SENTENCE SOLUTION e.g. 'Instantly hire more legal staff trained in your practice area and tech stack.']""
+CTA: vibrant orange pill (#FF7A1A), rounded corners, white sans-serif text reading ""[CTA e.g. 'Month-to-month, cancel any time.']"".
+Right-third visual: 4 floating rounded-square cards arranged as a cluster, each containing a photorealistic portrait of a diverse remote legal staff worker (Asian woman, Latino man, Caucasian woman, Filipino man), all wearing dark blazers and slim black headsets, smiling gently, looking forward. Cards float above a solid bright blue (#2A6DF4) rounded rectangle.
+Bottom-left: same Legal Soft wordmark again if not at top. Aspect ratio: [1:1 | 4:5 | 9:16].
+Reference assets in this library
+• Legal Soft/Advertising/Creative/FT Meta Batch #4/1_Image_White_Text_ValueProp_Legal Soft_063025.png
+• Legal Soft/Advertising/Creative/FT Meta Batch #5/4_Image_White_Text_Offer_Legal Soft_08.15.25-1.png
+• Legal Soft/AAW Ads/Q2/Campaign 1/370 x 300.png
+• Legal Soft/Booklet/PNGs Final/04 Cost Savings Spread.png","1, Legal Soft, Navy #0A2B6B/ Orange #FF7A1A, Causten, 4-up team grid/ professional, Lawyers: ... / Hire Virtual Legal Staff, Orange pill Book a Demo"
+2. Al Answering - Al receptionist / call handling,"Identity: Al-powered 24/7 inbound + outbound call answering for law firms.
+Palette: Magenta #D6249F -> violet #7B2FBD -> indigo #1B1B4A diagonal gradient. Accent: pastel pink #F8B6E6; CTA jet black.
+Logo: AI Answering white wordmark, top-right.
+Photography: Photoreal black iPhone mockup, screen showing missed-call stack / low-battery / Al-Answering dashboard.
+Headline patterns: Doom-loop / FOMO 3-6-word punches stacked over 2-3 lines No answer / means / no client. Your phones go offline. Your callers don't.
+Sub-headline: One tactical line listing capabilities Inbound. Outbound. Intake. Scheduling. Follow-up. Analytics. All in one place.
+CTA: Solid black pill, white text BOOK A DEMO, bottom-right.
+Master prompt
+A [ASPECT 1:1 | 4:5 | 9:16] AI Answering ad for [USE CASE Meta feed | IG story | LinkedIn].
+Background: full-bleed diagonal gradient from electric magenta (#D6249F) at top-right through violet (#7B2FBD) to deep indigo (#1B1B4A) at bottom-left, with a soft bokeh of an out-of-focus office desk lamp behind it.
+Top-right logo: white "" AI Answering"" wordmark, ~30pt.
+Hero subject (left or right half): a photoreal black iPhone shown at a slight angle, floating over the gradient with a soft shadow, screen showing [a stack of missed-call notifications labelled ""Unknown"" / a low-battery 1% screen / an AI Answering dashboard with conversion metrics and call counts].
+Headline (stacked, bold geometric sans, mixed white + pastel pink #F8B6E6, ~70pt, 2-3 short lines): ""[PUNCHY DOOM-LOOP HOOK e.g. 'No answer / means / no client.']"".
+Sub-headline (plain white sans, smaller, single line): ""[ONE TACTICAL CAPABILITY LINE e.g. 'Inbound. Outbound. Intake. Scheduling. Follow-up. Analytics. All in one place.']"".
+CTA: solid jet-black rounded pill, white sans-serif text ""BOOK A DEMO"", bottom-right.
+Aspect ratio [1:1 | 4:5 | 9:16]. Style: glossy modern, high contrast, sales-poster energy, premium B2B.","What they sell: Al-powered 24/7 inbound and outbound call answering for law firms.
+Visual ideology
+• Signature magenta -> violet -> indigo gradient background, dramatic and saturated.
+• A photorealistic iPhone mockup is always present, screen turned slightly toward the viewer, showing missed-call notifications, a battery-dead screen, or an analytics dashboard.
+• Headlines use a pastel pink accent on the first phrase, then white for the rest - high-contrast on the gradient.
+• CTA pill is jet-black with white text (Book a Demo), placed bottom-right.
+• Logo: AI Answering lockup, top-right, white.
+Copy ideology
+• Doom-loop/ FOMO framing: ""No answer means no client."", ""Your phones go offline. Your callers don't.""
+• Very short headlines (3-6 words) split into stacked lines.
+• Sub-headline is one tactical sentence (Inbound. Outbound. Intake. Scheduling. Follow-up. Analytics. All in one place.).
+Master Prompt
+A modern saturated ad for ""AI Answering"" an AI receptionist platform for law firms.
+Full-bleed background: dramatic diagonal gradient from electric magenta (#D6249F) at top-right through violet (#7B2FBD) to deep indigo (#1B1B4A) at bottom-left, slight bokeh of an out-of-focus office desk lamp behind it.
+Hero subject (left or right half): a photorealistic black iPhone shown at a slight angle, floating over the gradient, screen showing [missed-call notifications stack labeled ""Unknown"", or a low-battery screen, or an AI Answering dashboard with conversion metrics].
+Headline (white + light-pink #F8B6E6 mixed words, bold geometric sans, 70pt, stacked on 2-3 short lines): ""[PUNCHY HOOK e.g. 'No answer / means / no client.']""
+Sub-headline below in plain white sans, smaller: ""[ONE TACTICAL LINE]"".
+CTA: solid black pill, white text ""BOOK A DEMO"", bottom-right.
+Top-right logo: white "" AI Answering"" wordmark. Aspect ratio [1:1 | 4:5 | 9:16]. Style: glossy modern, high contrast, sales-poster energy.
+Reference assets
+• AI Answering/Ad Creatives/Feed (1_1)/Ad 01.png
+• AI Answering/Ad Creatives/Instagram (4_5)/Ad 02.png
+• AI Answering/Ad Creatives/Story (9_16)/Ad 05.png","2, Al Answering, Magenta indigo gradient, Geometric sans, iPhone mockup, For Your Firm! No answer / means / no client., Black pill BOOK A DEMO"
+3. Bookkeeper Law (Bookkeeper. Law) - virtual bookkeeping for law firms,"Identity: IOLTA-compliant remote bookkeepers trained on law-firm financials.
+Palette: Two modes - Mode A bright sky-blue #3DA0F5 #2A7EE0; Mode B near-white light-blue grid #EAF4FD. Teal #115F8C offer pill, mustard #F5C147, peach #F4A36B, navy #1E3A66 accent squares.
+Logo: Black ""BOOKKEEPER virtual assistant"" wordmark with a small blue ""B"" icon + powered by LEGAL SOFT micro-line.
+Photography: Single smiling Filipino/Asian female bookkeeper at a clean desk with laptop + printed spreadsheets, soft natural light, shallow depth of field.
+Headline patterns: Two-line setup-payoff with Lawyers: prefix Lawyers: / Stop thinking about vendor payments.; IOLTA wedge Never worry about IOLTA again.
+Decorative motif: 4-6 small square colour blocks (mustard /peach/navy/teal) clustered at corners.
+Tech-partner row: tinted-circle icons of Clio, QuickBooks, Xero, Filevine, LawPay along the bottom.
+Master prompt
+A [ASPECT 1:1 | 4:5] Bookkeeper Virtual Assistant (powered by Legal Soft) ad aimed at U.S. law firm owners.
+Background: choose [Mode A bright sky-blue gradient (#3DA0F5 #2A7EE0) with subtle abstract concentric arcs in the lower portion / Mode B very-light-blue (#EAF4FD) with faint grid lines like graph paper]. Add a small cluster of 4-6 square colour blocks (mustard #F5C147, peach #F4A36B, navy #1E3A66, teal #1D7A9C) scattered in the bottom-left and top-right corners.
+Top-center: black ""BO0KKEEPER virtual assistant"" wordmark with the small blue ""B"" icon to its left, and small ""powered by LEGAL SOFT"" tagline beneath it.
+Headline (centred or left, deep teal #0F4F73 on light backgrounds / white on blue backgrounds, bold geometric sans, ~62pt, 2 lines): ""[PERSONA PREFIX e.g. 'Lawyers:'] / [PROBLEM STATEMENT e.g. 'Stop thinking about vendor payments.' or 'Never worry about IOLTA again.']""
+Sub-headline (gray regular, smaller): ""Our bookkeepers are trained in your firm's practice area and [handle all of your financial operations / ensure you stay IOLTA-compliant / offload your trust-account reconciliation].""
+Offer pill: teal #115F8C rounded pill, white text with a yellow accent on the price ""Starting at $14 / hour"" (or any value-prop the campaign needs).
+Hero photo (centre-bottom or right, rounded corners, ~50% width): a single smiling Filipino / Asian female bookkeeper in a light shirt sitting at a clean desk with a laptop and printed spreadsheets in front of her, soft natural light, shallow depth of field.
+Bottom row (optional): tinted circle icons of Clio, QuickBooks, Xero, Filevine, LawPay logos arranged horizontally.
+Aspect ratio [1:1 | 4:5]. Style: clean SaaS marketing, calm financial-services feel.","What they sell: IOLTA-compliant remote bookkeepers trained on law-firm financials.
+Visual ideology
+• Two-mode color system: bright sky-blue background (Mode A) or near-white light-blue grid background (Mode B).
+Recurring squares-of-colored-blocks motif in corners (mustard, navy, teal, peach) fragmenting around the photo.
+• Photography: a single Filipino/Asian female bookkeeper at a clean desk with laptop, charts, papers shot with shallow depth-of-field.
+• Logo lockup: B BOOKKEEPER virtual assistant powered by Legal Soft (small blue B icon).
+• Tech partner row at the bottom in some variants: tinted-circle icons of Clio, QuickBooks, Xero, Filevine, LawPay.
+Copy ideology
+• Two-line setup-payoff headlines: ""Lawyers: / Stop thinking about vendor payments.""
+• IOLTA/trust-account compliance language is repeated as the wedge (""Never worry about IOLTA again."", ""Offload your IOLTA compliance to our team."").
+• Price hooks: Starting at $14 / hour in a teal pill.
+Master Prompt
+A 1:1 Meta ad for ""Bookkeeper Virtual Assistant powered by Legal Soft"", aimed at U.S. law firm owners. Background: very-light-blue (#EAF4FD) with faint grid lines OR bright sky-blue gradient (#3DA0F5 #2A7EE0). Subtle abstract concentric arcs in the lower portion.
+Top-center: black ""BOOKKEEPER virtual assistant"" logo with the blue ""B"" icon, ""powered by LEGAL SOFT"" tagline beneath it, small.
+Headline (centered, deep teal #0F4F73, bold geometric sans, ~62pt): ""[PERSONA: 'Lawyers:'] / [PROBLEM STATEMENT e.g. 'Stop thinking about vendor payments.']""
+Sub-headline (gray, regular): ""Our bookkeepers are trained in your firm's practice area and [handle all of your financial operations / ensure you stay compliant].""
+Offer pill (teal #115F8C, white text with yellow accent on the price): ""Starting at $14 / hour"".
+Photo block (center-bottom, rounded corners, ~50% width): a single smiling Filipino or Asian female bookkeeper in a light shirt sitting at a clean desk with a laptop and printed spreadsheets in front of her, soft natural light, shallow depth of field.
+Decorative motif: 4-6 small square color blocks (mustard #F5C147, peach #F4A36B, navy #1E3A66, teal #1D7A9C) clustered at the bottom-left and top-right corners of the photo, creating a ""scattered tiles"" feel.
+Optional bottom row: tinted circle icons of Clio, QuickBooks, Xero, Filevine, LawPay logos. Aspect ratio 1:1. Style: clean SaaS marketing.
+Reference assets
+• Bookkeeper Law/Advertising/Creative/FT Meta Batch #1/V1/PNGs/5_Image_Blue_Text_ValueProp...
+• Bookkeeper Law/Advertising/Creative/FT Meta Batch #1/V3/PNGs/3_Image_White_Text_ValueProp...
+• Bookkeeper Law/Advertising/Creative/FT Meta Batch #6/V1/3a_Image_Gradient_Text_Offer...","3, Bookkeeper Law, Sky-blue/white grid, Geometric sans, Asian female bookkeeper at desk, Lawyers: / Stop thinking about vendor payments., Teal pill Starting at $14/hour"
+4. Legal Intaker - virtual intake specialists,"Identity: Pre-trained virtual intake specialists for U.S. law firms.
+Palette: Cinematic midnight navy #091436 / #0A1E3A. Accents: sky-blue #9AD2F0 / #B0DCF5 (headline part 1), coral-orange #FF6A4D / #FF6E55 (CTA + secondary offer pill).
+Logo: White chain-link icon + ""Legal Intaker"" wordmark, top-centre.
+Photography: Either (a) middle-aged Caucasian male attorney slumped at a messy desk piled with files (hand on forehead, exhausted) under warm brass-lamp rim light, OR (b) trio of confident headset intake specialists (Latino male, Latina female, Caucasian male in dark suits) in front of a blurred dim call centre.
+Headline patterns: Empathy -> pain question Hire, and delegate. / Why is it so hard?.
+Hard dollar promise Save $60k per Year Starting Now!.
+CTA: Bright coral-orange pill - Let's Fix That!, Get Started.
+Mood: cinematic, problem solution, premium B2B.
+Master prompt
+A [ASPECT 1:1 | 9:16] dark-mode Meta/IG ad for ""Legal Intaker"" a service that places pre-trained virtual intake specialists into U.S. law firms.
+Background: deep midnight navy (#091A36) with a moody, slightly out-of-focus law-office set behind the subject bookshelves of legal volumes, a brass desk lamp casting warm rim light, a leather chair partially visible at frame edge.
+Top-centre logo: white chain-link icon next to white ""Legal Intaker"" wordmark, ~30pt.
+Headline (centred, two-line, mixed colours, bold sans, ~56pt):
+Line 1 (sky-blue #B0DCF5): ""[EMPATHY PHRASE e.g. 'Hire, and delegate.']""
+Line 2 (white, same weight): ""[PAIN QUESTION -e.g 'Why is it so hard?']""
+Hero subject (centre, photoreal AI render):
+Option A single middle-aged Caucasian male attorney in dark suit, slumped at a messy desk piled with files, hand on forehead, exhausted expression, dramatic warm rim light.
+Option B trio of confident intake specialists (Latino male, Latina female, Caucasian male) in dark suits + slim black headsets, smiling, standing in front of a blurred dim call centre.
+Optional secondary pill above CTA: coral with white text ""Save $60k per Year Starting Now!"" (or any dollar promise the campaign needs).
+CTA pill: bright coral-orange (#FF6E55) gradient, rounded, white bold text ""[CTA-e.g 'Let's Fix That!' or 'Get Started']"", centre-bottom.
+Foot line (white regular, smaller, centred): ""[REASSURANCE e.g. 'Our VAs, no training needed. Just proven legal talent.']""
+Aspect ratio [1:1 | 9:16]. Mood: cinematic, problem solution, premium B2B Saas.","What they sell: Pre-trained virtual intake specialists for U.S. law firms.
+Visual ideology
+• Cinematic dark navy backgrounds (#0A1E3A) with moody library / law-office set dressing (stacked law books, brass lamp, leather chair).
+• Al-generated photoreal hero subjects under stress - middle-aged white male attorney slumping at desk with hand on forehead - OR confident headset-wearing intake-team trio in front of a dimly lit call center.
+• Sky-blue accent (#9AD2F0) for the first phrase of the headline + white for the rest.
+• CTA pill: bright coral/orange (#FF6A4D) - ""Let's Fix That!"", ""Get Started"".
+• Logo top-center: [ Legal Intaker with white icon resembling chain links.
+Copy ideology
+• Empathy-first: surface the burnout (""Hire, and delegate. Why is it so hard?"") then offer relief (""Our VA's, no training needed. Just proven legal talent."").
+• Hard dollar promise: Save $60k per Year Starting Now!.
+Headlines mix sentence-case and stylized line breaks for poster-like rhythm.
+Master Prompt
+A 1:1/9:16 dark-mode Meta ad for ""Legal Intaker"" a service that places pre-trained virtual intake specialists into U.S. law firms. Cinematic, dramatic lighting.
+Background: deep midnight navy (#091A36) with a moody, slightly out-of-focus law office set behind the subject bookshelves of legal volumes, a brass desk lamp casting warm rim light, a leather chair partially visible.
+Top-center logo: white chain-link icon next to white wordmark ""Legal Intaker"", ~30pt.
+Headline (centered, two-line, mixed colors):
+Line 1 (sky-blue #B0DCF5, bold sans, 56pt): ""[EMPATHY PHRASE e.g. 'Hire, and delegate.']""
+Line 2 (white, same weight): ""[PAIN QUESTION e.g. 'Why is it so hard?']""
+Hero subject (center, photorealistic AI rendering):
+Option A single middle-aged Caucasian male attorney in dark suit, slumped at messy desk piled with files, hand on forehead, exhausted expression.
+Option B trio of confident intake specialists (Latino male, Latina female, Caucasian male) wearing dark suits + black headsets, smiling, standing in front of a blurred dim call center.
+CTA pill: bright coral-orange (#FF6E55) gradient, rounded, white bold text ""[CTA e.g. 'Let's Fix That! or 'Get Started']"", center-bottom.
+Foot line (white, smaller, centered): ""[REASSURANCE e.g. 'Our VA's, no training needed. Just proven legal talent.']""
+Optional secondary pill above CTA: coral with white text ""Save $60k per Year Starting Now!""
+Aspect ratio [1:1 | 9:16]. Mood: cinematic, problem solution, premium B2B SaaS.
+Reference assets
+• Legal Intaker/Advertising/Creative/LI Meta Batch #1/Feed (1_1)/Ad #26.png
+• Legal Intaker/Meta Creatives/2025/Story (9_16)/Ad #15.png","4, Legal Intaker, Midnight navy + sky-blue + coral, Bold sans, Exhausted attorney OR intake trio, Hire, and delegate. / Why is it so hard?, Coral pill Let's Fix That!"
+5. Remote Attorneys (RA) - outsourced licensed attorneys,"Identity: Pre-vetted remote attorneys + paralegals for U.S. firms at up to 80% lower cost.
+Palette: Neutral light cool gray #EDEEEF. Dominant accent: orange #FF9128. Secondary: blue tints.
+Logo: R Remote Attorneys (interlocking R and A in orange) - bottom-center or top-right.
+Photography (ads): Bar-chart infographic where each bar is a coloured panel containing a remote-staff headshot with a price stamped above; the tallest ""in-house"" bar is left blank or silhouetted with a red x.
+Photography (web blog heroes): Warm amber/orange backlit office; female attorney in black blazer + white blouse writing notes; faint stock-ticker overlay in the background; small white tile with orange ""RA"" monogram bottom-right.
+Headline patterns: Lawyers: orange pill prefix; Hire Virtual Legal Staff For Your Firm; Save Up to 80%; For Up To 80% Less Cost. Blog hero overlay: practice area name (Bankruptcy Lawyers, Personal Injury Lawyers, Family Law Attorneys).
+CTA: Explore Our Talent Now orange pill.
+Master prompt
+A [ASPECT 1:1/4:5 | 16:9 carousel | 16:9 blog hero] Remote Attorneys (RA) creative for [USE CASE Meta carousel | comparison infographic | practice-area blog hero | display banner].
+Background Mode A (ads): clean cool gray (#EDEEEF). Mode B (blog heroes): warm amber office scene at golden hour with sunlight coming through window blinds; cinematic moody lighting; faint translucent stock-ticker text and candlestick chart lines drift across the warm wall in orange.
+For ad mode: Top-centre orange (#FF9128) rounded pill with white bold text ""Lawyers:"", followed below by black bold sans-serif headline ""[VALUE HEADLINE e.g. 'Hire Virtual Legal Staff For Your Firm']"".
+For ad mode centre infographic: a stylised 3-bar chart rising left-to-right against a $0-$100 vertical axis on the far left:
+Bar 1 (short, orange-tinted): photo of a smiling female remote attorney in tan blazer, labelled above ""Attorney Virtual from $20/hr"", orange check badge.
+Bar 2 (medium, blue-tinted): photo of a smiling male remote paralegal in blue shirt, labelled ""Paralegal Virtual from $17/hr"", blue check badge.
+Bar 3 (tallest, mostly empty with a flat blue silhouette of a person, red x badge): labelled ""Attorney In-house from $32/hr / Paralegal In-house from $88/hr"".
+Between bars 1 and 3, large bold orange text: ""Save Up to 80%"".
+CTA pill (ad mode): orange pill at bottom-centre, white text ""Explore Our Talent Now"", with the orange ""RA Remote Attorneys"" wordmark centred directly beneath.
+For carousel page variant: replace bars with a single floating rounded headshot card of one remote attorney on the left (orange gradient frame) and a large orange rounded content panel on the right with the headline ""Is Your Firm Paying Too Much for Legal Staff? Switch to Remote Attorneys"", and a bottom-aligned ""FOR UP TO 80% LESS COST"" mega-number.
+For blog-hero mode (16:9, 1024x576): subject is a female attorney in her 30s, brunette, wearing a black blazer over a white blouse, glasses, head down writing on legal pads with a fountain pen / gavel resting next to her hand. Left side white display sans title across 2 lines: ""[PRACTICE AREA e.g. 'Bankruptcy Lawyers', 'Personal Injury Lawyers', 'Family Law Attorneys']"". Bottom-right corner: white square tile containing the orange ""RA"" monogram.
+Aspect ratio [1:1 | 4:5 | 16:9]. Style: clean infographic + B2B SaaS (ad) or cinematic warm law-firm marketing (blog).","What they sell: Pre-vetted remote attorneys + paralegals for U.S. firms at 80% lower cost.
+Visual ideology
+• Light gray background (#EDEDED) - the most neutral palette in the family.
+Signature visual: a 3-column bar chart where each bar is a colored panel containing a virtual staff member's headshot, with the price (from $20/hr, from $17/hr) stamped above their image; the tallest ""in-house"" bar is left blank/silhouetted with a red x - a literal ""cheaper than in-house"" infographic.
+Orange (#FF9128) is the dominant brand color - pills, ""80%"" callouts, bar fills.
+• Carousel format frequently used (rounded-rectangle stacked layout, dot indicators at bottom).
+• Logo: R. Remote Attorneys (interlocking R and A in orange) - bottom-center or top-right.
+Copy ideology
+• Comparison/savings framing: ""Save Up to 80%"", ""For Up To 80% Less Cost"".
+Persona prefix in orange pill: Lawyers:.
+• CTA: Explore Our Talent Now.
+Master Prompt
+A 4:5/1:1 Meta ad/carousel for ""Remote Attorneys"" (RA) outsourced remote attorneys and paralegals for U.S. law firms. Clean infographic style.
+Background: light cool gray (#EDEEEF).
+Top center: orange (#FF9128) rounded pill with white bold text ""Lawyers:"", followed below by black bold sans-serif headline ""[VALUE HEADLINE e.g. 'Hire Virtual Legal Staff For Your Firm']"".
+Center infographic a stylized bar chart with three bars rising left-to-right against a $0 to $100 vertical axis on the far left:
+Bar 1 (short, orange-tinted): photo of a smiling female remote attorney in tan blazer, labeled above ""Attorney Virtual from $20/hr"", with an orange check badge.
+Bar 2 (medium, blue-tinted): photo of a smiling male remote paralegal in blue shirt, labeled ""Paralegal Virtual from $17/hr"", blue check badge.
+Bar 3 (tallest, mostly empty with a flat blue silhouette of a person, red x badge): labeled ""Attorney In-house from $32/hr / Paralegal In-house from $88/hr"".
+Between bars 1 and 3, large bold orange text: ""Save Up to 80%"".
+CTA: orange pill at bottom-center, white text ""Explore Our Talent Now"", with the ""RA Remote Attorneys"" wordmark in orange centered directly below.
+Optional carousel-page variant: replace bars with a single floating rounded headshot card of one remote attorney on the left (orange gradient frame) and a big orange rounded content panel on the right with the headline ""Is Your Firm Paying Too Much for Legal Staff? Switch to Remote Attorneys"", and a bottom-aligned ""FOR UP TO 80% LESS COST"" mega-number.
+Aspect ratio [1:1 | 4:5]. Style: clean infographic + B2B SaaS.
+Reference assets
+• Remote Attorneys/Advertising/Creative/CG Meta Batch #1/FEED OK/RA-ANUNCIOS-01.png
+• Remote Attorneys/Advertising/Creative/CG Meta Batch #2.1/CAROUSEL/RA-carousel-AD6-A.png","5, Remote Attorneys, Gray + orange #FF9128, Bold sans, Bar-chart with headshots/ amber attorney, Save Up to 80% / [Practice Area] Lawyers, Orange pill Explore Our Talent Now"
+6. Remote Case Manager (RCM) - case-manager staffing,"Identity: Pre-vetted remote case managers ready to plug into existing law firms.
+Palette: Deep blood-red / burgundy radial #2A0F0F #6E1A1A; gold-cream #F1D58D CTA pill; faint dark-red hexagonal pattern overlay.
+Logo: Small white M Remote Case Manager wordmark with M-icon, top-left.
+Photography: Confident blonde Caucasian woman ~35, shoulder-length wavy hair, in a vivid red blazer over a maroon top, seated at a wood conference table with a laptop, smiling subtly, warm rim light against burgundy background. 16:9 variant adds a stressed-pose card next to the happy pose.
+Headline patterns: Cost-of-bad-hire - The True Cost of a Bad Legal Hire is More Than Just a Salary.; urgency Need a Case Manager YESTERDAY?
+Checklist motif: Gold circle icons with - Recruiting Fees, Salary and Benefits, Training.
+CTA: Cream/gold pill Book A FREE Demo / SEE CANDIDATES.
+Master prompt
+A [ASPECT 1:1 | 16:9] Meta + YouTube ad for ""Remote Case Manager"" (RCM) a service that places pre-vetted remote case managers into U.S. law firms.
+Background: deep burgundy radial gradient, dark crimson #2C0E0E at edges fading to brighter ruby #6B1717 in the centre, with a faint dark-red hexagonal pattern overlay.
+Top-left logo: small white ""M Remote Case Manager"" wordmark with M-icon, ~24pt.
+Headline (left-aligned, bold white sans, ~60pt, stacked 3-4 lines): ""[STAT-DRIVEN HOOK e.g. 'The True Cost of a Bad Legal Hire is More Than Just a Salary. or 'Need a Case Manager YESTERDAY?']""
+Checklist (below headline, 3 bullets, each with a gold-cream filled circle containing a white): ""Recruiting Fees"" / ""Salary and Benefits"" / ""Training"".
+Hero photo (right side, ~45% width, no border): photoreal blonde Caucasian woman ~35 with shoulder-length wavy hair, wearing a vivid red blazer over a maroon top, seated at a wood conference table with a laptop, smiling subtly at camera, warm rim light against the burgundy background.
+Foot line (bottom-left, smaller white): ""[CLOSER -e.g 'Pre-vetted, Remote Case Managers Ready from Day One.']""
+CTA pill: solid cream/gold (#F1D58D) rounded button bottom-right, black bold text ""Book A FREE Demo"" or ""SEE CANDIDATES"".
+16:9 variant: two stacked rounded-corner photo cards on the right showing the same blonde woman left card: happy & typing; right card: stressed with hand on temple to visualise the before/after.
+Aspect ratio [1:1 | 16:9]. Style: cinematic, premium, urgency-driven B2B.","What they sell: Pre-vetted remote case managers ready to plug into existing law firms.
+Visual ideology
+Signature deep blood-red / burgundy radial gradient backgrounds (#2A0F0F -> #6E1A1A) distinctive and instantly different from sibling brands.
+• Hero subject: a confident blonde Caucasian woman in a red blazer working at a laptop, lit dramatically with rim light.
+• Gold/cream pill CTA (#F1D58D) - ""Book A FREE Demo"", ""SEE CANDIDATES"".
+• Checklist motif: gold circle icons with check, listing pain points (Recruiting Fees / Salary and Benefits / Training).
+• 16:9 variant: split layout, copy left + two side-by-side rounded photo cards on the right showing the same model in happy vs. stressed poses.
+Copy ideology
+• Cost-of-bad-hire framing: ""The True Cost of a Bad Legal Hire is More Than Just a Salary.""
+• Urgency framing on 16:9: ""Need a Case Manager YESTERDAY?""
+• CTA: Book A FREE Demo, See Candidates.
+Master Prompt
+A 1:1 / 16:9 Meta + YouTube ad for ""Remote Case Manager"" (RCM) a service that places pre-vetted remote case managers into law firms.
+Background: deep burgundy radial gradient, dark crimson #2C0E0E at edges fading to brighter ruby #681717 in the center, with a faint dark-red hexagonal pattern overlay.
+Top-left logo: small white ""M Remote Case Manager"" wordmark with M-icon, ~24pt.
+Headline (left-aligned, bold white sans, ~60pt, stacked 3-4 lines): ""[STAT-DRIVEN HOOK e.g. 'The True Cost of a Bad Legal Hire is More Than Just a Salary.']""
+Checklist (below headline, 3 bullets, each with a gold-cream filled circle containing a white check):
+Recruiting Fees
+Salary and Benefits
+Training
+Hero photo (right side, ~45% width, no border) photoreal blonde Caucasian woman ~35, with shoulder-length wavy hair, wearing a vivid red blazer over a maroon top, seated at a wood conference table with a laptop, smiling subtly at camera, lit with warm rim light against the burgundy background.
+Foot line (bottom-left, smaller white): ""[CLOSER e.g. 'Pre-vetted, Remote Case Managers Ready from Day One.']""
+CTA pill: solid cream/gold (#F1D58D) rounded button bottom-right, black bold text ""Book A FREE Demo"" or ""SEE CANDIDATES"".
+16:9 variant: two stacked rounded-corner photo cards on the right showing the same blonde woman left card: happy & typing, right card: stressed with hand on temple to visualize the before/after.
+Aspect ratio [1:1 | 16:9]. Style: cinematic, premium, urgency-driven B2B.
+Reference assets
+• Remote Case Manager/Advertising/Creative/RCM Meta P3D Batch #1/Feed (1_1)/Ad #1.png
+• Remote Case Manager/Advertising/Creative/RCM Meta P3D Batch #1/Youtube-Google (16_9)/Ad #4.png","6, Remote Case Manager, Burgundy + cream gold, Bold sans, Blonde woman in red blazer, The True Cost of a Bad Legal Hire..., Cream pill Book A FREE Demo"
+7. MedVirtual - Virtual medical staffing,"Identity: Remote medical admins, scribes, billers, schedulers and bookkeepers for clinics, chiropractic, dental, vet, cosmetic, imaging.
+Palette: Teal / cyan #0E5E63 #14C0CB / #16A8B5 / #1ABFC9 / #1FA7B0. Light-teal headline accent #5FE5EC. White-to-teal hero gradient.
+Logo: White "" MedVirtual"" wordmark (X-icon over lowercase ""Med"" + uppercase ""Virtual"") + powered by LEGAL SOFT micro-lockup.
+Type: Stacked display headline - light-teal kicker + heavy black main headline.
+Photography: Either (a) hero collage of 4 multi-ethnic smiling agents in teal/blue polos with black headsets, shoulders-up, overlapping in a horizontal strip across the middle on a white-to-teal gradient, or (b) Asian female doctor in scrubs and stethoscope at a laptop in a clinical setting (used for the revamp flyer).
+Headline patterns: Hire Dedicated Virtual Medical Staff, Get a Trained Virtual Healthcare Support Without Full In-House Hiring Costs, Transforming Healthcare Staffing, Grow Your Medical Practice.
+Trust proofs: 1,000+ practices, 1,500+ staff, 1,200+ practices supported, 7 global offices. Co-brands: ATSU A.T. Still University, Bautch Chiropractic, Derrow Dermatology, FCMW (Florida Concierge), Center for Wellness & Paincare of America.
+Price anchor: STARTING AT $10/HR *FREE TRIAL* (or 30 DAY FREE TRIAL For [EVENT] Attendees badge variant).
+CTA: BOOK A CONSULT teal pill/ Talk To Our Team 818-208-7786 curve overlay / Scan to book a meeting QR.
+Master prompt
+A [ASPECT -1:1 LinkedIn | 4:5 IG | 8.5x11 flyer | 3.5x2 business card | 3-panel tri-fold] MedVirtual creative for [USE CASE Meta/LinkedIn ad | conference flyer | tri-fold brochure | personnel business card].
+Background: deep-teal-to-aqua radial gradient (#0E5E63 at top-left to #1FA7B0 at bottom-right) for ads, OR white-fading-to-brand-teal (#1ABFC9) at a curved divider for flyers, with soft bokeh circles of out-of-focus turquoise light.
+Top-centre logo: white ""x MedVirtual"" wordmark with the X-icon, ~28pt, with a tiny ""powered by LEGAL SOFT"" micro-lockup directly beneath.
+Headline (stacked split, bold geometric sans):
+Kicker (light-teal #5FE5EC, smaller): ""[KICKER e.g. 'HIRE DEDICATED' or 'Get a']""
+Main (heavy black or white display, 60pt, 2 lines): ""[MAIN e.g. 'VIRTUAL MEDICAL STAFF' or 'Trained Virtual / Healthcare Support']""
+Sub-headline (white or dark regular sans): ""Trusted by More Than [1,000]+ Practices"" or ""Access specialised support roles while controlling hiring burden and operational costs.""
+Hero subject (centre, right or middle band):
+Option A (flyer hero collage) 4 multi-ethnic smiling virtual-staff agents shoulders -up, wearing teal & blue polos with black call-centre headsets, overlapping in a curved horizontal strip across the middle.
+Option B (LinkedIn / Meta ad) single photoreal young woman with long dark hair, light makeup, wearing a soft teal sweater or teal scrubs, smiling warmly at camera, working at a laptop.
+Option C (revamp flyer P1) Asian female doctor in scrubs and stethoscope at a laptop in a clinical setting, teal half-circle frame at top.
+Mid-curve overlay (flyer only): thin black band with white script ""[OVERLAY LINE e.g. 'Grow Your Medical Practice' or 'Talk To Our Team [PHONE]']"".
+Offer pill (large, dark-teal rounded rectangle, white text): ""STARTING AT $10/HR"" with smaller pill below it ""*FREE TRIAL*"" (or replace pill with circular badge ""30 DAY FREE TRIAL For [EVENT] Attendees"" for conference variants).
+Categories grid (flyer only) 3-column 3-row grid of circular black icons each captioned in white sans: Dentists, Chiropractors, Cosmetic Centers, Medical Billers, Physician Groups, Imaging Centers, Solo Practitioners, Veterinary Clinics, Alternative Medicine.
+For tri-fold inside spread: 4 role cards (Medical Admin, Medical Biller, Bookkeeping Assistant, Marketing Assistant) each card white-on-teal-gradient with a rounded headshot circle, role title in teal, 3 white-checkmark bullets. Centre column: ""Benefits of Virtual Medical Staffing with MedVirtual"" with Experienced Recruiters / Industry-Leading Training Curriculum / Proprietary Performance Monitoring Software / Access to Medical Talent for Lower Cost.
+For tri-fold outside: trust strip with grayscale logos (FCMW, Center for Wellness & Paincare, Derrow Dermatology, Bautch Chiropractic, ATSU A.T. Still University) + 3-step ""How it works"" (Book a demo / Select trained agents / Take your practice to the next level) + QR code ""Scale Your Practice Now"".
+For business card (3.5x2 in front): teal-to-cyan vertical gradient ground. Top-left rounded-square headshot. Top-right white rounded-square QR with MedVirtual ""X"" centred. Bottom half: large white sans display ""[FULL NAME]"", thinner ""[TITLE]"", thin divider, white contact stack ""(818) [XXX-XXXX]"" + ""[first]@medvirtual.ai"", light-teal footer ""www.medvirtual.ai"".
+CTA / footer: ""MEDVIRTUAL.AI"" centred at the foot in teal sans uppercase, OR teal pill ""BOOK A CONSULT"" bottom-left, OR ""info@medvirtual.ai 818-230-4446"".
+Aspect ratio [1:1 | 4:5 | 8.5x11]. Style: clean healthcare Saas, calm, professional, high-contrast.","What they sell: Remote medical admins, scribes, billers, and schedulers for clinics, chiropractors, dental, vet, cosmetic.
+Visual ideology
+• Teal / aqua gradient backgrounds (#0E5E63 -> #14C0CB) - instantly readable as ""healthcare"".
+• Subject: smiling young female healthcare worker in teal scrubs or a soft sweater, in a clinical setting with a laptop.
+• Bokeh circles in the background (out-of-focus medical office lighting). Logo: white X ""MedVirtual"" lockup top-left.
+• CTA pill: bright teal (#14C0CB) on dark bg, dark teal text ""BOOK A CONSULT"".
+Copy ideology
+• Cost + capability promise: ""Get a Trained Virtual Healthcare Support Without Full In-House Hiring Costs"".
+Headlines split key phrase in light-teal accent color vs white.
+• Always references the role offered (Medical Admin Assistant / Medical Biller / Medical Scribe) and the result (Less Than 2% Denial Rate / Real-time EMR Charting).
+Master Prompt
+A 1:1 LinkedIn / Meta ad for ""MedVirtual"" virtual medical staffing for clinics, dental, chiropractic and vet practices.
+Background: deep-teal-to-aqua radial gradient (#0E5E63 at top-left, #1FA7B0 at bottom-right) with soft bokeh circles of out-of-focus turquoise light.
+Top-left: white ""x MedVirtual"" wordmark with the X-shaped X-icon, ~28pt.
+Hero subject (center-right, 60% height): a photoreal young woman with long dark hair, light makeup, wearing a soft teal sweater or teal scrubs, smiling warmly at camera, working at a laptop. Subtle warm rim light on her face against the teal background.
+Headline (left, stacked, mixed colors):
+Line 1 white bold sans 56pt: ""Get a""
+Line 2 light-teal #5FE5EC bold sans 60pt: ""Trained Virtual""
+Line 3 light-teal continues: ""Healthcare Support""
+Line 4 white: ""Without Full In-House""
+Line 5 white: ""Hiring Costs""
+Sub-headline (white regular sans, smaller): ""Access specialized support roles while controlling hiring burden and operational costs.""
+CTA pill: bright teal (#14C0CB) bottom-left, dark navy text ""BOOK A CONSULT"".
+Aspect ratio 1:1 (or 4:5 for Story). Style: clean healthcare SaaS, calm professional.
+Reference assets
+• MedVirtual/LinkedIn Ad Creatives/Creative 9.png
+• MedVirtual/Flyers/General Flyer/MedVirtual -Brochure (1).pdf","7, MedVirtual, Teal #1ABFC9, Stacked split, 4 headset agents/ female doctor, Hire Dedicated Virtual Medical Staff, Teal pill BOOK A CONSULT / $10/HR FREE TRIAL"
+8. Virtual Staffing - Parent staffing platform,"Identity: Virtual Staff Inc. - the broader platform that staffs all roles for any industry; tech-startup feel.
+Palette: Electric royal blue #1A47E0.
+Logo: White V VIRTUAL STAFFING wordmark with slanted-V icon, bottom-centre.
+Photography: Smiling Caucasian woman ~30 at a laptop, cut out and floated over the blue with glassmorphic Ul cards orbiting her.
+Headline patterns: Scale f st. (lightning-bolt swap for ""a""), We'll handle the backend.
+Floating UI motif: chat-app pill with role label (Case Manager, Intake, Paralegal), Zoom-style call mockup, ""Training Progress 78%"" dashboard card, dotted-line connectors to a V-logo card.
+Master prompt
+A [ASPECT 1:1/4:5/9:16] modern startup-feel Meta/LinkedIn ad for ""Virtual Staffing"" a SaaS-flavoured virtual-staff platform. Tech-product energy.
+Background: full-bleed electric royal blue (#1A47E0) with a subtle inner glow.
+Headline (centre-top, white bold sans, 78pt, with a stylised lightning-bolt icon replacing the ""a"" letter): ""Scale fest."" (or any short product-y headline with an icon substitution, e.g. ""Hire fst."", ""Ship fst."").
+Hero subject (centre): a photoreal smiling Caucasian woman ~30 with shoulder-length blonde hair, wearing a navy blazer + white shirt, working at a laptop. Cut out cleanly and floated over the blue background with a subtle drop shadow.
+Floating UI elements arranged around her in a circular orbit (glassmorphic, semi-transparent white with thin border, soft shadow):
+- top-left: small chat-app window showing a ""[ROLE Case Manager | Intake | Paralegal]"" pill
+- middle-left: a Zoom-style call mockup with caller bubbles
+- top-right: a dashboard card ""Training Progress [N]%"" with a progress bar
+- bottom-right: small circular profile photos linked by a dotted line to a ""V"" logo card
+- centre-right: a black pill speech bubble ""[TAG LINE -e.g 'We'll handle the backend.']""
+Bottom-centre logo: white ""V VIRTUAL STAFFING"" wordmark with the slanted-V icon.
+Aspect ratio [1:1/4:5/9:16]. Style: modern SaaS, friendly tech, slight 3D depth.","What they sell: The broader Virtual Staff Inc. platform - all virtual staff for any industry.
+Visual ideology
+• Royal/electric blue flat background (#1A47E0) - the deepest, most saturated blue in the family.
+• Headline includes a lightning bolt or check icon literally inside a letter (Scale f st.) - playful, modern, tech-startup-energy.
+• Floating glassmorphic Ul cards around the subject: chat windows, progress bars (Training Progress 78%), Zoom-style call mockups - to feel product-y, not just service-y.
+• Hero subject: a smiling Caucasian woman at a laptop, cut out and floated over the blue with cards orbiting her.
+Logo: white V Virtual Staffing wordmark, bottom-center.
+Copy ideology
+• Tech-startup tone: ""Scale fast."" / ""We'll handle the backend.""
+• Pill labels indicate the role being staffed (Case Manager, Intake, Paralegal).
+Master Prompt
+A 1:1 modern startup-feel Meta ad for ""Virtual Staffing"" a SaaS-flavored virtual-staff platform. Tech-product energy.
+Background: full-bleed electric royal blue (#1A47E0) with soft inner glow.
+Headline (center-top, white bold sans, 78pt with a stylized lightning-bolt icon replacing the ""a"" letter): ""Scale f st.""
+Hero subject (center): a photoreal smiling Caucasian woman ~30 with shoulder-length blonde hair, wearing a navy blazer + white shirt, working at a laptop. Cut out cleanly and floated over the blue background with a subtle drop shadow.
+Floating UI elements arranged around her in a circular orbit (glassmorphic, semi-transparent white with thin border, casting soft shadow):
+- top-left: a small chat-app window showing a ""Case Manager"" pill
+- middle-left: a Zoom-style call mockup with caller bubbles
+- top-right: a dashboard card ""Training Progress 78%"" with a progress bar
+- bottom-right: small circular profile photos linked by dotted line to a ""V"" logo card
+- center-right: a black pill speech bubble ""We'll handle the backend.""
+Bottom-center: white ""V VIRTUAL STAFFING"" wordmark with the slanted-V icon. Aspect 1:1. Style: modern SaaS, friendly tech, slight 3D depth.
+Reference assets
+• Virtual Staffing/Meta Creatives/2025/Feed (1_1)/Month 1/General Graphics/Innovation & Scale.png
+• PSD source: Virtual Staffing/Meta Creatives/PSD Files/... (252 MB master file)","8, Virtual Staffing, Royal blue #1A47E0, Display + icon swap, Woman + glassmorphic Ul orbit, Scale fest., Bottom-centre V wordmark"
+9. Virtual Staffing Careers - Candidate-side spotlight ads & merch,"Identity: Recruits candidates into the Virtual Staff talent pool, while showing law firms who is ready to hire. Doubles as the employer-brand merch line.
+Palette: Cool light-blue #EAF1FB grid; royal blue #1F5BFF CTA; merch backdrop #2E7BFF gradient with white chevron AV/V pattern.
+Logo: Round blue+white ""V"" mark + 3-line stacked wordmark VIRTUAL / STAFFING / CAREERS.
+Photography (ads): Single named candidate, half-body shot, smiling, casual-smart attire.
+Photography (merch): Catalog product shots canvas tote on a wooden coat rack, white polo laid flat.
+Headline patterns: [Meet (NAME)] pill + Your Next Legal Assistant; merch tagline Work from Any Part of the World.
+Price hook: $12 /hour (massive royal-blue type with feature bullets 3+ years of experience, Bilingual, Trained by US attorneys).
+CTA: Royal-blue pill with magnifying-glass icon Explore Our Talent.
+Master prompt
+A [ASPECT -4:5 talent spotlight | 3:4 merch mockup | 1:1 ad] Virtual Staffing Careers creative for [USE CASE candidate spotlight Meta ad | tote / polo merch mockup | recruiting carousel].
+For ad / spotlight mode:
+Background: very light cool blue (#EAF1FB) with subtle grid lines like graph paper.
+Top-centre label pill: light-blue rounded pill, dark navy text ""[Meet (NAME)]""e.g. ""Meet John"".
+Headline (centre, bold black sans, 60pt, 2 lines): ""Your Next Legal Assistant"".
+Hero subject (left half): single photoreal half-body portrait of a smiling [male candidate with trimmed beard in gray blazer + black tee / female candidate in cream blouse], soft natural lighting, confident-friendly expression.
+Right column (stacked):
+""Ready to join your team today"" (blue sans, italic-feel, ~28pt)
+small ""For Just"" label
+MASSIVE bold royal blue (#1A4EE2) ""$[12] /hour"", 110pt, dollar sign slightly darker
+Three feature bullets with circular blue check icons:
+✓ 3+ years of experience
+✓ Bilingual
+✓ Trained by US attorneys
+CTA pill (bottom-centre): solid royal blue (#1F5BFF) rounded pill with white magnifying-glass icon, white text ""Explore Our Talent"".
+For merch mockup mode (3:4):
+Backdrop: blue gradient (#2E7BFF centre to lighter cyan at edges) with a sansevieria-style green leaf visible at the lower-right edge (tote scene) OR seamless white-to-blue gradient (polo scene).
+Subject:
+Tote beige canvas tote hanging from a vertical wooden coat rack. Bag artwork: top-third covered in a repeating staggered chevron ""AV/V"" pattern in blue. circular badge with the VSC stacked logomark bottom-right of the bag face.
+Polo White white polo laid flat. Entire body covered by the same staggered chevron ""AV/V"" pattern in soft white-on-blue, more pronounced toward the bottom. semi-transparent blue ""V"" watermark in the middle of the face; lower-left tagline in black sans ""Work from Any Part of the World.""; large Upper-right chest: VSC stacked logomark embroidered.
+Top-left small white sans label: ""Tote Design"" / ""Polo Design"".
+Top-right or bottom-right: VSC stacked logomark.
+Aspect ratio [4:5 | 3:4 | 1:1). Style: clean recruiting / freelance-marketplace card (ads) or premium swag catalog (merch).","What they sell: Recruiting candidates into the Virtual Staff talent pool (B2C, not B2B). Marketed to law firms showing off the candidates ready to hire.
+Visual ideology
+• Soft light-blue grid background (similar to Bookkeeper Law Mode B but cooler).
+• Single named candidate photo on the left (e.g. ""Meet John"") - friendly half-body shot, smiling, wearing casual smart attire.
+• Big price-led pill on the right with $12 /hour as the dominant typographic element.
+• Tagged feature list with blue check circles: ""3+ years of experience / Bilingual / Trained by US attorneys"".
+• CTA: bright blue rounded pill with magnifying-glass icon, white text ""Explore Our Talent"".
+Copy ideology
+• Personalize the talent (real-feeling name + role).
+Strong price hook above all else.
+• Reassurance bullets quantify experience, language, and training.
+Master Prompt
+A 4:5 talent-spotlight Meta ad for ""Virtual Staffing Careers"" used to show U.S. law firms specific candidates available to hire from a Filipino/LATAM virtual talent pool.
+Background: very light cool blue (#EAF1FB) with subtle grid lines like graph paper.
+Top-center label pill: light-blue rounded pill, dark navy text ""[Meet (NAME)]""e.g. ""Meet John"".
+Headline (center, bold black sans, 60pt, 2 lines): ""Your Next Legal Assistant""
+Hero subject (left half): a single photoreal half-body portrait of a smiling male candidate with a trimmed beard, wearing a gray blazer over a black t-shirt, soft natural lighting, neutral expression of confident friendliness.
+Right column (stacked):
+""Ready to join your team today"" (blue sans, italic-feel, ~28pt)
+""For Just"" small label
+- ""$12 /hour"" MASSIVE bold royal blue (#1A4EE2) text, 110pt, with the dollar sign in a slightly darker tone
+- Three feature bullets with circular blue check icons:
+✓ 3+ years of experience
+✓ Bilingual
+✓ Trained by US attorneys
+CTA pill (bottom-center): solid royal blue (#1F5BFF) rounded pill with white magnifying-glass icon, white text ""Explore Our Talent"".
+Aspect ratio 4:5. Style: clean recruiting / freelance-marketplace card.
+Reference assets
+• Virtual Staffing Careers/Advertising/Creative/Batch #2.1/VS-AD2.png","9, Virtual Staffing Careers, Light blue + royal blue, Black bold sans, Named candidate / merch mockup, Meet [Name] Your Next Legal Assistant $12/hour, Blue pill Explore Our Talent"
+10. Practice Al / Lawvy - Al operating system for law firms,"Identity: Practice Al = an ""Al operating system"" suite (intake automation, document generation, case workflows). Sold via conference presence. Lawvy is its mascot a small black Pomeranian, used both as a 3D-rendered character and as the real dog in short-form social.
+Palette: Conference posters - deep midnight navy #0E1B47 with hexagonal honeycomb mesh + orange #F2A23C location pills. Mascot work - soft pastel + character vignette.
+Logo: Gradient teal-violet Practice AI wordmark with arrow play-icon.
+Photography (conferences): Architectural / venue photo darkened - Venetian Hotel, capitol buildings, Vegas casinos.
+Photography (mascot): 3D-rendered Lawvy (OpenEXR frames) OR live-action black Pomeranian in a circular vignette on bright off-white interior.
+Headline patterns: The AI Operating System for Modern Law Firms, Practice AI goes to [EVENT NAME] [YEAR]. Mascot copy is short and conversational.
+Sub-headline: Automate intake, document generation, and case workflows.
+Location pill: Orange rounded pill [VENUE] | [DATE].
+Master prompt
+A [ASPECT 1:1 LinkedIn | 4:5 IG | 10x8 conference banner | 9:16 mascot reel] Practice AI creative for [USE CASE conference / event poster | venue announcement | Lawvy mascot content (3D render | live-action TikTok)].
+For conference-poster mode:
+Background: deep midnight navy (#0E1B47) with a faint hexagonal honeycomb mesh overlay in slightly lighter blue. Behind the mesh: a soft, slightly darkened wide-angle photo of the target event venue (e.g. ""The Venetian Resort Las Vegas at twilight"", ""U.S. Capitol at dusk"").
+Headline (top-centre, white bold sans, ~58pt, 2 lines): ""The AI Operating System for Modern Law Firms"".
+Brand bar (centred, below headline): gradient teal-violet"" Practice AI"" wordmark, followed by white smaller text "" goes to "".
+Massive event title (centre, white extra-bold geometric sans, 220pt, with a tiny vertical gradient divider): ""[EVENT NAME e.g. 'Ai4'] | [YEAR e.g. '20 / 26']"".
+Tag-line (white regular sans, smaller, centred below): ""Automate intake, document generation, and case workflows.""
+Location pill (orange #F2A23C rounded pill, white bold text): ""[VENUE] | [DATE]"" -e.g. ""The Venetian, Las Vegas, NV | August 4-6, 2026"".
+Footer: small gold venue logo lockup centred at the very bottom.
+For mascot mode (Lawvy):
+Lawvy is a small fluffy black Pomeranian with big expressive amber-brown eyes Practice AI's mascot. Two treatments:
+Option A Illustrated / 3D rendered character: front-facing, soft fur with subtle violet/teal rim light, centred subject, soft seamless white-to-pale-violet background, gentle vignette. Clean vector-style render with subtle textures, suitable for social avatars and explainer animations.
+Option B Live-action TikTok frame (9:16): photo of a small fluffy black Pomeranian peeking up from the bottom-left of frame inside a soft circular vignette, on a bright off-white interior backdrop with diffused window light. Warm, intimate, slightly handheld feel. One beat in a quick playful dance/bounce sequence.
+Aspect ratio [1:1 | 4:5 | 9:16 | 10x8]. Style: premium B2B conference poster (conference mode) or playful character / soft social (mascot mode).","What they sell: Practice Al = an ""Al operating system"" suite (intake automation, document generation, case workflows). Sold via conference presence.
+Visual ideology
+• Deep midnight navy backgrounds (#0F1B4A) with translucent hexagonal honeycomb patterns and architectural photography (Vegas casinos, Venetian Hotel, capitol buildings).
+• Headlines feel like event posters, not Meta ads - large brand event names (""Ai4 2026""), location/date pills.
+• Orange (#F2A23C) is used in small accents (location pill, divider lines).
+Logo: gradient teal-violet "" Practice Al"" wordmark with arrow play-icon.
+Copy ideology
+• Conference-led: ""The Al Operating System for Modern Law Firms"", ""Practice Al goes to [Event Name 20XX]"".
+• Value-prop line: ""Automate intake, document generation, and case workflows.""
+Master Prompt
+A 1:1 event/conference promo for ""Practice AI"" the AI operating system for law firms. Polished, conference-poster aesthetic.
+Background: deep midnight navy (#0E1B47) with a faint hexagonal honeycomb mesh overlay in slightly lighter blue. Behind the mesh: a soft, slightly darkened wide-angle photo of the target event venue [e.g. The Venetian Resort Las Vegas at twilight].
+Headline (top-center, white bold sans, ~58pt, 2 lines): ""The AI Operating System for Modern Law Firms""
+Brand bar (centered, below headline): gradient teal-violet Practice AI"" wordmark, followed by white smaller text goes to "".
+Massive event title (center, white extra-bold geometric sans, 220pt, with a tiny vertical gradient divider): ""[EVENT NAME e.g. 'Ai4'] | [YEAR e.g. '20 / 26']""
+Tag-line (white regular sans, smaller, centered below): ""Automate intake, document generation, and case workflows.""
+Location pill (orange #F2A23C rounded pill, white bold text): ""[VENUE] | [DATE]"" -e.g. ""The Venetian, Las Vegas, NV | August 4-6, 2026"".
+Footer: small gold venue logo lockup centered at the very bottom.
+Aspect ratio 1:1 (or 4:5 for IG). Style: premium B2B conference poster.
+Reference assets
+• Practice AI/Conferences/2026/Ai4 Conference/Social Media/Without Promo/1_1 Linkedin.png
+• Practice AI/Conferences/2026/Conference Banners 2026/10x8 Banner.pdf","10, Practice Al / Lawvy, Navy #0E1B47 + honeycomb / pastel, Bold sans, Venue photo / Pomeranian mascot, The AI Operating System for Modern Law Firms / Practice AI goes to [EVENT], Orange location pill"
+11. US Immigration Al - Vertical Al for immigration law,"Identity: Vertical Al assistant for U.S. immigration law firms (case assembly, form auto-fill).
+Palette: Same dark-navy honeycomb language as Practice Al but with patriotic accents - flag motifs, Capitol silhouette, scales-of-justice briefcase iconography. Navy + gold + subtle red.
+Layout: Infographic - 5-step linear How It Works flow with icons, then a Before/After comparison block.
+Master prompt
+A [ASPECT 1:1 | 4:5] informational infographic ad for ""US Immigration AI"" vertical AI for U.S. immigration law firms.
+Background: deep navy (#0F1A45) with faint honeycomb hex mesh and a subtle gradient toward muted gold at the top-right.
+Hero illustration (top): a flat-vector composition of a small American flag, a document with a profile + green checkmark, a magnifying glass with a yellow checkmark, and a navy briefcase embossed with gold scales-of-justice; the silhouette of the U.S. Capitol fades behind them.
+Headline (centred, white bold sans, 56pt): ""AI Case Assembly"".
+Sub-headline (white regular, smaller): ""Streamlined Immigration Case Assembly Built for Law Firms"".
+Middle ""How It Works"" linear flow (5 numbered steps, each a tiny rounded card with icon + label, connected by an arrow line):
+1. Attorney Reviews Case
+2. Application Submitted
+3. Client Notified
+4. Status Automatically Tracked
+5. Case Closed + Review Collected
+Bottom ""Before & After US Immigration AI"": two columns. Left (red-tinted): 4-5 pain bullets (""Disorganised client files"", ""Manual form filling"", ""Hours assembling case packages""). Right (green-tinted): matching solution bullets.
+Footer pill: gold rounded pill with navy text ""[СТА e.g. 'Book a Demo']"".
+Aspect ratio [1:1 | 4:5]. Style: clean B2B infographic.","What they sell: Vertical Al assistant for immigration law firms (case assembly, form auto-fill).
+Visual ideology
+• Same dark-navy honeycomb language as Practice Al, but with patriotic accents - U.S. flag motifs, Capitol building silhouette, scales-of-justice briefcase iconography.
+• Infographic layout: linear ""How It Works"" 5-step flow with icons, then a Before/After comparison block.
+• Color: navy + gold + subtle red.
+Master Prompt
+A 1:1/4:5 informational infographic ad for ""US Immigration AI"" vertical AI for U.S. immigration law firms.
+Background: deep navy (#0F1A45) with faint honeycomb hex mesh and a subtle gradient toward muted gold at the top-right.
+Hero illustration (top): a flat-vector composition of a small American flag, a document with a profile + green checkmark, a magnifying glass with a yellow checkmark, and a navy briefcase embossed with gold scales-of-justice; the silhouette of the U.S. Capitol fades behind them.
+Headline (centered, white bold sans, 56pt): ""AI Case Assembly""
+Sub-headline (white regular, smaller): ""Streamlined Immigration Case Assembly Built for Law Firms"".
+Middle section ""How It Works"" linear flow (5 numbered steps, each a tiny rounded card with icon + label, connected by an arrow line):
+✓ 1. Attorney Reviews Case
+✓ 2. Application Submitted
+✓ 3. Client Notified
+✓ 4. Status Automatically Tracked
+✓ 5. Case Closed + Review Collected
+Bottom section ""Before & After US Immigration AI"": two columns. Left column (red-tinted): 4-5 pain bullets (""Disorganized client files"", ""Manual form filling"", ""Hours assembling case packages""). Right column (green-tinted): matching solution bullets.
+Footer pill: gold rounded pill with navy text ""[СТА e.g. 'Book a Demo']"".
+Aspect ratio [1:1 | 4:5]. Style: clean B2B infographic.
+Reference assets
+• US Immigration AI/Conferences/AILA 2026/8-Page Brochure/PNGs/Page 06.png","11, US Immigration Al, Navy + gold + red, Bold sans, 5-step icon flow + flag/Capitol, AI Case Assembly, Gold pill Book a Demo"
+12. Berry Virtual - Outsourcing for general SMBs,"Identity: General virtual staffing for SMBs (broader than law). Doubles as a thought-leadership content brand via blog + newsletter.
+Palette: Coral/salmon #C32F2F #F66E5C. White typography.
+Logo: White circle with bold ""B"" + BERRY VIRTUAL wordmark.
+Photography: Candid editorial photo of 2-3 young professionals collaborating in a modern co-working space (visible brick wall, plants, warm natural light), or hands-typing-on-laptop close-ups, or laptop-with-dashboard product shots.
+Layout - blog header: strong red-to-transparent gradient covers the left 55%; headline bottom-left in white bold sans, 2 lines max.
+Layout - newsletter / Mailchimp banner: coral background with arcing circle on the left; white headline left-stacked across 3-4 lines; logomark bottom-left.
+Headline patterns: 5 Winning Outsourcing Strategies for Growth, The Role of Data Entry in Today's Digital World, New Feature Alert: Workflow Automation Support, Here's how we can help you scale:.
+No CTA, no price - editorial / informational tone.
+Master prompt
+A [ASPECT 16:9 | 1.91:1 | 1024x512 newsletter | 1024x512 Mailchimp] Berry Virtual creative for [USE CASE blog header | newsletter banner | Mailchimp email banner].
+For blog-header mode:
+Background: candid editorial photo of 2-3 young professionals collaborating around a laptop in a modern co-working space (visible brick wall, plants, warm natural light); right half shows the photo in natural colour.
+Overlay: strong red-to-transparent gradient (#C32F2F transparent) covering the left 55% of the frame.
+Top-left wordmark: white circle with bold ""B"", followed by ""BERRY VIRTUAL"" in clean white sans.
+Headline (bottom-left, white bold sans, 60pt, max 2 lines): ""[ARTICLE TITLE e.g. '5 Winning Outsourcing Strategies for Growth']"".
+For newsletter / Mailchimp banner mode:
+Background: solid coral-salmon (#F66E5C) with a large soft pale-coral arcing circle on the left third.
+Right two-thirds: photograph (hands typing on a MacBook with a dashboard visible / over-the-shoulder workspace shot / laptop with KPI dashboard) under a warm coral wash that ties it to the background.
+Headline (left, heavy white display sans, 3 short lines): ""[HEADLINE e.g. 'New Feature Alert: Workflow Automation Support' or 'Here's how we can help you scale:']"".
+Bottom-left: white circular ""B"" logomark next to ""BERRY VIRTUAL"" wordmark in white.
+No CTA, no price. Aspect ratio [16:9 | 1.91:1 | 1024x512]. Style: editorial blog header or premium calm SaaS newsletter.","What they sell: General virtual staffing for SMBS (broader than law).
+Visual ideology
+• Red gradient overlay on left half of a candid office/collaboration photo.
+• All-white wordmark ""B Berry Virtual"" top-left.
+• Single big white bold headline bottom-left, sentence-case (""5 Winning Outsourcing Strategies for Growth"", ""The Role of Data Entry in Today's Digital World"").
+• Functions as blog/social headers more than transactional ads.
+Master Prompt
+A 16:9 / 1.91:1 blog header for ""Berry Virtual"" general outsourcing for SMBs.
+Background: a candid editorial photo of 2-3 young professionals collaborating around a laptop in a modern co-working space (visible brick wall, plants, warm natural light). Right half of the image shows the photo in natural color.
+Overlay: a strong red-to-transparent gradient (#C32F2F transparent) covers the left 55% of the frame.
+Top-left wordmark: white circle with bold ""B"", followed by ""BERRY VIRTUAL"" in clean white sans.
+Headline (bottom-left, white bold sans, 60pt, max 2 lines): ""[ARTICLE TITLE e.g. '5 Winning Outsourcing Strategies for Growth']""
+No CTA. No price. Aspect ratio 16:9 or 1.91:1. Style: editorial blog header.
+Reference assets
+• Berry Virtual/Blog Graphics/April Blog Headers/April Blog Header 01.png","12, Berry Virtual, Coral #F66E5C white, Heavy sans, Editorial co-working photo/ hands on laptop, 5 Winning Outsourcing Strategies for Growth / New Feature Alert:, None (editorial)"
+13. Legal Soft Academy - Law-firm-growth training,"Identity: Legal Soft Academy is Legal Soft's law-firm-growth training arm courses, live events, Linkedin presence.
+Palette: Same Legal Soft deep blue #1A3FB8 #0D2580 with a faint white X pattern (echoes the brand mark), warm orange light leak top-left. Orange #F7882F date badges.
+Tagline: Lead Smarter, Grow Faster, Win Bigger.
+Logo: White mortarboard-icon LEGAL SOFT ACADEMY wordmark.
+Domain: legalsoftacademy.com.
+Photography: Cut-out portrait of a male presenter (or stack of presenter headshots) on the right; pointing/expressive gestures. People seen: Adam Reiman (Law Firm Growth Director), Glen Larson, David Kadzai.
+Headline patterns: How Good Are You At Conversion?, Law Firm Processes, with a small light-blue Module X | Lesson Y pill above.
+Master prompt
+A [ASPECT -1024x683 course thumbnail | 1080x1080 live-event promo | 1024x256 LinkedIn banner] Legal Soft Academy creative for [USE CASE course thumbnail | live-event promo | social-channel cover | training social post].
+Background: deep blue radial gradient (#1A3FB8 centre #0D2580 edges) with a faint white ""X"" pattern motif and a soft warm orange light leak top-left.
+For course-thumbnail mode (1024x683):
+Left side: photo of a smiling [age 50s, male, in a checked navy blazer, pointing rightward] presenter, cleanly cut out.
+Right side: bold white display sans headline across 3-4 lines: ""[HEADLINE e.g. 'How Good Are You At Conversion?']"".
+Above headline: small light-blue rounded pill ""[Module Name) | Lesson [N]"". Bottom-right: white ""LEGAL SOFT ACADEMY"" mortarboard logomark.
+For live-event-promo mode (1080x1080):
+Top-right: white ""LEGAL SOFT ACADEMY"" logomark.
+Left half: large white display sans headline ""[TOPIC e.g. 'Law Firm Processes']"", then the word ""with"", then two small circular headshots of guest speakers with their names beneath (""[Guest 1]"", ""[Guest 2]"").
+Right half: large cut-out portrait of the main host smiling.
+Lower-left: orange rounded pill saying ""Event Date: [DATE] (Live event)"".
+Bottom-right: name + title in white over a faint blue pill '[Host Name] [Host Title "" e.g. ""Adam Reiman Law Firm Growth Director"".
+For LinkedIn-banner mode (1024x256):
+Blue gradient (white at the left fading to deep blue at the right) with a faint dotted globe / hemisphere motif on the right.
+Centred-left: white Legal Soft Academy mortarboard logomark.
+To its right, in white display sans across 3 short lines: ""Lead Smarter, Grow Faster, Win Bigger"".
+Tiny white URL beneath: ""www.legalsoftacademy.com"".
+Aspect ratio per use case. Style: empowering / instructional, premium B2B education.","FastDemands Al, My Medical VA, Practice 360, Practice HR, Hamid Kohan, Legal Soft Academy, Remote Paralegals, Alliance Partner Network
+These brands have smaller ad footprints in this library - mostly brand-kit assets, headshots, conference banners, or PDFs.
+They share the Universal House Style above with the following brand-specific accents.
+Brand: Legal Soft Academy
+Accent color: Legal Soft Blue
+Distinct visual marker: Educational icons, certificate motifs
+When generating an ad for any of these, start from the Universal House Style + Legal Soft prompt above, then swap the logo, accent color, and product noun.","13, Legal Soft Academy, Navy + X-pattern + orange date pill, White display sans, Male presenter cut-out, How Good Are You At Conversion? / Lead Smarter, Grow Faster, Win Bigger, Orange date pill"
+14. Practice 360 - Tech-forward sub-brand,"Identity: Practice 360 - the most overtly tech-forward sub-brand in the family. Mobile-app-style UI mockups; logo-led visuals.
+Palette: Black + blue purple red horizontal gradient capsule (signature flourish).
+Type: Clash Display (Complete family - OTF + Web bundle).
+Logo: Wordmark PRACTICE 360 in custom geometric Clash Display where the lowercase 'r' is replaced by a sweeping P-shape, with an elongated horizontal capsule (blue -> purple -> red gradient) between PR and ACTICE. Secondary lockup: vertical pink-red capsule containing the word PRACTICE running upward, joined to a black P 360° mark for square/profile uses.
+Photography: iPhone-frame Ul mockups (mobile app screens).
+Master prompt
+A [ASPECT 1:1 | 4:5 | 16:9 | logo lockup artboard] Practice 360 creative for [USE CASE product/app screenshot ad | brand banner | logo lockup variation].
+Background: solid black (#000000) for primary lockups; pure white for inverted use; or a dark-radial-gradient navy for product shots.
+Logo system (always present, never re-coloured outside the brand ramp):
+Primary horizontal lockup geometric wordmark ""PRACTICE 360"" in custom Clash Display sans: the lowercase ""r"" is replaced by a sweeping P-shape; an elongated horizontal capsule sits between PR and ACTICE with a blue-purple red gradient (#41C3FF -> #C440FF #F0345B).
+Secondary stacked lockup vertical pink-red capsule containing the word ""PRACTICE"" running upward, joined to a black ""P 360°"" mark on the right.
+Minimum clear space: the height of the lowercase ""a"" in PRACTICE on all sides. Never re-colour the gradient outside the blue purple red ramp. On dark backgrounds use the inverted white wordmark with the capsule retaining its full-colour gradient.
+Hero subject (for product ads) photorealistic iPhone mockup at slight angle, screen showing the Practice 360 app UI ([dashboard with KPIs / call flow / case board / patient record]); float the phone over the dark background with a subtle drop shadow and a soft purple-pink rim light from the right.
+Headline (white bold Clash Display, ~56pt, 2 lines max): ""[PRODUCT HEADLINE e.g. 'Practice management, in 360°.']"".
+Sub-headline (regular Clash Display or neutral humanist sans, smaller, light gray): ""[ONE-LINE PRODUCT VALUE]"".
+CTA pill (optional): pink-to-red gradient pill matching the capsule, white text ""[СТА - e.g. 'Get Practice 360']"".
+Aspect ratio per use case. Style: tech-forward, bold, premium SaaS.","FastDemands Al, My Medical VA, Practice 360, Practice HR, Hamid Kohan, Legal Soft Academy, Remote Paralegals, Alliance Partner Network
+These brands have smaller ad footprints in this library - mostly brand-kit assets, headshots, conference banners, or PDFs.
+They share the Universal House Style above with the following brand-specific accents.
+Brand: Practice 360
+Accent color: Cyan + slate
+Distinct visual marker: Mobile-app UI mockups in iPhone frames
+When generating an ad for any of these, start from the Universal House Style + Legal Soft prompt above, then swap the logo, accent color, and product noun.","14, Practice 360, Black + blue purple red gradient, Clash Display, iPhone app mockup, (Logo-led; short headlines), Pink-red gradient pill"
+15. Practice HR - HR-process / HR-tech vertical for law firms,"Identity: Practice HR - HR-process / HR-tech vertical for law firms (smaller ad footprint; brand-kit-led).
+Palette: Teal (Legal Soft sub-brand convention).
+Layout: HR-process diagrams (flow charts of hiring/onboarding stages); same Universal House Style with teal accent and the standard powered by LEGAL SOFT micro-line.
+Master prompt
+A [ASPECT -1:1 | 4:5 | 16:9] Practice HR creative for [USE CASE process diagram | Meta ad | LinkedIn carousel page).
+Background: light cool gray or white with a faint teal grid pattern.
+Top-left logo: ""Practice HR"" wordmark in deep teal sans, with ""powered by LEGAL SOFT"" micro-lockup beneath.
+Headline (left, deep teal bold sans, ~56pt, 2 lines): ""[HR HOOK e.g. 'Stop drowning in HR admin.']"".
+Sub-headline (gray regular sans, smaller): ""[ONE LINE e.g. 'Onboard, manage, and pay your virtual staff in one place.']"".
+Hero element: a horizontal HR-process diagram (4-5 stages e.g. ""Source -> Screen -> Onboard Pay Review""), each stage a teal rounded rectangle with a white icon and caption, connected by thin arrow lines.
+CTA pill: teal rounded pill, white text ""[CTA e.g. 'Book a Demo']"".
+Aspect ratio [1:1 | 4:5 | 16:9]. Style: clean HR-SaaS infographic.","FastDemands Al, My Medical VA, Practice 360, Practice HR, Hamid Kohan, Legal Soft Academy, Remote Paralegals, Alliance Partner Network
+These brands have smaller ad footprints in this library - mostly brand-kit assets, headshots, conference banners, or PDFs.
+They share the Universal House Style above with the following brand-specific accents.
+Brand: Practice HR
+Accent color: Teal
+Distinct visual marker: HR-process diagrams
+When generating an ad for any of these, start from the Universal House Style + Legal Soft prompt above, then swap the logo, accent color, and product noun.","15, Practice HR, Teal, Sans, HR-process diagram, Stop drowning in HR admin., Teal pill Book a Demo"
+16. My Medical VA - Medical virtual assistant,"Identity: Smaller medical-VA brand; coral / salmon palette differentiates it from MedVirtual's teal.
+Palette: Coral / salmon accents on white or light-cream backgrounds.
+Logo: ""My Medical VA"" wordmark with a stylised human silhouette icon.
+Photography: Friendly female medical-VA at a laptop in a soft pastel clinical setting.
+Master prompt
+A [ASPECT 1:1/4:5/9:16] My Medical VA creative for [USE CASE Meta/IG ad | LinkedIn post | flyer].
+Background: warm cream / off-white with a soft coral-to-peach gradient sweep from the bottom-right corner, faint medical-cross watermark.
+Top-left logo: ""My Medical VA"" wordmark with a small coral human-silhouette icon, with ""powered by LEGAL SOFT"" micro-line beneath.
+Headline (left, deep coral or charcoal bold sans, ~58pt, 2 lines): ""[HOOK e.g. A trained medical VA for your practice.']"".
+Sub-headline (gray regular, smaller): ""[ONE-LINE PROOF -e.g 'Scheduling, EMR, billing and patient follow-up handled remotely.']"".
+Hero subject (right ~45%): photoreal smiling female medical VA at a laptop in a soft pastel clinical setting, light makeup, scrubs or soft coral blouse, warm natural light.
+Offer pill (coral, rounded, white text): ""[OFFER e.g. 'Starting at $10/hr']"".
+CTA pill (charcoal, rounded, white text): ""[CTА e.g. 'Book a Consult']"" bottom-right.
+Aspect ratio [1:1 | 4:5 | 9:16]. Style: warm healthcare SaaS, friendly, approachable.","FastDemands Al, My Medical VA, Practice 360, Practice HR, Hamid Kohan, Legal Soft Academy, Remote Paralegals, Alliance Partner Network
+These brands have smaller ad footprints in this library - mostly brand-kit assets, headshots, conference banners, or PDFs.
+They share the Universal House Style above with the following brand-specific accents.
+Brand: My Medical VA
+Accent color: Coral/salmon
+Distinct visual marker: ""My Medical VA"" wordmark with stylized human silhouette icon
+When generating an ad for any of these, start from the Universal House Style + Legal Soft prompt above, then swap the logo, accent color, and product noun.","16, My Medical VA, Coral/cream, Sans, Female medical VA at laptop, A trained medical VA for your practice., Coral pill Starting at $10/hr"
+17. Remote Paralegals - Paralegal staffing,"Identity: Remote paralegal placement; smaller ad footprint, brand-kit-led.
+Palette: Legal Soft Blue with a lavender accent.
+Visual rule: Use the Legal Soft master prompt as the base, then swap the wordmark to ""Remote Paralegals"" and the accent colour to lavender (#9C8CFF) for badges and pills. Hero subject is a paralegal at a desk reviewing files / cite-checking.
+Master prompt
+A [ASPECT 1:1/4:5/9:16] Remote Paralegals creative for [USE CASE Meta/IG ad | LinkedIn post].
+Background: light cool-blue (#EAF1FB) with subtle grid lines OR deep Legal Soft navy (#0A2B6B #1E55D6) for premium variants.
+Top-left logo: ""Remote Paralegals"" wordmark in Legal Soft navy + Causten, with ""powered by LEGAL SOFT"" micro-line beneath.
+Headline (left, deep navy or white bold sans, ~58pt, 2 lines): ""[HOOK -e.g 'Hire a trained paralegal in 7 days.']"".
+Sub-headline (gray or light-blue regular): ""[ONE-LINE PROOF -e.g 'US-trained, billed hourly, no recruiting fees.']"".
+Hero subject (right ~45%): photoreal smiling female paralegal in a navy blazer at a desk reviewing case files / cite-checking on a laptop, warm rim light.
+Accent pill (lavender #9C8CFF, white text): ""[ROLE FEATURE -e.g 'PI-trained' / 'Cite-check ready']"".
+CTA pill (orange #FF7A1A, white text): ""[CTAe.g. 'Book a Demo']"" bottom-right.
+Aspect ratio [1:1 | 4:5 | 9:16]. Style: clean B2B legal SaaS, Legal Soft family.","FastDemands Al, My Medical VA, Practice 360, Practice HR, Hamid Kohan, Legal Soft Academy, Remote Paralegals, Alliance Partner Network
+These brands have smaller ad footprints in this library - mostly brand-kit assets, headshots, conference banners, or PDFs.
+They share the Universal House Style above with the following brand-specific accents.
+Brand: Remote Paralegals
+Accent color: Legal Soft Blue + lavender
+Distinct visual marker: Brand kit only
+When generating an ad for any of these, start from the Universal House Style + Legal Soft prompt above, then swap the logo, accent color, and product noun.","17, Remote Paralegals, Legal Soft Blue + lavender, Causten, Paralegal at desk reviewing files, Hire a trained paralegal in 7 days., Orange pill Book a Demo"
+18. FastDemands AI - Al demand-letter automation,"Identity: Vertical Al tool for personal-injury demand-letter automation. Brand-kit-led.
+Palette: Indigo + amber accents.
+Type: Nourd font family.
+Master prompt
+A [ASPECT 1:1/4:5/9:16] FastDemands AI creative for [USE CASE Meta/IG ad | product screen | LinkedIn post].
+Background: deep indigo (#1F2270 #2C2F8A radial) with subtle amber light glow from the top-right corner.
+Top-left logo: ""FastDemands AI"" wordmark in Nourd font, white with a small amber arrow icon, with ""powered by LEGAL SOFT"" micro-line beneath.
+Headline (left, white bold Nourd, 60pt, 2 lines): ""[HOOK e.g. 'Demand letters drafted in minutes, not days.']"".
+Sub-headline (light-amber #F5C16D regular, smaller): ""[ONE-LINE PROOF e.g. 'AI-drafted, attorney-reviewed, ready to send.']"".
+Hero subject: floating photoreal MacBook frame showing the FastDemands AI app with a demand-letter preview on screen, drop shadow, soft amber rim light.
+CTA pill (amber, indigo text): ""[CТА e.g. 'Book a Demo']"" bottom-right.
+Aspect ratio [1:1 | 4:5 | 9:16]. Style: indigo-amber AI SaaS, premium tech.","FastDemands Al, My Medical VA, Practice 360, Practice HR, Hamid Kohan, Legal Soft Academy, Remote Paralegals, Alliance Partner Network
+These brands have smaller ad footprints in this library - mostly brand-kit assets, headshots, conference banners, or PDFs.
+They share the Universal House Style above with the following brand-specific accents.
+Brand: FastDemands Al
+Accent color: Indigo + amber
+Distinct visual marker: Brand kit only uses the Nourd font family
+When generating an ad for any of these, start from the Universal House Style + Legal Soft prompt above, then swap the logo, accent color, and product noun.","18, FastDemands Al, Indigo + amber, Nourd, MacBook with app preview, Demand letters drafted in minutes, not days., Amber pill Book a Demo"
+19. Hamid Kohan - Personal / CEO brand,"Identity: Hamid Kohan, founder/CEO of Legal Soft. Editorial press features, TechTimes-style layouts, podcast covers, conference keynote graphics.
+Palette: Editorial neutrals (warm grays, ivory, charcoal).
+Photography: Professional studio headshot in a dark suit; or on-stage keynote shots.
+Master prompt
+A [ASPECT -1:1 | 16:9 | 4:5] Hamid Kohan personal-brand creative for [USE CASE press feature graphic | podcast cover | keynote announcement | LinkedIn post].
+Background: editorial cream (#F6F2EA) or charcoal (#1F1F1F) with a faint horizontal ruled-line motif (like a magazine pull-quote spread).
+Layout: split left two-thirds is type, right one-third is a cut-out studio headshot of Hamid Kohan in a dark suit, slight smile, looking forward, soft natural-window light.
+Pull-quote (left, charcoal or cream bold serif, 60pt, 3 lines with hanging quotation marks): ""[QUOTE -e.g '""The future of legal practice is virtual-first.""']"".
+Byline (smaller sans, under quote): ""Hamid Kohan, Founder & CEO, Legal Soft"".
+Optional publication lockup top-left: ""[Featured in TECHTIMES / FORBES / LAW360]"" in a thin rule.
+CTA pill (optional, if for an event): coral or orange rounded pill, white text e.g. 'Hear Hamid speak at [EVENT]')"" bottom-right.
+Aspect ratio [1:1 | 16:9 | 4:5]. Style: premium editorial / press-feature feel.","FastDemands Al, My Medical VA, Practice 360, Practice HR, Hamid Kohan, Legal Soft Academy, Remote Paralegals, Alliance Partner Network
+These brands have smaller ad footprints in this library - mostly brand-kit assets, headshots, conference banners, or PDFs.
+They share the Universal House Style above with the following brand-specific accents.
+Brand: Hamid Kohan (personal brand)
+Accent color: Editorial neutrals
+Distinct visual marker: Headshotdriven -press features; TechTimes-style layouts
+When generating an ad for any of these, start from the Universal House Style + Legal Soft prompt above, then swap the logo, accent color, and product noun.","19, Hamid Kohan, Editorial cream / charcoal, Serif, Studio headshot, ""[Pull quote]"" Hamid Kohan, Optional event pill"
+20. Alliance Partner Network - Referral / partnership program,"Identity: The referral and partnership channel for Legal Soft. Co-marketing assets and partner-onboarding documents.
+Palette: Helvetica / Roboto on white.
+Visual rule: Horizontal ""Trusted by"" rows of partner logos in soft grayscale, with the Legal Soft Alliance wordmark anchoring the layout.
+Master prompt
+A [ASPECT -1:1 | 4:5 | 16:9] Alliance Partner Network creative for [USE CASE CO-marketing one-pager | partner-onboarding deck slide | ""Trusted by"" social proof banner].
+Background: clean white with a thin Legal-Soft-navy horizontal accent line.
+Top-centre logo: ""Legal Soft Alliance"" wordmark in Legal Soft navy + Causten, with ""Partner Network"" subtitle in lighter gray.
+Headline (centred, navy bold sans, ~52pt, 1 line): ""[HOOK e.g. 'Trusted by leading law-firm consultants.' or 'Join the Legal Soft Alliance.']"".
+Sub-headline (gray regular, smaller, 1 line): ""[ONE-LINE BENEFIT e.g. 'Refer your law firms to Legal Soft and earn ongoing referral fees.']"".
+Centre element: a horizontal row of 5-8 partner logos in soft grayscale (e.g. Scott Bautch, Scarlett Lester, Case Status, My Legal Academy ...) arranged at equal spacing inside a thin gray bordered band, with the section label ""Trusted by"" small and centred above.
+Stats strip (optional, 3 columns): ""[Stat 1 -e.g '500+ firms placed']"" / "" [Stat 2 - e.g. '10% lifetime referral fee']"" / ""[Stat 3 -e.g '1-year auto-renewing term']"".
+CTA pill (Legal Soft orange #FF7A1A, white text): ""[CTA e.g. 'Become an Alliance Partner']"" bottom-centre.
+Aspect ratio [1:1 | 4:5 | 16:9]. Style: clean corporate partnership / B2B deck.","FastDemands Al, My Medical VA, Practice 360, Practice HR, Hamid Kohan, Legal Soft Academy, Remote Paralegals, Alliance Partner Network
+These brands have smaller ad footprints in this library - mostly brand-kit assets, headshots, conference banners, or PDFs.
+They share the Universal House Style above with the following brand-specific accents.
+Brand: Alliance Partner Network
+Accent color: Helvetica + Roboto on white
+Distinct visual marker: Partner logos arranged in horizontal rows (""Trusted by"")
+When generating an ad for any of these, start from the Universal House Style + Legal Soft prompt above, then swap the logo, accent color, and product noun.","20, Alliance Partner Network, White + Legal Soft navy, Helvetica / Roboto, Row of grayscale partner logos, Trusted by leading law-firm consultants., Orange pill Become an Alliance Partner"
+Misc / Master Prompts and Export Guidelines,"How to use these prompts
+1. Pick the brand section that matches your asset.
+2. Copy the master prompt block.
+3. Fill every [BRACKETED] slot with the campaign / asset specifics.
+4. Pick the aspect ratio from the [ASPECT ...] choices.
+5. (Optional) Adda --style rawv 6-ar [ratio] suffix for Midjourney, or paste straight into DALL E/Imagen / Nano-Banana / Reve / Sora image mode.
+Each prompt is self-contained - colour codes, type, photo direction, layout, headline pattern, CTA copy and decorative motifs are all baked in, so a fresh design pass should land on-brand even without the human designer in the loop.
+
+Sources
+All identity, palette, type, photography, and layout calls in this document are reverse-engineered from the actual asset files in:
+LS DESIGN PRODUCTIONS/ production ad creatives (304 files) Brand Kits/ master brand identity assets (153 files)
+See:
+AD_CREATIVE_MASTER_PROMPTS.md for the per-creative reference asset paths.
+brand-kits/BRAND KIT MASTER PROMPTS.md for the per-kit reference asset paths.
+folder_summary.csv for the full 283-row folder-by-folder inventory.","Quick ""fill-in-the-blanks"" master meta-prompt
+Use this if you want one prompt that adapts to any brand in this library:
+A [ASPECT] Meta/LinkedIn ad for ""[BRAND NAME]"" [ONE-LINE BRAND DESCRIPTION].
+Background: [BRAND ACCENT GRADIENT or SOLID].
+Top-[LEFT|CENTER]: [BRAND LOGO LOCKUP] in [white brand color], ~24-30pt.
+Headline (left-aligned, bold geometric sans, 60pt, 2-3 stacked lines): ""[PERSONA HOOK e.g. 'Lawyers: '] / [PAIN-OR-VALUE STATEMENT]"" split the most important 2-3 words in the brand accent color, the rest in white or dark navy depending on background brightness.
+Sub-headline (regular sans, smaller, lighter shade): ""[ONE TACTICAL SENTENCE delivering the solution or proof point]""
+Offer pill (large, rounded, brand accent color): ""[PRICE OR OFFER e.g. 'Starting at $12/hr', 'Save Up to 80%', '$1,000 OFF Your First Month']""
+Hero photo (right/bottom-right ~40% of frame, rounded corners or floated cards): a single photoreal portrait or 3-4 cluster of diverse remote staff workers wearing professional attire and slim black headsets, gently smiling at camera, lit warm against [BRAND COLOR GRADIENT]. AI-generated, hyperreal, slight cinematic rim light.
+CTA pill (high-contrast vs background, rounded, bottom-right): ""[CTA e.g. 'Book a Demo', 'Get Started', 'Explore Our Talent', 'See Candidates']"" orange/black/gold depending on brand.
+Decorative motifs (subtle, per brand): [dotted halftone arcs | scattered color squares | honeycomb hex mesh | floating glassmorphic UI cards | bar chart panels].
+Output as [1:1 | 4:5 | 9:16 | 16:9 | 300x250 banner]. Style: clean modern B2B SaaS / legal marketing, premium, slightly conversion-focused.
+
+File-naming convention to keep when exporting
+The LS Design team encodes every ad's intent right in the filename. Mirror this:
+<sequenceNumber>_Image_<BackgroundColor>_<TextColor>_<IntentTag>_<BrandName>_<MMDDYY>.png
+Examples observed:
+1_Image_White_Text_ValueProp_Legal Soft_063025.png
+3a_Image_Gradient_Text_Offer_Bookkeeper_100825.png
+5_Image_Blue_Text_ValueProp_Legal Soft Bookkeeping.law_070125.png
+2A_LegalAssistant_Image_White_Text_EventAttendees + Offer_TVLA_091225.png
+Where:
+• sequenceNumber = batch order (1, 2, 3a, 3b, 5b...)
+• BackgroundColor = White | Blue | Gradient | Image
+• TextColor = Text (default) or White Text
+• IntentTag = ValueProp | Offer | EventAttendees | Promo | Discount
+• BrandName = exact LS brand name
+• MMDDYY = creation/export date
+
+Sources used
+All observations above are reverse-engineered from the actual ad PNGs in LS DESIGN PRODUCTIONS/. Specifically these reference assets:
+[List of reference assets omitted here since they are extracted individually for relevant brands above]",

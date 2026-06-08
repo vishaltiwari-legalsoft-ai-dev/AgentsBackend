@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+gcp-service-account.json
+*.pem
+*.log
+.pytest_cache/
+# Cloud Run deploy env (contains secrets); keep only the .example
+deploy.env.yaml

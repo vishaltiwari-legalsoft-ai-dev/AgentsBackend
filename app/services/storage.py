@@ -1,0 +1,198 @@
+"""Google Cloud Storage access (the file "Vault").
+
+Files live in GCS; Firestore stores only their URLs. The client is created
+lazily, and `is_configured` lets callers fall back to inline data URLs when GCS
+is not yet set up.
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import timedelta
+from typing import Optional
+
+from google.cloud import storage
+
+from app.config import settings
+
+_client: Optional[storage.Client] = None
+
+
+def _storage() -> storage.Client:
+    global _client
+    if _client is None:
+        _client = storage.Client(project=settings.require("gcp_project_id"))
+    return _client
+
+
+def is_configured() -> bool:
+    return bool(settings.gcp_project_id and settings.gcs_bucket_name)
+
+
+def download_bytes(gs_uri: str) -> bytes:
+    """Download an object's bytes given its `gs://bucket/object` URI."""
+    if not gs_uri.startswith("gs://"):
+        raise ValueError(f"Not a gs:// URI: {gs_uri}")
+    bucket_name, _, object_path = gs_uri[len("gs://"):].partition("/")
+    if not bucket_name or not object_path:
+        raise ValueError(f"Malformed gs:// URI: {gs_uri}")
+    return _storage().bucket(bucket_name).blob(object_path).download_as_bytes()
+
+
+def _safe_name(file_name: str) -> str:
+    return re.sub(r"[^\w.\-() ]", "_", file_name)
+
+
+def _upload(object_path: str, data: bytes, content_type: str) -> tuple[str, str]:
+    """Upload bytes and return (gs_uri, signed_url)."""
+    bucket_name = settings.require("gcs_bucket_name")
+    try:
+        blob = _storage().bucket(bucket_name).blob(object_path)
+        blob.upload_from_string(data, content_type=content_type)
+        signed_url = blob.generate_signed_url(
+            version="v4", expiration=timedelta(hours=1), method="GET"
+        )
+        return f"gs://{bucket_name}/{object_path}", signed_url
+    except Exception as exc:  # noqa: BLE001 - surface storage errors with context
+        raise RuntimeError(f'GCS upload failed for "{object_path}": {exc}') from exc
+
+
+def upload_creative(
+    brand_id: str, file_name: str, data: bytes, content_type: str
+) -> tuple[str, str]:
+    """Store a brand creative at `<brand_id>/creatives/<file_name>`."""
+    return _upload(f"{brand_id}/creatives/{_safe_name(file_name)}", data, content_type)
+
+
+def upload_reference(
+    user_id: str, file_name: str, data: bytes, content_type: str
+) -> tuple[str, str]:
+    """Store a user reference file at `references/<user_id>/<file_name>`."""
+    return _upload(f"references/{user_id}/{_safe_name(file_name)}", data, content_type)
+
+
+def upload_generated(
+    partition: str, file_name: str, data: bytes, content_type: str
+) -> tuple[str, str]:
+    """Store an AI-generated asset at `generated/<partition>/<file_name>`.
+
+    Intentionally kept OUTSIDE the brand-kit GCS namespace and never written
+    to Firestore so the agent's retrieval pipeline can never pull its own
+    prior outputs as "brand samples" (which would cause model drift).
+    """
+    return _upload(
+        f"generated/{partition}/{_safe_name(file_name)}", data, content_type
+    )
+
+
+def signed_url_for_gs_uri(gs_uri: str, expires_in_hours: int = 1) -> str:
+    """Convert a `gs://bucket/object` URI into a time-limited HTTPS view URL."""
+    if not gs_uri.startswith("gs://"):
+        raise ValueError(f"Not a gs:// URI: {gs_uri}")
+    without_scheme = gs_uri[len("gs://"):]
+    bucket_name, _, object_path = without_scheme.partition("/")
+    if not bucket_name or not object_path:
+        raise ValueError(f"Malformed gs:// URI: {gs_uri}")
+    blob = _storage().bucket(bucket_name).blob(object_path)
+    return blob.generate_signed_url(
+        version="v4",
+        expiration=timedelta(hours=expires_in_hours),
+        method="GET",
+    )
+
+
+# Browser-renderable image formats (the only ones safe to put in <img>).
+_RENDERABLE_IMAGE_MIMES = frozenset({
+    "image/png", "image/jpeg", "image/webp", "image/gif", "image/svg+xml",
+})
+_RENDERABLE_IMAGE_EXTS = frozenset({
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg",
+})
+
+
+def _is_browser_renderable(file_name: str, file_type: str) -> bool:
+    """True only if a browser can put this asset inside an <img> tag.
+
+    Checks BOTH MIME and extension so files ingested before we added a MIME
+    mapping (and thus saved as `application/octet-stream`) are still detected
+    by their extension. Anything not confirmed renderable (EXR, PSD, PDF,
+    fonts, video, etc.) is shown as a typed card on the frontend instead.
+    """
+    if file_type in _RENDERABLE_IMAGE_MIMES:
+        return True
+    lower = file_name.lower()
+    return any(lower.endswith(ext) for ext in _RENDERABLE_IMAGE_EXTS)
+
+
+def to_gallery(creatives: list[dict], limit: int) -> list[dict]:
+    """Build a UI-ready gallery from raw creative records.
+
+    Each returned item carries an `is_image` flag so the frontend can choose
+    between a thumbnail and a typed-asset card. Renderable images are
+    surfaced first so the gallery is visually rich at a glance.
+    """
+    items: list[dict] = []
+    sorted_creatives = sorted(
+        creatives,
+        key=lambda c: 0 if _is_browser_renderable(
+            c.get("file_name", ""), c.get("file_type", "")
+        ) else 1,
+    )
+    for c in sorted_creatives:
+        if len(items) >= limit:
+            break
+        gs_uri = c.get("file_url", "")
+        if not isinstance(gs_uri, str) or not gs_uri.startswith("gs://"):
+            continue
+        try:
+            view_url = signed_url_for_gs_uri(gs_uri)
+        except Exception:  # noqa: BLE001 - skip the bad asset, keep going
+            continue
+        file_name = c.get("file_name", "")
+        file_type = c.get("file_type", "application/octet-stream")
+        items.append({
+            "file_name": file_name,
+            "file_type": file_type,
+            "view_url": view_url,
+            "gs_uri": gs_uri,  # source path, for re-signing from chat history
+            "is_image": _is_browser_renderable(file_name, file_type),
+        })
+    return items
+
+
+def rehydrate_result(result: dict) -> dict:
+    """Re-sign any `gs_uri` fields in a stored agent result so a resumed chat
+    renders even after the original signed URLs have expired.
+    """
+    if not isinstance(result, dict) or not is_configured():
+        return result
+
+    def _sign(gs_uri: str | None) -> str | None:
+        if not gs_uri:
+            return None
+        try:
+            return signed_url_for_gs_uri(gs_uri)
+        except Exception:  # noqa: BLE001 - leave stale url if signing fails
+            return None
+
+    assets = result.get("assets")
+    if isinstance(assets, dict):
+        for variation in assets.values():
+            fresh = _sign(variation.get("gs_uri")) if isinstance(variation, dict) else None
+            if fresh:
+                variation["url"] = fresh
+
+    logo = result.get("logo")
+    if isinstance(logo, dict):
+        fresh = _sign(logo.get("gs_uri"))
+        if fresh:
+            logo["view_url"] = fresh
+
+    gallery = result.get("gallery")
+    if isinstance(gallery, list):
+        for item in gallery:
+            fresh = _sign(item.get("gs_uri")) if isinstance(item, dict) else None
+            if fresh:
+                item["view_url"] = fresh
+
+    return result
