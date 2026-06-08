@@ -7,9 +7,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Native libs for SVG logo rasterization (svglib/rlPyCairo -> cairo).
+# Libs for SVG logo rasterization. pycairo (via svglib/rlPyCairo) has no Linux
+# wheel and compiles from source, so we need the C toolchain + cairo dev headers
+# at build time and libcairo2 at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
     libcairo2 \
+    libcairo2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
