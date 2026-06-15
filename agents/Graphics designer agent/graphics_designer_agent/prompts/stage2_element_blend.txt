@@ -1,0 +1,28 @@
+You are compositing ONE premium advertising image for a US legal-tech SaaS brand.
+
+You are given a single background image: a finished brand gradient produced in the previous step. Your ONLY job is to place the subject described below onto THAT background and merge the two into one seamless, high-end composition.
+
+═══════════════════════════════════
+BACKGROUND — KEEP IT EXACTLY
+═══════════════════════════════════
+The provided image IS the background. Preserve it exactly as given — same colours, same gradient, same direction, same composition. Do NOT regenerate, recolour, restyle, re-grade, blur, crop, or replace it, and do NOT add any new scenery, rooms, props, furniture, textures, or environment of your own. The background is final. You are only adding the subject.
+
+═══════════════════════════════════
+SUBJECT TO ADD
+═══════════════════════════════════
+[SUBJECT]
+
+═══════════════════════════════════
+SEAMLESS MERGE (most important)
+═══════════════════════════════════
+- The subject lives directly on the background with NO card, frame, border, rectangle, panel, Polaroid edge, drop shadow, or hard cut-out line.
+- Feather the subject's outer edges softly into the background; let the background's colour and light wrap gently onto the subject's shadow side so the two read as a single photograph, never a paste-up or collage.
+- Match the subject's lighting direction, colour temperature, contrast, and grain to the background so nothing looks pasted on.
+- Respect the placement noted in the subject and keep the background's open / empty areas clear, so a headline and CTA can be added later.
+
+═══════════════════════════════════
+FINISH
+═══════════════════════════════════
+Premium, editorial, cohesive — one unified, thumb-stopping composition with a high-end SaaS feel.
+
+No text, no logos, no watermarks, no readable UI, no readable documents, no nameplates, no captions.

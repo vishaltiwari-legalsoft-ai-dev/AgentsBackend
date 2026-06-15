@@ -11,11 +11,6 @@ app/
   config.py            Typed settings (pydantic-settings) from .env
   models.py            Pydantic request/response schemas
   security.py          JWT issue/verify + password hashing (bcrypt)
-  agent/
-    state.py           LangGraph AgentState
-    prompts.py         Master Prompt + dual-asset instructions
-    nodes.py           Graph nodes (retrieve, intent, analyze, prompt, generate, persist)
-    graph.py           StateGraph assembly + run_agent()
   services/
     openrouter.py      LLM (LangChain) + image generation
     firestore_repo.py  Firestore data access
@@ -43,7 +38,7 @@ API docs: <http://localhost:8080/docs>
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
 | GET | `/api/health` | – | Liveness |
-| POST | `/api/agent` | – | Run the LangGraph agent (`{ "message": "..." }`) |
+| GET | `/api/agent/settings` | Bearer | Graphic Designer configuration options |
 | GET | `/api/brands` | – | List brands |
 | GET | `/api/brands/{id}` | – | Brand detail + creatives |
 | POST | `/api/auth/register` / `/api/auth/login` | – | Get a JWT |
@@ -51,10 +46,6 @@ API docs: <http://localhost:8080/docs>
 | GET | `/api/references` | Bearer | The user's uploads |
 | GET | `/api/canva/authorize` · `/api/canva/callback` | – | Canva OAuth |
 | POST | `/api/canva/import` | – | Import an asset into Canva |
-
-The agent response is typed: `{type: "assets" | "brand_analysis" | "message", ...}`.
-If Cloud Storage is unconfigured, generated images return as inline data URLs so
-the app is demoable during setup.
 
 ## Ingest Brand Kits
 

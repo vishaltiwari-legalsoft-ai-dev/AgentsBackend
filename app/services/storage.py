@@ -83,6 +83,25 @@ def _upload(object_path: str, data: bytes, content_type: str) -> tuple[str, str]
         raise RuntimeError(f'GCS upload failed for "{object_path}": {exc}') from exc
 
 
+def delete_all_brand_kit_blobs() -> int:
+    """Delete every ingested brand-kit object (`<brand_id>/creatives/...`).
+
+    Leaves `generated/` and `references/` untouched.
+    """
+    bucket_name = settings.require("gcs_bucket_name")
+    bucket = _storage().bucket(bucket_name)
+    deleted = 0
+    for blob in bucket.list_blobs():
+        parts = blob.name.split("/", 2)
+        if len(parts) >= 2 and parts[1] == "creatives" and parts[0] not in (
+            "generated",
+            "references",
+        ):
+            blob.delete()
+            deleted += 1
+    return deleted
+
+
 def upload_creative(
     brand_id: str, file_name: str, data: bytes, content_type: str
 ) -> tuple[str, str]:

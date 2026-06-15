@@ -20,6 +20,7 @@ from app.routers import (
     brands,
     canva,
     conversations,
+    graphics_designer,
     health,
     library,
     references,
@@ -71,6 +72,7 @@ for router in (
     conversations,
     admin,
     canva,
+    graphics_designer,
 ):
     app.include_router(router.router, prefix="/api")
 

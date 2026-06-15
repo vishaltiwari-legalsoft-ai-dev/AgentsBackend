@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     port: int = 8080
     # Comma-separated list of allowed browser origins (the Vercel frontend).
-    cors_origins: str = "http://localhost:3000"
+    cors_origins: str = "http://localhost:3000,http://localhost:3001,http://localhost:8000"
 
     # Auth
     jwt_secret: str = ""
@@ -36,14 +36,23 @@ class Settings(BaseSettings):
     # OpenRouter (agent LLM + image generation)
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    # Reasoning model used by the LangGraph agent (master-prompt synthesis,
-    # categorization, intent). A strong model is important for faithfully
-    # preserving brand detail from the master-prompt CSV.
-    openrouter_model: str = "anthropic/claude-sonnet-4.5"
-    # Image-output model (must have "image" in its output modalities).
-    # Default is Nano Banana Pro (Gemini 3 Pro Image). Premium alternative:
-    # "openai/gpt-5.4-image-2".
+    # Reasoning model — the agent's "brain" for piecing everything together:
+    # brand persona compilation, creative-type decision, and master-prompt
+    # synthesis. A top-tier model is important for faithfully preserving brand
+    # detail and making good art-direction calls.
+    openrouter_model: str = "anthropic/claude-opus-4.6"
+    # Fast/cheap model for trivial parsing (extracting aspect ratio/brief from
+    # chat, guessing the official website URL). Quality is not critical here.
+    openrouter_fast_model: str = "anthropic/claude-sonnet-4.5"
+    # Image-output model. Nano Banana Pro (Gemini 3 Pro Image) is the default
+    # because it accepts the real brand logo as a reference image AND follows the
+    # detailed brand master prompt — giving on-brand, logo-accurate creatives.
+    # Flux.2 (black-forest-labs/flux.2-pro|max) is excellent for pure backgrounds
+    # but is image-only (can't composite the real logo), so it's reserved for the
+    # future layered editor.
     openrouter_image_model: str = "google/gemini-3-pro-image-preview"
+    # Optional alternative/background model toggle.
+    openrouter_image_model_hero: str = "black-forest-labs/flux.2-max"
     # Vision-capable model used for OCR / reading uploaded images.
     openrouter_vision_model: str = "openai/gpt-4o-mini"
     # Sent as HTTP-Referer/X-Title to OpenRouter for attribution (optional).
@@ -66,8 +75,8 @@ class Settings(BaseSettings):
     # Ingestion source (the ONLY brand-asset directory the app reads).
     brand_kits_dir: str = ""
 
-    # Reference CSV of example master prompts (few-shot guidance). Empty = use
-    # the bundled app/data/master_prompts.csv.
+    # Brand-wise master prompt library CSV. Empty = use the bundled
+    # app/data/Sample_master_prompt_brandwise - Sheet2.csv.
     master_prompts_csv: str = ""
 
     @property

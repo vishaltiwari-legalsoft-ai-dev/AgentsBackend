@@ -21,17 +21,35 @@ def _default_headers() -> dict[str, str]:
     return {"HTTP-Referer": settings.app_public_url, "X-Title": settings.app_title}
 
 
-def get_llm(temperature: float = 0.4) -> ChatOpenAI:
-    """LangChain chat model backed by OpenRouter (used inside the LangGraph agent)."""
+def get_llm(temperature: float = 0.4, *, fast: bool = False) -> ChatOpenAI:
+    """LangChain chat model backed by OpenRouter (used inside the LangGraph agent).
+
+    `fast=True` selects the cheap parsing model; the default is the high-end
+    reasoning model that pieces the creative together (persona, art direction,
+    master prompt).
+    """
+    model = settings.openrouter_fast_model if fast else settings.openrouter_model
     return ChatOpenAI(
-        model=settings.openrouter_model,
+        model=model,
         api_key=settings.require("openrouter_api_key"),
         base_url=settings.openrouter_base_url,
         default_headers=_default_headers(),
         temperature=temperature,
-        timeout=60,
+        timeout=120,
         max_retries=2,
     )
+
+
+def _image_modalities(model: str) -> list[str]:
+    """Correct `modalities` for an OpenRouter image model.
+
+    Text+image models (Gemini, GPT image) use ["image","text"]; image-only
+    models (Flux, Recraft, etc.) require ["image"] or OpenRouter rejects them.
+    """
+    text_and_image = ("gemini", "gpt-5-image", "gpt-4o", "gpt-image")
+    if any(token in model.lower() for token in text_and_image):
+        return ["image", "text"]
+    return ["image"]
 
 
 def _parse_data_url(data_url: str) -> tuple[bytes, str]:
@@ -96,9 +114,53 @@ def vision_extract_text(image_bytes: bytes, mime_type: str) -> str:
     return str(content).strip()
 
 
+def analyze_images(
+    prompt: str,
+    images: list[tuple[bytes, str]],
+    model: str | None = None,
+) -> str:
+    """Analyze one or more images with a vision-capable chat model.
+
+    Used to reverse-engineer a brand's visual design system from its website
+    imagery. Defaults to the reasoning model (multimodal); callers may pass
+    `settings.openrouter_vision_model` as a cheaper fallback.
+    """
+    api_key = settings.require("openrouter_api_key")
+    url = f"{settings.openrouter_base_url}/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", **_default_headers()}
+
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for img_bytes, mime in images:
+        data_url = (
+            f"data:{mime or 'image/png'};base64,{base64.b64encode(img_bytes).decode()}"
+        )
+        content.append({"type": "image_url", "image_url": {"url": data_url}})
+
+    body = {
+        "model": model or settings.openrouter_model,
+        "messages": [{"role": "user", "content": content}],
+    }
+    response = httpx.post(url, json=body, headers=headers, timeout=180)
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"OpenRouter image analysis failed ({response.status_code}): {response.text}"
+        )
+    payload = response.json()
+    try:
+        result = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as exc:
+        raise RuntimeError(f"Unexpected OpenRouter response shape: {payload}") from exc
+    if isinstance(result, list):
+        result = " ".join(
+            part.get("text", "") for part in result if isinstance(part, dict)
+        )
+    return str(result).strip()
+
+
 def generate_image(
     prompt: str,
     reference_images: list[tuple[bytes, str]] | None = None,
+    model: str | None = None,
 ) -> tuple[bytes, str]:
     """Render a single image through an OpenRouter image-output model.
 
@@ -119,10 +181,11 @@ def generate_image(
     else:
         messages = [{"role": "user", "content": prompt}]
 
+    image_model = model or settings.openrouter_image_model
     body = {
-        "model": settings.openrouter_image_model,
+        "model": image_model,
         "messages": messages,
-        "modalities": ["image", "text"],
+        "modalities": _image_modalities(image_model),
     }
 
     try:

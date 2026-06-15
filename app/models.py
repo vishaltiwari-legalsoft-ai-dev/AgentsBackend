@@ -25,16 +25,19 @@ class CanvaInfo(BaseModel):
 class AssetsResult(BaseModel):
     type: Literal["assets"] = "assets"
     brand: Optional[str] = None
+    creative_type: Optional[str] = None
+    purpose: Optional[str] = None
     master_prompt: str
+    brand_profile: Optional[str] = None
     assets: GeneratedAssets
     canva: CanvaInfo
 
 
-class BrandAnalysisResult(BaseModel):
-    type: Literal["brand_analysis"] = "brand_analysis"
-    brand: dict[str, Any]
-    creative_count: int
-    summary: str
+class IntakeResult(BaseModel):
+    type: Literal["intake"] = "intake"
+    text: str
+    missing_fields: list[str] = Field(default_factory=list)
+    suggestions: dict[str, Any] = Field(default_factory=dict)
 
 
 class MessageResult(BaseModel):

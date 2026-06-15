@@ -11,6 +11,7 @@ The client is created lazily so the server can boot before GCP is configured.
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -20,6 +21,11 @@ from google.cloud import firestore
 from app.config import settings
 
 _client: Optional[firestore.Client] = None
+
+# Brands change only on ingest, so a short in-process cache keeps the opening
+# brand picker instant and avoids re-hitting Firestore mid-conversation.
+_BRANDS_TTL_SECONDS = 60.0
+_brands_cache: tuple[float, list[dict[str, Any]]] | None = None
 
 
 def _db() -> firestore.Client:
@@ -40,9 +46,14 @@ def _now() -> str:
 # Brands
 # --------------------------------------------------------------------------- #
 
-def list_brands() -> list[dict[str, Any]]:
+def list_brands(*, use_cache: bool = True) -> list[dict[str, Any]]:
+    global _brands_cache
+    if use_cache and _brands_cache and (time.monotonic() - _brands_cache[0]) < _BRANDS_TTL_SECONDS:
+        return _brands_cache[1]
     docs = _db().collection("brands").order_by("brand_name").stream()
-    return [doc.to_dict() | {"id": doc.id} for doc in docs]
+    brands = [doc.to_dict() | {"id": doc.id} for doc in docs]
+    _brands_cache = (time.monotonic(), brands)
+    return brands
 
 
 def get_brand(brand_id: str) -> Optional[dict[str, Any]]:
@@ -62,7 +73,13 @@ def find_brand_by_name(name: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def _invalidate_brands_cache() -> None:
+    global _brands_cache
+    _brands_cache = None
+
+
 def upsert_brand(brand_name: str, brand_metadata: dict[str, Any]) -> dict[str, Any]:
+    _invalidate_brands_cache()
     existing = find_brand_by_name(brand_name)
     payload = {
         "brand_name": brand_name,
@@ -105,6 +122,35 @@ def count_creatives_by_brand(brand_id: str) -> int:
     result = query.get()
     # `count()` returns a list of aggregation results; value is on the first.
     return int(result[0][0].value) if result and result[0] else 0
+
+
+def _delete_collection(collection_name: str) -> int:
+    """Delete every document in a Firestore collection. Returns deleted count."""
+    deleted = 0
+    batch = _db().batch()
+    batch_size = 0
+    for doc in _db().collection(collection_name).stream():
+        batch.delete(doc.reference)
+        batch_size += 1
+        deleted += 1
+        if batch_size >= 400:
+            batch.commit()
+            batch = _db().batch()
+            batch_size = 0
+    if batch_size > 0:
+        batch.commit()
+    return deleted
+
+
+def delete_all_brands() -> int:
+    """Wipe the entire brands collection."""
+    _invalidate_brands_cache()
+    return _delete_collection("brands")
+
+
+def delete_all_creatives() -> int:
+    """Wipe the entire creatives collection."""
+    return _delete_collection("creatives")
 
 
 def delete_ingested_creatives(brand_id: str) -> int:

@@ -1,0 +1,106 @@
+Add a premium advertising text overlay ON TOP of the provided image. Render only the text and CTA button — do not alter the underlying image. Follow these exact specifications:
+
+═══════════════════════════════════
+PRESERVE THE PROVIDED IMAGE (CRITICAL)
+═══════════════════════════════════
+- You are given a finished image. Do NOT regenerate, repaint, recompose, crop, zoom, rotate, re-grade, or change its aspect ratio in any way.
+- Keep every pixel of the underlying image exactly as-is. The output must be the SAME image at the SAME aspect ratio and resolution, with only the text and CTA added on top.
+- Place the text in the image's clean / empty negative space; it must never cover or obscure the main subject.
+
+═══════════════════════════════════
+LAYOUT & POSITIONING
+═══════════════════════════════════
+- Text block placement: [TEXT_PLACEMENT]
+- CTA button placement: [CTA_PLACEMENT]
+- Keep a comfortable margin (~6–8%) from the nearest edges — nothing clipped, crowded, or touching an edge.
+- Reading order: headline first, then sub-text, then the CTA button, with clear spacing between them.
+
+═══════════════════════════════════
+TEXT CONTENT
+═══════════════════════════════════
+1. HEADLINE (bold, punchy):
+   "Hire Experienced Virtual Legal Staff For Your Firm"
+   - Gradient highlight on: "Virtual Legal Staff"
+   - Other words in #0F0F0F
+   - Max 4 lines, natural wrapping, no clipping
+
+2. SUPPORTING SUB-TEXT (styled as TWO short value statements, NOT a paragraph):
+   Break the message into 2 distinct lines with subtle visual rhythm:
+
+   Line 1: "Build your team with the best legal staff in the world."
+   Line 2: "Choose from pre-vetted candidates — start in under 3 days."
+
+   - Each line on its own with slightly more line-gap between them than within
+   - Color: #0F0F0F at ~85% opacity (slightly softer than headline, gives hierarchy)
+   - Line height: 1.5x
+   - Optional: add a small thin accent bar/dot (in #85AEFD) before each line, OR a subtle minimalist check icon — pick whichever feels cleaner. Icons must be SMALL and refined, not chunky.
+   - DO NOT render as a flat paragraph block. Treat it like two crisp value props.
+
+3. CTA BUTTON TEXT:
+   "Book a Free Consultation  →"   (include a small right-arrow at the end inside the button)
+
+═══════════════════════════════════
+TYPOGRAPHY
+═══════════════════════════════════
+- Font family: "Artica Bold" for headline and CTA
+- Sub-text: "Artica Bold" but slightly lighter visual weight via opacity (85%)
+- Headline size: moderate — the longest line fits comfortably inside its placement zone with margin
+- Sub-text size: ~32% of headline size
+- CTA text size: ~38% of headline size
+- Line height (headline): 1.1x
+- Line height (sub-text): 1.5x
+- Letter spacing: normal/tight
+
+═══════════════════════════════════
+CTA BUTTON — PREMIUM SAAS STYLING (CRITICAL)
+═══════════════════════════════════
+- Shape: Pill-shaped, fully rounded corners
+- Background: Vibrant orange GRADIENT (not flat color)
+   → Start: #FF8A3D (lighter orange, top-left)
+   → End:   #F26A1A (deeper orange, bottom-right)
+   → Direction: diagonal (135°)
+- Subtle inner highlight on top edge (very faint white at low opacity) to add dimension
+- Soft drop shadow underneath:
+   → Color: orange-tinted shadow (rgba(242, 106, 26, 0.25))
+   → Offset: 0px 8px 20px blur
+   → Creates a "floating button" premium feel, NOT a harsh black shadow
+- Text inside: White (#FFFFFF), Artica Bold, with a small right-arrow "→" after the text (same color)
+- Padding inside button: ~22px vertical, ~32px horizontal (generous, but compact)
+- Button width: hugs the content (text + arrow + padding) — NOT stretched
+- Slight icon/text gap: small space between "Consultation" and "→"
+- The button should feel CLICKABLE, ELEVATED, and PREMIUM — like a Stripe, Linear, or Notion CTA button
+
+═══════════════════════════════════
+COLOR SPECIFICATIONS
+═══════════════════════════════════
+- Primary text: #0F0F0F
+- Sub-text: #0F0F0F at 85% opacity
+- Accent (small bars/dots before sub-text lines, if used): #85AEFD
+- Highlighted headline words ("Virtual Legal Staff"): linear gradient left-to-right
+   → Start: #86AFFE
+   → End:   #2653AB
+- CTA button: orange gradient #FF8A3D → #F26A1A (135°)
+- CTA shadow: rgba(242, 106, 26, 0.25), soft, 0 8px 20px
+
+═══════════════════════════════════
+SPACING BETWEEN ELEMENTS
+═══════════════════════════════════
+- Headline → Sub-text: comfortable gap (~1.5x sub-text size)
+- Sub-text → CTA: generous gap (~2.5x sub-text size) — CTA must feel like its own confident element, not stuck to the paragraph
+- Between sub-text lines: slightly more spacing than default line-height for that "premium breathing room" feel
+
+═══════════════════════════════════
+STYLE RULES
+═══════════════════════════════════
+- Premium SaaS landing-page aesthetic — think Stripe, Linear, Webflow
+- Sub-text must read as crisp value props, NOT a wall of paragraph text
+- CTA must feel elevated, gradient-rich, with soft glow — not flat
+- No element clipped, overlapping the main subject, or touching the canvas edge
+- No clutter, no decorative noise
+
+═══════════════════════════════════
+DELIVERABLE
+═══════════════════════════════════
+- The provided image, unchanged, with a refined text overlay placed exactly as specified above
+- Underlying image, composition, and aspect ratio fully preserved
+- Original resolution maintained

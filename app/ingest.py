@@ -1,14 +1,17 @@
 """Brand Kits ingestion.
 
-Walks the Brand Kits directory (the ONLY brand-asset source), treats each
-top-level folder as a brand, uploads every file to GCS, and records metadata in
-Firestore. The sibling "LS DESIGN PRODUCTIONS" folder is never touched.
+Walks a brand-asset directory, treats each top-level folder as a brand (or
+detects a nested `Brand Kit` subfolder), uploads every file to GCS, and records
+metadata in Firestore.
 
-Run with:  python -m app.ingest
+Run with:
+    python -m app.ingest              # ingest / update from BRAND_KITS_DIR
+    python -m app.ingest --reset      # wipe brands + creatives + GCS kit files, then re-ingest
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 from pathlib import Path
@@ -27,6 +30,12 @@ MIME_BY_EXT = {
     ".doc": "application/msword",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".mp4": "video/mp4",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ai": "application/postscript",
+    ".eps": "application/postscript",
 }
 
 
@@ -39,13 +48,40 @@ def _brand_name(folder_name: str) -> str:
     return cleaned or folder_name
 
 
-def _ingest_brand(brand_folder: Path) -> None:
-    brand_name = _brand_name(brand_folder.name)
-    brand = firestore_repo.upsert_brand(brand_name, {"source_folder": brand_folder.name})
+def _discover_brands(base: Path) -> list[tuple[str, Path]]:
+    """Return (brand_name, kit_folder) pairs from a data directory.
+
+    Handles three layouts seen under `Data/`:
+    - `{Brand}/Brand Kit/...`          e.g. MedVirtual/Brand Kit/
+    - `{Name} brand kit/...`           e.g. Legal soft brand kit/ (kit at top level)
+    - `{Brand}/...`                    fallback: entire folder is the kit
+    """
+    results: list[tuple[str, Path]] = []
+    for entry in sorted(base.iterdir()):
+        if not entry.is_dir():
+            continue
+
+        if "brand kit" in entry.name.lower():
+            results.append((_brand_name(entry.name), entry))
+            continue
+
+        kit_sub = entry / "Brand Kit"
+        if kit_sub.is_dir():
+            results.append((_brand_name(entry.name), kit_sub))
+            continue
+
+        results.append((_brand_name(entry.name), entry))
+
+    return results
+
+
+def _ingest_brand(brand_name: str, brand_folder: Path) -> None:
+    brand = firestore_repo.upsert_brand(
+        brand_name,
+        {"source_folder": brand_folder.name, "source_path": str(brand_folder)},
+    )
     print(f"\n[ingest] Brand: {brand_name} ({brand['id']})")
 
-    # Make re-runs idempotent: wipe this brand's previously ingested creatives
-    # before re-uploading. AI-generated assets (author=AgentOS) are preserved.
     pruned = firestore_repo.delete_ingested_creatives(brand["id"])
     if pruned:
         print(f"[ingest]   pruned {pruned} previously-ingested records")
@@ -62,7 +98,10 @@ def _ingest_brand(brand_folder: Path) -> None:
                 brand["id"], flat_name, data, _mime_for(file_path)
             )
             firestore_repo.create_creative(
-                brand["id"], relative, _mime_for(file_path), gs_uri,
+                brand["id"],
+                relative,
+                _mime_for(file_path),
+                gs_uri,
                 {"relative_path": relative, "author": "Marketing Team"},
             )
             uploaded += 1
@@ -74,21 +113,50 @@ def _ingest_brand(brand_folder: Path) -> None:
     print(f"[ingest] Done: {uploaded} uploaded, {failed} skipped.")
 
 
+def _reset_all() -> None:
+    """Remove all brand-kit data from Firestore and GCS (keeps users/chats)."""
+    print("[reset] Deleting GCS brand-kit blobs...")
+    gcs_deleted = storage.delete_all_brand_kit_blobs()
+    print(f"[reset]   removed {gcs_deleted} GCS objects")
+
+    print("[reset] Deleting Firestore creatives...")
+    creatives_deleted = firestore_repo.delete_all_creatives()
+    print(f"[reset]   removed {creatives_deleted} creative records")
+
+    print("[reset] Deleting Firestore brands...")
+    brands_deleted = firestore_repo.delete_all_brands()
+    print(f"[reset]   removed {brands_deleted} brand records")
+    print("[reset] Done.\n")
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Ingest brand kits into GCS + Firestore")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Wipe all brands/creatives/GCS kit files before re-ingesting",
+    )
+    args = parser.parse_args()
+
     source = settings.brand_kits_dir or os.path.join(os.getcwd(), "Brand Kits")
     base = Path(source)
     print(f"[ingest] Source: {base}")
     if not base.is_dir():
         raise SystemExit(f"Brand Kits directory not found: {base}")
 
-    brand_folders = sorted(p for p in base.iterdir() if p.is_dir())
-    if not brand_folders:
+    if args.reset:
+        _reset_all()
+
+    brands = _discover_brands(base)
+    if not brands:
         print("[ingest] No brand folders found.")
         return
 
-    for folder in brand_folders:
-        _ingest_brand(folder)
-    print(f"\n[ingest] Ingested {len(brand_folders)} brands.")
+    for brand_name, kit_folder in brands:
+        print(f"[ingest] Kit folder: {kit_folder}")
+        _ingest_brand(brand_name, kit_folder)
+
+    print(f"\n[ingest] Ingested {len(brands)} brands.")
 
 
 if __name__ == "__main__":

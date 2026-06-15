@@ -21,6 +21,7 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY app ./app
+COPY agents ./agents
 
 # Cloud Run injects $PORT; default to 8080 locally.
 ENV PORT=8080
