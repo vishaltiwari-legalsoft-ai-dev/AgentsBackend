@@ -1,0 +1,262 @@
+{
+  "id": "035fb4f3aff4",
+  "user_id": "10aac79143a04e18a887f12f670a0592",
+  "brand_id": null,
+  "created_at": "2026-06-15T15:23:11.997501+00:00",
+  "updated_at": "2026-06-15T15:34:51.573030+00:00",
+  "state": "DONE",
+  "config": {
+    "font": "Artica Bold",
+    "aspect_ratio": "16:9",
+    "use_ai_compositor": true,
+    "tokens": {
+      "headline": "Hire Experienced Virtual Legal Staff For Your Firm",
+      "highlight": "Virtual Legal Staff",
+      "subtext1": "Build your team with the best legal staff in the world.",
+      "subtext2": "Choose from pre-vetted candidates — start in under 3 days.",
+      "cta": "Book a Free Consultation"
+    },
+    "tokens_approved": {
+      "headline": true,
+      "highlight": true,
+      "subtext1": true,
+      "subtext2": true,
+      "cta": true
+    }
+  },
+  "stages": {
+    "1": {
+      "variant": "D",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "L",
+          "artifact": "stage-1/L-1.png",
+          "prompt": "Create a 16:9 aspect ratio immersive brand background. Base layer: a near-solid #1746A2 blue overlay laid over a faded, blurred office/library interior photo. The overlay is fairly even and opaque, letting only ghosted furniture shapes show through in slightly lighter #1746A2/#BDCFED values. Treatment: a very subtle radial lift toward the center-right (where the photo is marginally brighter), edges settling back into uniform deep blue. Flat, calm, monochromatic — the photo functions only as faint texture beneath a dominant blue wash. No text, no logos, high resolution.",
+          "prompt_hash": "d4b74fc6338f8ab53d93d4988be93025bcbcf8b6986871e5478afc91581336f1",
+          "diffs": [],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T15:23:44.916554+00:00"
+        },
+        {
+          "attempt": 2,
+          "variant": "L",
+          "artifact": "stage-1/L-2.png",
+          "prompt": "Create a 16:9 aspect ratio immersive brand background. Base layer: a near-solid #1746A2 blue overlay laid over a faded, blurred office/library interior photo. The overlay is fairly even and opaque, letting only ghosted furniture shapes show through in slightly lighter #1746A2/#BDCFED values. Treatment: a very subtle radial lift toward the center-right (where the photo is marginally brighter), edges settling back into uniform deep blue. Flat, calm, monochromatic — the photo functions only as faint texture beneath a dominant blue wash. No text, no logos, high resolution.",
+          "prompt_hash": "d4b74fc6338f8ab53d93d4988be93025bcbcf8b6986871e5478afc91581336f1",
+          "diffs": [],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T15:25:40.700861+00:00"
+        },
+        {
+          "attempt": 3,
+          "variant": "K",
+          "artifact": "stage-1/K-3.png",
+          "prompt": "Create a 16:9 aspect ratio immersive brand background. Base layer: a vertical sky gradient — richer blue (#1746A2) at the top edge, descending through mid-blue and brightening to a luminous cyan-leaning blue (#A2C0E6) across the bottom third. Bright and atmospheric. Texture overlays: in the upper half, soft realistic white (#FFFFFF) cloud wisps float with low opacity, scattered and feathery. Across the lower half, a faint translucent city street-map line network (thin pale-blue #BDCFED lines on the blue field) overlays like an aerial map, very low contrast. The map texture fades out toward the middle where it meets the clouds. Open, airy, dimensional sky feel. No text, no logos, high resolution.",
+          "prompt_hash": "a77373cec63427b24fe5d3bd4d5cf9e308bab67e3e4de7c97d75a83643885b40",
+          "diffs": [],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T15:26:10.048086+00:00"
+        },
+        {
+          "attempt": 4,
+          "variant": "D",
+          "artifact": "stage-1/D-4.png",
+          "prompt": "Create a 16:9 aspect ratio immersive brand background. A very light, airy pale-blue-to-white sky gradient, white (#FFFFFF) dominant at top blending into faint blue. Lower portion holds a desaturated, washed-out cityscape silhouette fading into the pale background. Extremely light, high-key, hazy and bright. No text, no logos, high resolution.",
+          "prompt_hash": "aabf1fc80c751e108b032089a2a1d802836d67faf921cd46752fcd12922dc512",
+          "diffs": [],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T15:30:11.445938+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 4,
+        "variant": "D",
+        "artifact": "stage-1/D-4.png"
+      }
+    },
+    "2": {
+      "variant": "A",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "D",
+          "artifact": "stage-2/D-1.png",
+          "prompt": "Horizontal social media post, 1920x1080px (16:9 aspect ratio), single unified \ncinematic composition for Legal Soft — a US legal-tech SaaS company providing \ntrained Virtual Assistants to American law firms. Premium B2B SaaS aesthetic, \neditorial campaign quality, ATTENTION-STOPPING conceptual visual storytelling.\n\nFULL CANVAS BACKGROUND: smooth bilinear brand gradient — top-left pure white \n(#FFFFFF) flowing diagonally into deep royal blue (#1746A2) at the bottom-\nright, with soft sky blue (#A2C0E6) transitioning across the top-right. \nButtery smooth, Legal Soft's signature brand identity, confident and strong.\n\nTOP-RIGHT CORNER: faint PCB circuit traces in pale luminous blue at 25-30% \nopacity, radially dissolving toward center. Subtle blue dotted texture at \n8% opacity.\n\nLEFT 45-50% OF CANVAS: generous negative space within the gradient for \nheadline + CTA overlay.\n\nRIGHT 50-55% OF CANVAS: a single dramatic, cinematic photograph featuring \nthe HERO CONCEPT below.\n\n═══════════════════════════════════════════════════════════════\nTHE HERO CONCEPT — \"THE PARTNER'S CORNER OFFICE AT 11:47 PM\"\n═══════════════════════════════════════════════════════════════\n\nThe scene: an empty, prestigious senior partner's corner office in a top-\ntier American law firm — photographed at NIGHT, lit only by a single \nwarm desk lamp casting a golden pool of light onto a desk overflowing with \nwork. The OWNER OF THIS OFFICE IS NOT IN FRAME — but their presence is \nfelt through the chaos and ambition the room holds.\n\nTHE STORY THE IMAGE TELLS WITHOUT WORDS:\n\"This is what 'success' looks like at 11:47 PM. The trial brief is half-\nwritten. The phone has 23 missed calls. The coffee went cold three hours \nago. The view of Manhattan is breathtaking — but nobody's looking at it. \nYou built this firm. Now it's eating you alive.\"\n\nEvery law firm partner who scrolls past this image will FEEL it in their \nchest. It's their life on a screen.\n\n═══════════════════════════════════════════════════════════════\n\nSCENE COMPOSITION — what's in the frame:\n\nTHE DESK (foreground, dominant):\n- A heavy executive mahogany or walnut desk, polished, partially visible \nin the lower foreground of the frame\n- A single brass-shaded green banker's lamp (classic legal library style) \nglowing warm gold — the ONLY light source in the room, creating a dramatic \npool of warm light\n- Scattered across the desk: stacks of legal documents and case files in \nmanila folders, some open with visible pages (text not readable), a \nyellow legal pad with handwritten notes, multiple highlighters and a \nquality fountain pen left mid-thought\n- An open leather portfolio with documents spilling out\n- A half-full crystal whiskey glass or a cold coffee cup with cream \nswirls settled (untouched for hours)\n- A premium leather-bound legal book left open face-down\n- A reading glasses pair set down on top of the documents\n- A modern laptop open and glowing softly, screen showing abstract \nsoftware interfaces (NOT readable, just the impression of active work)\n- A modern smartphone face-up on the desk with a glowing notification \nscreen visible — multiple missed call indicators softly glowing (NOT \nreadable text, just the impression of accumulated notifications)\n\nTHE OFFICE ENVIRONMENT (background, atmospheric):\n- A floor-to-ceiling window or wall of windows on the right side of the \noffice, revealing a stunning NIGHTTIME CITYSCAPE view of an American \nfinancial district (Manhattan-style skyline, Chicago loop, or generic \nAmerican big-city skyscrapers) glittering with thousands of office \nlights and city traffic far below\n- The city lights outside are warm golden and cool blue, scattered like \nstars across the dark sky\n- A tufted oxblood or burgundy leather executive chair behind the desk, \npositioned slightly askew — pushed back as if the owner stepped away \nmomentarily\n- A wall of dark mahogany bookshelves filled with leather-bound law \nbooks behind the desk, partially visible in shadow\n- A framed law degree and bar admission certificate on the wall, just \nvisible in the ambient glow\n- A subtle American flag on a brass stand in the corner shadow (NOT \nprominent, just an authentic detail)\n- The rest of the office melts into dramatic shadows — deep navy and \ncharcoal shadows fill the corners\n\nLIGHTING — THIS IS WHERE THE MAGIC HAPPENS:\n- ONE warm golden pool of desk lamp light illuminating the work in the \nforeground — creating a dramatic chiaroscuro effect\n- The cityscape outside provides a secondary cool blue light source \nthrough the windows, creating premium warm-vs-cool contrast\n- Deep shadows envelop the rest of the office\n- Subtle warm amber glow from the laptop screen and phone screen adds \nambient highlights\n- Time of day: late night, somewhere between 11 PM and 1 AM — the city \nis still alive, but the office is in solitude\n\nPHOTOGRAPHY ANGLE:\n- Cinematic medium-wide angle, slightly low perspective, looking across \nthe desk surface from the chair side toward the window\n- Shallow-to-medium depth of field — the desk work is sharply focused \nin the foreground, the cityscape softly bokeh'd in the background\n- The empty executive chair is visible but slightly out of focus, \nemphasizing the ABSENCE\n\n═══════════════════════════════════════════════════════════════\n\nATTENTION-GRABBING DETAILS THAT MAKE LAW FIRM PARTNERS STOP SCROLLING:\n\n1. THE EMPTY CHAIR — psychologically powerful. They see themselves NOT in \nthe chair, working from somewhere else, having missed dinner again.\n\n2. THE GLOWING PHONE WITH MISSED CALLS — every partner knows that screen. \nThe dread it creates is universal. Their pulse will quicken.\n\n3. THE COLD UNTOUCHED COFFEE — visual shorthand for \"you've been at this \nfor hours and you can't even pause to drink.\" Every partner has lived this.\n\n4. THE BREATHTAKING VIEW NOBODY'S LOOKING AT — the cruel irony of \n\"success.\" They built this to enjoy the view, and now they never see it.\n\n5. THE OPEN BUT ABANDONED WORK — implies they walked away in the middle \nof something important. Could be a family emergency, an exhausted \ncollapse, or simply giving up for the night.\n\n6. THE GOLDEN POOL OF LAMP LIGHT — cinematic and seductive, like a \nprestige drama film still (Suits, The Good Wife, Better Call Saul).\n\n═══════════════════════════════════════════════════════════════\n\nCRITICAL — SEAMLESS BLEND INTO BRAND GRADIENT:\n\nThe photograph does NOT have a visible rectangular border, frame, or card \nedge. The right portion of the canvas IS the photograph. The scene is \ncrisp in its focal areas, but the LEFT edge of the photograph (where the \noffice's dark interior meets the open brand canvas) dissolves softly into \nthe brand gradient through a long gradual alpha feather (~300-350px wide).\n\nThe dark office shadows on the left side fade into the deep brand royal \nblue (#1746A2) — they ARE the deep blue, atmospherically. The cityscape \nwindow light bridges with the brand sky-blue tones in the upper area. \nThe warm golden lamp pool remains fully saturated and dominant in the \nfocal area.\n\nTOP edge softly vignettes into the lighter brand sky-blue gradient with \n80-100px feather. BOTTOM edge softly vignettes into the deep brand royal \nblue with similar feather. Only the right edge touches the canvas cleanly.\n\nThe effect: the partner's office emerges seamlessly from Legal Soft's \nbrand atmosphere — the visual story IS Legal Soft's world.\n\nCOLOR HARMONY:\n- The warm golden lamp light + city lights create premium warm contrast \nagainst the cool brand blue gradient\n- The deep navy/charcoal office shadows harmonize with the brand royal \nblue\n- The dark mahogany wood tones add richness without competing with the \nbrand palette\n- Result: cinematic warm-vs-cool that mirrors the EMOTIONAL warm-vs-cool \nof the story (the warmth of ambition vs. the cold reality of burnout)\n\nHARD RULE: the focal warm pool of light on the desk remains fully \nsaturated warm amber. The blue brand gradient only affects the AMBIENT \nSHADOWS and SKY background. Warm focal storytelling against cool brand \natmosphere = the correct premium contrast.\n\nNO HARD EDGES, NO CARD BORDERS, NO PHOTO FRAME — painted directly into \nthe brand gradient like a cinematic film still.\n\n═══════════════════════════════════════════════════════════════\n\nMOOD MESSAGE: \"We see you. The 11 PM grind, the missed dinner, the \nswelling caseload. Legal Soft is the partner who shows up when you're \nstretched thin.\" This isn't an ad about staffing — it's an ad about \nRECOGNITION of their reality.\n\nStyle: cinematic prestige-drama still (think Better Call Saul / Industry \n/ Succession color grading), premium architectural editorial photography, \nGQ-meets-Bloomberg-Law. Shot on Cinema Camera, 35mm lens, ambient light \nonly, dramatic chiaroscuro, deep cinematic shadows, golden lamp warmth \nagainst cool nightscape.\n\nNo text in the image, no logos, no readable software UI, no readable \ndocuments, no readable phone notifications, no harsh seams, no people in \nframe, no harsh photo border.\n\n--ar 16:9 --style raw --v 6",
+          "prompt_hash": "8d8c0227ee00374b594030952d1b95ee0ccd955d327d3329c6d4d98d44a823c5",
+          "diffs": [
+            {
+              "token": "ASPECT_RATIO.dimensions",
+              "find": "1080x1350px (4:5 aspect ratio)",
+              "replace": "1920x1080px (16:9 aspect ratio)",
+              "count": 1
+            },
+            {
+              "token": "ASPECT_RATIO.flag",
+              "find": "--ar 4:5",
+              "replace": "--ar 16:9",
+              "count": 1
+            },
+            {
+              "token": "ASPECT_RATIO.orientation",
+              "find": "Vertical social media post,",
+              "replace": "Horizontal social media post,",
+              "count": 1
+            }
+          ],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T15:27:39.971682+00:00"
+        },
+        {
+          "attempt": 2,
+          "variant": "D",
+          "artifact": "stage-2/D-2.png",
+          "prompt": "Horizontal social media post, 1920x1080px (16:9 aspect ratio), single unified \ncinematic composition for Legal Soft — a US legal-tech SaaS company providing \ntrained Virtual Assistants to American law firms. Premium B2B SaaS aesthetic, \neditorial campaign quality, ATTENTION-STOPPING conceptual visual storytelling.\n\nFULL CANVAS BACKGROUND: smooth bilinear brand gradient — top-left pure white \n(#FFFFFF) flowing diagonally into deep royal blue (#1746A2) at the bottom-\nright, with soft sky blue (#A2C0E6) transitioning across the top-right. \nButtery smooth, Legal Soft's signature brand identity, confident and strong.\n\nTOP-RIGHT CORNER: faint PCB circuit traces in pale luminous blue at 25-30% \nopacity, radially dissolving toward center. Subtle blue dotted texture at \n8% opacity.\n\nLEFT 45-50% OF CANVAS: generous negative space within the gradient for \nheadline + CTA overlay.\n\nRIGHT 50-55% OF CANVAS: a single dramatic, cinematic photograph featuring \nthe HERO CONCEPT below.\n\n═══════════════════════════════════════════════════════════════\nTHE HERO CONCEPT — \"THE PARTNER'S CORNER OFFICE AT 11:47 PM\"\n═══════════════════════════════════════════════════════════════\n\nThe scene: an empty, prestigious senior partner's corner office in a top-\ntier American law firm — photographed at NIGHT, lit only by a single \nwarm desk lamp casting a golden pool of light onto a desk overflowing with \nwork. The OWNER OF THIS OFFICE IS NOT IN FRAME — but their presence is \nfelt through the chaos and ambition the room holds.\n\nTHE STORY THE IMAGE TELLS WITHOUT WORDS:\n\"This is what 'success' looks like at 11:47 PM. The trial brief is half-\nwritten. The phone has 23 missed calls. The coffee went cold three hours \nago. The view of Manhattan is breathtaking — but nobody's looking at it. \nYou built this firm. Now it's eating you alive.\"\n\nEvery law firm partner who scrolls past this image will FEEL it in their \nchest. It's their life on a screen.\n\n═══════════════════════════════════════════════════════════════\n\nSCENE COMPOSITION — what's in the frame:\n\nTHE DESK (foreground, dominant):\n- A heavy executive mahogany or walnut desk, polished, partially visible \nin the lower foreground of the frame\n- A single brass-shaded green banker's lamp (classic legal library style) \nglowing warm gold — the ONLY light source in the room, creating a dramatic \npool of warm light\n- Scattered across the desk: stacks of legal documents and case files in \nmanila folders, some open with visible pages (text not readable), a \nyellow legal pad with handwritten notes, multiple highlighters and a \nquality fountain pen left mid-thought\n- An open leather portfolio with documents spilling out\n- A half-full crystal whiskey glass or a cold coffee cup with cream \nswirls settled (untouched for hours)\n- A premium leather-bound legal book left open face-down\n- A reading glasses pair set down on top of the documents\n- A modern laptop open and glowing softly, screen showing abstract \nsoftware interfaces (NOT readable, just the impression of active work)\n- A modern smartphone face-up on the desk with a glowing notification \nscreen visible — multiple missed call indicators softly glowing (NOT \nreadable text, just the impression of accumulated notifications)\n\nTHE OFFICE ENVIRONMENT (background, atmospheric):\n- A floor-to-ceiling window or wall of windows on the right side of the \noffice, revealing a stunning NIGHTTIME CITYSCAPE view of an American \nfinancial district (Manhattan-style skyline, Chicago loop, or generic \nAmerican big-city skyscrapers) glittering with thousands of office \nlights and city traffic far below\n- The city lights outside are warm golden and cool blue, scattered like \nstars across the dark sky\n- A tufted oxblood or burgundy leather executive chair behind the desk, \npositioned slightly askew — pushed back as if the owner stepped away \nmomentarily\n- A wall of dark mahogany bookshelves filled with leather-bound law \nbooks behind the desk, partially visible in shadow\n- A framed law degree and bar admission certificate on the wall, just \nvisible in the ambient glow\n- A subtle American flag on a brass stand in the corner shadow (NOT \nprominent, just an authentic detail)\n- The rest of the office melts into dramatic shadows — deep navy and \ncharcoal shadows fill the corners\n\nLIGHTING — THIS IS WHERE THE MAGIC HAPPENS:\n- ONE warm golden pool of desk lamp light illuminating the work in the \nforeground — creating a dramatic chiaroscuro effect\n- The cityscape outside provides a secondary cool blue light source \nthrough the windows, creating premium warm-vs-cool contrast\n- Deep shadows envelop the rest of the office\n- Subtle warm amber glow from the laptop screen and phone screen adds \nambient highlights\n- Time of day: late night, somewhere between 11 PM and 1 AM — the city \nis still alive, but the office is in solitude\n\nPHOTOGRAPHY ANGLE:\n- Cinematic medium-wide angle, slightly low perspective, looking across \nthe desk surface from the chair side toward the window\n- Shallow-to-medium depth of field — the desk work is sharply focused \nin the foreground, the cityscape softly bokeh'd in the background\n- The empty executive chair is visible but slightly out of focus, \nemphasizing the ABSENCE\n\n═══════════════════════════════════════════════════════════════\n\nATTENTION-GRABBING DETAILS THAT MAKE LAW FIRM PARTNERS STOP SCROLLING:\n\n1. THE EMPTY CHAIR — psychologically powerful. They see themselves NOT in \nthe chair, working from somewhere else, having missed dinner again.\n\n2. THE GLOWING PHONE WITH MISSED CALLS — every partner knows that screen. \nThe dread it creates is universal. Their pulse will quicken.\n\n3. THE COLD UNTOUCHED COFFEE — visual shorthand for \"you've been at this \nfor hours and you can't even pause to drink.\" Every partner has lived this.\n\n4. THE BREATHTAKING VIEW NOBODY'S LOOKING AT — the cruel irony of \n\"success.\" They built this to enjoy the view, and now they never see it.\n\n5. THE OPEN BUT ABANDONED WORK — implies they walked away in the middle \nof something important. Could be a family emergency, an exhausted \ncollapse, or simply giving up for the night.\n\n6. THE GOLDEN POOL OF LAMP LIGHT — cinematic and seductive, like a \nprestige drama film still (Suits, The Good Wife, Better Call Saul).\n\n═══════════════════════════════════════════════════════════════\n\nCRITICAL — SEAMLESS BLEND INTO BRAND GRADIENT:\n\nThe photograph does NOT have a visible rectangular border, frame, or card \nedge. The right portion of the canvas IS the photograph. The scene is \ncrisp in its focal areas, but the LEFT edge of the photograph (where the \noffice's dark interior meets the open brand canvas) dissolves softly into \nthe brand gradient through a long gradual alpha feather (~300-350px wide).\n\nThe dark office shadows on the left side fade into the deep brand royal \nblue (#1746A2) — they ARE the deep blue, atmospherically. The cityscape \nwindow light bridges with the brand sky-blue tones in the upper area. \nThe warm golden lamp pool remains fully saturated and dominant in the \nfocal area.\n\nTOP edge softly vignettes into the lighter brand sky-blue gradient with \n80-100px feather. BOTTOM edge softly vignettes into the deep brand royal \nblue with similar feather. Only the right edge touches the canvas cleanly.\n\nThe effect: the partner's office emerges seamlessly from Legal Soft's \nbrand atmosphere — the visual story IS Legal Soft's world.\n\nCOLOR HARMONY:\n- The warm golden lamp light + city lights create premium warm contrast \nagainst the cool brand blue gradient\n- The deep navy/charcoal office shadows harmonize with the brand royal \nblue\n- The dark mahogany wood tones add richness without competing with the \nbrand palette\n- Result: cinematic warm-vs-cool that mirrors the EMOTIONAL warm-vs-cool \nof the story (the warmth of ambition vs. the cold reality of burnout)\n\nHARD RULE: the focal warm pool of light on the desk remains fully \nsaturated warm amber. The blue brand gradient only affects the AMBIENT \nSHADOWS and SKY background. Warm focal storytelling against cool brand \natmosphere = the correct premium contrast.\n\nNO HARD EDGES, NO CARD BORDERS, NO PHOTO FRAME — painted directly into \nthe brand gradient like a cinematic film still.\n\n═══════════════════════════════════════════════════════════════\n\nMOOD MESSAGE: \"We see you. The 11 PM grind, the missed dinner, the \nswelling caseload. Legal Soft is the partner who shows up when you're \nstretched thin.\" This isn't an ad about staffing — it's an ad about \nRECOGNITION of their reality.\n\nStyle: cinematic prestige-drama still (think Better Call Saul / Industry \n/ Succession color grading), premium architectural editorial photography, \nGQ-meets-Bloomberg-Law. Shot on Cinema Camera, 35mm lens, ambient light \nonly, dramatic chiaroscuro, deep cinematic shadows, golden lamp warmth \nagainst cool nightscape.\n\nNo text in the image, no logos, no readable software UI, no readable \ndocuments, no readable phone notifications, no harsh seams, no people in \nframe, no harsh photo border.\n\n--ar 16:9 --style raw --v 6",
+          "prompt_hash": "8d8c0227ee00374b594030952d1b95ee0ccd955d327d3329c6d4d98d44a823c5",
+          "diffs": [
+            {
+              "token": "ASPECT_RATIO.dimensions",
+              "find": "1080x1350px (4:5 aspect ratio)",
+              "replace": "1920x1080px (16:9 aspect ratio)",
+              "count": 1
+            },
+            {
+              "token": "ASPECT_RATIO.flag",
+              "find": "--ar 4:5",
+              "replace": "--ar 16:9",
+              "count": 1
+            },
+            {
+              "token": "ASPECT_RATIO.orientation",
+              "find": "Vertical social media post,",
+              "replace": "Horizontal social media post,",
+              "count": 1
+            }
+          ],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T15:28:28.302163+00:00"
+        },
+        {
+          "attempt": 3,
+          "variant": "A",
+          "artifact": "stage-2/A-3.png",
+          "prompt": "Horizontal social media post, 1920x1080px (16:9 aspect ratio), single unified \ncinematic composition for a US legal-tech SaaS company that provides Virtual \nAssistants (VAs) to American law firms — ONE cohesive scene, NOT a layered \ncomposite, NOT a card collage.\n\nTOP HALF (approximately top 45% of canvas): empty negative space with a smooth \nbilinear gradient — top-left white (#FFFFFF) flowing diagonally into deep \nroyal blue (#1746A2) at bottom, with soft sky blue (#A2C0E6) at top-right. \nButtery smooth gradient, no banding, no sharp color shifts. Plenty of clean \nnegative space at the top for headline text overlay (the headline will be \nadded later in design software).\n\nTOP-RIGHT CORNER: ultra-faint PCB circuit traces in pale luminous blue, thin \nlines with tiny circular nodes, ghosted at 30% opacity, only in the upper-right \nquadrant, radially dissolving to nothing toward center.\n\nBOTTOM HALF (approximately bottom 55% of canvas): a single candid \ndocumentary-style photograph occupying the lower portion of the canvas, \nshowing a professional Virtual Assistant working remotely to support a US law \nfirm.\n\nSCENE CONTENT: a polished, professional Caucasian woman in her late 20s to \nmid-30s — fair skin, natural-toned makeup, light brown or dark blonde hair \nstyled neatly (loose waves, a low ponytail, or a sleek shoulder-length cut), \nwarm friendly expression, professional attire (a smart navy or cream blazer \nover a crisp white blouse). She is seated at a clean modern remote home-office \nworkspace, wearing a sleek black headset, genuinely focused and smiling \nsubtly while speaking on a client call. In front of her: a dual-monitor setup \nor laptop displaying legal case management software, calendars, and document \ninterfaces (UI shown abstractly, not readable). Beside her: a neat stack of \nmanila legal folders, a notepad with handwritten notes, a ceramic coffee cup \n— subtle legal cues that signal she's supporting attorneys remotely. \nBackground: a softly blurred modern home office with warm natural light, a \nbookshelf with law books visible out of focus, a framed certificate or diploma \non the wall hinting at legal training. Cinematic shallow depth of field with \nthe VA in sharp focus.\n\nCOMPOSITION FOR VERTICAL FORMAT: frame her from chest-up to slightly-above-\nhead, centered or slightly right of center, with her workspace and props \nvisible in the lower foreground. Her gaze should be directed slightly off-\ncamera (looking at her monitor), creating natural eyeline movement. Leave \nvisual breathing room at the very bottom for a CTA button overlay.\n\nMOOD: warm, productive, professional, efficient, trustworthy, \"behind the \nscenes hero\" energy. Think: modern remote-work culture meets legal \nprofessionalism. Approachable, intelligent, capable.\n\nLIGHTING: warm soft natural daylight from a window on the right, soft fill \nlight on the face flattering her fair complexion, golden hour interior glow, \nnaturally lit photojournalism style, available light only, no flash. Skin \ntones look natural and healthy — not overly pale, not orange — true to life.\n\nCRITICAL — SEAMLESS BLEND INTO GRADIENT (most important part for vertical \nlayout):\nThe photograph does NOT have a visible rectangular border, frame, card, or \nedge. The bottom half of the canvas IS the photograph — it lives directly on \nthe canvas. The photograph's TOP edge dissolves UPWARD into the blue gradient \nthrough a long, gradual alpha feather (250-300px tall soft fade) — the blue \nbackground atmospherically bleeds DOWNWARD into the top portion of the scene, \nso the ceiling, the upper wall, and the back of the room gradually become \nbathed in cool blue ambient light, then dissolve entirely into the gradient \nabove. The transition is misty, atmospheric, cinematic — like the workspace is \nemerging from a blue sky-like haze above her. The LEFT and RIGHT edges of the \nphoto also softly vignette into the gradient with a subtle 60-80px feather. \nOnly the bottom edge of the photo touches the canvas edge cleanly.\n\nCOLOR CONTINUITY: the deep blue of the gradient picks up subtly in the cool \nshadows of the photo's upper background area, while the warm amber daylight \nremains untouched and fully saturated on her face, hands, and the focal \nworkspace. Think: cinematic title-sequence atmosphere where two environments \nmelt into one — sky above, workspace below.\n\nNO HARD EDGES, NO CARD BORDERS, NO ROUNDED RECTANGLES, NO DROP SHADOWS — the \nphoto is painted directly into the gradient like a double exposure or a \ncinematic dissolve transition. The horizon line between gradient and \nphotograph should be invisible — pure atmospheric haze.\n\nStyle: premium B2B SaaS Instagram hero, modern legal services aesthetic, \nthumb-stopping social media quality, trustworthy, professional. Shot on Canon \nR5, 50mm f/1.8, photojournalism realism, available light, editorial campaign \nquality.\n\nNo text, no logos, no readable software UI, no readable documents, no \nnameplates, no captions, no card frames, no Polaroid borders, no harsh seams.\n\n--ar 16:9 --style raw --v 6",
+          "prompt_hash": "63eb44deaf3ff391e6fe2fd4e09d5ec8732dec28a93201450576ac97930fdbd9",
+          "diffs": [
+            {
+              "token": "ASPECT_RATIO.dimensions",
+              "find": "1080x1350px (4:5 aspect ratio)",
+              "replace": "1920x1080px (16:9 aspect ratio)",
+              "count": 1
+            },
+            {
+              "token": "ASPECT_RATIO.flag",
+              "find": "--ar 4:5",
+              "replace": "--ar 16:9",
+              "count": 1
+            },
+            {
+              "token": "ASPECT_RATIO.orientation",
+              "find": "Vertical social media post,",
+              "replace": "Horizontal social media post,",
+              "count": 1
+            }
+          ],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T15:31:53.701239+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 3,
+        "variant": "A",
+        "artifact": "stage-2/A-3.png"
+      }
+    },
+    "3": {
+      "variant": "T",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "T",
+          "artifact": "stage-3/T-1.png",
+          "prompt": "Add advertisement text overlay to the LEFT side of the provided image. Keep the original image untouched on the right side. Follow these exact specifications:\n\n═══════════════════════════════════\nLAYOUT & POSITIONING\n═══════════════════════════════════\n- Text block placement: LEFT side of the image (occupy ~40% of total width — DO NOT exceed)\n- Vertical alignment: Centered\n- Left margin: ~6% from the left edge\n- Right boundary of text: stops at ~42% of total image width\n- Top & bottom padding: ~8% each\n- Right side: original image fully visible, no overlap\n\n═══════════════════════════════════\nTEXT CONTENT\n═══════════════════════════════════\n1. HEADLINE (bold, punchy):\n   \"Hire Experienced Virtual Legal Staff For Your Firm\"\n   - Gradient highlight on: \"Virtual Legal Staff\"\n   - Other words in #0F0F0F\n   - Max 4 lines, natural wrapping, no clipping\n\n2. SUPPORTING SUB-TEXT (styled as TWO short value statements, NOT a paragraph):\n   Break the message into 2 distinct lines with subtle visual rhythm:\n   \n   Line 1: \"Build your team with the best legal staff in the world.\"\n   Line 2: \"Choose from pre-vetted candidates — start in under 3 days.\"\n   \n   - Each line on its own with slightly more line-gap between them than within\n   - Color: #0F0F0F at ~85% opacity (slightly softer than headline, gives hierarchy)\n   - Line height: 1.5x\n   - Optional: add a small thin accent bar/dot (in #85AEFD) before each line, OR a subtle minimalist check icon — pick whichever feels cleaner. Icons must be SMALL and refined, not chunky.\n   - DO NOT render as a flat paragraph block. Treat it like two crisp value props.\n\n3. CTA BUTTON TEXT:\n   \"Book a Free Consultation  →\"   (include a small right-arrow at the end inside the button)\n\n═══════════════════════════════════\nTYPOGRAPHY\n═══════════════════════════════════\n- Font family: \"Artica Bold\" for headline and CTA\n- Sub-text: \"Artica Bold\" but slightly lighter visual weight via opacity (85%)\n- Headline size: moderate — longest line fits within left 40% with margin\n- Sub-text size: ~32% of headline size\n- CTA text size: ~38% of headline size\n- Line height (headline): 1.1x\n- Line height (sub-text): 1.5x\n- Letter spacing: normal/tight\n\n═══════════════════════════════════\nCTA BUTTON — PREMIUM SAAS STYLING (CRITICAL)\n═══════════════════════════════════\n- Shape: Pill-shaped, fully rounded corners\n- Background: Vibrant orange GRADIENT (not flat color)\n   → Start: #FF8A3D (lighter orange, top-left)\n   → End:   #F26A1A (deeper orange, bottom-right)\n   → Direction: diagonal (135°)\n- Subtle inner highlight on top edge (very faint white at low opacity) to add dimension\n- Soft drop shadow underneath:\n   → Color: orange-tinted shadow (rgba(242, 106, 26, 0.25))\n   → Offset: 0px 8px 20px blur\n   → Creates a \"floating button\" premium feel, NOT a harsh black shadow\n- Text inside: White (#FFFFFF), Artica Bold, with a small right-arrow \"→\" after the text (same color)\n- Padding inside button: ~22px vertical, ~32px horizontal (generous, but compact)\n- Button width: hugs the content (text + arrow + padding) — NOT stretched\n- Slight icon/text gap: small space between \"Consultation\" and \"→\"\n- The button should feel CLICKABLE, ELEVATED, and PREMIUM — like a Stripe, Linear, or Notion CTA button\n\n═══════════════════════════════════\nCOLOR SPECIFICATIONS\n═══════════════════════════════════\n- Primary text: #0F0F0F\n- Sub-text: #0F0F0F at 85% opacity\n- Accent (small bars/dots before sub-text lines, if used): #85AEFD\n- Highlighted headline words (\"Virtual Legal Staff\"): linear gradient left-to-right\n   → Start: #86AFFE\n   → End:   #2653AB\n- CTA button: orange gradient #FF8A3D → #F26A1A (135°)\n- CTA shadow: rgba(242, 106, 26, 0.25), soft, 0 8px 20px\n\n═══════════════════════════════════\nSPACING BETWEEN ELEMENTS\n═══════════════════════════════════\n- Headline → Sub-text: comfortable gap (~1.5x sub-text size)\n- Sub-text → CTA: generous gap (~2.5x sub-text size) — CTA must feel like its own confident element, not stuck to the paragraph\n- Between sub-text lines: slightly more spacing than default line-height for that \"premium breathing room\" feel\n\n═══════════════════════════════════\nSTYLE RULES\n═══════════════════════════════════\n- Premium SaaS landing-page aesthetic — think Stripe, Linear, Webflow\n- Sub-text must read as crisp value props, NOT a wall of paragraph text\n- CTA must feel elevated, gradient-rich, with soft glow — not flat\n- No element clipped, overlapping, or touching the right image\n- No clutter, no decorative noise\n\n═══════════════════════════════════\nDELIVERABLE\n═══════════════════════════════════\n- Final composed advertisement with refined text overlay on LEFT only\n- Right-side image untouched\n- Original resolution maintained",
+          "prompt_hash": "0a72568d8640bcb4f8458c10e2bc425446663f2667c9f5e69ef880f95a71d673",
+          "diffs": [],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T15:33:21.275123+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 1,
+        "variant": "T",
+        "artifact": "stage-3/T-1.png"
+      }
+    },
+    "4": {
+      "variant": "final",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "final",
+          "artifact": "stage-4/final-1.png",
+          "logo_artifact": "stage-4/logo-1.png",
+          "method": "ai",
+          "created_at": "2026-06-15T15:34:38.475194+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 1,
+        "variant": "final",
+        "artifact": "stage-4/final-1.png"
+      }
+    }
+  },
+  "logo": {
+    "artifact": "stage-4/logo-1.png"
+  },
+  "manifest_log": [
+    {
+      "token": "headline",
+      "source": "user",
+      "original_suggestion": null,
+      "final_value": "Hire Experienced Virtual Legal Staff For Your Firm",
+      "timestamp": "2026-06-15T15:32:46.983282+00:00"
+    },
+    {
+      "token": "highlight",
+      "source": "user",
+      "original_suggestion": null,
+      "final_value": "Virtual Legal Staff",
+      "timestamp": "2026-06-15T15:32:47.666526+00:00"
+    },
+    {
+      "token": "subtext1",
+      "source": "user",
+      "original_suggestion": null,
+      "final_value": "Build your team with the best legal staff in the world.",
+      "timestamp": "2026-06-15T15:32:50.421119+00:00"
+    },
+    {
+      "token": "subtext2",
+      "source": "user",
+      "original_suggestion": null,
+      "final_value": "Choose from pre-vetted candidates — start in under 3 days.",
+      "timestamp": "2026-06-15T15:32:52.879242+00:00"
+    },
+    {
+      "token": "cta",
+      "source": "user",
+      "original_suggestion": null,
+      "final_value": "Book a Free Consultation",
+      "timestamp": "2026-06-15T15:32:54.069032+00:00"
+    }
+  ]
+}

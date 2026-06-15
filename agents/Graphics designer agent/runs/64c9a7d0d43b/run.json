@@ -1,0 +1,94 @@
+{
+  "id": "64c9a7d0d43b",
+  "user_id": "10aac79143a04e18a887f12f670a0592",
+  "brand_id": null,
+  "created_at": "2026-06-15T20:54:26.260940+00:00",
+  "updated_at": "2026-06-15T20:57:12.235716+00:00",
+  "state": "STAGE2_REVIEW",
+  "config": {
+    "font": "Artica Bold",
+    "aspect_ratio": "9:16",
+    "use_ai_compositor": false,
+    "tokens": {
+      "headline": "Hire Experienced Virtual Legal Staff For Your Firm",
+      "highlight": "Virtual Legal Staff",
+      "subtext1": "Build your team with the best legal staff in the world.",
+      "subtext2": "Choose from pre-vetted candidates — start in under 3 days.",
+      "cta": "Book a Free Consultation"
+    },
+    "tokens_approved": {
+      "headline": false,
+      "highlight": false,
+      "subtext1": false,
+      "subtext2": false,
+      "cta": false
+    }
+  },
+  "stages": {
+    "1": {
+      "variant": "L",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "L",
+          "artifact": "stage-1/L-1.png",
+          "prompt": "Create a 16:9 aspect ratio immersive brand background. Base layer: a near-solid #1746A2 blue overlay laid over a faded, blurred office/library interior photo. The overlay is fairly even and opaque, letting only ghosted furniture shapes show through in slightly lighter #1746A2/#BDCFED values. Treatment: a very subtle radial lift toward the center-right (where the photo is marginally brighter), edges settling back into uniform deep blue. Flat, calm, monochromatic — the photo functions only as faint texture beneath a dominant blue wash. No text, no logos, high resolution.",
+          "prompt_hash": "d4b74fc6338f8ab53d93d4988be93025bcbcf8b6986871e5478afc91581336f1",
+          "diffs": [],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T20:54:56.158886+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 1,
+        "variant": "L",
+        "artifact": "stage-1/L-1.png"
+      }
+    },
+    "2": {
+      "variant": "B",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "B",
+          "artifact": "stage-2/B-1.png",
+          "prompt": "Vertical social media post, 1080x1920px (9:16 aspect ratio), single unified \ncinematic composition for Legal Soft — a US legal-tech SaaS company providing \nglobal Virtual Assistants to American law firms. Premium B2B SaaS aesthetic, \nminimal, sophisticated.\n\nFULL CANVAS BACKGROUND: smooth bilinear gradient — top-left white (#FFFFFF) \nflowing diagonally into deep royal blue (#1746A2) at bottom-right, with soft \nsky blue (#A2C0E6) transitioning across the top. Buttery smooth, no banding.\n\nTOP-RIGHT CORNER AREA: ultra-faint PCB circuit traces in pale luminous blue, \nghosted at 25% opacity, weaving subtly behind the hexagonal cluster. Subtle \nblue dotted texture overlay at 8% opacity.\n\nLOWER TWO-THIRDS OF CANVAS: generous empty negative space — clean gradient \nonly, reserved for headline + CTA overlay.\n\nTOP-RIGHT CORNER: a clean honeycomb cluster of exactly 3 candid documentary-\nstyle photographs of professional Virtual Assistants, arranged in PROPER \nNON-OVERLAPPING honeycomb tessellation.\n\nHEXAGON ARRANGEMENT — exactly 3 flat-top hexagons, ALL SAME SIZE (~260px \nwide each), arranged in a true honeycomb pattern with NO OVERLAP between any \nhexagons. Each hexagon occupies its own distinct position. Adjacent \nhexagons share clean edges (edges meet at hairline borders) but DO NOT \noverlap or sit on top of each other.\n\nPRECISE LAYOUT GEOMETRY:\n\n- HEX 1 (top, anchor): positioned in the top-right area of the canvas. Its \nright edge extends slightly beyond the canvas right edge (cropped, ~88% \nvisible). Its top edge extends slightly beyond the canvas top (cropped, \n~88% visible). Fully anchored into the top-right corner.\n\n- HEX 2 (left of Hex 1, same horizontal row): positioned to the LEFT of \nHEX 1 in the same horizontal row. Hex 2's right edge MEETS Hex 1's left \nedge at a shared vertical boundary — they sit SIDE BY SIDE on the same \nrow, NOT overlapping, NOT stacked. Both hexagons are at the same vertical \nheight. Hex 2 is fully visible within the canvas.\n\n- HEX 3 (below, in the offset row): positioned in the row BELOW Hex 1 and \nHex 2, offset by half a hexagon width (standard honeycomb tessellation \noffset). Hex 3 sits DIRECTLY BELOW the gap/junction between Hex 1 and Hex \n2 — meaning its upper-left edge meets Hex 2's lower-right edge, and its \nupper-right edge meets Hex 1's lower-left edge. Hex 3 is in a NEW ROW, not \noverlapping with the row above. Hex 3 is fully visible within the canvas.\n\nCRITICAL GEOMETRY RULES:\n- Three hexagons total, all identical size (~260px wide)\n- Two distinct horizontal rows: Hex 1 + Hex 2 on top row, Hex 3 on bottom \nrow offset\n- NO hexagon overlaps another hexagon\n- NO hexagon sits in front of or behind another hexagon\n- Each hexagon occupies its own physical space in the honeycomb grid\n- Adjacent edges meet cleanly at shared boundaries with hairline white \nborders separating them\n- This is a flat 2D honeycomb tessellation, NOT a stacked or layered \narrangement\n\nThink of it like 3 tiles in a tile floor — they sit beside each other on \nthe same plane, edges touching, never one tile on top of another.\n\nHEXAGON CONTENT:\n\nHEX 1 (top-right, anchor): a confident professional Filipina woman in her \nearly 30s, warm medium-tan skin, dark brown hair, wearing a navy blazer \nover a white blouse, sleek black headset, genuinely engaged smile while on \na client call, looking slightly off-camera. Soft natural lighting.\n\nHEX 2 (top-left of pair): a professional Filipino or Latino man in his \nearly 30s, short dark hair, light blue shirt, wearing a black headset, \nfocused candid expression looking at his monitor. Warm interior lighting.\n\nHEX 3 (bottom, offset): a professional Latina woman in her late 20s, wavy \ndark brown hair, cream or light blazer, focused on her laptop, soft natural \nsmile, taking notes. Soft daylight.\n\nALL FACES VISIBLE, sharp focus, candid documentary style, warm natural \nlighting, professional but human.\n\nPROGRESSIVE BLEND — applied at OUTER edges of the cluster only:\n- HEX 1 (corner anchor): 100% opacity, fully crisp.\n- HEX 2 (left side of cluster): 90% opacity, with its LEFT and LOWER-LEFT \nouter edges (the edges facing the gradient negative space, NOT the edge \nshared with Hex 1) dissolving softly into the gradient through a ~60px \nalpha feather.\n- HEX 3 (bottom of cluster): 80% opacity, with its LOWER and LOWER-LEFT \nouter edges (facing the gradient, NOT the edges shared with Hex 1 and Hex \n2) dissolving into the gradient through a ~80px alpha feather.\n\nThe INNER edges where hexagons meet each other remain crisp and defined — \nhairline white borders show the tessellation clearly. Only the OUTER edges \n(facing the empty gradient) feather and dissolve.\n\nHEXAGON STYLING:\n- Hairline 1-2px white borders along every hexagon edge\n- The shared internal edges between adjacent hexagons remain crisp\n- Outer edges fade with the opacity gradient described above\n- Very soft pale-blue outer glow around the entire cluster (~25px radius, \n8% opacity)\n- Photos inside hexagons are FULLY OPAQUE, FULLY SATURATED, crisp — NO \nblue tint on skin, NO color overlay on photo content\n\nBRAND DETAIL: a single small circular Philippines flag chip (~24px) \nfloating just outside the lower-right edge of HEX 1, thin white border, \nfully opaque.\n\nNO OVERLAPPING HEXAGONS, NO STACKED HEXAGONS, NO HEXAGONS LAYERED ON TOP OF \nEACH OTHER. Each hex is its own discrete tile in a flat honeycomb pattern. \nNO connecting lines, NO particles, NO decorative elements, NO text.\n\nMOOD: premium, confident, atmospheric. Compact corner accent that signals \n\"vetted global talent\" without dominating the canvas.\n\nStyle: premium B2B SaaS Instagram hero, Linear/Stripe/Vercel-level design \nrestraint, modern legal-tech, editorial campaign quality. Shot on Canon R5, \n50mm f/1.8, photojournalism realism, available light.\n\nNo text, no logos, no readable software UI, no readable documents, no \ncaptions, no decorative flourishes.\n\n--ar 9:16 --style raw --v 6",
+          "prompt_hash": "0f41f92d56cf8540810dcb3ef04dc0cc52c6aec897fd2f504fd323cdfc4ac0ea",
+          "diffs": [
+            {
+              "token": "ASPECT_RATIO.dimensions",
+              "find": "1080x1350px (4:5 aspect ratio)",
+              "replace": "1080x1920px (9:16 aspect ratio)",
+              "count": 1
+            },
+            {
+              "token": "ASPECT_RATIO.flag",
+              "find": "--ar 4:5",
+              "replace": "--ar 9:16",
+              "count": 1
+            }
+          ],
+          "warnings": [
+            "Provider has no negative-prompt support — Prompt B negative was skipped."
+          ],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T20:57:12.235694+00:00"
+        }
+      ],
+      "approved": null
+    },
+    "3": {
+      "variant": null,
+      "attempts": [],
+      "approved": null
+    },
+    "4": {
+      "variant": null,
+      "attempts": [],
+      "approved": null
+    }
+  },
+  "logo": null,
+  "manifest_log": []
+}

@@ -1,0 +1,208 @@
+{
+  "id": "bd59d75abd5d",
+  "user_id": "10aac79143a04e18a887f12f670a0592",
+  "brand_id": null,
+  "created_at": "2026-06-15T15:41:11.300278+00:00",
+  "updated_at": "2026-06-15T18:04:19.073829+00:00",
+  "state": "STAGE4_REVIEW",
+  "config": {
+    "font": "Artica Bold",
+    "aspect_ratio": "9:16",
+    "use_ai_compositor": true,
+    "tokens": {
+      "headline": "Elevate Your Firm With Legal Staff",
+      "highlight": "Legal Staff",
+      "subtext1": "Build your team with the best legal staff in the world.",
+      "subtext2": "Choose from pre-vetted candidates — start in under 3 days.",
+      "cta": "Book a Free Consultation"
+    },
+    "tokens_approved": {
+      "headline": true,
+      "highlight": true,
+      "subtext1": true,
+      "subtext2": true,
+      "cta": true
+    }
+  },
+  "stages": {
+    "1": {
+      "variant": "G",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "G",
+          "artifact": "stage-1/G-1.png",
+          "prompt": "Create a 16:9 aspect ratio immersive brand background. Base layer: a horizontal diagonal gradient flowing from white / very pale #BDCFED on the upper-left, deepening rightward and downward into solid #1746A2 on the right and lower-right. The light source reads as upper-left. Embedded geometry: very subtle, low-contrast angular chevron / arrow facets are embedded across the surface — particularly visible in the lower-left and right zones as faint diagonal planes in slightly varied tones of #BDCFED and #1746A2. They behave like overlapping translucent paper planes catching light, giving quiet dimensional texture without strong edges. Clean, soft, professional, left-light-to-right-dark. No text, no logos, high resolution.",
+          "prompt_hash": "48722e1bbbf0c2d95ecfb2cc87fd63b411f1e0482cd01768b1c3c5712bfe42b8",
+          "diffs": [],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T15:41:47.187694+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 1,
+        "variant": "G",
+        "artifact": "stage-1/G-1.png"
+      }
+    },
+    "2": {
+      "variant": "C",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "C",
+          "artifact": "stage-2/C-1.png",
+          "prompt": "Vertical social media post, 1080x1920px (9:16 aspect ratio), single unified \ncinematic composition for Legal Soft — a US legal-tech SaaS company providing \ntrained Virtual Assistants to American law firms. Premium B2B SaaS aesthetic, \neditorial campaign quality, BRAND-FORWARD design.\n\nFULL CANVAS BACKGROUND: smooth bilinear brand gradient — top-left pure white \n(#FFFFFF) flowing diagonally into deep royal blue (#1746A2) at the bottom-\nright, with soft sky blue (#A2C0E6) transitioning across the top-right. \nButtery smooth, no banding, no sharp color shifts. The gradient is BRAND-\nPRESENT and confident — this is Legal Soft's signature visual identity, \nstrong and elegantly executed. Saturation matches a premium brand campaign.\n\nGRADIENT BEHAVIOR:\n- Top-left corner: clean white (#FFFFFF) — strong headline contrast zone\n- Upper-right area: soft brand sky blue (#A2C0E6)\n- Lower-left to bottom: deep brand royal blue (#1746A2) — full saturation\n- Bottom-right corner: anchored in deep brand royal blue (#1746A2)\n- Transitions are smooth and gradual but the brand colors hit their FULL \nintended saturation in their corner zones — no muting, no desaturation\n\nTOP-RIGHT CORNER: faint PCB circuit traces in pale luminous blue, ghosted \nat 25-30% opacity, only in the upper-right corner, radially dissolving \ntoward center. Subtle blue dotted texture overlay at 8% opacity adding \ndepth to the brand atmosphere.\n\nLEFT 45-50% OF CANVAS: generous negative space within the gradient — the \nwhite-to-light-blue zone — reserved for headline text + CTA overlay (added \nlater in design software).\n\nRIGHT 50-55% OF CANVAS: a single FULL-FIGURE candid documentary-style \nphotograph of a professional Caucasian male Virtual Assistant attending a \nclient call, occupying the right portion of the canvas from top to bottom.\n\nSUBJECT — full-figure male VA:\nA polished professional Caucasian man in his early 30s to early 40s, \nphotographed in a NEAR-FULL-BODY or three-quarter-body composition (visible \nfrom head to mid-thigh or below knee). He is shown at his workstation in a \ngenuine candid moment during a professional client call.\n\nAPPEARANCE:\n- Fair to medium-fair skin with natural healthy tone (NOT overly pale, NOT \norange-tanned)\n- Short to medium-length neatly styled brown or dark blonde hair — classic \nside part, modern textured crop, or a polished slicked-back style\n- Clean-shaven OR neatly trimmed light stubble / short professional beard\n- Sharp jawline, intelligent attentive expression\n- Confident but approachable presence — focused listening face or subtle \nengaged smile, NOT a wide forced grin\n\nATTIRE — FULL FORMAL BUSINESS PROFESSIONAL:\n- A tailored two-piece business suit in navy, charcoal, or dark grey — \nmatching jacket and trousers, properly fitted to his frame\n- A crisp white, pale blue, or subtle striped formal dress shirt underneath\n- A professional silk tie in a complementary color (navy, burgundy, deep \ngrey, or subtle pattern) — knotted neatly with a clean dimple, sitting \nproperly at the collar\n- Polished black or dark brown leather oxford or derby dress shoes (visible \nin the lower portion of the frame)\n- Subtle professional accessories: a quality wristwatch (leather strap or \nstainless steel), perhaps a discreet tie bar, possibly a folded pocket \nsquare (optional, understated)\n- The full formal outfit must be clearly visible — this is NOT business-\ncasual, this is full corporate attorney-office professional attire\n\nPOSE AND ACTION:\n- He is standing or seated at his desk in a poised, confident professional \nposture — full body visible, NOT just head-and-shoulders\n- Wearing a sleek black or grey professional headset over his ear\n- One hand may be lightly adjusting the headset's mic, holding a leather \nportfolio / document folder, OR gesturing naturally mid-conversation\n- Could be standing beside his desk while on the call (more dynamic, full-\nbody visible, weight on one foot, relaxed-professional stance) OR sitting \nupright at his workstation with jacket fully on and properly buttoned\n- Looking slightly off-camera (toward his monitor or thoughtfully into the \ndistance) — candid mid-conversation moment, NOT posing for camera\n\nENVIRONMENT:\n- Modern professional remote workspace — clean, organized, premium home-\noffice or executive co-working space\n- Softly blurred background featuring: a sleek modern desk, monitors \nshowing abstract software interfaces (NOT readable), a neatly arranged \nleather portfolio, a quality pen, a coffee cup or glass of water, a small \nplant, a framed certificate or law degree on the wall, a bookshelf with \nlaw books out of focus\n- Warm natural daylight from a window on the right side, soft fill \nlighting, golden interior glow\n- Shallow depth of field with him in sharp focus, background gently blurred\n\nCOMPOSITION FOR VERTICAL FORMAT:\n- He is positioned in the right portion of the canvas, full figure visible \nfrom head down to at least mid-thigh\n- Body fills the vertical space — head near the top quarter of canvas, \ntorso in center, legs/lower body visible in the bottom quarter\n- Slight 3/4 body turn toward the viewer's left, away from the canvas \nright edge — creates natural diagonal energy\n- Negative gradient space on the LEFT of his figure for headline placement\n\nLIGHTING: warm natural daylight from the right side (window light), soft \nfill on the face flattering his complexion, golden hour interior glow, \nnaturally lit photojournalism style, available light only, no flash. Skin \ntones natural and healthy — neither washed out nor orange-tanned.\n\nCRITICAL — SEAMLESS BLEND INTO BRAND GRADIENT:\nThe photograph does NOT have a visible rectangular border, frame, or card \nedge. The right portion of the canvas IS the photograph. His figure stands \ncrisp and clearly defined within the scene, but the LEFT edge of the \nphotograph (where his workspace background meets the open brand canvas) \ndissolves softly into the brand gradient through a long gradual alpha \nfeather (~300-350px wide).\n\nThe workspace background — wall, blurred furniture, ambient room — gently \nfades into the brand blue gradient on the left side. The brand blue \natmospherically bleeds INTO the cool shadows on the left side of his \nworkspace, while the warm daylight on his face, suit, and focal areas \nremains fully saturated.\n\nThe TOP edge of the photo also softly vignettes into the lighter sky-blue \ngradient with a subtle 80-100px feather. The BOTTOM edge softly vignettes \ninto the deep brand royal blue with a similar feather. Only the right edge \ntouches the canvas edge cleanly.\n\nThe effect: his professional figure emerges seamlessly from the Legal Soft \nbrand atmosphere — he IS Legal Soft, not pasted onto Legal Soft.\n\nCOLOR HARMONY:\n- The deep brand royal blue at the bottom is REINFORCED by his dark navy/\ncharcoal suit — the formal tailoring picks up and echoes the brand color\n- His tie can subtly echo brand tones (navy especially complements the \ngradient beautifully)\n- The warm interior daylight in the photo creates premium contrast against \nthe cool brand gradient\n- White elements (his dress shirt, ambient highlights) connect visually \nwith the white headline space on the left\n- Result: cohesive brand-photo harmony where the figure feels integrated \ninto Legal Soft's visual world, NOT placed on top of it\n\nHARD RULE: his face, skin tone, and the focal areas of his body retain \nWARM natural lighting — golden, healthy, dimensional. The blue brand \ngradient only affects the AMBIENT WORKSPACE BACKGROUND on the left side, \nNEVER the subject himself. Warm subject against cool brand background = \nthe correct premium contrast.\n\nNO HARD EDGES, NO CARD BORDERS, NO ROUNDED RECTANGLES, NO DROP SHADOWS, \nNO PHOTO FRAME — the photograph is painted directly into the brand \ngradient like a cinematic dissolve.\n\nMOOD: confident, capable, brand-forward, executive-trustworthy. He is \npolished and authoritative, emerging from Legal Soft's signature blue \natmosphere — premium corporate professionalism inside a recognizable brand \nworld. The kind of professional an attorney would proudly introduce as \npart of their firm's team. NOT a fashion model, NOT a stock-photo \nbusinessman cliche.\n\nStyle: premium B2B SaaS Instagram hero, brand-forward legal services \ncampaign, editorial corporate aesthetic with strong brand identity, GQ-\nbusiness-section meets enterprise SaaS. Shot on Canon R5, 50mm f/1.4, \nnatural light photojournalism, premium commercial photography quality.\n\nNo text, no logos, no readable software UI, no readable documents, no \nnameplates, no captions, no harsh seams.\n\n--ar 9:16 --style raw --v 6",
+          "prompt_hash": "58386b104c162164f7d3188d17a81776842343ea635aebc804df0ffd4a2bd125",
+          "diffs": [
+            {
+              "token": "ASPECT_RATIO.dimensions",
+              "find": "1080x1350px (4:5 aspect ratio)",
+              "replace": "1080x1920px (9:16 aspect ratio)",
+              "count": 1
+            },
+            {
+              "token": "ASPECT_RATIO.flag",
+              "find": "--ar 4:5",
+              "replace": "--ar 9:16",
+              "count": 1
+            }
+          ],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T15:43:43.679388+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 1,
+        "variant": "C",
+        "artifact": "stage-2/C-1.png"
+      }
+    },
+    "3": {
+      "variant": "T",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "T",
+          "artifact": "stage-3/T-1.png",
+          "prompt": "Add advertisement text overlay to the LEFT side of the provided image. Keep the original image untouched on the right side. Follow these exact specifications:\n\n═══════════════════════════════════\nLAYOUT & POSITIONING\n═══════════════════════════════════\n- Text block placement: LEFT side of the image (occupy ~40% of total width — DO NOT exceed)\n- Vertical alignment: Centered\n- Left margin: ~6% from the left edge\n- Right boundary of text: stops at ~42% of total image width\n- Top & bottom padding: ~8% each\n- Right side: original image fully visible, no overlap\n\n═══════════════════════════════════\nTEXT CONTENT\n═══════════════════════════════════\n1. HEADLINE (bold, punchy):\n   \"Elevate Your Firm With Legal Staff\"\n   - Gradient highlight on: \"Legal Staff\"\n   - Other words in #0F0F0F\n   - Max 4 lines, natural wrapping, no clipping\n\n2. SUPPORTING SUB-TEXT (styled as TWO short value statements, NOT a paragraph):\n   Break the message into 2 distinct lines with subtle visual rhythm:\n   \n   Line 1: \"Build your team with the best legal staff in the world.\"\n   Line 2: \"Choose from pre-vetted candidates — start in under 3 days.\"\n   \n   - Each line on its own with slightly more line-gap between them than within\n   - Color: #0F0F0F at ~85% opacity (slightly softer than headline, gives hierarchy)\n   - Line height: 1.5x\n   - Optional: add a small thin accent bar/dot (in #85AEFD) before each line, OR a subtle minimalist check icon — pick whichever feels cleaner. Icons must be SMALL and refined, not chunky.\n   - DO NOT render as a flat paragraph block. Treat it like two crisp value props.\n\n3. CTA BUTTON TEXT:\n   \"Book a Free Consultation  →\"   (include a small right-arrow at the end inside the button)\n\n═══════════════════════════════════\nTYPOGRAPHY\n═══════════════════════════════════\n- Font family: \"Artica Bold\" for headline and CTA\n- Sub-text: \"Artica Bold\" but slightly lighter visual weight via opacity (85%)\n- Headline size: moderate — longest line fits within left 40% with margin\n- Sub-text size: ~32% of headline size\n- CTA text size: ~38% of headline size\n- Line height (headline): 1.1x\n- Line height (sub-text): 1.5x\n- Letter spacing: normal/tight\n\n═══════════════════════════════════\nCTA BUTTON — PREMIUM SAAS STYLING (CRITICAL)\n═══════════════════════════════════\n- Shape: Pill-shaped, fully rounded corners\n- Background: Vibrant orange GRADIENT (not flat color)\n   → Start: #FF8A3D (lighter orange, top-left)\n   → End:   #F26A1A (deeper orange, bottom-right)\n   → Direction: diagonal (135°)\n- Subtle inner highlight on top edge (very faint white at low opacity) to add dimension\n- Soft drop shadow underneath:\n   → Color: orange-tinted shadow (rgba(242, 106, 26, 0.25))\n   → Offset: 0px 8px 20px blur\n   → Creates a \"floating button\" premium feel, NOT a harsh black shadow\n- Text inside: White (#FFFFFF), Artica Bold, with a small right-arrow \"→\" after the text (same color)\n- Padding inside button: ~22px vertical, ~32px horizontal (generous, but compact)\n- Button width: hugs the content (text + arrow + padding) — NOT stretched\n- Slight icon/text gap: small space between \"Consultation\" and \"→\"\n- The button should feel CLICKABLE, ELEVATED, and PREMIUM — like a Stripe, Linear, or Notion CTA button\n\n═══════════════════════════════════\nCOLOR SPECIFICATIONS\n═══════════════════════════════════\n- Primary text: #0F0F0F\n- Sub-text: #0F0F0F at 85% opacity\n- Accent (small bars/dots before sub-text lines, if used): #85AEFD\n- Highlighted headline words (\"Legal Staff\"): linear gradient left-to-right\n   → Start: #86AFFE\n   → End:   #2653AB\n- CTA button: orange gradient #FF8A3D → #F26A1A (135°)\n- CTA shadow: rgba(242, 106, 26, 0.25), soft, 0 8px 20px\n\n═══════════════════════════════════\nSPACING BETWEEN ELEMENTS\n═══════════════════════════════════\n- Headline → Sub-text: comfortable gap (~1.5x sub-text size)\n- Sub-text → CTA: generous gap (~2.5x sub-text size) — CTA must feel like its own confident element, not stuck to the paragraph\n- Between sub-text lines: slightly more spacing than default line-height for that \"premium breathing room\" feel\n\n═══════════════════════════════════\nSTYLE RULES\n═══════════════════════════════════\n- Premium SaaS landing-page aesthetic — think Stripe, Linear, Webflow\n- Sub-text must read as crisp value props, NOT a wall of paragraph text\n- CTA must feel elevated, gradient-rich, with soft glow — not flat\n- No element clipped, overlapping, or touching the right image\n- No clutter, no decorative noise\n\n═══════════════════════════════════\nDELIVERABLE\n═══════════════════════════════════\n- Final composed advertisement with refined text overlay on LEFT only\n- Right-side image untouched\n- Original resolution maintained",
+          "prompt_hash": "2fec326d294cc2002ab0b5e8404d61daa8ab8bb479b567b27f2bc290af160a00",
+          "diffs": [
+            {
+              "token": "HEADLINE",
+              "find": "Hire Experienced Virtual Legal Staff For Your Firm",
+              "replace": "Elevate Your Firm With Legal Staff",
+              "count": 1
+            },
+            {
+              "token": "HIGHLIGHT_PHRASE",
+              "find": "Virtual Legal Staff",
+              "replace": "Legal Staff",
+              "count": 2
+            }
+          ],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T15:46:01.917923+00:00"
+        },
+        {
+          "attempt": 2,
+          "variant": "T",
+          "artifact": "stage-3/T-2.png",
+          "prompt": "Add advertisement text overlay to the LEFT side of the provided image. Keep the original image untouched on the right side. Follow these exact specifications:\n\n═══════════════════════════════════\nLAYOUT & POSITIONING\n═══════════════════════════════════\n- Text block placement: LEFT side of the image (occupy ~40% of total width — DO NOT exceed)\n- Vertical alignment: Centered\n- Left margin: ~6% from the left edge\n- Right boundary of text: stops at ~42% of total image width\n- Top & bottom padding: ~8% each\n- Right side: original image fully visible, no overlap\n\n═══════════════════════════════════\nTEXT CONTENT\n═══════════════════════════════════\n1. HEADLINE (bold, punchy):\n   \"Elevate Your Firm With Legal Staff\"\n   - Gradient highlight on: \"Legal Staff\"\n   - Other words in #0F0F0F\n   - Max 4 lines, natural wrapping, no clipping\n\n2. SUPPORTING SUB-TEXT (styled as TWO short value statements, NOT a paragraph):\n   Break the message into 2 distinct lines with subtle visual rhythm:\n   \n   Line 1: \"Build your team with the best legal staff in the world.\"\n   Line 2: \"Choose from pre-vetted candidates — start in under 3 days.\"\n   \n   - Each line on its own with slightly more line-gap between them than within\n   - Color: #0F0F0F at ~85% opacity (slightly softer than headline, gives hierarchy)\n   - Line height: 1.5x\n   - Optional: add a small thin accent bar/dot (in #85AEFD) before each line, OR a subtle minimalist check icon — pick whichever feels cleaner. Icons must be SMALL and refined, not chunky.\n   - DO NOT render as a flat paragraph block. Treat it like two crisp value props.\n\n3. CTA BUTTON TEXT:\n   \"Book a Free Consultation  →\"   (include a small right-arrow at the end inside the button)\n\n═══════════════════════════════════\nTYPOGRAPHY\n═══════════════════════════════════\n- Font family: \"Artica Bold\" for headline and CTA\n- Sub-text: \"Artica Bold\" but slightly lighter visual weight via opacity (85%)\n- Headline size: moderate — longest line fits within left 40% with margin\n- Sub-text size: ~32% of headline size\n- CTA text size: ~38% of headline size\n- Line height (headline): 1.1x\n- Line height (sub-text): 1.5x\n- Letter spacing: normal/tight\n\n═══════════════════════════════════\nCTA BUTTON — PREMIUM SAAS STYLING (CRITICAL)\n═══════════════════════════════════\n- Shape: Pill-shaped, fully rounded corners\n- Background: Vibrant orange GRADIENT (not flat color)\n   → Start: #FF8A3D (lighter orange, top-left)\n   → End:   #F26A1A (deeper orange, bottom-right)\n   → Direction: diagonal (135°)\n- Subtle inner highlight on top edge (very faint white at low opacity) to add dimension\n- Soft drop shadow underneath:\n   → Color: orange-tinted shadow (rgba(242, 106, 26, 0.25))\n   → Offset: 0px 8px 20px blur\n   → Creates a \"floating button\" premium feel, NOT a harsh black shadow\n- Text inside: White (#FFFFFF), Artica Bold, with a small right-arrow \"→\" after the text (same color)\n- Padding inside button: ~22px vertical, ~32px horizontal (generous, but compact)\n- Button width: hugs the content (text + arrow + padding) — NOT stretched\n- Slight icon/text gap: small space between \"Consultation\" and \"→\"\n- The button should feel CLICKABLE, ELEVATED, and PREMIUM — like a Stripe, Linear, or Notion CTA button\n\n═══════════════════════════════════\nCOLOR SPECIFICATIONS\n═══════════════════════════════════\n- Primary text: #0F0F0F\n- Sub-text: #0F0F0F at 85% opacity\n- Accent (small bars/dots before sub-text lines, if used): #85AEFD\n- Highlighted headline words (\"Legal Staff\"): linear gradient left-to-right\n   → Start: #86AFFE\n   → End:   #2653AB\n- CTA button: orange gradient #FF8A3D → #F26A1A (135°)\n- CTA shadow: rgba(242, 106, 26, 0.25), soft, 0 8px 20px\n\n═══════════════════════════════════\nSPACING BETWEEN ELEMENTS\n═══════════════════════════════════\n- Headline → Sub-text: comfortable gap (~1.5x sub-text size)\n- Sub-text → CTA: generous gap (~2.5x sub-text size) — CTA must feel like its own confident element, not stuck to the paragraph\n- Between sub-text lines: slightly more spacing than default line-height for that \"premium breathing room\" feel\n\n═══════════════════════════════════\nSTYLE RULES\n═══════════════════════════════════\n- Premium SaaS landing-page aesthetic — think Stripe, Linear, Webflow\n- Sub-text must read as crisp value props, NOT a wall of paragraph text\n- CTA must feel elevated, gradient-rich, with soft glow — not flat\n- No element clipped, overlapping, or touching the right image\n- No clutter, no decorative noise\n\n═══════════════════════════════════\nDELIVERABLE\n═══════════════════════════════════\n- Final composed advertisement with refined text overlay on LEFT only\n- Right-side image untouched\n- Original resolution maintained",
+          "prompt_hash": "2fec326d294cc2002ab0b5e8404d61daa8ab8bb479b567b27f2bc290af160a00",
+          "diffs": [
+            {
+              "token": "HEADLINE",
+              "find": "Hire Experienced Virtual Legal Staff For Your Firm",
+              "replace": "Elevate Your Firm With Legal Staff",
+              "count": 1
+            },
+            {
+              "token": "HIGHLIGHT_PHRASE",
+              "find": "Virtual Legal Staff",
+              "replace": "Legal Staff",
+              "count": 2
+            }
+          ],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T15:47:25.935280+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 1,
+        "variant": "T",
+        "artifact": "stage-3/T-1.png"
+      }
+    },
+    "4": {
+      "variant": "final",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "final",
+          "artifact": "stage-4/final-1.png",
+          "logo_artifact": "stage-4/logo-1.png",
+          "method": "deterministic",
+          "created_at": "2026-06-15T15:51:58.286812+00:00"
+        },
+        {
+          "attempt": 2,
+          "variant": "final",
+          "artifact": "stage-4/final-2.png",
+          "logo_artifact": "stage-4/logo-2.png",
+          "method": "ai",
+          "created_at": "2026-06-15T18:04:19.073314+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 1,
+        "variant": "final",
+        "artifact": "stage-4/final-1.png"
+      }
+    }
+  },
+  "logo": {
+    "artifact": "stage-4/logo-2.png"
+  },
+  "manifest_log": [
+    {
+      "token": "headline",
+      "source": "agent",
+      "original_suggestion": "Elevate Your Firm With Legal Staff",
+      "final_value": "Elevate Your Firm With Legal Staff",
+      "timestamp": "2026-06-15T15:45:00.581067+00:00"
+    },
+    {
+      "token": "highlight",
+      "source": "agent",
+      "original_suggestion": "Legal Staff",
+      "final_value": "Legal Staff",
+      "timestamp": "2026-06-15T15:45:00.581081+00:00"
+    },
+    {
+      "token": "subtext2",
+      "source": "user",
+      "original_suggestion": null,
+      "final_value": "Choose from pre-vetted candidates — start in under 3 days.",
+      "timestamp": "2026-06-15T15:45:06.639624+00:00"
+    },
+    {
+      "token": "subtext1",
+      "source": "user",
+      "original_suggestion": null,
+      "final_value": "Build your team with the best legal staff in the world.",
+      "timestamp": "2026-06-15T15:45:07.756196+00:00"
+    },
+    {
+      "token": "cta",
+      "source": "user",
+      "original_suggestion": null,
+      "final_value": "Book a Free Consultation",
+      "timestamp": "2026-06-15T15:45:10.742813+00:00"
+    }
+  ]
+}

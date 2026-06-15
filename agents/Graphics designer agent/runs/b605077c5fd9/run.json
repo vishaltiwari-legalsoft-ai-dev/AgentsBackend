@@ -1,0 +1,79 @@
+{
+  "id": "b605077c5fd9",
+  "user_id": "10aac79143a04e18a887f12f670a0592",
+  "brand_id": null,
+  "created_at": "2026-06-15T21:07:15.126542+00:00",
+  "updated_at": "2026-06-15T21:08:21.581480+00:00",
+  "state": "STAGE2_REVIEW",
+  "config": {
+    "font": "Artica Bold",
+    "aspect_ratio": "4:5",
+    "use_ai_compositor": false,
+    "tokens": {
+      "headline": "Hire Experienced Virtual Legal Staff For Your Firm",
+      "highlight": "Virtual Legal Staff",
+      "subtext1": "Build your team with the best legal staff in the world.",
+      "subtext2": "Choose from pre-vetted candidates — start in under 3 days.",
+      "cta": "Book a Free Consultation"
+    },
+    "tokens_approved": {
+      "headline": false,
+      "highlight": false,
+      "subtext1": false,
+      "subtext2": false,
+      "cta": false
+    }
+  },
+  "stages": {
+    "1": {
+      "variant": "C",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "C",
+          "artifact": "stage-1/C-1.png",
+          "prompt": "Create a 16:9 aspect ratio immersive brand background. Base layer: a #1746A2 blue color overlay laid over a photographic office/law-library scene. The overlay is densest and most opaque at the bottom and lower-left (near-solid #1746A2), thinning toward the upper-right so more photographic detail shows through there. Treatment: the photo beneath reads in a blue duotone — highlights pushed toward #BDCFED, shadows into #1746A2 — so the whole frame unifies into a cohesive cool-blue tone. A subtle vertical gradient reinforces darkness at the bottom edge fading lighter upward. Photographic grain and depth-of-field remain, unlike the flat-vector images. No text, no logos, high resolution.",
+          "prompt_hash": "e4e0db337340dbb4660b854870bb0703b3eab0f6dd55ad598adfe659ddd79a45",
+          "diffs": [],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T21:07:42.126088+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 1,
+        "variant": "C",
+        "artifact": "stage-1/C-1.png"
+      }
+    },
+    "2": {
+      "variant": "E",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "E",
+          "artifact": "stage-2/E-1.png",
+          "prompt": "ULL CANVAS BACKGROUND: smooth bilinear brand gradient — top-left pure white (#FFFFFF) flowing diagonally into deep royal blue (#1746A2) at the bottom- right, with soft sky blue (#A2C0E6) transitioning across the top-right. Buttery smooth, no banding, no sharp color shifts. Legal Soft's signature visual identity, strong and confident. GRADIENT BEHAVIOR: - Top-left corner: clean white (#FFFFFF) — headline contrast zone - Upper-right area: soft brand sky blue (#A2C0E6) - Lower-left to bottom: deep brand royal blue (#1746A2) — full saturation - Bottom-right corner: anchored in deep brand royal blue (#1746A2) - Brand colors hit FULL intended saturation in their corner zones TOP-RIGHT CORNER: faint PCB circuit traces in pale luminous blue, ghosted at 25-30% opacity, only in the upper-right corner, radially dissolving toward center. Subtle blue dotted texture overlay at 8% opacity. LEFT 45-50% OF CANVAS: generous negative space within the gradient — the white-to-light-blue zone — reserved for headline + CTA overlay. RIGHT 50-55% OF CANVAS: a single dramatic architectural photograph of iconic US judiciary / federal courthouse architecture, occupying the right portion of the canvas from top to bottom.\n\nSUBJECT — PRESTIGIOUS BIG LAW OFFICE TOWER:\n\nFeatured building: an iconic American Big Law firm headquarters — a \nsophisticated modern-classical office tower in a major US legal city \n(Manhattan, Chicago Loop, DC, San Francisco, LA). The building reads as \nunmistakably PRESTIGIOUS LAW FIRM, not generic corporate.\n\nARCHITECTURAL ELEMENTS:\n- A polished granite or limestone facade with classical proportions\n- Tall vertical bays of bronze-framed windows reflecting golden hour light\n- A grand street-level entrance with revolving doors and a covered portico\n- Possibly a subtle stone-carved firm name on the facade (not readable, \njust the impression of carved lettering)\n- Manicured small landscaping at the entry\n- The building rises 15-30 stories, photographed from a heroic upward \nangle showing the soaring vertical lines\n- Modern but timeless — like Skidmore Owings & Merrill or Pei Cobb Freed \narchitecture, NOT a generic glass box\n\nPHOTOGRAPHY: heroic upward angle, golden hour light raking across the \nfacade, classical American urban context.",
+          "prompt_hash": "8bc6bbe8c77341df0c589d923aa6bc9a944d3f826dd4b5304ea8dd71c15bd92a",
+          "diffs": [],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T21:08:21.581440+00:00"
+        }
+      ],
+      "approved": null
+    },
+    "3": {
+      "variant": null,
+      "attempts": [],
+      "approved": null
+    },
+    "4": {
+      "variant": null,
+      "attempts": [],
+      "approved": null
+    }
+  },
+  "logo": null,
+  "manifest_log": []
+}

@@ -1,0 +1,211 @@
+{
+  "id": "dc0a3961fe15",
+  "user_id": "10aac79143a04e18a887f12f670a0592",
+  "brand_id": null,
+  "created_at": "2026-06-15T21:35:47.979246+00:00",
+  "updated_at": "2026-06-15T21:42:03.740577+00:00",
+  "state": "STAGE3_REVIEW",
+  "config": {
+    "font": "Causten Bold",
+    "aspect_ratio": "4:5",
+    "use_ai_compositor": false,
+    "tokens": {
+      "headline": "Grow Faster With Virtual Legal Staff",
+      "highlight": "Virtual Legal Staff",
+      "subtext1": "Build your team with the best legal staff in the world.",
+      "subtext2": "Choose from pre-vetted candidates — start in under 3 days.",
+      "cta": "Book a Free Consultation"
+    },
+    "tokens_approved": {
+      "headline": true,
+      "highlight": true,
+      "subtext1": true,
+      "subtext2": true,
+      "cta": true
+    }
+  },
+  "stages": {
+    "1": {
+      "variant": "D",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "D",
+          "artifact": "stage-1/D-1.png",
+          "prompt": "Create a 16:9 aspect ratio immersive brand background. A very light, airy pale-blue-to-white sky gradient, white (#FFFFFF) dominant at top blending into faint blue. Lower portion holds a desaturated, washed-out cityscape silhouette fading into the pale background. Extremely light, high-key, hazy and bright. No text, no logos, high resolution.",
+          "prompt_hash": "aabf1fc80c751e108b032089a2a1d802836d67faf921cd46752fcd12922dc512",
+          "diffs": [],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T21:36:15.483082+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 1,
+        "variant": "D",
+        "artifact": "stage-1/D-1.png"
+      }
+    },
+    "2": {
+      "variant": "K",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "K",
+          "artifact": "stage-2/K-1.png",
+          "prompt": "You are compositing ONE premium advertising image for a US legal-tech SaaS brand.\n\nYou are given a single background image: a finished brand gradient produced in the previous step. Your ONLY job is to place the subject described below onto THAT background and merge the two into one seamless, high-end composition.\n\n═══════════════════════════════════\nBACKGROUND — KEEP IT EXACTLY\n═══════════════════════════════════\nThe provided image IS the background. Preserve it exactly as given — same colours, same gradient, same direction, same composition. Do NOT regenerate, recolour, restyle, re-grade, blur, crop, or replace it, and do NOT add any new scenery, rooms, props, furniture, textures, or environment of your own. The background is final. You are only adding the subject.\n\n═══════════════════════════════════\nSUBJECT TO ADD\n═══════════════════════════════════\nA restrained close-up of two hands meeting in a calm handshake, plain navy sleeve and plain white cuff, soft single key light, the rest of the hands and arms dissolving gently into shadow. 90mm macro, f/2.8. Hands centered-low, broad empty space above. Photoreal, matte, premium.\n\n═══════════════════════════════════\nSEAMLESS MERGE (most important)\n═══════════════════════════════════\n- The subject lives directly on the background with NO card, frame, border, rectangle, panel, Polaroid edge, drop shadow, or hard cut-out line.\n- Feather the subject's outer edges softly into the background; let the background's colour and light wrap gently onto the subject's shadow side so the two read as a single photograph, never a paste-up or collage.\n- Match the subject's lighting direction, colour temperature, contrast, and grain to the background so nothing looks pasted on.\n- Respect the placement noted in the subject and keep the background's open / empty areas clear, so a headline and CTA can be added later.\n\n═══════════════════════════════════\nFINISH\n═══════════════════════════════════\nPremium, editorial, cohesive — one unified, thumb-stopping composition with a high-end SaaS feel.\n\nNo text, no logos, no watermarks, no readable UI, no readable documents, no nameplates, no captions.\n",
+          "prompt_hash": "a57d263d911c52bdffabc51e97b98deeca1d1e286ee3048bc14984b8f10b3d70",
+          "diffs": [
+            {
+              "token": "SUBJECT",
+              "find": "[SUBJECT]",
+              "replace": "A restrained close-up of two hands meeting in a calm handshake, plain navy sleeve and plain white cuff, soft single key light, the rest of the hands and arms dissolving gently into shadow. 90mm macro, f/2.8. Hands centered-low, broad empty space above. Photoreal, matte, premium.",
+              "count": 1
+            }
+          ],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T21:38:43.969404+00:00"
+        },
+        {
+          "attempt": 2,
+          "variant": "K",
+          "artifact": "stage-2/K-2.png",
+          "prompt": "You are compositing ONE premium advertising image for a US legal-tech SaaS brand.\n\nYou are given a single background image: a finished brand gradient produced in the previous step. Your ONLY job is to place the subject described below onto THAT background and merge the two into one seamless, high-end composition.\n\n═══════════════════════════════════\nBACKGROUND — KEEP IT EXACTLY\n═══════════════════════════════════\nThe provided image IS the background. Preserve it exactly as given — same colours, same gradient, same direction, same composition. Do NOT regenerate, recolour, restyle, re-grade, blur, crop, or replace it, and do NOT add any new scenery, rooms, props, furniture, textures, or environment of your own. The background is final. You are only adding the subject.\n\n═══════════════════════════════════\nSUBJECT TO ADD\n═══════════════════════════════════\nA restrained close-up of two hands meeting in a calm handshake, plain navy sleeve and plain white cuff, soft single key light, the rest of the hands and arms dissolving gently into shadow. 90mm macro, f/2.8. Hands centered-low, broad empty space above. Photoreal, matte, premium.\n\n═══════════════════════════════════\nSEAMLESS MERGE (most important)\n═══════════════════════════════════\n- The subject lives directly on the background with NO card, frame, border, rectangle, panel, Polaroid edge, drop shadow, or hard cut-out line.\n- Feather the subject's outer edges softly into the background; let the background's colour and light wrap gently onto the subject's shadow side so the two read as a single photograph, never a paste-up or collage.\n- Match the subject's lighting direction, colour temperature, contrast, and grain to the background so nothing looks pasted on.\n- Respect the placement noted in the subject and keep the background's open / empty areas clear, so a headline and CTA can be added later.\n\n═══════════════════════════════════\nFINISH\n═══════════════════════════════════\nPremium, editorial, cohesive — one unified, thumb-stopping composition with a high-end SaaS feel.\n\nNo text, no logos, no watermarks, no readable UI, no readable documents, no nameplates, no captions.\n",
+          "prompt_hash": "a57d263d911c52bdffabc51e97b98deeca1d1e286ee3048bc14984b8f10b3d70",
+          "diffs": [
+            {
+              "token": "SUBJECT",
+              "find": "[SUBJECT]",
+              "replace": "A restrained close-up of two hands meeting in a calm handshake, plain navy sleeve and plain white cuff, soft single key light, the rest of the hands and arms dissolving gently into shadow. 90mm macro, f/2.8. Hands centered-low, broad empty space above. Photoreal, matte, premium.",
+              "count": 1
+            }
+          ],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T21:40:08.425898+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 2,
+        "variant": "K",
+        "artifact": "stage-2/K-2.png"
+      }
+    },
+    "3": {
+      "variant": "T",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "T",
+          "artifact": "stage-3/T-1.png",
+          "prompt": "Add advertisement text overlay to the LEFT side of the provided image. Keep the original image untouched on the right side. Follow these exact specifications:\n\n═══════════════════════════════════\nLAYOUT & POSITIONING\n═══════════════════════════════════\n- Text block placement: LEFT side of the image (occupy ~40% of total width — DO NOT exceed)\n- Vertical alignment: Centered\n- Left margin: ~6% from the left edge\n- Right boundary of text: stops at ~42% of total image width\n- Top & bottom padding: ~8% each\n- Right side: original image fully visible, no overlap\n\n═══════════════════════════════════\nTEXT CONTENT\n═══════════════════════════════════\n1. HEADLINE (bold, punchy):\n   \"Grow Faster With Virtual Legal Staff\"\n   - Gradient highlight on: \"Virtual Legal Staff\"\n   - Other words in #0F0F0F\n   - Max 4 lines, natural wrapping, no clipping\n\n2. SUPPORTING SUB-TEXT (styled as TWO short value statements, NOT a paragraph):\n   Break the message into 2 distinct lines with subtle visual rhythm:\n   \n   Line 1: \"Build your team with the best legal staff in the world.\"\n   Line 2: \"Choose from pre-vetted candidates — start in under 3 days.\"\n   \n   - Each line on its own with slightly more line-gap between them than within\n   - Color: #0F0F0F at ~85% opacity (slightly softer than headline, gives hierarchy)\n   - Line height: 1.5x\n   - Optional: add a small thin accent bar/dot (in #85AEFD) before each line, OR a subtle minimalist check icon — pick whichever feels cleaner. Icons must be SMALL and refined, not chunky.\n   - DO NOT render as a flat paragraph block. Treat it like two crisp value props.\n\n3. CTA BUTTON TEXT:\n   \"Book a Free Consultation  →\"   (include a small right-arrow at the end inside the button)\n\n═══════════════════════════════════\nTYPOGRAPHY\n═══════════════════════════════════\n- Font family: \"Causten Bold\" for headline and CTA\n- Sub-text: \"Causten Bold\" but slightly lighter visual weight via opacity (85%)\n- Headline size: moderate — longest line fits within left 40% with margin\n- Sub-text size: ~32% of headline size\n- CTA text size: ~38% of headline size\n- Line height (headline): 1.1x\n- Line height (sub-text): 1.5x\n- Letter spacing: normal/tight\n\n═══════════════════════════════════\nCTA BUTTON — PREMIUM SAAS STYLING (CRITICAL)\n═══════════════════════════════════\n- Shape: Pill-shaped, fully rounded corners\n- Background: Vibrant orange GRADIENT (not flat color)\n   → Start: #FF8A3D (lighter orange, top-left)\n   → End:   #F26A1A (deeper orange, bottom-right)\n   → Direction: diagonal (135°)\n- Subtle inner highlight on top edge (very faint white at low opacity) to add dimension\n- Soft drop shadow underneath:\n   → Color: orange-tinted shadow (rgba(242, 106, 26, 0.25))\n   → Offset: 0px 8px 20px blur\n   → Creates a \"floating button\" premium feel, NOT a harsh black shadow\n- Text inside: White (#FFFFFF), Causten Bold, with a small right-arrow \"→\" after the text (same color)\n- Padding inside button: ~22px vertical, ~32px horizontal (generous, but compact)\n- Button width: hugs the content (text + arrow + padding) — NOT stretched\n- Slight icon/text gap: small space between \"Consultation\" and \"→\"\n- The button should feel CLICKABLE, ELEVATED, and PREMIUM — like a Stripe, Linear, or Notion CTA button\n\n═══════════════════════════════════\nCOLOR SPECIFICATIONS\n═══════════════════════════════════\n- Primary text: #0F0F0F\n- Sub-text: #0F0F0F at 85% opacity\n- Accent (small bars/dots before sub-text lines, if used): #85AEFD\n- Highlighted headline words (\"Virtual Legal Staff\"): linear gradient left-to-right\n   → Start: #86AFFE\n   → End:   #2653AB\n- CTA button: orange gradient #FF8A3D → #F26A1A (135°)\n- CTA shadow: rgba(242, 106, 26, 0.25), soft, 0 8px 20px\n\n═══════════════════════════════════\nSPACING BETWEEN ELEMENTS\n═══════════════════════════════════\n- Headline → Sub-text: comfortable gap (~1.5x sub-text size)\n- Sub-text → CTA: generous gap (~2.5x sub-text size) — CTA must feel like its own confident element, not stuck to the paragraph\n- Between sub-text lines: slightly more spacing than default line-height for that \"premium breathing room\" feel\n\n═══════════════════════════════════\nSTYLE RULES\n═══════════════════════════════════\n- Premium SaaS landing-page aesthetic — think Stripe, Linear, Webflow\n- Sub-text must read as crisp value props, NOT a wall of paragraph text\n- CTA must feel elevated, gradient-rich, with soft glow — not flat\n- No element clipped, overlapping, or touching the right image\n- No clutter, no decorative noise\n\n═══════════════════════════════════\nDELIVERABLE\n═══════════════════════════════════\n- Final composed advertisement with refined text overlay on LEFT only\n- Right-side image untouched\n- Original resolution maintained",
+          "prompt_hash": "5119fb241c47be3f03dcff385dd9e78b3e87848eef1badaa4361d9e3317ec4ac",
+          "diffs": [
+            {
+              "token": "FONT",
+              "find": "Artica Bold",
+              "replace": "Causten Bold",
+              "count": 3
+            },
+            {
+              "token": "HEADLINE",
+              "find": "Hire Experienced Virtual Legal Staff For Your Firm",
+              "replace": "Grow Faster With Virtual Legal Staff",
+              "count": 1
+            }
+          ],
+          "warnings": [],
+          "provider": "openrouter",
+          "created_at": "2026-06-15T21:42:03.740545+00:00"
+        }
+      ],
+      "approved": null
+    },
+    "4": {
+      "variant": null,
+      "attempts": [],
+      "approved": null
+    }
+  },
+  "logo": null,
+  "manifest_log": [
+    {
+      "token": "headline",
+      "source": "agent",
+      "original_suggestion": "Hire Vetted Virtual Legal Staff Fast",
+      "final_value": "Hire Vetted Virtual Legal Staff Fast",
+      "timestamp": "2026-06-15T21:41:28.503407+00:00"
+    },
+    {
+      "token": "highlight",
+      "source": "agent",
+      "original_suggestion": "Virtual Legal Staff",
+      "final_value": "Virtual Legal Staff",
+      "timestamp": "2026-06-15T21:41:28.503431+00:00"
+    },
+    {
+      "token": "headline",
+      "source": "agent",
+      "original_suggestion": "Scale Your Firm With Virtual Legal Staff",
+      "final_value": "Scale Your Firm With Virtual Legal Staff",
+      "timestamp": "2026-06-15T21:41:28.848554+00:00"
+    },
+    {
+      "token": "highlight",
+      "source": "agent",
+      "original_suggestion": "Virtual Legal Staff",
+      "final_value": "Virtual Legal Staff",
+      "timestamp": "2026-06-15T21:41:28.848570+00:00"
+    },
+    {
+      "token": "headline",
+      "source": "agent",
+      "original_suggestion": "Add Trusted Virtual Legal Staff Today",
+      "final_value": "Add Trusted Virtual Legal Staff Today",
+      "timestamp": "2026-06-15T21:41:29.246569+00:00"
+    },
+    {
+      "token": "highlight",
+      "source": "agent",
+      "original_suggestion": "Virtual Legal Staff",
+      "final_value": "Virtual Legal Staff",
+      "timestamp": "2026-06-15T21:41:29.246579+00:00"
+    },
+    {
+      "token": "headline",
+      "source": "agent",
+      "original_suggestion": "Grow Faster With Virtual Legal Staff",
+      "final_value": "Grow Faster With Virtual Legal Staff",
+      "timestamp": "2026-06-15T21:41:29.655440+00:00"
+    },
+    {
+      "token": "highlight",
+      "source": "agent",
+      "original_suggestion": "Virtual Legal Staff",
+      "final_value": "Virtual Legal Staff",
+      "timestamp": "2026-06-15T21:41:29.655457+00:00"
+    },
+    {
+      "token": "subtext1",
+      "source": "user",
+      "original_suggestion": null,
+      "final_value": "Build your team with the best legal staff in the world.",
+      "timestamp": "2026-06-15T21:41:33.589320+00:00"
+    },
+    {
+      "token": "subtext2",
+      "source": "user",
+      "original_suggestion": null,
+      "final_value": "Choose from pre-vetted candidates — start in under 3 days.",
+      "timestamp": "2026-06-15T21:41:34.047257+00:00"
+    },
+    {
+      "token": "cta",
+      "source": "user",
+      "original_suggestion": null,
+      "final_value": "Book a Free Consultation",
+      "timestamp": "2026-06-15T21:41:35.403709+00:00"
+    }
+  ]
+}

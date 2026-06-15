@@ -1,0 +1,197 @@
+{
+  "id": "f2b502dbd9e9",
+  "user_id": "10aac79143a04e18a887f12f670a0592",
+  "brand_id": null,
+  "created_at": "2026-06-12T22:48:49.996046+00:00",
+  "updated_at": "2026-06-12T22:50:57.482840+00:00",
+  "state": "DONE",
+  "config": {
+    "font": "Artica Bold",
+    "aspect_ratio": "4:5",
+    "use_ai_compositor": false,
+    "tokens": {
+      "headline": "Hire Experienced Virtual Legal Staff For Your Firm",
+      "highlight": "Virtual Legal Staff",
+      "subtext1": "Build your team with the best legal staff in the world.",
+      "subtext2": "Choose from pre-vetted candidates — start in under 3 days.",
+      "cta": "Book a Free Consultation"
+    },
+    "tokens_approved": {
+      "headline": true,
+      "highlight": true,
+      "subtext1": true,
+      "subtext2": true,
+      "cta": true
+    }
+  },
+  "stages": {
+    "1": {
+      "variant": "B",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "B",
+          "artifact": "stage-1/B-1.png",
+          "prompt": "Create a 16:9 aspect ratio immersive abstract background gradient with an inverted horizon effect. The top of the image is deep royal blue #1746A2 flowing horizontally across, gradually transitioning downward into soft light blue #A2C0E6 and #BDCFED in the middle, and finishing with pure white #FFFFFF at the bottom. Subtle vertical blending on the left and right edges adds depth. Cinematic, atmospheric, ultra-smooth gradient with no harsh edges, no noise, no text, high resolution.",
+          "prompt_hash": "55963e93462c1d3801e0e9784dd1e6d7e251a1b0a1b5753212f54097a3f35adc",
+          "diffs": [],
+          "warnings": [],
+          "provider": "mock",
+          "created_at": "2026-06-12T22:48:53.783427+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 1,
+        "variant": "B",
+        "artifact": "stage-1/B-1.png"
+      }
+    },
+    "2": {
+      "variant": "D",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "D",
+          "artifact": "stage-2/D-1.png",
+          "prompt": "Vertical social media post, 1080x1350px (4:5 aspect ratio), single unified \ncinematic composition for Legal Soft — a US legal-tech SaaS company providing \ntrained Virtual Assistants to American law firms. Premium B2B SaaS aesthetic, \neditorial campaign quality, ATTENTION-STOPPING conceptual visual storytelling.\n\nFULL CANVAS BACKGROUND: smooth bilinear brand gradient — top-left pure white \n(#FFFFFF) flowing diagonally into deep royal blue (#1746A2) at the bottom-\nright, with soft sky blue (#A2C0E6) transitioning across the top-right. \nButtery smooth, Legal Soft's signature brand identity, confident and strong.\n\nTOP-RIGHT CORNER: faint PCB circuit traces in pale luminous blue at 25-30% \nopacity, radially dissolving toward center. Subtle blue dotted texture at \n8% opacity.\n\nLEFT 45-50% OF CANVAS: generous negative space within the gradient for \nheadline + CTA overlay.\n\nRIGHT 50-55% OF CANVAS: a single dramatic, cinematic photograph featuring \nthe HERO CONCEPT below.\n\n═══════════════════════════════════════════════════════════════\nTHE HERO CONCEPT — \"THE PARTNER'S CORNER OFFICE AT 11:47 PM\"\n═══════════════════════════════════════════════════════════════\n\nThe scene: an empty, prestigious senior partner's corner office in a top-\ntier American law firm — photographed at NIGHT, lit only by a single \nwarm desk lamp casting a golden pool of light onto a desk overflowing with \nwork. The OWNER OF THIS OFFICE IS NOT IN FRAME — but their presence is \nfelt through the chaos and ambition the room holds.\n\nTHE STORY THE IMAGE TELLS WITHOUT WORDS:\n\"This is what 'success' looks like at 11:47 PM. The trial brief is half-\nwritten. The phone has 23 missed calls. The coffee went cold three hours \nago. The view of Manhattan is breathtaking — but nobody's looking at it. \nYou built this firm. Now it's eating you alive.\"\n\nEvery law firm partner who scrolls past this image will FEEL it in their \nchest. It's their life on a screen.\n\n═══════════════════════════════════════════════════════════════\n\nSCENE COMPOSITION — what's in the frame:\n\nTHE DESK (foreground, dominant):\n- A heavy executive mahogany or walnut desk, polished, partially visible \nin the lower foreground of the frame\n- A single brass-shaded green banker's lamp (classic legal library style) \nglowing warm gold — the ONLY light source in the room, creating a dramatic \npool of warm light\n- Scattered across the desk: stacks of legal documents and case files in \nmanila folders, some open with visible pages (text not readable), a \nyellow legal pad with handwritten notes, multiple highlighters and a \nquality fountain pen left mid-thought\n- An open leather portfolio with documents spilling out\n- A half-full crystal whiskey glass or a cold coffee cup with cream \nswirls settled (untouched for hours)\n- A premium leather-bound legal book left open face-down\n- A reading glasses pair set down on top of the documents\n- A modern laptop open and glowing softly, screen showing abstract \nsoftware interfaces (NOT readable, just the impression of active work)\n- A modern smartphone face-up on the desk with a glowing notification \nscreen visible — multiple missed call indicators softly glowing (NOT \nreadable text, just the impression of accumulated notifications)\n\nTHE OFFICE ENVIRONMENT (background, atmospheric):\n- A floor-to-ceiling window or wall of windows on the right side of the \noffice, revealing a stunning NIGHTTIME CITYSCAPE view of an American \nfinancial district (Manhattan-style skyline, Chicago loop, or generic \nAmerican big-city skyscrapers) glittering with thousands of office \nlights and city traffic far below\n- The city lights outside are warm golden and cool blue, scattered like \nstars across the dark sky\n- A tufted oxblood or burgundy leather executive chair behind the desk, \npositioned slightly askew — pushed back as if the owner stepped away \nmomentarily\n- A wall of dark mahogany bookshelves filled with leather-bound law \nbooks behind the desk, partially visible in shadow\n- A framed law degree and bar admission certificate on the wall, just \nvisible in the ambient glow\n- A subtle American flag on a brass stand in the corner shadow (NOT \nprominent, just an authentic detail)\n- The rest of the office melts into dramatic shadows — deep navy and \ncharcoal shadows fill the corners\n\nLIGHTING — THIS IS WHERE THE MAGIC HAPPENS:\n- ONE warm golden pool of desk lamp light illuminating the work in the \nforeground — creating a dramatic chiaroscuro effect\n- The cityscape outside provides a secondary cool blue light source \nthrough the windows, creating premium warm-vs-cool contrast\n- Deep shadows envelop the rest of the office\n- Subtle warm amber glow from the laptop screen and phone screen adds \nambient highlights\n- Time of day: late night, somewhere between 11 PM and 1 AM — the city \nis still alive, but the office is in solitude\n\nPHOTOGRAPHY ANGLE:\n- Cinematic medium-wide angle, slightly low perspective, looking across \nthe desk surface from the chair side toward the window\n- Shallow-to-medium depth of field — the desk work is sharply focused \nin the foreground, the cityscape softly bokeh'd in the background\n- The empty executive chair is visible but slightly out of focus, \nemphasizing the ABSENCE\n\n═══════════════════════════════════════════════════════════════\n\nATTENTION-GRABBING DETAILS THAT MAKE LAW FIRM PARTNERS STOP SCROLLING:\n\n1. THE EMPTY CHAIR — psychologically powerful. They see themselves NOT in \nthe chair, working from somewhere else, having missed dinner again.\n\n2. THE GLOWING PHONE WITH MISSED CALLS — every partner knows that screen. \nThe dread it creates is universal. Their pulse will quicken.\n\n3. THE COLD UNTOUCHED COFFEE — visual shorthand for \"you've been at this \nfor hours and you can't even pause to drink.\" Every partner has lived this.\n\n4. THE BREATHTAKING VIEW NOBODY'S LOOKING AT — the cruel irony of \n\"success.\" They built this to enjoy the view, and now they never see it.\n\n5. THE OPEN BUT ABANDONED WORK — implies they walked away in the middle \nof something important. Could be a family emergency, an exhausted \ncollapse, or simply giving up for the night.\n\n6. THE GOLDEN POOL OF LAMP LIGHT — cinematic and seductive, like a \nprestige drama film still (Suits, The Good Wife, Better Call Saul).\n\n═══════════════════════════════════════════════════════════════\n\nCRITICAL — SEAMLESS BLEND INTO BRAND GRADIENT:\n\nThe photograph does NOT have a visible rectangular border, frame, or card \nedge. The right portion of the canvas IS the photograph. The scene is \ncrisp in its focal areas, but the LEFT edge of the photograph (where the \noffice's dark interior meets the open brand canvas) dissolves softly into \nthe brand gradient through a long gradual alpha feather (~300-350px wide).\n\nThe dark office shadows on the left side fade into the deep brand royal \nblue (#1746A2) — they ARE the deep blue, atmospherically. The cityscape \nwindow light bridges with the brand sky-blue tones in the upper area. \nThe warm golden lamp pool remains fully saturated and dominant in the \nfocal area.\n\nTOP edge softly vignettes into the lighter brand sky-blue gradient with \n80-100px feather. BOTTOM edge softly vignettes into the deep brand royal \nblue with similar feather. Only the right edge touches the canvas cleanly.\n\nThe effect: the partner's office emerges seamlessly from Legal Soft's \nbrand atmosphere — the visual story IS Legal Soft's world.\n\nCOLOR HARMONY:\n- The warm golden lamp light + city lights create premium warm contrast \nagainst the cool brand blue gradient\n- The deep navy/charcoal office shadows harmonize with the brand royal \nblue\n- The dark mahogany wood tones add richness without competing with the \nbrand palette\n- Result: cinematic warm-vs-cool that mirrors the EMOTIONAL warm-vs-cool \nof the story (the warmth of ambition vs. the cold reality of burnout)\n\nHARD RULE: the focal warm pool of light on the desk remains fully \nsaturated warm amber. The blue brand gradient only affects the AMBIENT \nSHADOWS and SKY background. Warm focal storytelling against cool brand \natmosphere = the correct premium contrast.\n\nNO HARD EDGES, NO CARD BORDERS, NO PHOTO FRAME — painted directly into \nthe brand gradient like a cinematic film still.\n\n═══════════════════════════════════════════════════════════════\n\nMOOD MESSAGE: \"We see you. The 11 PM grind, the missed dinner, the \nswelling caseload. Legal Soft is the partner who shows up when you're \nstretched thin.\" This isn't an ad about staffing — it's an ad about \nRECOGNITION of their reality.\n\nStyle: cinematic prestige-drama still (think Better Call Saul / Industry \n/ Succession color grading), premium architectural editorial photography, \nGQ-meets-Bloomberg-Law. Shot on Cinema Camera, 35mm lens, ambient light \nonly, dramatic chiaroscuro, deep cinematic shadows, golden lamp warmth \nagainst cool nightscape.\n\nNo text in the image, no logos, no readable software UI, no readable \ndocuments, no readable phone notifications, no harsh seams, no people in \nframe, no harsh photo border.\n\n--ar 4:5 --style raw --v 6",
+          "prompt_hash": "2e5a007cc4e7fdd741c6347683aed59e10e7a8c467d6217785936450bf4c2d1f",
+          "diffs": [],
+          "warnings": [],
+          "provider": "mock",
+          "created_at": "2026-06-12T22:49:23.872942+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 1,
+        "variant": "D",
+        "artifact": "stage-2/D-1.png"
+      }
+    },
+    "3": {
+      "variant": "T",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "T",
+          "artifact": "stage-3/T-1.png",
+          "prompt": "Add advertisement text overlay to the LEFT side of the provided image. Keep the original image untouched on the right side. Follow these exact specifications:\n\n═══════════════════════════════════\nLAYOUT & POSITIONING\n═══════════════════════════════════\n- Text block placement: LEFT side of the image (occupy ~40% of total width — DO NOT exceed)\n- Vertical alignment: Centered\n- Left margin: ~6% from the left edge\n- Right boundary of text: stops at ~42% of total image width\n- Top & bottom padding: ~8% each\n- Right side: original image fully visible, no overlap\n\n═══════════════════════════════════\nTEXT CONTENT\n═══════════════════════════════════\n1. HEADLINE (bold, punchy):\n   \"Hire Experienced Virtual Legal Staff For Your Firm\"\n   - Gradient highlight on: \"Virtual Legal Staff\"\n   - Other words in #0F0F0F\n   - Max 4 lines, natural wrapping, no clipping\n\n2. SUPPORTING SUB-TEXT (styled as TWO short value statements, NOT a paragraph):\n   Break the message into 2 distinct lines with subtle visual rhythm:\n   \n   Line 1: \"Build your team with the best legal staff in the world.\"\n   Line 2: \"Choose from pre-vetted candidates — start in under 3 days.\"\n   \n   - Each line on its own with slightly more line-gap between them than within\n   - Color: #0F0F0F at ~85% opacity (slightly softer than headline, gives hierarchy)\n   - Line height: 1.5x\n   - Optional: add a small thin accent bar/dot (in #85AEFD) before each line, OR a subtle minimalist check icon — pick whichever feels cleaner. Icons must be SMALL and refined, not chunky.\n   - DO NOT render as a flat paragraph block. Treat it like two crisp value props.\n\n3. CTA BUTTON TEXT:\n   \"Book a Free Consultation  →\"   (include a small right-arrow at the end inside the button)\n\n═══════════════════════════════════\nTYPOGRAPHY\n═══════════════════════════════════\n- Font family: \"Artica Bold\" for headline and CTA\n- Sub-text: \"Artica Bold\" but slightly lighter visual weight via opacity (85%)\n- Headline size: moderate — longest line fits within left 40% with margin\n- Sub-text size: ~32% of headline size\n- CTA text size: ~38% of headline size\n- Line height (headline): 1.1x\n- Line height (sub-text): 1.5x\n- Letter spacing: normal/tight\n\n═══════════════════════════════════\nCTA BUTTON — PREMIUM SAAS STYLING (CRITICAL)\n═══════════════════════════════════\n- Shape: Pill-shaped, fully rounded corners\n- Background: Vibrant orange GRADIENT (not flat color)\n   → Start: #FF8A3D (lighter orange, top-left)\n   → End:   #F26A1A (deeper orange, bottom-right)\n   → Direction: diagonal (135°)\n- Subtle inner highlight on top edge (very faint white at low opacity) to add dimension\n- Soft drop shadow underneath:\n   → Color: orange-tinted shadow (rgba(242, 106, 26, 0.25))\n   → Offset: 0px 8px 20px blur\n   → Creates a \"floating button\" premium feel, NOT a harsh black shadow\n- Text inside: White (#FFFFFF), Artica Bold, with a small right-arrow \"→\" after the text (same color)\n- Padding inside button: ~22px vertical, ~32px horizontal (generous, but compact)\n- Button width: hugs the content (text + arrow + padding) — NOT stretched\n- Slight icon/text gap: small space between \"Consultation\" and \"→\"\n- The button should feel CLICKABLE, ELEVATED, and PREMIUM — like a Stripe, Linear, or Notion CTA button\n\n═══════════════════════════════════\nCOLOR SPECIFICATIONS\n═══════════════════════════════════\n- Primary text: #0F0F0F\n- Sub-text: #0F0F0F at 85% opacity\n- Accent (small bars/dots before sub-text lines, if used): #85AEFD\n- Highlighted headline words (\"Virtual Legal Staff\"): linear gradient left-to-right\n   → Start: #86AFFE\n   → End:   #2653AB\n- CTA button: orange gradient #FF8A3D → #F26A1A (135°)\n- CTA shadow: rgba(242, 106, 26, 0.25), soft, 0 8px 20px\n\n═══════════════════════════════════\nSPACING BETWEEN ELEMENTS\n═══════════════════════════════════\n- Headline → Sub-text: comfortable gap (~1.5x sub-text size)\n- Sub-text → CTA: generous gap (~2.5x sub-text size) — CTA must feel like its own confident element, not stuck to the paragraph\n- Between sub-text lines: slightly more spacing than default line-height for that \"premium breathing room\" feel\n\n═══════════════════════════════════\nSTYLE RULES\n═══════════════════════════════════\n- Premium SaaS landing-page aesthetic — think Stripe, Linear, Webflow\n- Sub-text must read as crisp value props, NOT a wall of paragraph text\n- CTA must feel elevated, gradient-rich, with soft glow — not flat\n- No element clipped, overlapping, or touching the right image\n- No clutter, no decorative noise\n\n═══════════════════════════════════\nDELIVERABLE\n═══════════════════════════════════\n- Final composed advertisement with refined text overlay on LEFT only\n- Right-side image untouched\n- Original resolution maintained",
+          "prompt_hash": "0a72568d8640bcb4f8458c10e2bc425446663f2667c9f5e69ef880f95a71d673",
+          "diffs": [],
+          "warnings": [],
+          "provider": "mock",
+          "created_at": "2026-06-12T22:50:05.815939+00:00"
+        },
+        {
+          "attempt": 2,
+          "variant": "T",
+          "artifact": "stage-3/T-2.png",
+          "prompt": "Add advertisement text overlay to the LEFT side of the provided image. Keep the original image untouched on the right side. Follow these exact specifications:\n\n═══════════════════════════════════\nLAYOUT & POSITIONING\n═══════════════════════════════════\n- Text block placement: LEFT side of the image (occupy ~40% of total width — DO NOT exceed)\n- Vertical alignment: Centered\n- Left margin: ~6% from the left edge\n- Right boundary of text: stops at ~42% of total image width\n- Top & bottom padding: ~8% each\n- Right side: original image fully visible, no overlap\n\n═══════════════════════════════════\nTEXT CONTENT\n═══════════════════════════════════\n1. HEADLINE (bold, punchy):\n   \"Hire Experienced Virtual Legal Staff For Your Firm\"\n   - Gradient highlight on: \"Virtual Legal Staff\"\n   - Other words in #0F0F0F\n   - Max 4 lines, natural wrapping, no clipping\n\n2. SUPPORTING SUB-TEXT (styled as TWO short value statements, NOT a paragraph):\n   Break the message into 2 distinct lines with subtle visual rhythm:\n   \n   Line 1: \"Build your team with the best legal staff in the world.\"\n   Line 2: \"Choose from pre-vetted candidates — start in under 3 days.\"\n   \n   - Each line on its own with slightly more line-gap between them than within\n   - Color: #0F0F0F at ~85% opacity (slightly softer than headline, gives hierarchy)\n   - Line height: 1.5x\n   - Optional: add a small thin accent bar/dot (in #85AEFD) before each line, OR a subtle minimalist check icon — pick whichever feels cleaner. Icons must be SMALL and refined, not chunky.\n   - DO NOT render as a flat paragraph block. Treat it like two crisp value props.\n\n3. CTA BUTTON TEXT:\n   \"Book a Free Consultation  →\"   (include a small right-arrow at the end inside the button)\n\n═══════════════════════════════════\nTYPOGRAPHY\n═══════════════════════════════════\n- Font family: \"Artica Bold\" for headline and CTA\n- Sub-text: \"Artica Bold\" but slightly lighter visual weight via opacity (85%)\n- Headline size: moderate — longest line fits within left 40% with margin\n- Sub-text size: ~32% of headline size\n- CTA text size: ~38% of headline size\n- Line height (headline): 1.1x\n- Line height (sub-text): 1.5x\n- Letter spacing: normal/tight\n\n═══════════════════════════════════\nCTA BUTTON — PREMIUM SAAS STYLING (CRITICAL)\n═══════════════════════════════════\n- Shape: Pill-shaped, fully rounded corners\n- Background: Vibrant orange GRADIENT (not flat color)\n   → Start: #FF8A3D (lighter orange, top-left)\n   → End:   #F26A1A (deeper orange, bottom-right)\n   → Direction: diagonal (135°)\n- Subtle inner highlight on top edge (very faint white at low opacity) to add dimension\n- Soft drop shadow underneath:\n   → Color: orange-tinted shadow (rgba(242, 106, 26, 0.25))\n   → Offset: 0px 8px 20px blur\n   → Creates a \"floating button\" premium feel, NOT a harsh black shadow\n- Text inside: White (#FFFFFF), Artica Bold, with a small right-arrow \"→\" after the text (same color)\n- Padding inside button: ~22px vertical, ~32px horizontal (generous, but compact)\n- Button width: hugs the content (text + arrow + padding) — NOT stretched\n- Slight icon/text gap: small space between \"Consultation\" and \"→\"\n- The button should feel CLICKABLE, ELEVATED, and PREMIUM — like a Stripe, Linear, or Notion CTA button\n\n═══════════════════════════════════\nCOLOR SPECIFICATIONS\n═══════════════════════════════════\n- Primary text: #0F0F0F\n- Sub-text: #0F0F0F at 85% opacity\n- Accent (small bars/dots before sub-text lines, if used): #85AEFD\n- Highlighted headline words (\"Virtual Legal Staff\"): linear gradient left-to-right\n   → Start: #86AFFE\n   → End:   #2653AB\n- CTA button: orange gradient #FF8A3D → #F26A1A (135°)\n- CTA shadow: rgba(242, 106, 26, 0.25), soft, 0 8px 20px\n\n═══════════════════════════════════\nSPACING BETWEEN ELEMENTS\n═══════════════════════════════════\n- Headline → Sub-text: comfortable gap (~1.5x sub-text size)\n- Sub-text → CTA: generous gap (~2.5x sub-text size) — CTA must feel like its own confident element, not stuck to the paragraph\n- Between sub-text lines: slightly more spacing than default line-height for that \"premium breathing room\" feel\n\n═══════════════════════════════════\nSTYLE RULES\n═══════════════════════════════════\n- Premium SaaS landing-page aesthetic — think Stripe, Linear, Webflow\n- Sub-text must read as crisp value props, NOT a wall of paragraph text\n- CTA must feel elevated, gradient-rich, with soft glow — not flat\n- No element clipped, overlapping, or touching the right image\n- No clutter, no decorative noise\n\n═══════════════════════════════════\nDELIVERABLE\n═══════════════════════════════════\n- Final composed advertisement with refined text overlay on LEFT only\n- Right-side image untouched\n- Original resolution maintained",
+          "prompt_hash": "0a72568d8640bcb4f8458c10e2bc425446663f2667c9f5e69ef880f95a71d673",
+          "diffs": [],
+          "warnings": [],
+          "provider": "mock",
+          "created_at": "2026-06-12T22:50:09.703435+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 2,
+        "variant": "T",
+        "artifact": "stage-3/T-2.png"
+      }
+    },
+    "4": {
+      "variant": "final",
+      "attempts": [
+        {
+          "attempt": 1,
+          "variant": "final",
+          "artifact": "stage-4/final-1.png",
+          "logo_artifact": "stage-4/logo-1.png",
+          "method": "deterministic",
+          "created_at": "2026-06-12T22:50:51.927521+00:00"
+        },
+        {
+          "attempt": 2,
+          "variant": "final",
+          "artifact": "stage-4/final-2.png",
+          "logo_artifact": "stage-4/logo-2.png",
+          "method": "deterministic",
+          "created_at": "2026-06-12T22:50:55.217683+00:00"
+        }
+      ],
+      "approved": {
+        "attempt": 2,
+        "variant": "final",
+        "artifact": "stage-4/final-2.png"
+      }
+    }
+  },
+  "logo": {
+    "artifact": "stage-4/logo-2.png"
+  },
+  "manifest_log": [
+    {
+      "token": "headline",
+      "source": "agent",
+      "original_suggestion": "Reclaim Your Evenings With Legal Staff",
+      "final_value": "Reclaim Your Evenings With Legal Staff",
+      "timestamp": "2026-06-12T22:49:48.055492+00:00"
+    },
+    {
+      "token": "highlight",
+      "source": "agent",
+      "original_suggestion": "Legal Staff",
+      "final_value": "Legal Staff",
+      "timestamp": "2026-06-12T22:49:48.055509+00:00"
+    },
+    {
+      "token": "headline",
+      "source": "agent",
+      "original_suggestion": "Hire Experienced Virtual Legal Staff For Your Firm",
+      "final_value": "Hire Experienced Virtual Legal Staff For Your Firm",
+      "timestamp": "2026-06-12T22:49:50.849126+00:00"
+    },
+    {
+      "token": "highlight",
+      "source": "agent",
+      "original_suggestion": "Virtual Legal Staff",
+      "final_value": "Virtual Legal Staff",
+      "timestamp": "2026-06-12T22:49:50.849141+00:00"
+    },
+    {
+      "token": "cta",
+      "source": "user",
+      "original_suggestion": null,
+      "final_value": "Book a Free Consultation",
+      "timestamp": "2026-06-12T22:49:56.458311+00:00"
+    },
+    {
+      "token": "subtext2",
+      "source": "user",
+      "original_suggestion": null,
+      "final_value": "Choose from pre-vetted candidates — start in under 3 days.",
+      "timestamp": "2026-06-12T22:49:58.404054+00:00"
+    },
+    {
+      "token": "subtext1",
+      "source": "user",
+      "original_suggestion": null,
+      "final_value": "Build your team with the best legal staff in the world.",
+      "timestamp": "2026-06-12T22:49:59.622594+00:00"
+    },
+    {
+      "token": "headline",
+      "source": "agent",
+      "original_suggestion": "Hire Experienced Virtual Legal Staff For Your Firm",
+      "final_value": "Hire Experienced Virtual Legal Staff For Your Firm",
+      "timestamp": "2026-06-12T22:50:01.327119+00:00"
+    },
+    {
+      "token": "highlight",
+      "source": "agent",
+      "original_suggestion": "Virtual Legal Staff",
+      "final_value": "Virtual Legal Staff",
+      "timestamp": "2026-06-12T22:50:01.327134+00:00"
+    }
+  ]
+}
