@@ -369,6 +369,62 @@ def cta_placement_phrase(key: str) -> str:
     return _CTA_PLACEMENT_PHRASE.get(key, _CTA_PLACEMENT_PHRASE["bottom"])
 
 
+# ── Stage 3 — per-element text colour palette (§6.4) ──────────────────────────
+# The brand text-gradient stays LOCKED; white is added so a creative on a dark
+# photo stays readable. Each text element picks one of these; the CTA button
+# keeps its locked orange gradient and is not colour-selectable. ``swatch`` is a
+# CSS value the UI renders in the picker; ``phrase`` is what reaches the prompt.
+TEXT_COLORS = [
+    {"key": "dark", "label": "Dark", "swatch": "#0F0F0F",
+     "phrase": "solid near-black #0F0F0F"},
+    {"key": "gradient", "label": "Brand gradient",
+     "swatch": "linear-gradient(90deg, #86AFFE, #2653AB)",
+     "phrase": "a smooth left-to-right linear gradient from #86AFFE to #2653AB applied across the glyphs"},
+    {"key": "white", "label": "White", "swatch": "#FFFFFF",
+     "phrase": "solid white #FFFFFF"},
+]
+_TEXT_COLOR_PHRASE = {c["key"]: c["phrase"] for c in TEXT_COLORS}
+TEXT_COLOR_KEYS = [c["key"] for c in TEXT_COLORS]
+
+
+def text_color_phrase(key: str) -> str:
+    return _TEXT_COLOR_PHRASE.get(key, _TEXT_COLOR_PHRASE["dark"])
+
+
+# Styleable Stage-3 elements (drives the per-element control bars in the UI).
+# ``placeable`` elements get a placement bar; ``colorable`` ones get the colour
+# palette. The highlight is inline in the headline (no placement); the CTA keeps
+# its locked orange button (no colour picker).
+STAGE3_ELEMENTS = [
+    {"key": "headline",  "label": "Heading",       "token": "headline",  "placeable": True,  "colorable": True,  "placement_kind": "text"},
+    {"key": "highlight", "label": "Hook / highlight", "token": "highlight", "placeable": False, "colorable": True,  "placement_kind": "text"},
+    {"key": "subtext1",  "label": "Sub-heading 1", "token": "subtext1",  "placeable": True,  "colorable": True,  "placement_kind": "text"},
+    {"key": "subtext2",  "label": "Sub-heading 2", "token": "subtext2",  "placeable": True,  "colorable": True,  "placement_kind": "text"},
+    {"key": "cta",       "label": "CTA button",    "token": "cta",       "placeable": True,  "colorable": False, "placement_kind": "cta"},
+]
+
+
+# ── Stage 4 — logo placement grid (UI) ────────────────────────────────────────
+# The 3×3 grid the studio renders as the logo placement guide. ``key`` matches
+# compositor.LOGO_POSITION_KEYS; row/col drive the grid layout.
+LOGO_POSITIONS = [
+    {"key": "top-left", "label": "Top left", "row": 0, "col": 0},
+    {"key": "top-center", "label": "Top center", "row": 0, "col": 1},
+    {"key": "top-right", "label": "Top right", "row": 0, "col": 2},
+    {"key": "middle-left", "label": "Middle left", "row": 1, "col": 0},
+    {"key": "middle-center", "label": "Center", "row": 1, "col": 1},
+    {"key": "middle-right", "label": "Middle right", "row": 1, "col": 2},
+    {"key": "bottom-left", "label": "Bottom left", "row": 2, "col": 0},
+    {"key": "bottom-center", "label": "Bottom center", "row": 2, "col": 1},
+    {"key": "bottom-right", "label": "Bottom right", "row": 2, "col": 2},
+]
+
+# Slider bounds for the logo size (% of canvas width) and fine px nudge range.
+LOGO_SIZE_PCT_MIN = 4
+LOGO_SIZE_PCT_MAX = 60
+LOGO_OFFSET_PX_RANGE = 400
+
+
 # ── Aspect-ratio presets for the UI dropdown (spec §6.2) ──────────────────────
 ASPECT_RATIO_PRESETS = [
     {

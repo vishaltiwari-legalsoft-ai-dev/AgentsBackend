@@ -30,7 +30,7 @@ CANONICAL_SHA256: dict[str, str] = {
     "stage1_gradient_K.txt": "a77373cec63427b24fe5d3bd4d5cf9e308bab67e3e4de7c97d75a83643885b40",
     "stage1_gradient_L.txt": "d4b74fc6338f8ab53d93d4988be93025bcbcf8b6986871e5478afc91581336f1",
     "stage2_element_blend.txt": "e49c3458fcfbfbac87731e58f1005a8528a5502bd59738e8d642bb313c934a5e",
-    "stage3_text_overlay.txt": "1d9dbcdc69f1defb4eaca92d58328bc6dc2152f14ac27981f02bfefb667ac01f",
+    "stage3_text_overlay.txt": "3330aa3b87985b0b8c92e8e5708ebfe40d2feb535c42b8213bd89e62a6257b71",
     "stage4_logo_composite.txt": "52efdb99f973ecdf524f5690fd1917cdfbe127481458f29f0d808780788d27e8",
 }
 

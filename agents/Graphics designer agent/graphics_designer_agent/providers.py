@@ -42,6 +42,8 @@ class ImageProvider(Protocol):
         height: int = 1350,
         negative_prompt: str | None = None,
         label: str = "",
+        aspect_ratio: str | None = None,
+        image_size: str | None = None,
     ) -> tuple[bytes, str]:
         ...
 
@@ -99,7 +101,12 @@ class MockImageProvider:
         height: int = 1350,
         negative_prompt: str | None = None,
         label: str = "",
+        aspect_ratio: str | None = None,
+        image_size: str | None = None,
     ) -> tuple[bytes, str]:
+        # The mock renders at the pixel dimensions it is given; aspect_ratio /
+        # image_size are honoured by the real provider only (width/height already
+        # encode the shape here).
         if reference_images:
             base = Image.open(BytesIO(reference_images[0][0])).convert("RGB")
             base = base.resize((width, height), Image.BICUBIC)
@@ -130,6 +137,8 @@ class OpenRouterProvider:
         height: int = 1350,
         negative_prompt: str | None = None,
         label: str = "",
+        aspect_ratio: str | None = None,
+        image_size: str | None = None,
     ) -> tuple[bytes, str]:
         # Imported lazily so the package works without the backend app installed.
         from app.services import openrouter
@@ -137,7 +146,13 @@ class OpenRouterProvider:
         full = prompt
         if negative_prompt:
             full = f"{prompt}\n\nAVOID THE FOLLOWING:\n{negative_prompt}"
-        return openrouter.generate_image(full, reference_images=reference_images, model=self.model)
+        return openrouter.generate_image(
+            full,
+            reference_images=reference_images,
+            model=self.model,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
+        )
 
 
 def _openrouter_key_configured() -> bool:

@@ -7,7 +7,8 @@ from graphics_designer_agent.tokens import (
     DEFAULT_HIGHLIGHT,
     DEFAULT_SUBTEXT_1,
     DEFAULT_SUBTEXT_2,
-    FONT_ANCHOR,
+    STAGE3_STYLE_ANCHORS,
+    default_element_styles,
     substitute_stage2,
     substitute_stage3,
 )
@@ -18,35 +19,46 @@ S3 = load_prompt("stage3_text_overlay.txt")
 S2 = load_prompt(STAGE2_BLEND_PROMPT)
 
 
-def test_font_isolation():
-    # Font is locked to the Causten family; selecting a variant swaps the anchor.
-    out = substitute_stage3(S3, font="Causten ExtraBold")
-    assert out.text == S3.replace(FONT_ANCHOR, "Causten ExtraBold")
-    assert out.text.replace("Causten ExtraBold", FONT_ANCHOR) == S3  # reversible
-
-
-def test_font_is_locked_to_causten_family():
-    from graphics_designer_agent.tokens import DEFAULT_FONT
-    from graphics_designer_agent.variants import FONT_FAMILY, FONTS
-
-    assert FONT_FAMILY == "Causten"
-    assert DEFAULT_FONT in FONTS
-    assert FONTS and all(f.startswith("Causten") for f in FONTS)
-    # With the Causten default selected, the Artica anchor is fully replaced.
-    out = substitute_stage3(S3, font=DEFAULT_FONT)
-    assert FONT_ANCHOR not in out.text
-    assert DEFAULT_FONT in out.text
-
-
-def test_placement_substitution_and_isolation():
-    # Default (no placement args): markers stay → byte-identical, no diffs.
-    assert substitute_stage3(S3).text == S3
-    # Resolved phrases replace only the placement markers.
-    out = substitute_stage3(S3, text_placement="the RIGHT side", cta_placement="centered")
-    assert "[TEXT_PLACEMENT]" not in out.text and "[CTA_PLACEMENT]" not in out.text
-    assert "the RIGHT side" in out.text and "centered" in out.text
-    expected = S3.replace("[TEXT_PLACEMENT]", "the RIGHT side").replace("[CTA_PLACEMENT]", "centered")
+def test_per_element_style_substitution_and_isolation():
+    styles = {
+        "headline": {"font": "Causten ExtraBold", "color": "solid white #FFFFFF",
+                     "placement": "the RIGHT side"},
+        "cta": {"font": "Causten Black", "placement": "centered below"},
+    }
+    out = substitute_stage3(S3, styles=styles)
+    # The targeted element markers are gone…
+    for marker in ("[HEADLINE_FONT]", "[HEADLINE_COLOR]", "[HEADLINE_PLACEMENT]",
+                   "[CTA_FONT]", "[CTA_PLACEMENT]"):
+        assert marker not in out.text
+    # …while untouched elements keep their markers (isolation).
+    assert "[SUBTEXT1_FONT]" in out.text and "[HIGHLIGHT_COLOR]" in out.text
+    expected = (
+        S3.replace("[HEADLINE_FONT]", "Causten ExtraBold")
+        .replace("[HEADLINE_COLOR]", "solid white #FFFFFF")
+        .replace("[HEADLINE_PLACEMENT]", "the RIGHT side")
+        .replace("[CTA_FONT]", "Causten Black")
+        .replace("[CTA_PLACEMENT]", "centered below")
+    )
     assert out.text == expected
+
+
+def test_highlight_has_no_placement_marker():
+    # The highlight is inline in the headline — it carries font + colour only.
+    assert "placement" not in STAGE3_STYLE_ANCHORS["highlight"]
+    assert "[HIGHLIGHT_PLACEMENT]" not in S3
+
+
+def test_no_box_instruction_present():
+    # The "AI keeps drawing a box behind the text" fix lives in the prompt.
+    assert "NO BOX OR PANEL BEHIND THE TEXT" in S3
+
+
+def test_default_element_styles_cover_every_styleable_element():
+    styles = default_element_styles()
+    assert set(styles) == set(STAGE3_STYLE_ANCHORS)
+    # Highlight defaults to the locked brand gradient; CTA carries no colour.
+    assert styles["highlight"]["color"] == "gradient"
+    assert "color" not in styles["cta"]
 
 
 def test_stage3_prompt_preserves_underlying_image():
@@ -61,7 +73,7 @@ def test_headline_isolation():
     assert out.text == S3.replace(DEFAULT_HEADLINE, new)
 
 
-def test_highlight_isolation_hits_all_three_occurrences():
+def test_highlight_isolation_hits_all_occurrences():
     out = substitute_stage3(S3, highlight="Legal Staff")
     assert out.text == S3.replace(DEFAULT_HIGHLIGHT, "Legal Staff")
 

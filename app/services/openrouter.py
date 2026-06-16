@@ -161,12 +161,21 @@ def generate_image(
     prompt: str,
     reference_images: list[tuple[bytes, str]] | None = None,
     model: str | None = None,
+    *,
+    aspect_ratio: str | None = None,
+    image_size: str | None = None,
 ) -> tuple[bytes, str]:
     """Render a single image through an OpenRouter image-output model.
 
     If `reference_images` (list of (bytes, mime)) is provided, they are sent
     alongside the prompt so the model can composite them (e.g. the exact brand
     logo) rather than inventing them. Returns the image bytes and MIME type.
+
+    `aspect_ratio` (e.g. "4:5", "16:9") and `image_size` ("1K"/"2K"/"4K") are
+    forwarded via OpenRouter's `image_config` so the model renders at the
+    requested shape and resolution instead of its 1:1/1K default. Without these
+    the model only infers the shape from the prompt/reference and emits a
+    low-resolution image — the cause of off-aspect, soft "2K-looking" output.
     """
     api_key = settings.require("openrouter_api_key")
     url = f"{settings.openrouter_base_url}/chat/completions"
@@ -182,11 +191,19 @@ def generate_image(
         messages = [{"role": "user", "content": prompt}]
 
     image_model = model or settings.openrouter_image_model
-    body = {
+    body: dict = {
         "model": image_model,
         "messages": messages,
         "modalities": _image_modalities(image_model),
     }
+
+    image_config: dict[str, str] = {}
+    if aspect_ratio:
+        image_config["aspect_ratio"] = aspect_ratio
+    if image_size:
+        image_config["image_size"] = image_size
+    if image_config:
+        body["image_config"] = image_config
 
     try:
         response = httpx.post(url, json=body, headers=headers, timeout=180)

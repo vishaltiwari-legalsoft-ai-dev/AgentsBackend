@@ -19,7 +19,22 @@ from .runs import (
     save_artifact,
     save_run,
 )
-from .tokens import ASPECT_RATIOS, DEFAULT_AR, substitute_stage2, substitute_stage3
+from .tokens import (
+    ASPECT_RATIOS,
+    DEFAULT_AR,
+    DEFAULT_FONT,
+    default_element_styles,
+    substitute_stage1,
+    substitute_stage2,
+    substitute_stage3,
+)
+
+# Resolution requested from the image model per stage (OpenRouter image_config
+# image_size). Stage 1 is a smooth gradient base that gets re-rendered downstream,
+# so 2K is plenty; Stages 2-4 carry the photographic subject, text and the final
+# deliverable, so they render at the full 4K the brand requires. The model
+# defaults to 1K when this is unset — the cause of the soft, low-res output.
+STAGE_IMAGE_SIZE = {1: "2K", 2: "4K", 3: "4K", 4: "4K"}
 
 
 class PipelineError(Exception):
@@ -30,9 +45,38 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _stage_ar(run: dict) -> str:
+    """The AR token the user selected for this run (validated against presets)."""
+    ar = run["config"]["aspect_ratio"]
+    return ar if ar in ASPECT_RATIOS else DEFAULT_AR
+
+
+def _resolve_stage3_styles(cfg: dict) -> dict:
+    """Turn the run's per-element style keys into the resolved descriptive
+    phrases the Stage-3 prompt expects. Falls back to the factory defaults (and,
+    for older runs without ``element_styles``, the legacy single ``font``) so the
+    prompt never ends up with an unsubstituted marker."""
+    raw = cfg.get("element_styles") or {}
+    legacy_font = cfg.get("font") or DEFAULT_FONT
+    resolved: dict = {}
+    for element, default in default_element_styles().items():
+        s = {**default, **(raw.get(element) or {})}
+        out = {"font": s.get("font") or legacy_font}
+        if "color" in default:
+            out["color"] = variants.text_color_phrase(s.get("color", default["color"]))
+        if "placement" in default:
+            key = s.get("placement", default["placement"])
+            out["placement"] = (
+                variants.cta_placement_phrase(key) if element == "cta"
+                else variants.text_placement_phrase(key)
+            )
+        resolved[element] = out
+    return resolved
+
+
 def _stage_dims(run: dict, stage: int) -> tuple[int, int]:
-    if stage == 1:
-        return (1920, 1080)  # Stage 1 prompts are always 16:9 (§6.2)
+    # Every stage now honours the user's selected aspect ratio — including Stage 1,
+    # which previously hard-locked to 16:9 (§6.2).
     ar = ASPECT_RATIOS.get(run["config"]["aspect_ratio"], ASPECT_RATIOS[DEFAULT_AR])
     return (ar["w"], ar["h"])
 
@@ -61,7 +105,10 @@ def build_prompt(run: dict, stage: int, variant: str) -> dict:
     negative: str | None = None
 
     if stage == 1:
-        text = load_prompt(variants.stage1_variant(variant)["prompt_file"])
+        sub = substitute_stage1(
+            load_prompt(variants.stage1_variant(variant)["prompt_file"]), ar
+        )
+        text, diffs, warnings = sub.text, sub.diffs, list(sub.warnings)
     elif stage == 2:
         v = variants.stage2_variant(variant)
         sub = substitute_stage2(
@@ -74,9 +121,7 @@ def build_prompt(run: dict, stage: int, variant: str) -> dict:
             load_prompt("stage3_text_overlay.txt"),
             headline=tk["headline"], highlight=tk["highlight"],
             subtext1=tk["subtext1"], subtext2=tk["subtext2"], cta=tk["cta"],
-            font=cfg["font"],
-            text_placement=variants.text_placement_phrase(cfg.get("text_placement", "left")),
-            cta_placement=variants.cta_placement_phrase(cfg.get("cta_placement", "bottom")),
+            styles=_resolve_stage3_styles(cfg),
         )
         text, diffs, warnings = sub.text, sub.diffs, list(sub.warnings)
     elif stage == 4:
@@ -124,6 +169,8 @@ def generate(run: dict, stage: int, variant: str | None = None,
         width=w, height=h,
         negative_prompt=built["negative_prompt"] if provider.supports_negative else None,
         label=label,
+        aspect_ratio=_stage_ar(run),
+        image_size=STAGE_IMAGE_SIZE[stage],
     )
     rel = save_artifact(run["id"], stage, variant, attempt_no, png)
     attempt = {
@@ -154,18 +201,26 @@ def generate_stage4(run: dict, logo_png: bytes, *, use_ai: bool | None = None,
     use_ai = run["config"]["use_ai_compositor"] if use_ai is None else use_ai
     attempt_no = len(run["stages"]["4"]["attempts"]) + 1
 
+    layout = run["config"].get("logo_layout") or {}
     logo_rel = save_artifact(run["id"], 4, "logo", attempt_no, logo_png)
     if use_ai:
         provider = provider or get_provider()
         text = load_prompt("stage4_logo_composite.txt")
+        hint = _logo_placement_hint(layout)
+        if hint:
+            text = f"{text}\n\nLOGO PLACEMENT (follow precisely):\n{hint}"
+        w, h = _stage_dims(run, 4)
         png, _ = provider.generate(
             text,
             reference_images=[(base, "image/png"), (logo_png, "image/png")],
+            width=w, height=h,
             label=f"STAGE 4 · final · #{attempt_no}",
+            aspect_ratio=_stage_ar(run),
+            image_size=STAGE_IMAGE_SIZE[4],
         )
         method = "ai"
     else:
-        png = composite_logo(base, logo_png)
+        png = composite_logo(base, logo_png, layout)
         method = "deterministic"
 
     rel = save_artifact(run["id"], 4, "final", attempt_no, png)
@@ -217,7 +272,29 @@ def go_back(run: dict, target_stage: int) -> dict:
     return run
 
 
+def _logo_placement_hint(layout: dict) -> str:
+    """A short natural-language placement instruction for the AI compositor path."""
+    if not layout:
+        return ""
+    pos = (layout.get("position") or "top-left").replace("-", " ")
+    size = layout.get("size_pct")
+    size_txt = f"about {round(size)}% of the image width" if size else "about 20% of the image width"
+    bits = [
+        f"Place the logo in the {pos} of the image, sized {size_txt}, with a comfortable edge margin.",
+        "Preserve the logo's exact colours, shapes and proportions — do not redraw or restyle it.",
+    ]
+    return " ".join(bits)
+
+
 def stage4_logo_preview(run: dict, logo_w: int, logo_h: int) -> dict:
     """Bounding box the deterministic compositor will use (for the UI preview)."""
     w, h = _stage_dims(run, 4)
-    return logo_placement(w, h, logo_w, logo_h)
+    layout = run["config"].get("logo_layout") or {}
+    return logo_placement(
+        w, h, logo_w, logo_h,
+        position=layout.get("position", "top-left"),
+        size_pct=layout.get("size_pct"),
+        margin_pct=layout.get("margin_pct"),
+        offset_x=int(layout.get("offset_x", 0) or 0),
+        offset_y=int(layout.get("offset_y", 0) or 0),
+    )

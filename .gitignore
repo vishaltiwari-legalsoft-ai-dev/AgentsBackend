@@ -11,3 +11,5 @@ gcp-service-account.json
 .pytest_cache/
 # Cloud Run deploy env (contains secrets); keep only the .example
 deploy.env.yaml
+# Graphics Designer generated run artifacts (output, not source)
+agents/**/runs/

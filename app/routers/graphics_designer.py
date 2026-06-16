@@ -63,6 +63,87 @@ def _guard(fn):
         raise HTTPException(409, str(exc)) from exc
 
 
+def _apply_element_styles(cfg: dict, incoming: dict) -> None:
+    """Validate + merge per-element Stage-3 styling into the run config.
+
+    Each element may set ``font`` (any Causten variant), ``color`` (dark /
+    gradient / white — text elements only) and ``placement`` (text or CTA
+    placement key, placeable elements only). Unknown elements/attributes or
+    out-of-family values are rejected so the prompt only ever sees valid input.
+    """
+    elements = {e["key"]: e for e in variants.STAGE3_ELEMENTS}
+    color_keys = set(variants.TEXT_COLOR_KEYS)
+    text_places = {p["key"] for p in variants.TEXT_PLACEMENTS}
+    cta_places = {p["key"] for p in variants.CTA_PLACEMENTS}
+    styles = cfg.setdefault("element_styles", {})
+
+    for key, patch in incoming.items():
+        meta = elements.get(key)
+        if not meta or not isinstance(patch, dict):
+            raise HTTPException(400, f"Unknown Stage-3 element '{key}'")
+        cur = dict(styles.get(key) or {})
+        if "font" in patch:
+            if patch["font"] not in variants.FONTS:
+                raise HTTPException(
+                    400, f"Font is locked to the {variants.FONT_FAMILY} family; "
+                    f"'{patch['font']}' is not an allowed variant.")
+            cur["font"] = patch["font"]
+        if "color" in patch:
+            if not meta["colorable"]:
+                raise HTTPException(400, f"Element '{key}' has a locked colour.")
+            if patch["color"] not in color_keys:
+                raise HTTPException(400, f"Unknown text colour '{patch['color']}'")
+            cur["color"] = patch["color"]
+        if "placement" in patch:
+            if not meta["placeable"]:
+                raise HTTPException(400, f"Element '{key}' has no placement control.")
+            allowed = cta_places if meta["placement_kind"] == "cta" else text_places
+            if patch["placement"] not in allowed:
+                raise HTTPException(400, f"Unknown placement '{patch['placement']}' for '{key}'")
+            cur["placement"] = patch["placement"]
+        styles[key] = cur
+
+
+def _apply_logo_layout(cfg: dict, patch: dict) -> None:
+    """Validate + merge the Stage-4 logo placement controls into the run config."""
+    from graphics_designer_agent.compositor import default_logo_layout
+
+    positions = {p["key"] for p in variants.LOGO_POSITIONS}
+    cur = {**default_logo_layout(), **(cfg.get("logo_layout") or {})}
+
+    if "position" in patch:
+        if patch["position"] not in positions:
+            raise HTTPException(400, f"Unknown logo position '{patch['position']}'")
+        cur["position"] = patch["position"]
+    if "size_pct" in patch:
+        v = patch["size_pct"]
+        if v is not None:
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "logo size_pct must be a number")
+            if not 1 <= v <= 100:
+                raise HTTPException(400, "logo size_pct must be between 1 and 100")
+        cur["size_pct"] = v
+    if "margin_pct" in patch:
+        try:
+            m = float(patch["margin_pct"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "logo margin_pct must be a number")
+        if not 0 <= m <= 25:
+            raise HTTPException(400, "logo margin_pct must be between 0 and 25")
+        cur["margin_pct"] = m
+    for axis in ("offset_x", "offset_y"):
+        if axis in patch:
+            try:
+                cur[axis] = int(round(float(patch[axis])))
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"logo {axis} must be an integer")
+            if abs(cur[axis]) > variants.LOGO_OFFSET_PX_RANGE:
+                raise HTTPException(400, f"logo {axis} out of range")
+    cfg["logo_layout"] = cur
+
+
 # ── static config for the studio UI ───────────────────────────────────────────
 @router.get("/gd/config")
 def gd_config(_user: dict = Depends(get_current_user)) -> dict:
@@ -75,6 +156,12 @@ def gd_config(_user: dict = Depends(get_current_user)) -> dict:
         "font_variants": variants.FONT_VARIANTS,
         "text_placements": variants.TEXT_PLACEMENTS,
         "cta_placements": variants.CTA_PLACEMENTS,
+        "text_colors": variants.TEXT_COLORS,
+        "stage3_elements": variants.STAGE3_ELEMENTS,
+        "logo_positions": variants.LOGO_POSITIONS,
+        "logo_size_pct_min": variants.LOGO_SIZE_PCT_MIN,
+        "logo_size_pct_max": variants.LOGO_SIZE_PCT_MAX,
+        "logo_offset_px_range": variants.LOGO_OFFSET_PX_RANGE,
         "aspect_ratios": variants.ASPECT_RATIO_PRESETS,
         "brand_kit_block": variants.BRAND_KIT_BLOCK,
         "locked_colors": variants.LOCKED_COLORS,
@@ -120,6 +207,10 @@ class ConfigBody(BaseModel):
     aspect_ratio: str | None = None
     text_placement: str | None = None
     cta_placement: str | None = None
+    # Per-element Stage-3 styling: element key -> {font?, color?, placement?}.
+    element_styles: dict[str, dict] | None = None
+    # Stage-4 logo placement: {position?, size_pct?, margin_pct?, offset_x?, offset_y?}.
+    logo_layout: dict | None = None
     use_ai_compositor: bool | None = None
     tokens: dict[str, str] | None = None
     # token -> {approved: bool, source: "user"|"agent", original_suggestion?: str}
@@ -162,6 +253,10 @@ def update_config(run_id: str, body: ConfigBody, user: dict = Depends(get_curren
         if body.cta_placement not in allowed:
             raise HTTPException(400, f"Unknown CTA placement '{body.cta_placement}'")
         cfg["cta_placement"] = body.cta_placement
+    if body.element_styles is not None:
+        _apply_element_styles(cfg, body.element_styles)
+    if body.logo_layout is not None:
+        _apply_logo_layout(cfg, body.logo_layout)
     if body.use_ai_compositor is not None:
         cfg["use_ai_compositor"] = bool(body.use_ai_compositor)
     if body.tokens:

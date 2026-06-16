@@ -19,12 +19,6 @@ from dataclasses import dataclass, field
 
 
 # ── Canonical defaults (must match the bytes in the prompt files) ──────────────
-# FONT_ANCHOR is the literal string baked into the immutable Stage-3 prompt
-# (spec §6.1). It is NOT a user-selectable value — it exists only as the
-# substitution target. The brand font is LOCKED to the Causten family (see
-# ``variants.FONT_FAMILY``), so every run substitutes this anchor for a Causten
-# variant; the default selection is ``DEFAULT_FONT`` below.
-FONT_ANCHOR = "Artica Bold"
 DEFAULT_FONT = "Causten Bold"
 DEFAULT_HEADLINE = "Hire Experienced Virtual Legal Staff For Your Firm"
 DEFAULT_HIGHLIGHT = "Virtual Legal Staff"
@@ -32,14 +26,38 @@ DEFAULT_SUBTEXT_1 = "Build your team with the best legal staff in the world."
 DEFAULT_SUBTEXT_2 = "Choose from pre-vetted candidates — start in under 3 days."
 DEFAULT_CTA = "Book a Free Consultation"
 
-# Stage-3 placement tokens (markers in stage3_text_overlay.txt). The UI lets the
-# user choose where the text block and CTA sit; build_prompt resolves the chosen
-# key to a descriptive phrase (see variants.TEXT_PLACEMENTS / CTA_PLACEMENTS) and
-# substitutes it here. Defaults reproduce the original left-aligned layout.
-TEXT_PLACEMENT_ANCHOR = "[TEXT_PLACEMENT]"
-CTA_PLACEMENT_ANCHOR = "[CTA_PLACEMENT]"
+# Stage-3 per-element style markers (literals in stage3_text_overlay.txt). Each
+# of the five text elements is styled independently: every element carries a
+# font + colour, and the four positionable blocks also carry a placement. The
+# highlight is rendered inline inside the headline, so it has font + colour only
+# (its position follows the headline). build_prompt resolves the chosen keys to
+# descriptive phrases and substitutes them here; with no styles passed every
+# marker stays untouched, so the canonical file is byte-identical (§9.1).
+STAGE3_STYLE_ANCHORS: dict[str, dict[str, str]] = {
+    "headline":  {"font": "[HEADLINE_FONT]",  "color": "[HEADLINE_COLOR]",  "placement": "[HEADLINE_PLACEMENT]"},
+    "highlight": {"font": "[HIGHLIGHT_FONT]",  "color": "[HIGHLIGHT_COLOR]"},
+    "subtext1":  {"font": "[SUBTEXT1_FONT]",   "color": "[SUBTEXT1_COLOR]",  "placement": "[SUBTEXT1_PLACEMENT]"},
+    "subtext2":  {"font": "[SUBTEXT2_FONT]",   "color": "[SUBTEXT2_COLOR]",  "placement": "[SUBTEXT2_PLACEMENT]"},
+    "cta":       {"font": "[CTA_FONT]",        "placement": "[CTA_PLACEMENT]"},
+}
+
 DEFAULT_TEXT_PLACEMENT = "left"
 DEFAULT_CTA_PLACEMENT = "bottom"
+# Per-element colour keys (resolved to phrases in variants.text_color_phrase).
+DEFAULT_ELEMENT_COLORS = {"headline": "dark", "highlight": "gradient", "subtext1": "dark", "subtext2": "dark"}
+
+
+def default_element_styles() -> dict:
+    """The factory Stage-3 styling — reproduces the original left-aligned, dark
+    headline / gradient-highlight layout. Each element is independently
+    overridable by the user from here."""
+    return {
+        "headline":  {"font": DEFAULT_FONT, "color": "dark",     "placement": DEFAULT_TEXT_PLACEMENT},
+        "highlight": {"font": DEFAULT_FONT, "color": "gradient"},
+        "subtext1":  {"font": DEFAULT_FONT, "color": "dark",     "placement": DEFAULT_TEXT_PLACEMENT},
+        "subtext2":  {"font": DEFAULT_FONT, "color": "dark",     "placement": DEFAULT_TEXT_PLACEMENT},
+        "cta":       {"font": DEFAULT_FONT, "placement": DEFAULT_CTA_PLACEMENT},
+    }
 
 # Aspect-ratio presets (§6.2). Key is the AR token.
 ASPECT_RATIOS: dict[str, dict] = {
@@ -58,6 +76,14 @@ _AR_ORIENTATION_ANCHOR = "Vertical social media post,"
 
 # Stage-2 subject token in the common blend prompt (stage2_element_blend.txt).
 SUBJECT_ANCHOR = "[SUBJECT]"
+
+# Stage-1 AR anchor. Every canonical Stage-1 prompt opens with the literal
+# "16:9 aspect ratio" (the bytes are frozen — see prompts.CANONICAL_SHA256), so
+# the studio used to render every background at 16:9 regardless of the user's
+# selection. We substitute this anchor for the selected AR at build time, exactly
+# like the Stage-2/3 tokens, so the prompt text agrees with the API's image_config
+# while the .txt files stay byte-identical (§9.1).
+STAGE1_AR_ANCHOR = "16:9 aspect ratio"
 
 
 @dataclass
@@ -86,6 +112,20 @@ def _apply(text: str, token: str, default: str, value: str | None,
         return text
     diffs.append(Diff(token=token, find=default, replace=value, count=count))
     return text.replace(default, value)
+
+
+def substitute_stage1(template: str, aspect_ratio: str = DEFAULT_AR) -> Substitution:
+    """Swap the Stage-1 prompt's hard-coded "16:9 aspect ratio" for the selected
+    AR. A no-op when the user actually picked 16:9 (so 16:9 stays byte-identical
+    to the canonical prompt)."""
+    diffs: list[Diff] = []
+    warnings: list[str] = []
+    if ASPECT_RATIOS.get(aspect_ratio) is None:
+        warnings.append(f"unknown aspect ratio '{aspect_ratio}' — using {DEFAULT_AR}")
+        aspect_ratio = DEFAULT_AR
+    t = _apply(template, "ASPECT_RATIO", STAGE1_AR_ANCHOR,
+               f"{aspect_ratio} aspect ratio", diffs, warnings)
+    return Substitution(text=t, diffs=diffs, warnings=warnings)
 
 
 def substitute_stage2(
@@ -138,28 +178,32 @@ def substitute_stage3(
     subtext1: str | None = None,
     subtext2: str | None = None,
     cta: str | None = None,
-    font: str | None = None,
-    text_placement: str | None = None,
-    cta_placement: str | None = None,
+    styles: dict | None = None,
 ) -> Substitution:
-    """Apply the §6.1 font token, §6.3 content tokens and the placement tokens to
-    the Stage-3 prompt. ``text_placement`` / ``cta_placement`` are the resolved
-    descriptive phrases (not the UI keys)."""
+    """Apply the §6.3 content tokens and the per-element style markers to the
+    Stage-3 prompt.
+
+    ``styles`` maps each element key (headline/highlight/subtext1/subtext2/cta)
+    to a dict of already-resolved descriptive values:
+    ``{"font": "Causten Bold", "color": "<phrase>", "placement": "<phrase>"}``.
+    Only the keys present for that element in ``STAGE3_STYLE_ANCHORS`` are
+    substituted. With ``styles=None`` (and no content) the prompt is returned
+    byte-identical, so the canonical file's integrity is preserved (§9.1)."""
     diffs: list[Diff] = []
     warnings: list[str] = []
     t = template
-    # Font is locked to the Causten family: the immutable prompt carries the
-    # FONT_ANCHOR literal, which we always replace with the selected Causten
-    # variant (the default is itself a Causten variant, so this is never a no-op).
-    t = _apply(t, "FONT", FONT_ANCHOR, font, diffs, warnings)
     # Full headline first (unique), then the remaining standalone highlight refs.
     t = _apply(t, "HEADLINE", DEFAULT_HEADLINE, headline, diffs, warnings)
     t = _apply(t, "SUBTEXT_LINE_1", DEFAULT_SUBTEXT_1, subtext1, diffs, warnings)
     t = _apply(t, "SUBTEXT_LINE_2", DEFAULT_SUBTEXT_2, subtext2, diffs, warnings)
     t = _apply(t, "CTA_TEXT", DEFAULT_CTA, cta, diffs, warnings)
     t = _apply(t, "HIGHLIGHT_PHRASE", DEFAULT_HIGHLIGHT, highlight, diffs, warnings)
-    t = _apply(t, "TEXT_PLACEMENT", TEXT_PLACEMENT_ANCHOR, text_placement, diffs, warnings)
-    t = _apply(t, "CTA_PLACEMENT", CTA_PLACEMENT_ANCHOR, cta_placement, diffs, warnings)
+
+    styles = styles or {}
+    for element, anchors in STAGE3_STYLE_ANCHORS.items():
+        s = styles.get(element) or {}
+        for attr, anchor in anchors.items():
+            t = _apply(t, f"{element}.{attr}", anchor, s.get(attr), diffs, warnings)
     return Substitution(text=t, diffs=diffs, warnings=warnings)
 
 

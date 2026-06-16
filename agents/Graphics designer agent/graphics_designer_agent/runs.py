@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .compositor import default_logo_layout
 from .tokens import (
     DEFAULT_AR,
     DEFAULT_CTA,
@@ -24,6 +25,7 @@ from .tokens import (
     DEFAULT_SUBTEXT_1,
     DEFAULT_SUBTEXT_2,
     DEFAULT_TEXT_PLACEMENT,
+    default_element_styles,
 )
 
 RUNS_ROOT = Path(os.environ.get("GD_RUNS_DIR") or (Path(__file__).resolve().parents[1] / "runs"))
@@ -53,6 +55,12 @@ def create_run(user_id: str, brand_id: str | None = None) -> dict:
             "aspect_ratio": DEFAULT_AR,
             "text_placement": DEFAULT_TEXT_PLACEMENT,
             "cta_placement": DEFAULT_CTA_PLACEMENT,
+            # Per-element Stage-3 styling (font + colour + placement per element).
+            # Supersedes the legacy single font/text_placement/cta_placement above,
+            # which are kept only as fallbacks for runs created before this field.
+            "element_styles": default_element_styles(),
+            # Stage-4 logo placement controls (deterministic compositor).
+            "logo_layout": default_logo_layout(),
             "use_ai_compositor": False,
             "tokens": {
                 "headline": DEFAULT_HEADLINE,
