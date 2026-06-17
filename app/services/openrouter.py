@@ -14,6 +14,7 @@ import httpx
 from langchain_openai import ChatOpenAI
 
 from app.config import settings
+from app.services import runtime_config
 
 
 def _default_headers() -> dict[str, str]:
@@ -28,10 +29,14 @@ def get_llm(temperature: float = 0.4, *, fast: bool = False) -> ChatOpenAI:
     reasoning model that pieces the creative together (persona, art direction,
     master prompt).
     """
-    model = settings.openrouter_fast_model if fast else settings.openrouter_model
+    model = (
+        runtime_config.get("openrouter_fast_model")
+        if fast
+        else runtime_config.get("openrouter_model")
+    )
     return ChatOpenAI(
         model=model,
-        api_key=settings.require("openrouter_api_key"),
+        api_key=runtime_config.require("openrouter_api_key"),
         base_url=settings.openrouter_base_url,
         default_headers=_default_headers(),
         temperature=temperature,
@@ -67,12 +72,12 @@ def vision_extract_text(image_bytes: bytes, mime_type: str) -> str:
     Returns extracted text plus a short description of key visual content, used
     to enrich the user's creative brief (Workflow C).
     """
-    api_key = settings.require("openrouter_api_key")
+    api_key = runtime_config.require("openrouter_api_key")
     url = f"{settings.openrouter_base_url}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", **_default_headers()}
     data_url = f"data:{mime_type or 'image/png'};base64,{base64.b64encode(image_bytes).decode()}"
     body = {
-        "model": settings.openrouter_vision_model,
+        "model": runtime_config.get("openrouter_vision_model"),
         "messages": [
             {
                 "role": "user",
@@ -125,7 +130,7 @@ def analyze_images(
     imagery. Defaults to the reasoning model (multimodal); callers may pass
     `settings.openrouter_vision_model` as a cheaper fallback.
     """
-    api_key = settings.require("openrouter_api_key")
+    api_key = runtime_config.require("openrouter_api_key")
     url = f"{settings.openrouter_base_url}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", **_default_headers()}
 
@@ -137,7 +142,7 @@ def analyze_images(
         content.append({"type": "image_url", "image_url": {"url": data_url}})
 
     body = {
-        "model": model or settings.openrouter_model,
+        "model": model or runtime_config.get("openrouter_model"),
         "messages": [{"role": "user", "content": content}],
     }
     response = httpx.post(url, json=body, headers=headers, timeout=180)
@@ -177,7 +182,7 @@ def generate_image(
     the model only infers the shape from the prompt/reference and emits a
     low-resolution image — the cause of off-aspect, soft "2K-looking" output.
     """
-    api_key = settings.require("openrouter_api_key")
+    api_key = runtime_config.require("openrouter_api_key")
     url = f"{settings.openrouter_base_url}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", **_default_headers()}
 
@@ -190,7 +195,7 @@ def generate_image(
     else:
         messages = [{"role": "user", "content": prompt}]
 
-    image_model = model or settings.openrouter_image_model
+    image_model = model or runtime_config.get("openrouter_image_model")
     body: dict = {
         "model": image_model,
         "messages": messages,

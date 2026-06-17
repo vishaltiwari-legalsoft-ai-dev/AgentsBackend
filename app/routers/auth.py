@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
-from app.security import create_token, is_admin, verify_google_id_token
+from app.security import create_token, is_admin, is_creator, verify_google_id_token
 from app.services import firestore_repo
 
 router = APIRouter()
@@ -30,5 +30,6 @@ def google_login(body: GoogleLogin) -> dict:
             "name": user.get("name", ""),
             "picture": user.get("picture", ""),
             "is_admin": is_admin(user["email"]),
+            "is_creator": is_creator(user["email"]),
         },
     }

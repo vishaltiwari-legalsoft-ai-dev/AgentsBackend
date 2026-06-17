@@ -57,8 +57,14 @@ def verify_google_id_token(credential: str) -> dict[str, str]:
     }
 
 
+def is_creator(email: str) -> bool:
+    """Top-tier role (above Super Admin): may manage secrets/integrations."""
+    return email.lower() in settings.creator_email_set
+
+
 def is_admin(email: str) -> bool:
-    return email.lower() in settings.admin_email_set
+    # Creators are a superset of Super Admins — they keep all admin access.
+    return email.lower() in settings.admin_email_set or is_creator(email)
 
 
 def create_token(user_id: str, email: str) -> str:
@@ -67,6 +73,7 @@ def create_token(user_id: str, email: str) -> str:
         "sub": user_id,
         "email": email,
         "admin": is_admin(email),
+        "creator": is_creator(email),
         "iat": now,
         "exp": now + settings.jwt_expires_minutes * 60,
     }
@@ -92,6 +99,7 @@ def get_current_user(
         "id": payload["sub"],
         "email": payload["email"],
         "is_admin": bool(payload.get("admin", False)),
+        "is_creator": bool(payload.get("creator", False)),
     }
 
 
@@ -100,4 +108,15 @@ def require_admin(
 ) -> dict[str, object]:
     if not user.get("is_admin"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
+    return user
+
+
+def require_creator(
+    user: dict[str, object] = Depends(get_current_user),
+) -> dict[str, object]:
+    """Creator-only guard — for managing secrets/integrations."""
+    if not user.get("is_creator"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Creator only"
+        )
     return user

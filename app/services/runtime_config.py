@@ -1,0 +1,55 @@
+"""Effective runtime configuration: admin overrides layered over the environment.
+
+Most config comes from environment variables (``app.config.settings``). A small
+set of sensitive, frequently-changed fields — the OpenRouter API key and the
+model ids — may instead be set by the Super Admin from the UI and stored in
+Firestore (``app_config/global``). This module returns the *effective* value:
+the Firestore override when set, otherwise the environment value.
+
+Consumers (``app.services.openrouter`` and the Graphics-Designer image provider)
+read through here instead of ``settings`` directly, so an admin-set key takes
+effect with no redeploy — while a missing Firestore (e.g. local dev offline)
+transparently falls back to ``.env``.
+"""
+
+from __future__ import annotations
+
+from app.config import settings
+from app.services import firestore_repo
+
+# The only fields an admin may override at runtime (must exist on ``settings``).
+OVERRIDE_FIELDS: tuple[str, ...] = (
+    "openrouter_api_key",
+    "openrouter_model",
+    "openrouter_fast_model",
+    "openrouter_image_model",
+    "openrouter_vision_model",
+)
+
+
+def _overrides() -> dict:
+    try:
+        return firestore_repo.get_app_config() or {}
+    except Exception:
+        return {}
+
+
+def get(field: str) -> str:
+    """Effective value for ``field``: a non-empty Firestore override wins,
+    otherwise the environment/``settings`` value. Always returns a string."""
+    if field in OVERRIDE_FIELDS:
+        value = _overrides().get(field)
+        if value:  # empty/missing override → fall through to env
+            return str(value)
+    return str(getattr(settings, field, "") or "")
+
+
+def require(field: str) -> str:
+    """Like :func:`get`, but raise a clear error if the value is empty."""
+    value = get(field)
+    if not value:
+        raise RuntimeError(
+            f'Missing required configuration "{field}". A Super Admin can set it '
+            f"in Settings → Secrets, or it can be provided via the environment."
+        )
+    return value

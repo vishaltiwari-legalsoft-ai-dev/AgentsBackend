@@ -12,6 +12,16 @@ from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Project owners — always granted the top-tier Creator role (Super Admin + the
+# ability to manage secrets/integrations from the UI), regardless of any env
+# config. These are the people who built and own the panel/project.
+CREATOR_EMAILS_DEFAULT: frozenset[str] = frozenset(
+    {
+        "vishal.tiwari@legalsoft.com",
+        "vishaltiwari230996@gmail.com",
+    }
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -32,6 +42,10 @@ class Settings(BaseSettings):
     google_client_id: str = ""
     # Comma-separated emails granted Super Admin (analytics + user directory).
     admin_emails: str = ""
+    # Comma-separated emails granted the Creator role (Super Admin + secrets /
+    # integration management). The CREATOR_EMAILS_DEFAULT owners are always
+    # Creators even when this is empty.
+    creator_emails: str = ""
 
     # OpenRouter (agent LLM + image generation)
     openrouter_api_key: str = ""
@@ -86,6 +100,11 @@ class Settings(BaseSettings):
     @property
     def admin_email_set(self) -> set[str]:
         return {e.strip().lower() for e in self.admin_emails.split(",") if e.strip()}
+
+    @property
+    def creator_email_set(self) -> set[str]:
+        env = {e.strip().lower() for e in self.creator_emails.split(",") if e.strip()}
+        return set(CREATOR_EMAILS_DEFAULT) | env
 
     def require(self, field: str) -> str:
         """Return a config value, raising a descriptive error if it is empty."""

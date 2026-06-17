@@ -380,3 +380,45 @@ def log_creative_event(
 def list_creative_events(limit: int = 5000) -> list[dict[str, Any]]:
     docs = _db().collection("creative_events").limit(limit).stream()
     return [doc.to_dict() for doc in docs]
+
+
+# --------------------------------------------------------------------------- #
+# App config (admin-editable runtime settings — single document)
+# --------------------------------------------------------------------------- #
+# A single ``app_config/global`` doc holds admin-set overrides for sensitive
+# runtime config (the OpenRouter key + model ids). It lets the Super Admin manage
+# these from the UI instead of Cloud Run env vars. Read through a short cache so
+# the hot path (every LLM/image call) doesn't hit Firestore each time; writes
+# invalidate it. Firestore failures fall back to {} so the app still boots off
+# the environment.
+
+_APP_CONFIG_TTL_SECONDS = 30.0
+_app_config_cache: tuple[float, dict[str, Any]] | None = None
+
+
+def get_app_config(*, use_cache: bool = True) -> dict[str, Any]:
+    global _app_config_cache
+    if (
+        use_cache
+        and _app_config_cache
+        and (time.monotonic() - _app_config_cache[0]) < _APP_CONFIG_TTL_SECONDS
+    ):
+        return _app_config_cache[1]
+    try:
+        doc = _db().collection("app_config").document("global").get()
+        data = doc.to_dict() if doc.exists else {}
+    except Exception:  # Firestore unavailable/unconfigured — fall back to env.
+        data = {}
+    data = data or {}
+    _app_config_cache = (time.monotonic(), data)
+    return data
+
+
+def set_app_config(patch: dict[str, Any]) -> dict[str, Any]:
+    """Merge a patch into the global app-config doc and return the fresh state."""
+    global _app_config_cache
+    _db().collection("app_config").document("global").set(
+        {**patch, "updated_at": _now()}, merge=True
+    )
+    _app_config_cache = None
+    return get_app_config(use_cache=False)

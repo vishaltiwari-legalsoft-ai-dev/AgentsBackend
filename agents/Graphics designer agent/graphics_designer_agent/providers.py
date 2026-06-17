@@ -156,17 +156,19 @@ class OpenRouterProvider:
 
 
 def _openrouter_key_configured() -> bool:
-    """True if an OpenRouter key is available via env OR the app's settings.
+    """True if an OpenRouter key is available via env, the app's settings, OR an
+    admin-set override in Firestore.
 
     pydantic-settings loads ``.env`` into the settings object, not ``os.environ``,
-    so we must consult ``app.config`` to honour a key set there.
+    and the Super Admin may set the key from the UI (stored in Firestore), so we
+    consult ``runtime_config`` which layers the override over the environment.
     """
     if os.environ.get("OPENROUTER_API_KEY"):
         return True
     try:
-        from app.config import settings
+        from app.services import runtime_config
 
-        return bool(getattr(settings, "openrouter_api_key", ""))
+        return bool(runtime_config.get("openrouter_api_key"))
     except Exception:
         return False
 
