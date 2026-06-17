@@ -7,7 +7,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import asdict
 
-from . import variants
+from . import text_overlay, variants
 from .compositor import composite_logo, logo_placement
 from .prompts import load_prompt
 from .providers import ImageProvider, get_provider
@@ -22,11 +22,11 @@ from .runs import (
 from .tokens import (
     ASPECT_RATIOS,
     DEFAULT_AR,
+    DEFAULT_CTA_PLACEMENT,
     DEFAULT_FONT,
-    default_element_styles,
+    DEFAULT_TEXT_PLACEMENT,
     substitute_stage1,
     substitute_stage2,
-    substitute_stage3,
 )
 
 # Resolution requested from the image model per stage (OpenRouter image_config
@@ -51,27 +51,56 @@ def _stage_ar(run: dict) -> str:
     return ar if ar in ASPECT_RATIOS else DEFAULT_AR
 
 
-def _resolve_stage3_styles(cfg: dict) -> dict:
-    """Turn the run's per-element style keys into the resolved descriptive
-    phrases the Stage-3 prompt expects. Falls back to the factory defaults (and,
-    for older runs without ``element_styles``, the legacy single ``font``) so the
-    prompt never ends up with an unsubstituted marker."""
-    raw = cfg.get("element_styles") or {}
-    legacy_font = cfg.get("font") or DEFAULT_FONT
-    resolved: dict = {}
-    for element, default in default_element_styles().items():
-        s = {**default, **(raw.get(element) or {})}
-        out = {"font": s.get("font") or legacy_font}
-        if "color" in default:
-            out["color"] = variants.text_color_phrase(s.get("color", default["color"]))
-        if "placement" in default:
-            key = s.get("placement", default["placement"])
-            out["placement"] = (
-                variants.cta_placement_phrase(key) if element == "cta"
-                else variants.text_placement_phrase(key)
-            )
-        resolved[element] = out
-    return resolved
+def _resolve_overlay_spec(run: dict) -> dict:
+    """Build the deterministic Stage-3 renderer spec from the run config.
+
+    Resolves the headline (+ inline highlight), the dynamic sub-heading list and
+    the CTA into the shape ``text_overlay.render_overlay`` expects. Tolerant of
+    older runs that still carry the legacy ``subtext1``/``subtext2`` tokens."""
+    cfg = run["config"]
+    tk = cfg.get("tokens") or {}
+    styles = cfg.get("element_styles") or {}
+    base_font = cfg.get("font") or DEFAULT_FONT
+    sizes = variants.DEFAULT_TEXT_SIZE_PCT
+
+    def off(s: dict) -> tuple[int, int]:
+        return (int(s.get("offset_x", 0) or 0), int(s.get("offset_y", 0) or 0))
+
+    hs = styles.get("headline") or {}
+    his = styles.get("highlight") or {}
+    cs = styles.get("cta") or {}
+
+    headline = {
+        "text": tk.get("headline", ""), "highlight": tk.get("highlight", ""),
+        "font": hs.get("font") or base_font,
+        "size_pct": float(hs.get("size_pct", sizes["headline"])),
+        "color": hs.get("color", "dark"),
+        "highlight_color": his.get("color", "gradient"),
+        "placement": hs.get("placement", DEFAULT_TEXT_PLACEMENT),
+        "offset": off(hs),
+    }
+
+    raw_subs = cfg.get("subheadings")
+    if raw_subs is None:  # legacy run — fall back to the old two subtext tokens
+        raw_subs = [{"text": tk.get("subtext1", "")}, {"text": tk.get("subtext2", "")}]
+    subheadings = [
+        {
+            "text": s["text"], "font": s.get("font") or base_font,
+            "size_pct": float(s.get("size_pct", sizes["subheading"])),
+            "color": s.get("color", "dark"),
+            "placement": s.get("placement", DEFAULT_TEXT_PLACEMENT),
+            "offset": off(s),
+        }
+        for s in raw_subs if (s.get("text") or "").strip()
+    ]
+
+    cta = {
+        "text": tk.get("cta", ""), "font": cs.get("font") or base_font,
+        "size_pct": float(cs.get("size_pct", sizes["cta"])),
+        "placement": cs.get("placement", DEFAULT_CTA_PLACEMENT),
+        "offset": off(cs),
+    }
+    return {"headline": headline, "subheadings": subheadings, "cta": cta}
 
 
 def _stage_dims(run: dict, stage: int) -> tuple[int, int]:
@@ -105,25 +134,36 @@ def build_prompt(run: dict, stage: int, variant: str) -> dict:
     negative: str | None = None
 
     if stage == 1:
-        sub = substitute_stage1(
-            load_prompt(variants.stage1_variant(variant)["prompt_file"]), ar
-        )
+        if variant.upper() == "AI":
+            # Temporary AI gradient — its prompt lives on the run config only (never
+            # in prompts/ or CANONICAL_SHA256). It still flows through the same AR
+            # substitution as the canonical variants.
+            custom = cfg.get("custom_gradient") or {}
+            template = custom.get("prompt")
+            if not template:
+                raise PipelineError("Generate an AI gradient first.")
+        else:
+            template = load_prompt(variants.stage1_variant(variant)["prompt_file"])
+        sub = substitute_stage1(template, ar)
         text, diffs, warnings = sub.text, sub.diffs, list(sub.warnings)
     elif stage == 2:
-        v = variants.stage2_variant(variant)
+        if variant.upper() == "AI":
+            # Temporary AI element — its subject lives on the run config only (never
+            # added to STAGE2_VARIANTS). It blends through the same shared prompt.
+            custom = cfg.get("custom_element") or {}
+            subject = custom.get("subject")
+            if not subject:
+                raise PipelineError("Generate an AI element first.")
+        else:
+            subject = variants.stage2_variant(variant)["subject"]
         sub = substitute_stage2(
-            load_prompt(variants.STAGE2_BLEND_PROMPT), variant, ar, subject=v["subject"]
+            load_prompt(variants.STAGE2_BLEND_PROMPT), variant, ar, subject=subject
         )
         text, diffs, warnings = sub.text, sub.diffs, list(sub.warnings)
     elif stage == 3:
-        tk = cfg["tokens"]
-        sub = substitute_stage3(
-            load_prompt("stage3_text_overlay.txt"),
-            headline=tk["headline"], highlight=tk["highlight"],
-            subtext1=tk["subtext1"], subtext2=tk["subtext2"], cta=tk["cta"],
-            styles=_resolve_stage3_styles(cfg),
-        )
-        text, diffs, warnings = sub.text, sub.diffs, list(sub.warnings)
+        # Stage 3 is rendered deterministically (text_overlay), not by the model,
+        # so the "prompt" shown in the audit panel is a readable layout summary.
+        text = text_overlay.overlay_spec_summary(_resolve_overlay_spec(run))
     elif stage == 4:
         text = load_prompt("stage4_logo_composite.txt")
     else:
@@ -137,11 +177,45 @@ def build_prompt(run: dict, stage: int, variant: str) -> dict:
     }
 
 
+def _generate_stage3(run: dict) -> dict:
+    """Render the Stage-3 text overlay deterministically onto the approved Stage-2
+    image (no model call) — exact sizes, positions, colours; base pixels intact."""
+    base = _approved_png(run, 2)
+    if base is None:
+        raise PipelineError("Stage 3 requires the approved Stage 2 image.")
+    spec = _resolve_overlay_spec(run)
+    w, h = _stage_dims(run, 3)
+    png = text_overlay.render_overlay(base, spec, w, h)
+    summary = text_overlay.overlay_spec_summary(spec)
+    attempt_no = len(run["stages"]["3"]["attempts"]) + 1
+    rel = save_artifact(run["id"], 3, "T", attempt_no, png)
+    attempt = {
+        "attempt": attempt_no,
+        "variant": "T",
+        "artifact": rel,
+        "prompt": summary,
+        "prompt_hash": _sha(summary),
+        "diffs": [],
+        "warnings": [],
+        "provider": "deterministic",
+        "created_at": now_iso(),
+    }
+    st = run["stages"]["3"]
+    st["attempts"].append(attempt)
+    st["variant"] = "T"
+    run["state"] = STATE_FOR_STAGE_REVIEW[3]
+    save_run(run)
+    return attempt
+
+
 def generate(run: dict, stage: int, variant: str | None = None,
              provider: ImageProvider | None = None) -> dict:
     """Generate an attempt for stage 1–3; chains the approved upstream image."""
     if stage == 4:
         raise PipelineError("Use generate_stage4 for the logo stage.")
+    if stage == 3:
+        # Deterministic text overlay — no image model, no upstream prompt.
+        return _generate_stage3(run)
     provider = provider or get_provider()
     key = str(stage)
 

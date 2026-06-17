@@ -6,7 +6,14 @@ to render the studio UI. Prompt content lives exclusively in ``./prompts``.
 
 from __future__ import annotations
 
-from .tokens import ASPECT_RATIOS, DEFAULT_FONT
+from .tokens import (
+    ASPECT_RATIOS,
+    DEFAULT_CTA_PLACEMENT,
+    DEFAULT_FONT,
+    DEFAULT_SUBTEXT_1,
+    DEFAULT_SUBTEXT_2,
+    DEFAULT_TEXT_PLACEMENT,
+)
 
 # ── Locked brand system (spec §2.2 / §2.3) — read-only in the UI ──────────────
 LOCKED_COLORS = {
@@ -395,13 +402,63 @@ def text_color_phrase(key: str) -> str:
 # ``placeable`` elements get a placement bar; ``colorable`` ones get the colour
 # palette. The highlight is inline in the headline (no placement); the CTA keeps
 # its locked orange button (no colour picker).
+# The fixed Stage-3 elements that get their own control bar. Sub-headings are a
+# DYNAMIC list (1–5) handled separately, so they are no longer listed here. The
+# highlight is rendered inline inside the headline, so it follows the headline's
+# size + placement (font + colour only). ``sizable`` elements get a size slider.
 STAGE3_ELEMENTS = [
-    {"key": "headline",  "label": "Heading",       "token": "headline",  "placeable": True,  "colorable": True,  "placement_kind": "text"},
-    {"key": "highlight", "label": "Hook / highlight", "token": "highlight", "placeable": False, "colorable": True,  "placement_kind": "text"},
-    {"key": "subtext1",  "label": "Sub-heading 1", "token": "subtext1",  "placeable": True,  "colorable": True,  "placement_kind": "text"},
-    {"key": "subtext2",  "label": "Sub-heading 2", "token": "subtext2",  "placeable": True,  "colorable": True,  "placement_kind": "text"},
-    {"key": "cta",       "label": "CTA button",    "token": "cta",       "placeable": True,  "colorable": False, "placement_kind": "cta"},
+    {"key": "headline",  "label": "Heading",         "token": "headline",  "placeable": True,  "colorable": True,  "sizable": True,  "placement_kind": "text"},
+    {"key": "highlight", "label": "Hook / highlight", "token": "highlight", "placeable": False, "colorable": True,  "sizable": False, "placement_kind": "text"},
+    {"key": "cta",       "label": "CTA button",      "token": "cta",       "placeable": True,  "colorable": False, "sizable": True,  "placement_kind": "cta"},
 ]
+
+# ── Stage 3 — deterministic renderer bounds (size slider + pixel nudge) ────────
+# Text is rendered deterministically (text_overlay.py) using the real Causten
+# fonts, so size and position are EXACT. Size is a percentage of the canvas WIDTH;
+# the defaults reproduce the previous prompt's ratios (sub-text ≈ 32% of headline,
+# CTA ≈ 38%). Offsets are fine pixel nudges applied after placement anchoring.
+TEXT_SIZE_PCT_MIN = 1.5
+TEXT_SIZE_PCT_MAX = 18.0
+DEFAULT_TEXT_SIZE_PCT = {"headline": 8.0, "subheading": 3.0, "cta": 3.4}
+TEXT_OFFSET_PX_RANGE = 600
+
+# Number of sub-heading lines the user may add (1–5, defaulting to 2).
+SUBHEADING_MIN = 1
+SUBHEADING_MAX = 5
+
+_FONT_FILE = {v["name"]: v["file"] for v in FONT_VARIANTS}
+
+
+def font_file(name: str) -> str:
+    """The Causten .otf filename for a selectable font name (falls back to the
+    default weight if an unknown name slips through)."""
+    return _FONT_FILE.get(name, _FONT_FILE[DEFAULT_FONT])
+
+
+def default_stage3_styles() -> dict:
+    """Factory per-element styling for the deterministic Stage-3 renderer. The
+    headline and CTA carry size + pixel nudge; the highlight is inline (font +
+    colour only). Sub-headings are a separate list (``default_subheadings``)."""
+    return {
+        "headline": {"font": DEFAULT_FONT, "color": "dark",
+                     "size_pct": DEFAULT_TEXT_SIZE_PCT["headline"],
+                     "placement": DEFAULT_TEXT_PLACEMENT, "offset_x": 0, "offset_y": 0},
+        "highlight": {"font": DEFAULT_FONT, "color": "gradient"},
+        "cta": {"font": DEFAULT_FONT, "size_pct": DEFAULT_TEXT_SIZE_PCT["cta"],
+                "placement": DEFAULT_CTA_PLACEMENT, "offset_x": 0, "offset_y": 0},
+    }
+
+
+def _subheading(text: str) -> dict:
+    return {"text": text, "font": DEFAULT_FONT, "color": "dark",
+            "size_pct": DEFAULT_TEXT_SIZE_PCT["subheading"],
+            "placement": DEFAULT_TEXT_PLACEMENT, "offset_x": 0, "offset_y": 0,
+            "approved": False}
+
+
+def default_subheadings() -> list:
+    """The two starter sub-heading lines (the user can add up to 5 or trim to 1)."""
+    return [_subheading(DEFAULT_SUBTEXT_1), _subheading(DEFAULT_SUBTEXT_2)]
 
 
 # ── Stage 4 — logo placement grid (UI) ────────────────────────────────────────

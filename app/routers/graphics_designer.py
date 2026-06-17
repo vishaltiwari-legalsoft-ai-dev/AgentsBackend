@@ -20,12 +20,44 @@ from graphics_designer_agent import pipeline, suggestions, variants
 from graphics_designer_agent.pipeline import PipelineError
 from graphics_designer_agent.prompts import CANONICAL_SHA256, load_prompt, prompt_hash
 from graphics_designer_agent.runs import get_run, log_manifest, save_run
-from graphics_designer_agent.tokens import ASPECT_RATIOS
+from graphics_designer_agent.tokens import ASPECT_RATIOS, DEFAULT_FONT
 
 router = APIRouter()
 logger = logging.getLogger("agentos.gd")
 
-CONTENT_TOKENS = ["headline", "highlight", "subtext1", "subtext2", "cta"]
+# Headline/highlight/CTA text tokens. Sub-heading text lives in the dynamic
+# ``subheadings`` list, each with its own approval, gated separately.
+CONTENT_TOKENS = ["headline", "highlight", "cta"]
+
+
+def _stage3_ready(cfg: dict) -> bool:
+    """True when every Stage-3 content token AND every sub-heading is approved."""
+    if not all(cfg["tokens_approved"].get(t) for t in CONTENT_TOKENS):
+        return False
+    subs = cfg.get("subheadings") or []
+    return bool(subs) and all(s.get("approved") for s in subs)
+
+
+def _valid_size_pct(v) -> float:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "size_pct must be a number")
+    if not variants.TEXT_SIZE_PCT_MIN <= v <= variants.TEXT_SIZE_PCT_MAX:
+        raise HTTPException(
+            400, f"size_pct must be between {variants.TEXT_SIZE_PCT_MIN} and "
+            f"{variants.TEXT_SIZE_PCT_MAX}")
+    return round(v, 2)
+
+
+def _valid_offset(v, axis: str) -> int:
+    try:
+        v = int(round(float(v)))
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"{axis} must be an integer")
+    if abs(v) > variants.TEXT_OFFSET_PX_RANGE:
+        raise HTTPException(400, f"{axis} out of range")
+    return v
 
 
 # ── serialization ─────────────────────────────────────────────────────────────
@@ -45,7 +77,7 @@ def _to_client(run: dict) -> dict:
             approved = {**approved, "url": _artifact_url(run["id"], approved["artifact"])}
         stages[n] = {**st, "attempts": attempts, "approved": approved}
     out["stages"] = stages
-    out["tokens_ready"] = all(run["config"]["tokens_approved"].get(t) for t in CONTENT_TOKENS)
+    out["tokens_ready"] = _stage3_ready(run["config"])
     return out
 
 
@@ -101,7 +133,111 @@ def _apply_element_styles(cfg: dict, incoming: dict) -> None:
             if patch["placement"] not in allowed:
                 raise HTTPException(400, f"Unknown placement '{patch['placement']}' for '{key}'")
             cur["placement"] = patch["placement"]
+        if "size_pct" in patch:
+            if not meta.get("sizable"):
+                raise HTTPException(400, f"Element '{key}' has no size control.")
+            cur["size_pct"] = _valid_size_pct(patch["size_pct"])
+        for axis in ("offset_x", "offset_y"):
+            if axis in patch:
+                if not meta["placeable"]:
+                    raise HTTPException(400, f"Element '{key}' has no position nudge.")
+                cur[axis] = _valid_offset(patch[axis], axis)
         styles[key] = cur
+
+
+def _apply_subheadings(cfg: dict, incoming: list) -> None:
+    """Validate + replace the full Stage-3 sub-heading list (1–5 lines). Each line
+    carries its own text, font (Causten family), colour, size %, placement and
+    pixel nudge so the deterministic renderer can place it exactly."""
+    if not isinstance(incoming, list):
+        raise HTTPException(400, "subheadings must be a list")
+    if not variants.SUBHEADING_MIN <= len(incoming) <= variants.SUBHEADING_MAX:
+        raise HTTPException(
+            400, f"Sub-headings must number {variants.SUBHEADING_MIN}–"
+            f"{variants.SUBHEADING_MAX}.")
+    text_places = {p["key"] for p in variants.TEXT_PLACEMENTS}
+    color_keys = set(variants.TEXT_COLOR_KEYS)
+    out: list[dict] = []
+    for item in incoming:
+        if not isinstance(item, dict):
+            raise HTTPException(400, "Each sub-heading must be an object")
+        text = str(item.get("text", "")).strip()
+        if len(text) > 120:
+            raise HTTPException(400, "Sub-heading must be ≤ 120 characters.")
+        font = item.get("font") or DEFAULT_FONT
+        if font not in variants.FONTS:
+            raise HTTPException(
+                400, f"Font is locked to the {variants.FONT_FAMILY} family; "
+                f"'{font}' is not allowed.")
+        color = item.get("color", "dark")
+        if color not in color_keys:
+            raise HTTPException(400, f"Unknown text colour '{color}'")
+        placement = item.get("placement", "left")
+        if placement not in text_places:
+            raise HTTPException(400, f"Unknown placement '{placement}'")
+        out.append({
+            "text": text,
+            "font": font,
+            "color": color,
+            "size_pct": _valid_size_pct(item.get("size_pct", variants.DEFAULT_TEXT_SIZE_PCT["subheading"])),
+            "placement": placement,
+            "offset_x": _valid_offset(item.get("offset_x", 0), "offset_x"),
+            "offset_y": _valid_offset(item.get("offset_y", 0), "offset_y"),
+            "approved": bool(item.get("approved", False)),
+        })
+    cfg["subheadings"] = out
+
+
+_CUSTOM_GRADIENT_KEYS = ("id", "cid", "title", "desc", "prompt", "css_gradient", "source")
+
+
+def _apply_custom_gradient(cfg: dict, patch: dict | None) -> None:
+    """Validate + store (or clear) the per-creative temporary AI gradient.
+
+    Passing ``None`` / ``{}`` clears it. Otherwise the prompt is validated with
+    the same brand/anchor rules the suggestion layer uses, only whitelisted keys
+    are kept, and the variant id is pinned to ``"AI"``. The gradient is stored on
+    the run config ONLY — never written to ``prompts/`` or the canonical baseline.
+    """
+    if not patch:
+        cfg["custom_gradient"] = None
+        return
+    if not isinstance(patch, dict):
+        raise HTTPException(400, "custom_gradient must be an object")
+    prompt = str(patch.get("prompt") or "")
+    errors = suggestions._validate_gradient_prompt(prompt)
+    if errors:
+        raise HTTPException(400, "Invalid AI gradient: " + "; ".join(errors))
+    stored = {k: patch[k] for k in _CUSTOM_GRADIENT_KEYS if k in patch}
+    stored["id"] = "AI"
+    stored["prompt"] = prompt
+    cfg["custom_gradient"] = stored
+
+
+_CUSTOM_ELEMENT_KEYS = ("id", "cid", "title", "desc", "category", "subject", "source")
+
+
+def _apply_custom_element(cfg: dict, patch: dict | None) -> None:
+    """Validate + store (or clear) the per-creative temporary AI element.
+
+    Passing ``None`` / ``{}`` clears it. Otherwise the subject is validated with the
+    same foreground-only rules the suggestion layer uses (no colours / background),
+    only whitelisted keys are kept, and the variant id is pinned to ``"AI"``. Stored
+    on the run config ONLY — never added to STAGE2_VARIANTS.
+    """
+    if not patch:
+        cfg["custom_element"] = None
+        return
+    if not isinstance(patch, dict):
+        raise HTTPException(400, "custom_element must be an object")
+    subject = str(patch.get("subject") or "")
+    errors = suggestions._validate_element_subject(subject)
+    if errors:
+        raise HTTPException(400, "Invalid AI element: " + "; ".join(errors))
+    stored = {k: patch[k] for k in _CUSTOM_ELEMENT_KEYS if k in patch}
+    stored["id"] = "AI"
+    stored["subject"] = subject
+    cfg["custom_element"] = stored
 
 
 def _apply_logo_layout(cfg: dict, patch: dict) -> None:
@@ -158,6 +294,12 @@ def gd_config(_user: dict = Depends(get_current_user)) -> dict:
         "cta_placements": variants.CTA_PLACEMENTS,
         "text_colors": variants.TEXT_COLORS,
         "stage3_elements": variants.STAGE3_ELEMENTS,
+        "text_size_pct_min": variants.TEXT_SIZE_PCT_MIN,
+        "text_size_pct_max": variants.TEXT_SIZE_PCT_MAX,
+        "default_text_size_pct": variants.DEFAULT_TEXT_SIZE_PCT,
+        "text_offset_px_range": variants.TEXT_OFFSET_PX_RANGE,
+        "subheading_min": variants.SUBHEADING_MIN,
+        "subheading_max": variants.SUBHEADING_MAX,
         "logo_positions": variants.LOGO_POSITIONS,
         "logo_size_pct_min": variants.LOGO_SIZE_PCT_MIN,
         "logo_size_pct_max": variants.LOGO_SIZE_PCT_MAX,
@@ -207,10 +349,16 @@ class ConfigBody(BaseModel):
     aspect_ratio: str | None = None
     text_placement: str | None = None
     cta_placement: str | None = None
-    # Per-element Stage-3 styling: element key -> {font?, color?, placement?}.
+    # Per-element Stage-3 styling: element key -> {font?, color?, placement?, size_pct?, offset_x?, offset_y?}.
     element_styles: dict[str, dict] | None = None
+    # Stage-3 sub-heading lines (1–5). Full-list replace.
+    subheadings: list[dict] | None = None
     # Stage-4 logo placement: {position?, size_pct?, margin_pct?, offset_x?, offset_y?}.
     logo_layout: dict | None = None
+    # Per-creative temporary AI gradient (Stage 1). Explicit null clears it.
+    custom_gradient: dict | None = None
+    # Per-creative temporary AI element (Stage 2). Explicit null clears it.
+    custom_element: dict | None = None
     use_ai_compositor: bool | None = None
     tokens: dict[str, str] | None = None
     # token -> {approved: bool, source: "user"|"agent", original_suggestion?: str}
@@ -255,8 +403,16 @@ def update_config(run_id: str, body: ConfigBody, user: dict = Depends(get_curren
         cfg["cta_placement"] = body.cta_placement
     if body.element_styles is not None:
         _apply_element_styles(cfg, body.element_styles)
+    if body.subheadings is not None:
+        _apply_subheadings(cfg, body.subheadings)
     if body.logo_layout is not None:
         _apply_logo_layout(cfg, body.logo_layout)
+    # Use the field-set so an explicit ``null`` clears the gradient (omission
+    # leaves whatever is already stored untouched).
+    if "custom_gradient" in body.model_fields_set:
+        _apply_custom_gradient(cfg, body.custom_gradient)
+    if "custom_element" in body.model_fields_set:
+        _apply_custom_element(cfg, body.custom_element)
     if body.use_ai_compositor is not None:
         cfg["use_ai_compositor"] = bool(body.use_ai_compositor)
     if body.tokens:
@@ -288,8 +444,8 @@ class GenerateBody(BaseModel):
 @router.post("/gd/runs/{run_id}/generate")
 def generate_endpoint(run_id: str, body: GenerateBody, user: dict = Depends(get_current_user)) -> dict:
     run = _owned_run(run_id, user)
-    if body.stage == 3 and not all(run["config"]["tokens_approved"].get(t) for t in CONTENT_TOKENS):
-        raise HTTPException(409, "Approve all content tokens before generating Stage 3.")
+    if body.stage == 3 and not _stage3_ready(run["config"]):
+        raise HTTPException(409, "Approve the headline, highlight, CTA and every sub-heading before generating Stage 3.")
     attempt = _guard(lambda: pipeline.generate(run, body.stage, variant=body.variant))
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
 
@@ -347,12 +503,13 @@ def prompt_preview(run_id: str, stage: int, variant: str = "A",
 
 # ── suggestions (approval-gated) ──────────────────────────────────────────────
 class SuggestBody(BaseModel):
-    kind: str  # concept | explore | aspect_ratio | hooks | font | qa
+    kind: str  # concept | explore | gradient | element | aspect_ratio | hooks | font | qa
     answers: dict | None = None
     placement: str | None = None
     concept: str | None = None
     stage: int | None = None
-    exclude: list[str] | None = None  # variant ids to skip in 'explore'
+    exclude: list[str] | None = None  # variant ids / gradient cids to skip
+    steer: str | None = None  # optional free-text nudge for 'gradient'
 
 
 @router.post("/gd/runs/{run_id}/suggest")
@@ -362,6 +519,14 @@ def suggest_endpoint(run_id: str, body: SuggestBody, user: dict = Depends(get_cu
         return suggestions.recommend_concept(body.answers or {})
     if body.kind == "explore":
         return suggestions.explore_elements(body.answers or {}, exclude=body.exclude)
+    if body.kind == "gradient":
+        return suggestions.suggest_gradient(
+            body.answers or {}, steer=body.steer, exclude=body.exclude
+        )
+    if body.kind == "element":
+        return suggestions.suggest_element(
+            body.answers or {}, steer=body.steer, exclude=body.exclude
+        )
     if body.kind == "aspect_ratio":
         return suggestions.recommend_aspect_ratio(body.placement)
     if body.kind == "hooks":

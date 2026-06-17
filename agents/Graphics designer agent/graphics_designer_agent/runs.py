@@ -22,11 +22,9 @@ from .tokens import (
     DEFAULT_FONT,
     DEFAULT_HEADLINE,
     DEFAULT_HIGHLIGHT,
-    DEFAULT_SUBTEXT_1,
-    DEFAULT_SUBTEXT_2,
     DEFAULT_TEXT_PLACEMENT,
-    default_element_styles,
 )
+from .variants import default_stage3_styles, default_subheadings
 
 RUNS_ROOT = Path(os.environ.get("GD_RUNS_DIR") or (Path(__file__).resolve().parents[1] / "runs"))
 
@@ -55,21 +53,30 @@ def create_run(user_id: str, brand_id: str | None = None) -> dict:
             "aspect_ratio": DEFAULT_AR,
             "text_placement": DEFAULT_TEXT_PLACEMENT,
             "cta_placement": DEFAULT_CTA_PLACEMENT,
-            # Per-element Stage-3 styling (font + colour + placement per element).
-            # Supersedes the legacy single font/text_placement/cta_placement above,
-            # which are kept only as fallbacks for runs created before this field.
-            "element_styles": default_element_styles(),
+            # Per-element Stage-3 styling for the deterministic renderer: headline +
+            # CTA carry font/colour/size/placement/pixel-nudge; highlight is inline
+            # (font + colour). Sub-headings are the dynamic list below.
+            "element_styles": default_stage3_styles(),
+            # Stage-3 sub-heading lines (1–5). Each carries its own text + styling.
+            "subheadings": default_subheadings(),
             # Stage-4 logo placement controls (deterministic compositor).
             "logo_layout": default_logo_layout(),
             "use_ai_compositor": False,
+            # Per-creative AI gradient (Stage 1). Temporary + non-canonical: an
+            # agent-proposed gradient stored ONLY here, never written to prompts/
+            # or added to CANONICAL_SHA256 / STAGE1_VARIANTS. None until proposed.
+            "custom_gradient": None,
+            # Per-creative AI element (Stage 2). Temporary + non-canonical: an
+            # agent-proposed foreground subject stored ONLY here, never added to
+            # STAGE2_VARIANTS. None until proposed. Selected with variant "AI".
+            "custom_element": None,
+            # Headline/highlight/CTA text. Sub-heading text lives in ``subheadings``.
             "tokens": {
                 "headline": DEFAULT_HEADLINE,
                 "highlight": DEFAULT_HIGHLIGHT,
-                "subtext1": DEFAULT_SUBTEXT_1,
-                "subtext2": DEFAULT_SUBTEXT_2,
                 "cta": DEFAULT_CTA,
             },
-            "tokens_approved": {"headline": False, "highlight": False, "subtext1": False, "subtext2": False, "cta": False},
+            "tokens_approved": {"headline": False, "highlight": False, "cta": False},
         },
         "stages": {str(n): _empty_stage() for n in range(1, 5)},
         "logo": None,
