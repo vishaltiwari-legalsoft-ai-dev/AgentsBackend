@@ -45,6 +45,23 @@ def get_llm(temperature: float = 0.4, *, fast: bool = False) -> ChatOpenAI:
     )
 
 
+# Models known to accept a "4K" image_size. Everything else tops out at 2K —
+# requesting 4K from e.g. an OpenAI image model returns a 400. Keep this
+# permissive (substring match) so new Gemini 3 Pro Image revisions still qualify.
+_FOUR_K_CAPABLE = ("gemini-3-pro-image", "gemini-3-pro")
+
+
+def _clamp_image_size(model: str, size: str | None) -> str | None:
+    """Downgrade an unsupported 4K request to 2K for non-4K-capable models, so
+    an admin-selected image model never fails OpenRouter's image_size validation.
+    """
+    if size and size.upper() == "4K":
+        m = model.lower()
+        if not any(tok in m for tok in _FOUR_K_CAPABLE):
+            return "2K"
+    return size
+
+
 def _image_modalities(model: str) -> list[str]:
     """Correct `modalities` for an OpenRouter image model.
 
@@ -205,8 +222,9 @@ def generate_image(
     image_config: dict[str, str] = {}
     if aspect_ratio:
         image_config["aspect_ratio"] = aspect_ratio
-    if image_size:
-        image_config["image_size"] = image_size
+    size = _clamp_image_size(image_model, image_size)
+    if size:
+        image_config["image_size"] = size
     if image_config:
         body["image_config"] = image_config
 
