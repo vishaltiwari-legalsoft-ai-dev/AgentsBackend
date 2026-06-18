@@ -1,13 +1,14 @@
 import logging
 from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.config import settings
-from app.security import require_admin, require_creator
-from app.services import firestore_repo, runtime_config
+from app.security import get_current_user, require_admin, require_creator
+from app.services import agent_config, firestore_repo, runtime_config
 
 router = APIRouter()
 logger = logging.getLogger("agentos.admin")
@@ -53,6 +54,8 @@ def _settings_payload() -> dict:
         "sources": {
             f: ("override" if overrides.get(f) else "env") for f in _MODEL_FIELDS
         },
+        # Curated model choices so the UI offers dropdowns instead of free text.
+        "catalog": agent_config.MODEL_CATALOG,
     }
 
 
@@ -126,6 +129,207 @@ def test_openrouter_key(_creator: dict = Depends(require_creator)) -> dict:
             "is_free_tier": data.get("is_free_tier"),
         }
     raise HTTPException(400, f"OpenRouter rejected the key (HTTP {resp.status_code}).")
+
+
+# --------------------------------------------------------------------------- #
+# Agent configuration (creator-only): per-agent model overrides.
+# --------------------------------------------------------------------------- #
+
+def _agents_payload() -> dict:
+    """Every agent with its per-agent overrides and the resolved (effective)
+    model for each field, plus the curated catalog the UI offers as dropdowns."""
+    overrides = firestore_repo.get_app_config(use_cache=False)
+    agents_cfg = overrides.get("agents") or {}
+    fields = runtime_config.AGENT_OVERRIDE_FIELDS
+
+    agents = []
+    for agent in agent_config.AGENTS:
+        agent_id = str(agent["id"])
+        saved = agents_cfg.get(agent_id) or {}
+        agents.append(
+            {
+                **agent,
+                # The value explicitly chosen for this agent ("" / missing = inherit global).
+                "overrides": {f: saved.get(f, "") for f in fields},
+                # What this agent will actually use right now (agent → global → env).
+                "effective": {
+                    f: runtime_config.get_for_agent(agent_id, f) for f in fields
+                },
+            }
+        )
+
+    return {
+        "agents": agents,
+        "fields": list(fields),
+        "catalog": agent_config.MODEL_CATALOG,
+        # The platform-wide fallback shown as the "inherit" option per field.
+        "global_defaults": {f: runtime_config.get(f) for f in fields},
+    }
+
+
+class AgentConfigBody(BaseModel):
+    # None = leave untouched; "" = clear the override (fall back to global).
+    openrouter_model: str | None = None
+    openrouter_fast_model: str | None = None
+    openrouter_image_model: str | None = None
+    openrouter_vision_model: str | None = None
+
+
+@router.get("/admin/agents")
+def get_agent_config(_creator: dict = Depends(require_creator)) -> dict:
+    """Creator only: per-agent model configuration + the model catalog."""
+    return _agents_payload()
+
+
+@router.post("/admin/agents/{agent_id}")
+def update_agent_config(
+    agent_id: str,
+    body: AgentConfigBody,
+    _creator: dict = Depends(require_creator),
+) -> dict:
+    """Creator only: save per-agent model overrides for ``agent_id``.
+
+    Only provided fields are written; an empty string clears that override so the
+    agent reverts to the global default. A chosen model must exist in the curated
+    catalog for that field — this prevents typos that silently break generation.
+    """
+    if agent_id not in agent_config.AGENT_IDS:
+        raise HTTPException(404, f"Unknown agent '{agent_id}'.")
+
+    patch: dict[str, str] = {}
+    for field in runtime_config.AGENT_OVERRIDE_FIELDS:
+        value = getattr(body, field)
+        if value is None:
+            continue
+        value = value.strip()
+        if value:
+            allowed = {str(m["id"]) for m in agent_config.MODEL_CATALOG.get(field, [])}
+            if value not in allowed:
+                raise HTTPException(400, f"'{value}' is not an allowed {field}.")
+        patch[field] = value
+
+    if patch:
+        firestore_repo.set_agent_config(agent_id, patch)
+        logger.info(
+            "Creator %s updated agent %s config: %s",
+            _creator.get("email"),
+            agent_id,
+            sorted(patch.keys()),
+        )
+    return _agents_payload()
+
+
+# --------------------------------------------------------------------------- #
+# News banner: a single announcement the creator writes; every signed-in user
+# sees it scroll across the top bar. Stored on the global app-config doc.
+# --------------------------------------------------------------------------- #
+
+class NewsBody(BaseModel):
+    text: str = ""
+
+
+def _news_payload() -> dict:
+    cfg = firestore_repo.get_app_config(use_cache=False)
+    news = cfg.get("news_banner") or {}
+    if isinstance(news, str):  # tolerate a legacy plain-string value
+        news = {"text": news}
+    return {"text": news.get("text", ""), "updated_at": news.get("updated_at", "")}
+
+
+@router.get("/news")
+def get_news(_user: dict = Depends(get_current_user)) -> dict:
+    """Any signed-in user: the current announcement banner (set by the creator)."""
+    return _news_payload()
+
+
+@router.post("/news")
+def update_news(body: NewsBody, _creator: dict = Depends(require_creator)) -> dict:
+    """Creator only: set (or clear, with empty text) the announcement banner."""
+    text = body.text.strip()
+    firestore_repo.set_app_config(
+        {"news_banner": {"text": text, "updated_at": firestore_repo._now()}}
+    )
+    logger.info("Creator %s updated news banner (%d chars)", _creator.get("email"), len(text))
+    return _news_payload()
+
+
+# --------------------------------------------------------------------------- #
+# Usage dashboard (Home): per-agent activity + a daily creatives/sessions graph.
+# Per-user by default; the creator may request scope=all (everyone aggregated).
+# --------------------------------------------------------------------------- #
+
+def _usage_payload(user_id: str | None, days: int) -> dict:
+    days = max(1, min(days, 365))
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=days - 1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    events = firestore_repo.list_usage_events(user_id, start.isoformat())
+
+    agent_sessions: Counter[str] = Counter()   # per-agent tile count
+    agent_creatives: Counter[str] = Counter()  # assets produced per agent
+    day_sessions: Counter[str] = Counter()
+    day_creatives: Counter[str] = Counter()
+    for ev in events:
+        agent_id = ev.get("agent_id") or ev.get("category") or "unknown"
+        day = ev.get("day") or str(ev.get("created_at", ""))[:10]
+        count = int(ev.get("count", 1) or 1)
+        if ev.get("action") == "session":
+            agent_sessions[agent_id] += 1
+            day_sessions[day] += 1
+        else:  # "generate" (or legacy events without an action)
+            agent_creatives[agent_id] += count
+            day_creatives[day] += count
+
+    per_agent = [
+        {
+            "agent_id": str(agent["id"]),
+            "name": agent["name"],
+            "role": agent.get("role", ""),
+            "category": agent.get("category", "design"),
+            "live": bool(agent.get("live")),
+            "sessions": int(agent_sessions.get(str(agent["id"]), 0)),
+            "creatives": int(agent_creatives.get(str(agent["id"]), 0)),
+        }
+        for agent in agent_config.AGENTS
+    ]
+
+    # Continuous day-by-day series so idle days render as zero on the chart.
+    daily = []
+    for i in range(days):
+        d = (start + timedelta(days=i)).strftime("%Y-%m-%d")
+        daily.append(
+            {
+                "day": d,
+                "creatives": int(day_creatives.get(d, 0)),
+                "sessions": int(day_sessions.get(d, 0)),
+            }
+        )
+
+    return {
+        "days": days,
+        "scope": "all" if user_id is None else "me",
+        "per_agent": per_agent,
+        "daily": daily,
+        "totals": {
+            "sessions": int(sum(agent_sessions.values())),
+            "creatives": int(sum(agent_creatives.values())),
+            "active_days": sum(1 for d in daily if d["creatives"] or d["sessions"]),
+        },
+    }
+
+
+@router.get("/usage")
+def get_usage(
+    days: int = 30, scope: str = "me", user: dict = Depends(get_current_user)
+) -> dict:
+    """Home dashboard data. Default = the caller's own activity; ``scope=all``
+    (creator only) aggregates every user's activity together."""
+    if scope == "all":
+        if not user.get("is_creator"):
+            raise HTTPException(403, "The all-users view is available to the creator only.")
+        return _usage_payload(None, days)
+    return _usage_payload(str(user["id"]), days)
 
 
 @router.get("/admin/users")

@@ -14,7 +14,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from app.security import get_current_user
-from app.services import imaging
+from app.services import firestore_repo, imaging
 
 from graphics_designer_agent import pipeline, suggestions, variants
 from graphics_designer_agent.pipeline import PipelineError
@@ -24,6 +24,24 @@ from graphics_designer_agent.tokens import ASPECT_RATIOS, DEFAULT_FONT
 
 router = APIRouter()
 logger = logging.getLogger("agentos.gd")
+
+# The Graphic Designer is agent "a1" in the catalog — the one live agent today.
+# Usage events tag this id so the Home dashboard can break activity down per agent.
+GD_AGENT_ID = "a1"
+GD_AGENT_CATEGORY = "design"
+
+
+def _log_usage(user: dict, action: str, *, count: int = 1, brand: str | None = None) -> None:
+    """Best-effort usage event for the Home dashboard (never breaks the request)."""
+    firestore_repo.log_usage_event(
+        user_id=str(user["id"]),
+        email=str(user.get("email", "")),
+        agent_id=GD_AGENT_ID,
+        category=GD_AGENT_CATEGORY,
+        action=action,
+        count=count,
+        brand=brand,
+    )
 
 # Headline/highlight/CTA text tokens. Sub-heading text lives in the dynamic
 # ``subheadings`` list, each with its own approval, gated separately.
@@ -336,6 +354,7 @@ def create_run_endpoint(body: CreateRunBody = Body(default=CreateRunBody()),
     from graphics_designer_agent.runs import create_run
 
     run = create_run(user_id=str(user["id"]), brand_id=body.brand_id)
+    _log_usage(user, "session", brand=body.brand_id)  # one run = one GD session
     return _to_client(run)
 
 
@@ -447,6 +466,7 @@ def generate_endpoint(run_id: str, body: GenerateBody, user: dict = Depends(get_
     if body.stage == 3 and not _stage3_ready(run["config"]):
         raise HTTPException(409, "Approve the headline, highlight, CTA and every sub-heading before generating Stage 3.")
     attempt = _guard(lambda: pipeline.generate(run, body.stage, variant=body.variant))
+    _log_usage(user, "generate", brand=run.get("brand_id"))  # one creative produced
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
 
 
@@ -465,6 +485,7 @@ async def stage4_endpoint(
     if not png:
         raise HTTPException(415, f"Couldn't read '{logo.filename}' as an image (PNG/JPG/SVG).")
     attempt = _guard(lambda: pipeline.generate_stage4(run, png, use_ai=use_ai))
+    _log_usage(user, "generate", brand=run.get("brand_id"))  # final logo composite
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
 
 

@@ -26,6 +26,18 @@ OVERRIDE_FIELDS: tuple[str, ...] = (
     "openrouter_vision_model",
 )
 
+# Model fields that may additionally be overridden *per agent* in the creator's
+# Agent Configuration panel. The API key is intentionally NOT here — there is a
+# single shared OpenRouter key for the whole platform. Per-agent overrides are
+# stored under ``app_config/global``'s ``agents.{agent_id}`` map and layer on top
+# of the global override, which in turn layers on top of the environment.
+AGENT_OVERRIDE_FIELDS: tuple[str, ...] = (
+    "openrouter_model",
+    "openrouter_fast_model",
+    "openrouter_image_model",
+    "openrouter_vision_model",
+)
+
 
 def _overrides() -> dict:
     try:
@@ -42,6 +54,23 @@ def get(field: str) -> str:
         if value:  # empty/missing override → fall through to env
             return str(value)
     return str(getattr(settings, field, "") or "")
+
+
+def get_for_agent(agent_id: str | None, field: str) -> str:
+    """Effective value for ``field`` as seen by a specific agent.
+
+    Resolution order: a non-empty per-agent override (``agents.{agent_id}.{field}``)
+    wins, otherwise we fall back to :func:`get` (global override → environment).
+    Only :data:`AGENT_OVERRIDE_FIELDS` can be set per agent; anything else (e.g.
+    the shared API key) resolves globally.
+    """
+    if agent_id and field in AGENT_OVERRIDE_FIELDS:
+        agents = _overrides().get("agents") or {}
+        per_agent = agents.get(agent_id) or {}
+        value = per_agent.get(field)
+        if value:
+            return str(value)
+    return get(field)
 
 
 def require(field: str) -> str:

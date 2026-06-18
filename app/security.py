@@ -34,7 +34,7 @@ def verify_google_id_token(credential: str) -> dict[str, str]:
             credential,
             google_requests.Request(),
             client_id,
-            clock_skew_in_seconds=10,  # tolerate minor server/Google clock drift
+            clock_skew_in_seconds=60,  # tolerate minor server/Google clock drift
         )
     except ValueError as exc:
         logger.warning("Google ID token verification failed: %s", exc)

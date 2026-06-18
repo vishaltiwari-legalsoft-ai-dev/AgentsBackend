@@ -36,6 +36,11 @@ from .tokens import (
 # defaults to 1K when this is unset — the cause of the soft, low-res output.
 STAGE_IMAGE_SIZE = {1: "2K", 2: "4K", 3: "4K", 4: "4K"}
 
+# This pipeline IS the Graphic Designer agent ("a1" in the agent catalog). The id
+# lets the provider resolve this agent's per-agent image-model override set by the
+# creator in the Agent Configuration panel, falling back to the global default.
+GD_AGENT_ID = "a1"
+
 
 class PipelineError(Exception):
     """Raised for invalid pipeline transitions (mapped to HTTP 409/400)."""
@@ -216,7 +221,7 @@ def generate(run: dict, stage: int, variant: str | None = None,
     if stage == 3:
         # Deterministic text overlay — no image model, no upstream prompt.
         return _generate_stage3(run)
-    provider = provider or get_provider()
+    provider = provider or get_provider(agent_id=GD_AGENT_ID)
     key = str(stage)
 
     if stage in (1, 2):
@@ -278,7 +283,7 @@ def generate_stage4(run: dict, logo_png: bytes, *, use_ai: bool | None = None,
     layout = run["config"].get("logo_layout") or {}
     logo_rel = save_artifact(run["id"], 4, "logo", attempt_no, logo_png)
     if use_ai:
-        provider = provider or get_provider()
+        provider = provider or get_provider(agent_id=GD_AGENT_ID)
         text = load_prompt("stage4_logo_composite.txt")
         hint = _logo_placement_hint(layout)
         if hint:

@@ -50,6 +50,97 @@ IMAGE_MODELS: list[dict[str, str | bool]] = [
     },
 ]
 
+# Curated text/reasoning + vision model choices for the creator's Agent
+# Configuration panel. These power dropdowns (instead of free-text model ids) so
+# a typo can't silently break generation. Ids are OpenRouter model slugs.
+TEXT_MODELS: list[dict[str, str | bool]] = [
+    {
+        "id": "anthropic/claude-opus-4.6",
+        "name": "Claude Opus 4.6",
+        "provider": "Anthropic",
+        "description": "Top-tier reasoning — best for brand synthesis and art direction.",
+        "recommended": True,
+    },
+    {
+        "id": "anthropic/claude-sonnet-4.5",
+        "name": "Claude Sonnet 4.5",
+        "provider": "Anthropic",
+        "description": "Fast, capable all-rounder. Great default for cheaper tasks.",
+    },
+    {
+        "id": "anthropic/claude-haiku-4.5",
+        "name": "Claude Haiku 4.5",
+        "provider": "Anthropic",
+        "description": "Fastest/cheapest — good for trivial parsing.",
+    },
+    {
+        "id": "openai/gpt-5",
+        "name": "GPT-5",
+        "provider": "OpenAI",
+        "description": "Strong general reasoning model.",
+    },
+    {
+        "id": "google/gemini-3-pro",
+        "name": "Gemini 3 Pro",
+        "provider": "Google",
+        "description": "Long-context reasoning with strong instruction following.",
+    },
+]
+
+VISION_MODELS: list[dict[str, str | bool]] = [
+    {
+        "id": "openai/gpt-4o-mini",
+        "name": "GPT-4o mini",
+        "provider": "OpenAI",
+        "description": "Cheap, fast OCR / image reading.",
+        "recommended": True,
+    },
+    {
+        "id": "openai/gpt-4o",
+        "name": "GPT-4o",
+        "provider": "OpenAI",
+        "description": "Higher-accuracy image understanding.",
+    },
+    {
+        "id": "anthropic/claude-sonnet-4.5",
+        "name": "Claude Sonnet 4.5",
+        "provider": "Anthropic",
+        "description": "Multimodal reading with strong reasoning.",
+    },
+    {
+        "id": "google/gemini-3-pro",
+        "name": "Gemini 3 Pro",
+        "provider": "Google",
+        "description": "Multimodal with long context.",
+    },
+]
+
+# Maps each runtime-config model field to the catalog the UI should offer for it.
+MODEL_CATALOG: dict[str, list[dict[str, str | bool]]] = {
+    "openrouter_image_model": IMAGE_MODELS,
+    "openrouter_model": TEXT_MODELS,
+    "openrouter_fast_model": TEXT_MODELS,
+    "openrouter_vision_model": VISION_MODELS,
+}
+
+# The agents this platform exposes. Mirrors the frontend catalog
+# (newfrontend/lib/console-data.ts). ``live`` marks the agents actually wired to
+# the backend today — only those consume their per-agent model overrides; the
+# rest store config for when they go live. Keep ids in sync with the frontend.
+AGENTS: list[dict[str, str | bool]] = [
+    {"id": "a1", "name": "Graphic Designer", "role": "Brand & visual assets", "category": "design", "live": True},
+    {"id": "a2", "name": "SEO Analyst", "role": "Search & rankings", "category": "seo", "live": False},
+    {"id": "a3", "name": "Copywriter", "role": "Words that convert", "category": "copy", "live": False},
+    {"id": "a4", "name": "Social Scheduler", "role": "Posts & calendars", "category": "social", "live": False},
+    {"id": "a5", "name": "Ads Optimizer", "role": "Paid performance", "category": "ads", "live": False},
+    {"id": "a6", "name": "Market Researcher", "role": "Insights & trends", "category": "data", "live": False},
+    {"id": "a7", "name": "Email Marketer", "role": "Lifecycle & nurture", "category": "copy", "live": False},
+    {"id": "a8", "name": "Brand Strategist", "role": "Positioning & messaging", "category": "design", "live": False},
+]
+
+AGENT_IDS = {str(a["id"]) for a in AGENTS}
+
+
 ABILITIES: list[dict[str, str]] = [
     {
         "id": "generate_creatives",

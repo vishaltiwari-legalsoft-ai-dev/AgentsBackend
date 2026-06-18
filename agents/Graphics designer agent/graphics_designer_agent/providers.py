@@ -173,11 +173,26 @@ def _openrouter_key_configured() -> bool:
         return False
 
 
-def get_provider(name: str | None = None) -> ImageProvider:
+def _agent_image_model(agent_id: str | None) -> str | None:
+    """The image model this agent should use (per-agent override → global → env).
+    Returns None so the OpenRouter layer applies its own global fallback when we
+    can't resolve one (e.g. backend app not importable in standalone tests)."""
+    if not agent_id:
+        return None
+    try:
+        from app.services import runtime_config
+
+        return runtime_config.get_for_agent(agent_id, "openrouter_image_model") or None
+    except Exception:
+        return None
+
+
+def get_provider(name: str | None = None, *, agent_id: str | None = None) -> ImageProvider:
     name = (name or os.environ.get("GD_IMAGE_PROVIDER") or "").strip().lower()
     if name == "mock":
         return MockImageProvider()
+    model = _agent_image_model(agent_id)
     if name == "openrouter":
-        return OpenRouterProvider()
+        return OpenRouterProvider(model=model)
     # Auto: use the real model when a key is configured, otherwise the mock.
-    return OpenRouterProvider() if _openrouter_key_configured() else MockImageProvider()
+    return OpenRouterProvider(model=model) if _openrouter_key_configured() else MockImageProvider()

@@ -358,28 +358,74 @@ def delete_conversation(conv_id: str, user_id: str) -> bool:
 # Analytics (creative request events)
 # --------------------------------------------------------------------------- #
 
-def log_creative_event(
-    user_id: str, email: str, brand: Optional[str], category: str, engine: str
+def log_usage_event(
+    user_id: str,
+    email: str,
+    agent_id: str,
+    category: str,
+    action: str,
+    *,
+    count: int = 1,
+    brand: Optional[str] = None,
+    engine: Optional[str] = None,
 ) -> None:
-    """Record one creative-generation request for month-on-month analytics."""
+    """Record one usage event for the per-user Home dashboard + admin analytics.
+
+    ``action`` is "session" (a run/conversation was started — the per-agent tile
+    count) or "generate" (creatives were produced — ``count`` is how many). One
+    document per event keeps the model flexible; the dashboard reads a per-user,
+    date-windowed slice and aggregates in Python. Logging must never break the
+    request it accompanies, so Firestore errors are swallowed.
+    """
     now = datetime.now(timezone.utc)
     event_id = uuid.uuid4().hex
-    _db().collection("creative_events").document(event_id).set(
-        {
-            "user_id": user_id,
-            "email": email,
-            "brand": brand,
-            "category": category,
-            "engine": engine,
-            "created_at": now.isoformat(),
-            "year_month": now.strftime("%Y-%m"),
-        }
-    )
+    try:
+        _db().collection("creative_events").document(event_id).set(
+            {
+                "user_id": user_id,
+                "email": email,
+                "agent_id": agent_id,
+                "category": category,
+                "action": action,
+                "count": int(count),
+                "brand": brand,
+                "engine": engine,
+                "created_at": now.isoformat(),
+                "day": now.strftime("%Y-%m-%d"),
+                "year_month": now.strftime("%Y-%m"),
+            }
+        )
+    except Exception:  # analytics is best-effort — never fail the user's action
+        pass
 
 
 def list_creative_events(limit: int = 5000) -> list[dict[str, Any]]:
     docs = _db().collection("creative_events").limit(limit).stream()
     return [doc.to_dict() for doc in docs]
+
+
+def list_usage_events(
+    user_id: Optional[str], since_iso: str, limit: int = 10000
+) -> list[dict[str, Any]]:
+    """Usage events at/after ``since_iso``. Pass ``user_id`` for one user's data
+    (the per-user dashboard) or ``None`` for everyone (creator all-users view).
+
+    The ``user_id``-filtered query needs a composite index on
+    ``(user_id ASC, created_at ASC)`` — Firestore prints a one-click link to
+    create it the first time the query runs.
+    """
+    try:
+        col = _db().collection("creative_events")
+        query = col.where(
+            filter=firestore.FieldFilter("created_at", ">=", since_iso)
+        )
+        if user_id is not None:
+            query = col.where(
+                filter=firestore.FieldFilter("user_id", "==", user_id)
+            ).where(filter=firestore.FieldFilter("created_at", ">=", since_iso))
+        return [doc.to_dict() for doc in query.limit(limit).stream()]
+    except Exception:
+        return []
 
 
 # --------------------------------------------------------------------------- #
@@ -422,3 +468,25 @@ def set_app_config(patch: dict[str, Any]) -> dict[str, Any]:
     )
     _app_config_cache = None
     return get_app_config(use_cache=False)
+
+
+def set_agent_config(agent_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+    """Set per-agent model overrides under ``agents.{agent_id}`` and return the
+    fresh global config.
+
+    The merge is done explicitly in Python (read → merge → write the whole
+    ``agents`` map) rather than relying on Firestore's nested-merge semantics, so
+    the behaviour is identical whether or not Firestore is reachable in tests. An
+    empty-string value clears that field's override so it reverts to the global /
+    environment default.
+    """
+    current = get_app_config(use_cache=False)
+    agents: dict[str, Any] = dict(current.get("agents") or {})
+    agent_cfg: dict[str, Any] = dict(agents.get(agent_id) or {})
+    for field, value in patch.items():
+        if value == "" or value is None:
+            agent_cfg.pop(field, None)
+        else:
+            agent_cfg[field] = value
+    agents[agent_id] = agent_cfg
+    return set_app_config({"agents": agents})
