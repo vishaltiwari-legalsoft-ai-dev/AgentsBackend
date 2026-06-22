@@ -111,6 +111,50 @@ def list_creatives_by_brand(brand_id: str, limit: int = 50) -> list[dict[str, An
     return [doc.to_dict() | {"id": doc.id} for doc in docs]
 
 
+_LOGO_IMAGE_EXTS = (".png", ".svg", ".jpg", ".jpeg", ".webp")
+
+
+def find_brand_logo(brand_id: str) -> Optional[dict[str, Any]]:
+    """Best-guess the brand's logo from its ingested creatives (None if unknown).
+
+    Logos aren't explicitly tagged, so rank the human-curated (non-AgentOS) image
+    assets: a "logo" in the file name wins, then SVG, then PNG (usually
+    transparent), then any other image. Returns the creative record (carrying the
+    ``gs://`` ``file_url``) so callers can sign it or download the bytes.
+    """
+    if not brand_id:
+        return None
+    candidates = [
+        c
+        for c in list_creatives_by_brand(brand_id, limit=500)
+        if str(c.get("file_url", "")).startswith("gs://")
+        and (c.get("creative_metadata") or {}).get("author", "") != "AgentOS"
+        and _is_image_asset(c)
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=_logo_score)
+
+
+def _is_image_asset(creative: dict[str, Any]) -> bool:
+    name = (creative.get("file_name") or "").lower()
+    ftype = (creative.get("file_type") or "").lower()
+    return ftype.startswith("image/") or name.endswith(_LOGO_IMAGE_EXTS)
+
+
+def _logo_score(creative: dict[str, Any]) -> int:
+    name = (creative.get("file_name") or "").lower()
+    ftype = (creative.get("file_type") or "").lower()
+    score = 0
+    if "logo" in name:
+        score += 100
+    if name.endswith(".svg") or ftype == "image/svg+xml":
+        score += 20
+    elif name.endswith(".png") or ftype == "image/png":
+        score += 10
+    return score
+
+
 def count_creatives_by_brand(brand_id: str) -> int:
     """Return the real total of creatives for a brand (no limit)."""
     query = (

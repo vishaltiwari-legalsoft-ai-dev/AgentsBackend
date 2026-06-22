@@ -14,13 +14,12 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from app.security import get_current_user
-from app.services import firestore_repo, imaging
+from app.services import firestore_repo, imaging, storage
 
-from graphics_designer_agent import pipeline, suggestions, variants
+from graphics_designer_agent import pipeline, registry, suggestions, variants
 from graphics_designer_agent.pipeline import PipelineError
-from graphics_designer_agent.prompts import CANONICAL_SHA256, load_prompt, prompt_hash
 from graphics_designer_agent.runs import get_run, log_manifest, save_run
-from graphics_designer_agent.tokens import ASPECT_RATIOS, DEFAULT_FONT
+from graphics_designer_agent.tokens import ASPECT_RATIOS
 
 router = APIRouter()
 logger = logging.getLogger("agentos.gd")
@@ -29,6 +28,11 @@ logger = logging.getLogger("agentos.gd")
 # Usage events tag this id so the Home dashboard can break activity down per agent.
 GD_AGENT_ID = "a1"
 GD_AGENT_CATEGORY = "design"
+
+
+def _pack_for_run(run: dict):
+    """The brand pack backing a run (defaults to Legal Soft for legacy runs)."""
+    return registry.get_pack(run.get("brand_id"))
 
 
 def _log_usage(user: dict, action: str, *, count: int = 1, brand: str | None = None) -> None:
@@ -127,15 +131,16 @@ def _guard(fn):
         raise HTTPException(409, str(exc)) from exc
 
 
-def _apply_element_styles(cfg: dict, incoming: dict) -> None:
+def _apply_element_styles(cfg: dict, incoming: dict, pack) -> None:
     """Validate + merge per-element Stage-3 styling into the run config.
 
-    Each element may set ``font`` (any Causten variant), ``color`` (dark /
-    gradient / white — text elements only) and ``placement`` (text or CTA
+    Each element may set ``font`` (any variant in the brand family), ``color``
+    (dark / gradient / white — text elements only) and ``placement`` (text or CTA
     placement key, placeable elements only). Unknown elements/attributes or
     out-of-family values are rejected so the prompt only ever sees valid input.
     """
     elements = {e["key"]: e for e in variants.STAGE3_ELEMENTS}
+    fonts = set(pack.font_names())
     color_keys = set(variants.TEXT_COLOR_KEYS)
     text_places = {p["key"] for p in variants.TEXT_PLACEMENTS}
     cta_places = {p["key"] for p in variants.CTA_PLACEMENTS}
@@ -147,9 +152,9 @@ def _apply_element_styles(cfg: dict, incoming: dict) -> None:
             raise HTTPException(400, f"Unknown Stage-3 element '{key}'")
         cur = dict(styles.get(key) or {})
         if "font" in patch:
-            if patch["font"] not in variants.FONTS:
+            if patch["font"] not in fonts:
                 raise HTTPException(
-                    400, f"Font is locked to the {variants.FONT_FAMILY} family; "
+                    400, f"Font is locked to the {pack.font_family} family; "
                     f"'{patch['font']}' is not an allowed variant.")
             cur["font"] = patch["font"]
         if "color" in patch:
@@ -177,16 +182,17 @@ def _apply_element_styles(cfg: dict, incoming: dict) -> None:
         styles[key] = cur
 
 
-def _apply_subheadings(cfg: dict, incoming: list) -> None:
+def _apply_subheadings(cfg: dict, incoming: list, pack) -> None:
     """Validate + replace the full Stage-3 sub-heading list (1–5 lines). Each line
-    carries its own text, font (Causten family), colour, size %, placement and
-    pixel nudge so the deterministic renderer can place it exactly."""
+    carries its own text, font (brand family), colour, size %, placement and pixel
+    nudge so the deterministic renderer can place it exactly."""
     if not isinstance(incoming, list):
         raise HTTPException(400, "subheadings must be a list")
     if not variants.SUBHEADING_MIN <= len(incoming) <= variants.SUBHEADING_MAX:
         raise HTTPException(
             400, f"Sub-headings must number {variants.SUBHEADING_MIN}–"
             f"{variants.SUBHEADING_MAX}.")
+    fonts = set(pack.font_names())
     text_places = {p["key"] for p in variants.TEXT_PLACEMENTS}
     color_keys = set(variants.TEXT_COLOR_KEYS)
     out: list[dict] = []
@@ -196,10 +202,10 @@ def _apply_subheadings(cfg: dict, incoming: list) -> None:
         text = str(item.get("text", "")).strip()
         if len(text) > 120:
             raise HTTPException(400, "Sub-heading must be ≤ 120 characters.")
-        font = item.get("font") or DEFAULT_FONT
-        if font not in variants.FONTS:
+        font = item.get("font") or pack.default_font
+        if font not in fonts:
             raise HTTPException(
-                400, f"Font is locked to the {variants.FONT_FAMILY} family; "
+                400, f"Font is locked to the {pack.font_family} family; "
                 f"'{font}' is not allowed.")
         color = item.get("color", "dark")
         if color not in color_keys:
@@ -223,7 +229,7 @@ def _apply_subheadings(cfg: dict, incoming: list) -> None:
 _CUSTOM_GRADIENT_KEYS = ("id", "cid", "title", "desc", "prompt", "css_gradient", "source")
 
 
-def _apply_custom_gradient(cfg: dict, patch: dict | None) -> None:
+def _apply_custom_gradient(cfg: dict, patch: dict | None, pack) -> None:
     """Validate + store (or clear) the per-creative temporary AI gradient.
 
     Passing ``None`` / ``{}`` clears it. Otherwise the prompt is validated with
@@ -237,7 +243,7 @@ def _apply_custom_gradient(cfg: dict, patch: dict | None) -> None:
     if not isinstance(patch, dict):
         raise HTTPException(400, "custom_gradient must be an object")
     prompt = str(patch.get("prompt") or "")
-    errors = suggestions._validate_gradient_prompt(prompt)
+    errors = suggestions._validate_gradient_prompt(prompt, pack=pack)
     if errors:
         raise HTTPException(400, "Invalid AI gradient: " + "; ".join(errors))
     stored = {k: patch[k] for k in _CUSTOM_GRADIENT_KEYS if k in patch}
@@ -312,19 +318,29 @@ def _apply_logo_layout(cfg: dict, patch: dict) -> None:
     cfg["logo_layout"] = cur
 
 
-# ── static config for the studio UI ───────────────────────────────────────────
+# ── brand selection (multi-brand hub) ─────────────────────────────────────────
+@router.get("/gd/brands")
+def gd_brands(_user: dict = Depends(get_current_user)) -> dict:
+    """Brands the studio can produce creatives for (drives the left-panel picker)."""
+    return {"brands": registry.list_packs(), "default": registry.DEFAULT_BRAND_ID}
+
+
+# ── static config for the studio UI (per selected brand) ───────────────────────
 @router.get("/gd/config")
-def gd_config(_user: dict = Depends(get_current_user)) -> dict:
+def gd_config(brand: str | None = None, _user: dict = Depends(get_current_user)) -> dict:
+    pack = registry.get_pack(brand)
     return {
-        "stage1_variants": variants.STAGE1_VARIANTS,
-        "stage2_variants": variants.STAGE2_VARIANTS,
-        "stage2_categories": variants.STAGE2_CATEGORIES,
-        "fonts": variants.FONTS,
-        "font_family": variants.FONT_FAMILY,
-        "font_variants": variants.FONT_VARIANTS,
+        "brand_id": pack.id,
+        "brand_name": pack.name,
+        "stage1_variants": pack.stage1_variants,
+        "stage2_variants": pack.stage2_variants,
+        "stage2_categories": pack.stage2_categories,
+        "fonts": pack.font_names(),
+        "font_family": pack.font_family,
+        "font_variants": pack.font_variants,
         "text_placements": variants.TEXT_PLACEMENTS,
         "cta_placements": variants.CTA_PLACEMENTS,
-        "text_colors": variants.TEXT_COLORS,
+        "text_colors": pack.text_colors,
         "stage3_elements": variants.STAGE3_ELEMENTS,
         "text_size_pct_min": variants.TEXT_SIZE_PCT_MIN,
         "text_size_pct_max": variants.TEXT_SIZE_PCT_MAX,
@@ -337,22 +353,24 @@ def gd_config(_user: dict = Depends(get_current_user)) -> dict:
         "logo_size_pct_max": variants.LOGO_SIZE_PCT_MAX,
         "logo_offset_px_range": variants.LOGO_OFFSET_PX_RANGE,
         "aspect_ratios": variants.ASPECT_RATIO_PRESETS,
-        "brand_kit_block": variants.BRAND_KIT_BLOCK,
-        "locked_colors": variants.LOCKED_COLORS,
-        "stage1_source_note": variants.SOURCE_NOTE_STAGE1,
-        "onboarding_questions": suggestions.ONBOARDING_QUESTIONS,
+        "brand_kit_block": pack.brand_kit_block,
+        "locked_colors": pack.locked_colors,
+        "stage1_source_note": pack.source_note_stage1,
+        "onboarding_questions": pack.onboarding_questions,
         "content_tokens": CONTENT_TOKENS,
     }
 
 
 @router.get("/gd/prompts")
-def gd_prompts(_user: dict = Depends(get_current_user)) -> dict:
-    """Canonical prompt integrity report (audit panel)."""
+def gd_prompts(brand: str | None = None, _user: dict = Depends(get_current_user)) -> dict:
+    """Canonical prompt integrity report (audit panel) for the selected brand."""
+    pack = registry.get_pack(brand)
     return {
         "prompts": [
-            {"filename": name, "hash": prompt_hash(name), "expected": expected,
-             "ok": prompt_hash(name) == expected, "bytes": len(load_prompt(name).encode("utf-8"))}
-            for name, expected in CANONICAL_SHA256.items()
+            {"filename": name, "hash": pack.prompt_hash(name), "expected": expected,
+             "ok": pack.prompt_hash(name) == expected,
+             "bytes": len(pack.load_prompt(name).encode("utf-8"))}
+            for name, expected in pack.canonical_sha256.items()
         ]
     }
 
@@ -402,12 +420,13 @@ class ConfigBody(BaseModel):
 def update_config(run_id: str, body: ConfigBody, user: dict = Depends(get_current_user)) -> dict:
     run = _owned_run(run_id, user)
     cfg = run["config"]
+    pack = _pack_for_run(run)
     if body.font is not None:
-        # The creative font is locked to the Causten family — reject anything else.
-        if body.font not in variants.FONTS:
+        # The creative font is locked to the brand's family — reject anything else.
+        if body.font not in set(pack.font_names()):
             raise HTTPException(
                 400,
-                f"Font is locked to the {variants.FONT_FAMILY} family; "
+                f"Font is locked to the {pack.font_family} family; "
                 f"'{body.font}' is not an allowed variant.",
             )
         cfg["font"] = body.font
@@ -435,15 +454,15 @@ def update_config(run_id: str, body: ConfigBody, user: dict = Depends(get_curren
             raise HTTPException(400, f"Unknown CTA placement '{body.cta_placement}'")
         cfg["cta_placement"] = body.cta_placement
     if body.element_styles is not None:
-        _apply_element_styles(cfg, body.element_styles)
+        _apply_element_styles(cfg, body.element_styles, pack)
     if body.subheadings is not None:
-        _apply_subheadings(cfg, body.subheadings)
+        _apply_subheadings(cfg, body.subheadings, pack)
     if body.logo_layout is not None:
         _apply_logo_layout(cfg, body.logo_layout)
     # Use the field-set so an explicit ``null`` clears the gradient (omission
     # leaves whatever is already stored untouched).
     if "custom_gradient" in body.model_fields_set:
-        _apply_custom_gradient(cfg, body.custom_gradient)
+        _apply_custom_gradient(cfg, body.custom_gradient, pack)
     if "custom_element" in body.model_fields_set:
         _apply_custom_element(cfg, body.custom_element)
     if body.use_ai_compositor is not None:
@@ -484,20 +503,74 @@ def generate_endpoint(run_id: str, body: GenerateBody, user: dict = Depends(get_
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
 
 
+def _brand_logo_png(run: dict) -> bytes | None:
+    """PNG bytes for the run brand's resolved logo (None if unmapped / not found)."""
+    fb_id = _pack_for_run(run).firestore_brand_id
+    if not fb_id:
+        return None
+    rec = firestore_repo.find_brand_logo(fb_id)
+    if not rec:
+        return None
+    try:
+        raw = storage.download_bytes(rec["file_url"])
+    except Exception:  # noqa: BLE001 - treat an unreadable logo as "no logo"
+        logger.exception("GD: failed to download brand logo %s", rec.get("file_url"))
+        return None
+    return imaging.to_png_logo(raw, file_name=rec.get("file_name", ""), mime=rec.get("file_type", ""))
+
+
+@router.get("/gd/runs/{run_id}/brand-logo")
+def brand_logo_status(run_id: str, user: dict = Depends(get_current_user)) -> dict:
+    """Whether the run's brand has a logo on file, plus a preview URL for the UI.
+
+    Lets Stage 4 default to the brand logo instead of forcing an upload; the
+    actual composite re-resolves the logo server-side (never trusts the client).
+    """
+    run = _owned_run(run_id, user)
+    pack = _pack_for_run(run)
+    fb_id = pack.firestore_brand_id
+    if not fb_id:
+        return {"available": False, "view_url": None, "file_name": None, "brand_name": pack.name}
+    rec = firestore_repo.find_brand_logo(fb_id)
+    if not rec:
+        return {"available": False, "view_url": None, "file_name": None, "brand_name": pack.name}
+    view_url = None
+    try:
+        view_url = storage.signed_url_for_gs_uri(rec["file_url"])
+    except Exception:  # noqa: BLE001
+        logger.exception("GD: failed to sign brand logo for run %s", run_id)
+    return {
+        "available": True,
+        "view_url": view_url,
+        "file_name": rec.get("file_name"),
+        "brand_name": pack.name,
+    }
+
+
 @router.post("/gd/runs/{run_id}/stage4")
 async def stage4_endpoint(
     run_id: str,
-    logo: UploadFile = File(...),
+    logo: UploadFile | None = File(default=None),
     use_ai: bool = Form(default=False),
     user: dict = Depends(get_current_user),
 ) -> dict:
     run = _owned_run(run_id, user)
-    raw = await logo.read()
-    if not raw:
-        raise HTTPException(400, "Empty logo upload")
-    png = imaging.to_png_logo(raw, file_name=logo.filename or "", mime=logo.content_type or "")
-    if not png:
-        raise HTTPException(415, f"Couldn't read '{logo.filename}' as an image (PNG/JPG/SVG).")
+    # An uploaded file always wins (override); otherwise fall back to the brand's
+    # logo from Firestore so the user isn't forced to re-supply it every run.
+    png: bytes | None = None
+    if logo is not None:
+        raw = await logo.read()
+        if raw:
+            png = imaging.to_png_logo(raw, file_name=logo.filename or "", mime=logo.content_type or "")
+            if not png:
+                raise HTTPException(415, f"Couldn't read '{logo.filename}' as an image (PNG/JPG/SVG).")
+    if png is None:
+        png = _brand_logo_png(run)
+    if png is None:
+        raise HTTPException(
+            400,
+            "No logo available — upload one, or pick a brand that has a logo in its kit.",
+        )
     attempt = _guard(lambda: pipeline.generate_stage4(run, png, use_ai=use_ai))
     _log_usage(user, "generate", brand=run.get("brand_id"))  # final logo composite
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
@@ -549,27 +622,28 @@ class SuggestBody(BaseModel):
 
 @router.post("/gd/runs/{run_id}/suggest")
 def suggest_endpoint(run_id: str, body: SuggestBody, user: dict = Depends(get_current_user)) -> dict:
-    _owned_run(run_id, user)
+    run = _owned_run(run_id, user)
+    pack = _pack_for_run(run)
     if body.kind == "concept":
-        return suggestions.recommend_concept(body.answers or {})
+        return suggestions.recommend_concept(body.answers or {}, pack=pack)
     if body.kind == "explore":
-        return suggestions.explore_elements(body.answers or {}, exclude=body.exclude)
+        return suggestions.explore_elements(body.answers or {}, exclude=body.exclude, pack=pack)
     if body.kind == "gradient":
         return suggestions.suggest_gradient(
-            body.answers or {}, steer=body.steer, exclude=body.exclude
+            body.answers or {}, steer=body.steer, exclude=body.exclude, pack=pack
         )
     if body.kind == "element":
         return suggestions.suggest_element(
-            body.answers or {}, steer=body.steer, exclude=body.exclude
+            body.answers or {}, steer=body.steer, exclude=body.exclude, pack=pack
         )
     if body.kind == "aspect_ratio":
         return suggestions.recommend_aspect_ratio(body.placement)
     if body.kind == "hooks":
-        return suggestions.generate_hooks(body.concept)
+        return suggestions.generate_hooks(body.concept, pack=pack)
     if body.kind == "font":
-        return suggestions.recommend_font(body.concept)
+        return suggestions.recommend_font(body.concept, pack=pack)
     if body.kind == "qa":
-        return suggestions.qa_critique(body.stage or 1)
+        return suggestions.qa_critique(body.stage or 1, pack=pack)
     raise HTTPException(400, f"Unknown suggestion kind '{body.kind}'")
 
 

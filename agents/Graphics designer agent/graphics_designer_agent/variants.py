@@ -6,14 +6,7 @@ to render the studio UI. Prompt content lives exclusively in ``./prompts``.
 
 from __future__ import annotations
 
-from .tokens import (
-    ASPECT_RATIOS,
-    DEFAULT_CTA_PLACEMENT,
-    DEFAULT_FONT,
-    DEFAULT_SUBTEXT_1,
-    DEFAULT_SUBTEXT_2,
-    DEFAULT_TEXT_PLACEMENT,
-)
+from .tokens import ASPECT_RATIOS, DEFAULT_FONT
 
 # ── Locked brand system (spec §2.2 / §2.3) — read-only in the UI ──────────────
 LOCKED_COLORS = {
@@ -430,35 +423,16 @@ _FONT_FILE = {v["name"]: v["file"] for v in FONT_VARIANTS}
 
 
 def font_file(name: str) -> str:
-    """The Causten .otf filename for a selectable font name (falls back to the
-    default weight if an unknown name slips through)."""
+    """The brand .otf/.ttf filename for a selectable font name (falls back to the
+    default weight if an unknown name slips through). Used by the Stage-3 renderer
+    for the default (Legal Soft) theme; each brand pack supplies its own resolver."""
     return _FONT_FILE.get(name, _FONT_FILE[DEFAULT_FONT])
 
 
-def default_stage3_styles() -> dict:
-    """Factory per-element styling for the deterministic Stage-3 renderer. The
-    headline and CTA carry size + pixel nudge; the highlight is inline (font +
-    colour only). Sub-headings are a separate list (``default_subheadings``)."""
-    return {
-        "headline": {"font": DEFAULT_FONT, "color": "dark",
-                     "size_pct": DEFAULT_TEXT_SIZE_PCT["headline"],
-                     "placement": DEFAULT_TEXT_PLACEMENT, "offset_x": 0, "offset_y": 0},
-        "highlight": {"font": DEFAULT_FONT, "color": "gradient"},
-        "cta": {"font": DEFAULT_FONT, "size_pct": DEFAULT_TEXT_SIZE_PCT["cta"],
-                "placement": DEFAULT_CTA_PLACEMENT, "offset_x": 0, "offset_y": 0},
-    }
-
-
-def _subheading(text: str) -> dict:
-    return {"text": text, "font": DEFAULT_FONT, "color": "dark",
-            "size_pct": DEFAULT_TEXT_SIZE_PCT["subheading"],
-            "placement": DEFAULT_TEXT_PLACEMENT, "offset_x": 0, "offset_y": 0,
-            "approved": False}
-
-
-def default_subheadings() -> list:
-    """The two starter sub-heading lines (the user can add up to 5 or trim to 1)."""
-    return [_subheading(DEFAULT_SUBTEXT_1), _subheading(DEFAULT_SUBTEXT_2)]
+# Stage-3 factory styles + sub-headings now live on each ``BrandPack``
+# (``registry.BrandPack.default_stage3_styles`` / ``default_subheadings``) so they
+# follow the selected brand. The old brand-agnostic helpers were removed here to
+# keep a single source of truth.
 
 
 # ── Stage 4 — logo placement grid (UI) ────────────────────────────────────────
@@ -497,9 +471,5 @@ ASPECT_RATIO_PRESETS = [
 ]
 
 
-def stage1_variant(variant_id: str) -> dict:
-    return next(v for v in STAGE1_VARIANTS if v["id"] == variant_id.upper())
-
-
-def stage2_variant(variant_id: str) -> dict:
-    return next(v for v in STAGE2_VARIANTS if v["id"] == variant_id.upper())
+# Variant lookups live on ``BrandPack`` (``stage1_variant`` / ``stage2_variant``)
+# so they resolve against the selected brand's library, not a global one.

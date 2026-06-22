@@ -43,8 +43,6 @@ STAGE3_STYLE_ANCHORS: dict[str, dict[str, str]] = {
 
 DEFAULT_TEXT_PLACEMENT = "left"
 DEFAULT_CTA_PLACEMENT = "bottom"
-# Per-element colour keys (resolved to phrases in variants.text_color_phrase).
-DEFAULT_ELEMENT_COLORS = {"headline": "dark", "highlight": "gradient", "subtext1": "dark", "subtext2": "dark"}
 
 
 def default_element_styles() -> dict:

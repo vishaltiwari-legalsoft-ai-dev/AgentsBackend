@@ -13,7 +13,10 @@ D → pain-point, B → social-proof/global-talent, C/E → authority, A → eff
 from __future__ import annotations
 
 import json
+import logging
 import re
+
+logger = logging.getLogger("agentos.gd.suggestions")
 
 from .prompts import load_prompt
 from .tokens import (
@@ -54,8 +57,18 @@ ONBOARDING_QUESTIONS = [
 ]
 
 
-def _variant_index() -> dict[str, dict]:
-    return {v["id"]: v for v in STAGE2_VARIANTS}
+def _resolve_pack(pack=None):
+    """The active brand pack (defaults to Legal Soft). Lazy import avoids a cycle —
+    registry imports this module for the Legal Soft content."""
+    if pack is not None:
+        return pack
+    from . import registry
+
+    return registry.get_pack(None)
+
+
+def _variant_index(stage2_variants) -> dict[str, dict]:
+    return {v["id"]: v for v in stage2_variants}
 
 
 # Hand-written rationales for the primary recommendation set; every other
@@ -69,13 +82,16 @@ _CONCEPT_RATIONALE = {
 }
 
 
-def recommend_concept(answers: dict) -> dict:
+def recommend_concept(answers: dict, *, pack=None) -> dict:
     """Recommend ONE Stage-2 variant with a rationale (§7.1.1). Highlights only.
 
     The recommendation still comes from the curated primary set (A–E); the
     returned ``variants`` list now covers the full element catalogue so the UI
     can show every option with a one-line rationale.
     """
+    pack = _resolve_pack(pack)
+    stage2_variants = pack.stage2_variants
+    concept_rationale = pack.concept_rationale
     angle = answers.get("angle")
     audience = answers.get("audience")
     if angle == "pain":
@@ -96,9 +112,9 @@ def recommend_concept(answers: dict) -> dict:
             {
                 "id": v["id"],
                 "recommended": v["id"] == rec,
-                "rationale": _CONCEPT_RATIONALE.get(v["id"], v["desc"]),
+                "rationale": concept_rationale.get(v["id"], v["desc"]),
             }
-            for v in STAGE2_VARIANTS
+            for v in stage2_variants
         ],
     }
 
@@ -126,13 +142,13 @@ _EXPLORE_REASON = {
 _EXPLORE_ORDER = ["G", "H", "I", "K", "N", "Q", "O", "R", "D", "P", "L"]
 
 
-def _explore_reason(vid: str, idx: dict[str, dict]) -> str:
-    return _EXPLORE_REASON.get(vid) or idx[vid]["desc"]
+def _explore_reason(vid: str, idx: dict[str, dict], explore_reason: dict) -> str:
+    return explore_reason.get(vid) or idx[vid]["desc"]
 
 
-def _curated_explore(answers: dict, exclude: set[str]) -> dict:
-    idx = _variant_index()
-    order = [x for x in _EXPLORE_ORDER if x in idx]
+def _curated_explore(answers: dict, exclude: set[str], pack) -> dict:
+    idx = _variant_index(pack.stage2_variants)
+    order = [x for x in pack.explore_order if x in idx]
     if answers.get("angle") == "pain":
         order = ["D"] + [x for x in order if x != "D"]
     elif answers.get("goal") == "brand":
@@ -149,7 +165,8 @@ def _curated_explore(answers: dict, exclude: set[str]) -> dict:
 
     def card(vid: str) -> dict:
         v = idx[vid]
-        return {"id": vid, "title": v["title"], "category": v["category"], "reason": _explore_reason(vid, idx)}
+        return {"id": vid, "title": v["title"], "category": v["category"],
+                "reason": _explore_reason(vid, idx, pack.explore_reason)}
 
     return {
         "type": "explore",
@@ -163,29 +180,32 @@ def _curated_explore(answers: dict, exclude: set[str]) -> dict:
     }
 
 
-def explore_elements(answers: dict | None = None, exclude: list[str] | None = None) -> dict:
+def explore_elements(answers: dict | None = None, exclude: list[str] | None = None,
+                     *, pack=None) -> dict:
     """The agent 'plays' with the wider element library and proposes fresh picks.
 
     Curated + deterministic so it works fully offline; when an OpenRouter key is
     configured the reasoning is rewritten by the model (best-effort — any
     failure silently falls back to the curated result).
     """
+    pack = _resolve_pack(pack)
     answers = answers or {}
-    curated = _curated_explore(answers, set(exclude or []))
-    enriched = _enrich_explore_with_llm(answers, curated)
+    curated = _curated_explore(answers, set(exclude or []), pack)
+    enriched = _enrich_explore_with_llm(answers, curated, pack)
     return enriched or curated
 
 
-def _enrich_explore_with_llm(answers: dict, curated: dict) -> dict | None:
+def _enrich_explore_with_llm(answers: dict, curated: dict, pack) -> dict | None:
     """Best-effort LLM rewrite of the explorer's reasoning. Returns None on any
     problem so the caller keeps the curated result."""
-    idx = _variant_index()
+    idx = _variant_index(pack.stage2_variants)
     try:
         from app.services.openrouter import get_llm  # lazy — package works without the app
     except Exception:
+        logger.debug("OpenRouter not importable; using curated suggestion fallback")
         return None
     catalog = "\n".join(
-        f"- {v['id']} — {v['title']} ({v['category']}): {v['desc']}" for v in STAGE2_VARIANTS
+        f"- {v['id']} — {v['title']} ({v['category']}): {v['desc']}" for v in pack.stage2_variants
     )
     prompt = (
         "You are a creative director for premium legal-tech ad creatives. The "
@@ -211,7 +231,7 @@ def _enrich_explore_with_llm(answers: dict, curated: dict) -> dict | None:
             if vid not in idx:
                 return None
             v = idx[vid]
-            reason = str(item.get("reason") or _explore_reason(vid, idx)).strip()
+            reason = str(item.get("reason") or _explore_reason(vid, idx, pack.explore_reason)).strip()
             return {"id": vid, "title": v["title"], "category": v["category"], "reason": reason}
 
         picks = [c for c in (card(p) for p in data.get("picks", [])) if c]
@@ -227,6 +247,7 @@ def _enrich_explore_with_llm(answers: dict, curated: dict) -> dict | None:
             "idea": str(data.get("idea") or curated["idea"]).strip(),
         }
     except Exception:
+        logger.warning("LLM element-explore enrichment failed; using curated fallback", exc_info=True)
         return None
 
 
@@ -255,13 +276,14 @@ _GRADIENT_PROMPT_MIN = 80
 _GRADIENT_PROMPT_MAX = 1500
 
 
-def _validate_gradient_prompt(text: str) -> list[str]:
+def _validate_gradient_prompt(text: str, *, pack=None) -> list[str]:
     """Return validation errors (empty = valid) for a Stage-1 gradient prompt.
 
     Enforced so a temporary AI gradient stays on-brand and flows through the same
     machinery as the canonical prompts: it must carry the AR anchor (so
     ``tokens.substitute_stage1`` can swap the aspect ratio) and may only reference
-    the locked blue/white brand hexes."""
+    the selected brand's locked hexes."""
+    brand_hexes = _resolve_pack(pack).brand_gradient_hexes
     errors: list[str] = []
     t = (text or "").strip()
     if len(t) < _GRADIENT_PROMPT_MIN:
@@ -270,7 +292,7 @@ def _validate_gradient_prompt(text: str) -> list[str]:
         errors.append(f"Gradient prompt must be ≤ {_GRADIENT_PROMPT_MAX} characters.")
     if STAGE1_AR_ANCHOR not in t:
         errors.append(f'Gradient prompt must contain the "{STAGE1_AR_ANCHOR}" anchor.')
-    off_brand = sorted({h.upper() for h in _HEX_RE.findall(t)} - _BRAND_GRADIENT_HEXES)
+    off_brand = sorted({h.upper() for h in _HEX_RE.findall(t)} - brand_hexes)
     if off_brand:
         errors.append("Off-brand colours not allowed: " + ", ".join(off_brand))
     return errors
@@ -380,10 +402,11 @@ def _target_composition(steer: str, exclude: set[str]) -> tuple[str, str]:
     return _COMPOSITIONS[seed % len(_COMPOSITIONS)]
 
 
-def _curated_gradient(answers: dict, steer: str, exclude: set[str]) -> dict:
+def _curated_gradient(answers: dict, steer: str, exclude: set[str], pack) -> dict:
     """Pick one curated gradient, rotating past any already-seen ``cid``s so a
     "Regenerate" always returns something different."""
-    pool = [g for g in _CURATED_GRADIENTS if g["cid"] not in exclude] or _CURATED_GRADIENTS
+    curated_gradients = pack.curated_gradients
+    pool = [g for g in curated_gradients if g["cid"] not in exclude] or curated_gradients
     start = _stable_seed(steer, json.dumps(answers, sort_keys=True)) % len(pool)
     g = pool[(start + len(exclude)) % len(pool)]
     return {
@@ -408,35 +431,39 @@ def suggest_gradient(
     *,
     steer: str | None = None,
     exclude: list[str] | None = None,
+    pack=None,
 ) -> dict:
     """Propose ONE fresh, on-brand Stage-1 gradient for this creative only.
 
     Curated + deterministic so it works fully offline; when an OpenRouter key is
     configured the gradient is written by the model (best-effort — any failure or
     invalid/off-brand result silently falls back to the curated pick)."""
+    pack = _resolve_pack(pack)
     answers = answers or {}
     steer = (steer or "").strip()
     excl = set(exclude or [])
-    curated = _curated_gradient(answers, steer, excl)
-    enriched = _enrich_gradient_with_llm(answers, steer, curated, excl)
+    curated = _curated_gradient(answers, steer, excl, pack)
+    enriched = _enrich_gradient_with_llm(answers, steer, curated, excl, pack)
     return enriched or curated
 
 
 def _enrich_gradient_with_llm(
-    answers: dict, steer: str, curated: dict, exclude: set[str] | None = None
+    answers: dict, steer: str, curated: dict, exclude: set[str] | None = None, pack=None
 ) -> dict | None:
     """Best-effort: let the model study the canonical gradients and invent a new
     on-brand one. Returns None on any problem (caller keeps the curated pick)."""
+    pack = _resolve_pack(pack)
     try:
         from app.services.openrouter import get_llm  # lazy — package works without the app
     except Exception:
+        logger.debug("OpenRouter not importable; using curated suggestion fallback")
         return None
 
     inspiration = "\n".join(
-        f"- {v['id']} — {v['title']}: {load_prompt(v['prompt_file']).strip()}"
-        for v in STAGE1_VARIANTS
+        f"- {v['id']} — {v['title']}: {pack.load_prompt(v['prompt_file']).strip()}"
+        for v in pack.stage1_variants
     )
-    palette = ", ".join(sorted(_BRAND_GRADIENT_HEXES))
+    palette = ", ".join(sorted(pack.brand_gradient_hexes))
     _, comp_directive = _target_composition(steer, exclude or set())
     steer_line = f"\nUser steer (honour its mood, e.g. warmer/minimal): {steer}" if steer else ""
     prompt = (
@@ -453,7 +480,7 @@ def _enrich_gradient_with_llm(
         "4. Within that fixed composition, get novelty from colour ordering, light "
         "position, feathering and vignette — NEVER from new colours.\n"
         "5. No people, objects, logos, or text in the image.\n\n"
-        f"Brand kit (reference):\n{BRAND_KIT_BLOCK}\n{SOURCE_NOTE_STAGE1}\n\n"
+        f"Brand kit (reference):\n{pack.brand_kit_block}\n{pack.source_note_stage1}\n\n"
         f"Existing gradient prompts:\n{inspiration}{steer_line}\n\n"
         'Return ONLY minified JSON: {"title":"2-4 words","desc":"one sentence",'
         '"prompt":"the full gradient prompt","css_gradient":"a CSS gradient that '
@@ -468,12 +495,12 @@ def _enrich_gradient_with_llm(
             return None
         data = json.loads(match.group(0))
         text = str(data.get("prompt") or "").strip()
-        if _validate_gradient_prompt(text):  # non-empty error list → reject
+        if _validate_gradient_prompt(text, pack=pack):  # non-empty error list → reject
             return None
         css = str(data.get("css_gradient") or "").strip()
         css_ok = (
             css.startswith(("linear-gradient(", "radial-gradient("))
-            and not ({h.upper() for h in _HEX_RE.findall(css)} - _BRAND_GRADIENT_HEXES)
+            and not ({h.upper() for h in _HEX_RE.findall(css)} - pack.brand_gradient_hexes)
         )
         title = str(data.get("title") or "AI Gradient").strip()[:48]
         desc = str(data.get("desc") or curated["gradient"]["desc"]).strip()[:160]
@@ -491,6 +518,7 @@ def _enrich_gradient_with_llm(
             },
         }
     except Exception:
+        logger.warning("LLM gradient enrichment failed; using curated fallback", exc_info=True)
         return None
 
 
@@ -624,10 +652,11 @@ def _infer_element_category(steer: str) -> str | None:
     return best
 
 
-def _curated_element(answers: dict, steer: str, exclude: set[str]) -> dict:
+def _curated_element(answers: dict, steer: str, exclude: set[str], pack) -> dict:
     """Pick one curated element, preferring the steer's category and rotating past
     already-seen ``cid``s so the offline fallback still tracks what the user typed."""
-    pool = [e for e in _CURATED_ELEMENTS if e["cid"] not in exclude] or _CURATED_ELEMENTS
+    curated_elements = pack.curated_elements
+    pool = [e for e in curated_elements if e["cid"] not in exclude] or curated_elements
     cat = _infer_element_category(steer)
     preferred = [e for e in pool if e["category"] == cat] if cat else []
     pick_from = preferred or pool
@@ -655,31 +684,34 @@ def suggest_element(
     *,
     steer: str | None = None,
     exclude: list[str] | None = None,
+    pack=None,
 ) -> dict:
     """Propose ONE fresh, foreground-only Stage-2 element for this creative only.
 
     Curated + deterministic offline; an OpenRouter key upgrades it to a model-
     written element (best-effort — any failure or invalid result falls back)."""
+    pack = _resolve_pack(pack)
     answers = answers or {}
     steer = (steer or "").strip()
     excl = set(exclude or [])
-    curated = _curated_element(answers, steer, excl)
-    enriched = _enrich_element_with_llm(answers, steer, curated)
+    curated = _curated_element(answers, steer, excl, pack)
+    enriched = _enrich_element_with_llm(answers, steer, curated, pack)
     return enriched or curated
 
 
-def _enrich_element_with_llm(answers: dict, steer: str, curated: dict) -> dict | None:
+def _enrich_element_with_llm(answers: dict, steer: str, curated: dict, pack) -> dict | None:
     """Best-effort: let the model study the catalogue and invent a new element.
     Returns None on any problem (caller keeps the curated pick)."""
     try:
         from app.services.openrouter import get_llm  # lazy — package works without the app
     except Exception:
+        logger.debug("OpenRouter not importable; using curated suggestion fallback")
         return None
 
     catalog = "\n".join(
-        f"- {v['id']} — {v['title']} ({v['category']}): {v['subject']}" for v in STAGE2_VARIANTS
+        f"- {v['id']} — {v['title']} ({v['category']}): {v['subject']}" for v in pack.stage2_variants
     )
-    cats = ", ".join(STAGE2_CATEGORIES)
+    cats = ", ".join(pack.stage2_categories)
     # The user's request is the #1 driver. State it up front AND as the first rule
     # so the model depicts exactly what they typed instead of a generic catalogue echo.
     if steer:
@@ -743,7 +775,7 @@ def _enrich_element_with_llm(answers: dict, steer: str, curated: dict) -> dict |
             return None
         subject = str(data.get("subject") or "").strip()
         category = str(data.get("category") or "").strip().lower()
-        if category not in STAGE2_CATEGORIES:
+        if category not in pack.stage2_categories:
             category = curated["element"]["category"]
         title = str(data.get("title") or "AI Element").strip()[:48]
         desc = str(data.get("desc") or curated["element"]["desc"]).strip()[:160]
@@ -761,6 +793,7 @@ def _enrich_element_with_llm(answers: dict, steer: str, curated: dict) -> dict |
             },
         }
     except Exception:
+        logger.warning("LLM element enrichment failed; using curated fallback", exc_info=True)
         return None
 
 
@@ -837,44 +870,51 @@ _HOOKS["E"] = _HOOKS["C"]  # both authority
 _CTAS = ["Book a Free Consultation", "Get Started Today", "Hire Your Legal VA"]
 
 
-def generate_hooks(concept_id: str | None) -> dict:
+def generate_hooks(concept_id: str | None, *, pack=None) -> dict:
     """§7.1.3 — 5 headline hooks, 3 CTAs, 2 sub-text pairs, all §6.3-valid."""
-    pack = _HOOKS.get((concept_id or "A").upper(), _HOOKS["A"])
+    pk = _resolve_pack(pack)
+    hooks = pk.hooks
+    fallback = next(iter(hooks.values())) if hooks else {"headlines": [], "subtext": []}
+    block = hooks.get((concept_id or "A").upper(), fallback)
     headlines = []
-    for text, highlight in pack["headlines"]:
+    for text, highlight in block.get("headlines", []):
         errors = validate_stage3_tokens(
             headline=text, highlight=highlight,
-            subtext1=DEFAULT_SUBTEXT_1, subtext2=DEFAULT_SUBTEXT_2, cta=DEFAULT_CTA,
+            subtext1=pk.default_subtext_1, subtext2=pk.default_subtext_2, cta=pk.default_cta,
         )
         # Only headline/highlight errors are relevant here.
         relevant = [e for e in errors if "Headline" in e or "Highlight" in e]
         if not relevant:
             headlines.append({"headline": text, "highlight": highlight, "state": "proposed", "source": "agent"})
-    ctas = [{"cta": c, "state": "proposed", "source": "agent"} for c in _CTAS if len(c.split()) <= 4]
+    ctas = [{"cta": c, "state": "proposed", "source": "agent"} for c in pk.ctas if len(c.split()) <= 4]
     subtext = [
         {"subtext1": a, "subtext2": b, "state": "proposed", "source": "agent"}
-        for a, b in pack["subtext"]
+        for a, b in block.get("subtext", [])
         if len(a) <= 70 and len(b) <= 70
     ]
     return {"type": "hooks", "headlines": headlines, "ctas": ctas, "subtext_pairs": subtext}
 
 
-def recommend_font(concept_id: str | None) -> dict:
-    """§7.1.4 — font is locked to the Causten family; only the weight varies."""
-    # Authority concepts read heavier; warm/efficiency concepts read a touch lighter.
-    alt = "Causten ExtraBold" if (concept_id or "").upper() in ("C", "D", "E") else "Causten SemiBold"
+def recommend_font(concept_id: str | None, *, pack=None) -> dict:
+    """§7.1.4 — font is locked to the brand's family; only the weight varies."""
+    pk = _resolve_pack(pack)
+    family = pk.font_family
+    recommended = pk.default_font
+    names = pk.font_names()
+    # Offer a different in-family weight as the alternative (next name, else default).
+    alt = next((n for n in names if n != recommended), recommended)
     return {
         "type": "font",
         "state": "proposed",
         "source": "agent",
-        "family": "Causten",
+        "family": family,
         "locked": True,
-        "recommended": "Causten Bold",
+        "recommended": recommended,
         "alternative": alt,
         "rationale": (
-            "Causten is the locked brand font — every creative uses it. Causten Bold "
-            f"is the punchy default for headlines; {alt} is an in-family weight if you "
-            "want a different emphasis."
+            f"{family} is the locked brand font — every creative uses it. {recommended} "
+            f"is the default for headlines; {alt} is an in-family weight if you want a "
+            "different emphasis."
         ),
     }
 
@@ -887,6 +927,7 @@ _QA = {
 }
 
 
-def qa_critique(stage: int) -> dict:
+def qa_critique(stage: int, *, pack=None) -> dict:
     """§7.1.5 — advisory only, never auto-regenerates."""
-    return {"type": "qa", "state": "proposed", "source": "agent", "stage": stage, "note": _QA.get(stage, "")}
+    qa = _resolve_pack(pack).qa
+    return {"type": "qa", "state": "proposed", "source": "agent", "stage": stage, "note": qa.get(stage, "")}

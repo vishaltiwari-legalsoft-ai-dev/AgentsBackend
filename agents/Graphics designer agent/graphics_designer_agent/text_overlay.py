@@ -16,8 +16,10 @@ the per-element pixel nudge fine-tunes from there.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import Callable
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
@@ -31,28 +33,57 @@ def _hex(h: str) -> tuple[int, int, int]:
     return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
 
 
-# Brand colours (locked — derived from variants.LOCKED_COLORS, §2.2).
-_DARK = _hex(LOCKED_COLORS["text"])              # #0F0F0F
-_WHITE = (255, 255, 255)
-_GRAD_TEXT = (_hex(LOCKED_COLORS["headline_highlight"]["from"]),
-              _hex(LOCKED_COLORS["headline_highlight"]["to"]))   # #86AFFE → #2653AB
-_CTA_GRAD = (_hex(LOCKED_COLORS["cta"]["from"]),
-             _hex(LOCKED_COLORS["cta"]["to"]))    # #FF8A3D → #F26A1A
+@dataclass(frozen=True)
+class _Theme:
+    """Per-brand colours + font resolver the renderer draws with. Built from a
+    BrandPack, or from the Legal Soft defaults when no pack is supplied."""
+    dark: tuple
+    white: tuple
+    grad_text: tuple          # (start, end) for highlight text
+    cta_grad: tuple           # (start, end) for the CTA pill
+    fonts_dir: Path
+    font_file: Callable[[str], str]
+
+
+def _default_theme() -> _Theme:
+    """Legal Soft theme (back-compat for callers that pass no pack — e.g. tests)."""
+    return _Theme(
+        dark=_hex(LOCKED_COLORS["text"]),
+        white=(255, 255, 255),
+        grad_text=(_hex(LOCKED_COLORS["headline_highlight"]["from"]),
+                   _hex(LOCKED_COLORS["headline_highlight"]["to"])),
+        cta_grad=(_hex(LOCKED_COLORS["cta"]["from"]), _hex(LOCKED_COLORS["cta"]["to"])),
+        fonts_dir=FONT_DIR,
+        font_file=font_file,
+    )
+
+
+def _theme_from_pack(pack) -> _Theme:
+    lc = pack.locked_colors
+    return _Theme(
+        dark=_hex(lc["text"]),
+        white=(255, 255, 255),
+        grad_text=(_hex(lc["headline_highlight"]["from"]), _hex(lc["headline_highlight"]["to"])),
+        cta_grad=(_hex(lc["cta"]["from"]), _hex(lc["cta"]["to"])),
+        fonts_dir=pack.fonts_dir,
+        font_file=pack.font_file,
+    )
+
 
 _SCRATCH = ImageDraw.Draw(Image.new("RGB", (1, 1)))
 
 
-def _font(name: str, px: float) -> ImageFont.FreeTypeFont:
-    return ImageFont.truetype(str(FONT_DIR / font_file(name)), max(6, int(round(px))))
+def _font(name: str, px: float, theme: _Theme) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(str(theme.fonts_dir / theme.font_file(name)), max(6, int(round(px))))
 
 
-def _resolve_color(key: str):
+def _resolve_color(key: str, theme: _Theme):
     """Map a colour key to a fill spec the renderer understands."""
     if key == "white":
-        return ("solid", _WHITE)
+        return ("solid", theme.white)
     if key == "gradient":
-        return ("grad", _GRAD_TEXT)
-    return ("solid", _DARK)
+        return ("grad", theme.grad_text)
+    return ("solid", theme.dark)
 
 
 def _gradient(w: int, h: int, c0, c1) -> Image.Image:
@@ -124,8 +155,8 @@ def _headline_tokens(text: str, highlight: str):
     return [(w, False) for w in text.split()]
 
 
-def _element_layout(elem: dict, base_w: int, base_h: int, mx: int):
-    font = _font(elem["font"], elem["size_pct"] / 100 * base_w)
+def _element_layout(elem: dict, base_w: int, base_h: int, mx: int, theme: _Theme):
+    font = _font(elem["font"], elem["size_pct"] / 100 * base_w, theme)
     max_w, ha, va = _zone(elem["placement"], base_w, base_h, mx)
     lines = _wrap(elem["tokens"], font, max_w)
     asc, desc = font.getmetrics()
@@ -136,16 +167,20 @@ def _element_layout(elem: dict, base_w: int, base_h: int, mx: int):
             "va": va, "widths": widths, "height": lh * len(lines)}
 
 
-def _render_text_elements(canvas, elements, base_w, base_h):
+def _render_text_elements(canvas, elements, base_w, base_h, theme: _Theme, px_scale=1.0):
     """Place + draw the headline and sub-headings. Elements that share a
     placement are stacked in order so they never silently overlap; the
-    per-element pixel nudge then fine-tunes each one."""
+    per-element pixel nudge then fine-tunes each one.
+
+    ``px_scale`` scales the per-element pixel nudges when the canvas is rendered
+    larger than the 1080-px reference the user calibrated against (so a hi-res
+    render keeps the same visual position as the preview)."""
     mx, my = int(0.06 * base_w), int(0.06 * base_h)
     gap = int(0.025 * base_h)
 
     groups: dict[str, list] = {}
     for elem in elements:
-        lay = _element_layout(elem, base_w, base_h, mx)
+        lay = _element_layout(elem, base_w, base_h, mx, theme)
         groups.setdefault(elem["placement"], []).append((elem, lay))
 
     for items in groups.values():
@@ -158,7 +193,7 @@ def _render_text_elements(canvas, elements, base_w, base_h):
         else:
             y = (base_h - total) // 2
         for elem, lay in items:
-            ey = y + elem["offset"][1]
+            ey = y + round(elem["offset"][1] * px_scale)
             for i, ln in enumerate(lay["lines"]):
                 lw = lay["widths"][i]
                 if lay["ha"] == "right":
@@ -167,7 +202,7 @@ def _render_text_elements(canvas, elements, base_w, base_h):
                     x = (base_w - lw) / 2
                 else:
                     x = mx
-                x += elem["offset"][0]
+                x += round(elem["offset"][0] * px_scale)
                 yy = ey + i * lay["lh"]
                 cx = x
                 for tok in ln:
@@ -176,9 +211,9 @@ def _render_text_elements(canvas, elements, base_w, base_h):
             y += lay["height"] + gap
 
 
-def _draw_cta(canvas, cta: dict, base_w, base_h):
+def _draw_cta(canvas, cta: dict, base_w, base_h, theme: _Theme, px_scale=1.0):
     label = cta["text"].rstrip() + "  →"
-    font = _font(cta["font"], cta["size_pct"] / 100 * base_w)
+    font = _font(cta["font"], cta["size_pct"] / 100 * base_w, theme)
     asc, desc = font.getmetrics()
     th = asc + desc
     tw = int(round(font.getlength(label)))
@@ -195,27 +230,32 @@ def _draw_cta(canvas, cta: dict, base_w, base_h):
     else:  # center / top / bottom → horizontally centered
         x = (base_w - pw) // 2
     y = my if place == "top" else base_h - my - ph  # default sits low
-    x += cta["offset"][0]
-    y += cta["offset"][1]
+    x += round(cta["offset"][0] * px_scale)
+    y += round(cta["offset"][1] * px_scale)
 
     # Soft orange-tinted drop shadow (blurred rounded rect, slight downward offset).
-    pad = 40
+    # The absolute padding/blur/offset scale with the canvas so the shadow keeps
+    # the same softness on a hi-res render as in the 1080-px preview.
+    pad = max(1, round(40 * px_scale))
+    blur = max(1, round(14 * px_scale))
+    drop = max(1, round(10 * px_scale))
     shadow = Image.new("RGBA", (pw + 2 * pad, ph + 2 * pad), (0, 0, 0, 0))
     ImageDraw.Draw(shadow).rounded_rectangle(
-        [pad, pad, pad + pw, pad + ph], radius=radius, fill=_CTA_GRAD[1] + (90,))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(14))
-    canvas.alpha_composite(shadow, (x - pad, y - pad + 10))
+        [pad, pad, pad + pw, pad + ph], radius=radius, fill=theme.cta_grad[1] + (90,))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(blur))
+    canvas.alpha_composite(shadow, (x - pad, y - pad + drop))
 
     # Gradient-filled pill.
-    grad = _gradient(pw, ph, _CTA_GRAD[0], _CTA_GRAD[1]).convert("RGBA")
+    grad = _gradient(pw, ph, theme.cta_grad[0], theme.cta_grad[1]).convert("RGBA")
     mask = Image.new("L", (pw, ph), 0)
     ImageDraw.Draw(mask).rounded_rectangle([0, 0, pw - 1, ph - 1], radius=radius, fill=255)
     canvas.paste(grad, (x, y), mask)
 
-    _draw_run(canvas, x + pad_x, y + pad_y, label, font, ("solid", _WHITE))
+    _draw_run(canvas, x + pad_x, y + pad_y, label, font, ("solid", theme.white))
 
 
-def render_overlay(base_png: bytes, spec: dict, base_w: int, base_h: int) -> bytes:
+def render_overlay(base_png: bytes, spec: dict, base_w: int, base_h: int,
+                   *, px_scale: float = 1.0, pack=None) -> bytes:
     """Render the Stage-3 text overlay onto the base image and return PNG bytes.
 
     ``spec`` shape::
@@ -226,15 +266,21 @@ def render_overlay(base_png: bytes, spec: dict, base_w: int, base_h: int) -> byt
           "subheadings":[{"text","font","size_pct","color","placement","offset":(x,y)}],
           "cta":       {"text","font","size_pct","placement","offset":(x,y)},
         }
+
+    ``px_scale`` (>1 when ``base_w/base_h`` exceed the 1080-px UI reference) scales
+    the user's pixel nudges + the CTA shadow so a hi-res render matches the preview.
+    Font sizes and margins are already percentages of the width, so they scale on
+    their own; only the absolute pixel values need ``px_scale``.
     """
+    theme = _theme_from_pack(pack) if pack is not None else _default_theme()
     base = Image.open(BytesIO(base_png)).convert("RGBA")
     if base.size != (base_w, base_h):
         base = base.resize((base_w, base_h), Image.LANCZOS)
     canvas = base.copy()
 
     h = spec["headline"]
-    head_fill = _resolve_color(h.get("color", "dark"))
-    hl_fill = _resolve_color(h.get("highlight_color", "gradient"))
+    head_fill = _resolve_color(h.get("color", "dark"), theme)
+    hl_fill = _resolve_color(h.get("highlight_color", "gradient"), theme)
     elements = [{
         "tokens": _headline_tokens(h["text"], h.get("highlight", "")),
         "font": h["font"], "size_pct": h["size_pct"], "placement": h.get("placement", "left"),
@@ -242,7 +288,7 @@ def render_overlay(base_png: bytes, spec: dict, base_w: int, base_h: int) -> byt
         "color_for": (lambda t: hl_fill if t[1] else head_fill),
     }]
     for sh in spec.get("subheadings", []):
-        fill = _resolve_color(sh.get("color", "dark"))
+        fill = _resolve_color(sh.get("color", "dark"), theme)
         elements.append({
             "tokens": [(w, False) for w in sh["text"].split()] or [("", False)],
             "font": sh["font"], "size_pct": sh["size_pct"],
@@ -250,9 +296,9 @@ def render_overlay(base_png: bytes, spec: dict, base_w: int, base_h: int) -> byt
             "line_gap": 1.4, "color_for": (lambda t, f=fill: f),
         })
 
-    _render_text_elements(canvas, elements, base_w, base_h)
+    _render_text_elements(canvas, elements, base_w, base_h, theme, px_scale)
     if spec.get("cta", {}).get("text"):
-        _draw_cta(canvas, spec["cta"], base_w, base_h)
+        _draw_cta(canvas, spec["cta"], base_w, base_h, theme, px_scale)
 
     out = BytesIO()
     canvas.convert("RGB").save(out, format="PNG")

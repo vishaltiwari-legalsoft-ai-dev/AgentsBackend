@@ -5,11 +5,12 @@ image chaining (§2.5) and the deterministic Stage-4 composite (§5.4).
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import asdict
+from io import BytesIO
 
-from . import text_overlay, variants
+from . import registry, text_overlay, variants
 from .compositor import composite_logo, logo_placement
-from .prompts import load_prompt
 from .providers import ImageProvider, get_provider
 from .runs import (
     STATE_FOR_STAGE_CONFIG,
@@ -30,11 +31,36 @@ from .tokens import (
 )
 
 # Resolution requested from the image model per stage (OpenRouter image_config
-# image_size). Stage 1 is a smooth gradient base that gets re-rendered downstream,
-# so 2K is plenty; Stages 2-4 carry the photographic subject, text and the final
-# deliverable, so they render at the full 4K the brand requires. The model
-# defaults to 1K when this is unset — the cause of the soft, low-res output.
-STAGE_IMAGE_SIZE = {1: "2K", 2: "4K", 3: "4K", 4: "4K"}
+# image_size). Two profiles, selected by GD_IMAGE_QUALITY:
+#
+#   "social" (DEFAULT) — tuned for social delivery (~1080px feeds): a 1K gradient
+#     base + 2K photo. 2K (2048px) is already ~2x what the feed shows and keeps the
+#     Pro image model fast. Stage 3 never calls the model (deterministic overlay);
+#     Stage 4's size only applies on the AI-compositor path.
+#   "max" — print/large-format grade: 2K base + 4K downstream. Noticeably slower.
+#
+# Explicitly setting a size matters regardless of profile: the model defaults to
+# 1K when image_size is unset, which is the real cause of "soft" output.
+_IMAGE_QUALITY = (os.environ.get("GD_IMAGE_QUALITY") or "social").strip().lower()
+STAGE_IMAGE_SIZE = (
+    {1: "2K", 2: "4K", 3: "4K", 4: "4K"}
+    if _IMAGE_QUALITY == "max"
+    else {1: "1K", 2: "2K", 3: "2K", 4: "2K"}
+)
+
+# References (e.g. the Stage-1 gradient chained into Stage 2) only need to convey
+# composition + colour, not pixel detail — so we downscale them before upload.
+# This trims request size + the model's ingest time without affecting the fresh
+# output the model generates.
+REFERENCE_MAX_SIDE = 1024
+
+# Upper bound on the deterministic render width (px). The Stage-2 photo can come
+# back at the model's full 4K; we keep that resolution through the Stage-3 text
+# overlay and the Stage-4 logo composite instead of crushing it to the 1080-px AR
+# preset (the old behaviour, which downsized a 4K base — and any high-res logo —
+# back to ~1080 before compositing). Bounded so a pathologically large source
+# can't blow up memory.
+MAX_RENDER_WIDTH = 4096
 
 # This pipeline IS the Graphic Designer agent ("a1" in the agent catalog). The id
 # lets the provider resolve this agent's per-agent image-model override set by the
@@ -63,9 +89,10 @@ def _resolve_overlay_spec(run: dict) -> dict:
     the CTA into the shape ``text_overlay.render_overlay`` expects. Tolerant of
     older runs that still carry the legacy ``subtext1``/``subtext2`` tokens."""
     cfg = run["config"]
+    pack = registry.get_pack(run.get("brand_id"))
     tk = cfg.get("tokens") or {}
     styles = cfg.get("element_styles") or {}
-    base_font = cfg.get("font") or DEFAULT_FONT
+    base_font = cfg.get("font") or pack.default_font
     sizes = variants.DEFAULT_TEXT_SIZE_PCT
 
     def off(s: dict) -> tuple[int, int]:
@@ -130,9 +157,42 @@ def reference_for(run: dict, stage: int) -> list[tuple[bytes, str]] | None:
     return [(png, "image/png")] if png is not None else None
 
 
+def _shrink_reference(refs: list[tuple[bytes, str]] | None,
+                      max_side: int = REFERENCE_MAX_SIDE) -> list[tuple[bytes, str]] | None:
+    """Downscale reference images so the longest side is ``max_side`` px.
+
+    The reference only guides composition/colour, so a smaller copy gives the
+    same result with a smaller payload + faster model ingest. Best-effort: any
+    failure falls back to the original bytes."""
+    if not refs:
+        return refs
+    from PIL import Image
+
+    out: list[tuple[bytes, str]] = []
+    for data, mime in refs:
+        try:
+            img = Image.open(BytesIO(data))
+            longest = max(img.size)
+            if longest > max_side:
+                scale = max_side / longest
+                img = img.resize(
+                    (max(1, round(img.width * scale)), max(1, round(img.height * scale))),
+                    Image.LANCZOS,
+                )
+                buf = BytesIO()
+                img.save(buf, format="PNG")
+                out.append((buf.getvalue(), "image/png"))
+            else:
+                out.append((data, mime))
+        except Exception:  # noqa: BLE001 - never let a reference tweak break generation
+            out.append((data, mime))
+    return out
+
+
 def build_prompt(run: dict, stage: int, variant: str) -> dict:
     """Return the exact final prompt + audit diff for a stage (no generation)."""
     cfg = run["config"]
+    pack = registry.get_pack(run.get("brand_id"))
     ar = cfg["aspect_ratio"]
     diffs: list = []
     warnings: list[str] = []
@@ -148,7 +208,7 @@ def build_prompt(run: dict, stage: int, variant: str) -> dict:
             if not template:
                 raise PipelineError("Generate an AI gradient first.")
         else:
-            template = load_prompt(variants.stage1_variant(variant)["prompt_file"])
+            template = pack.load_prompt(pack.stage1_variant(variant)["prompt_file"])
         sub = substitute_stage1(template, ar)
         text, diffs, warnings = sub.text, sub.diffs, list(sub.warnings)
     elif stage == 2:
@@ -160,9 +220,9 @@ def build_prompt(run: dict, stage: int, variant: str) -> dict:
             if not subject:
                 raise PipelineError("Generate an AI element first.")
         else:
-            subject = variants.stage2_variant(variant)["subject"]
+            subject = pack.stage2_variant(variant)["subject"]
         sub = substitute_stage2(
-            load_prompt(variants.STAGE2_BLEND_PROMPT), variant, ar, subject=subject
+            pack.load_prompt(pack.stage2_blend_prompt), variant, ar, subject=subject
         )
         text, diffs, warnings = sub.text, sub.diffs, list(sub.warnings)
     elif stage == 3:
@@ -170,7 +230,7 @@ def build_prompt(run: dict, stage: int, variant: str) -> dict:
         # so the "prompt" shown in the audit panel is a readable layout summary.
         text = text_overlay.overlay_spec_summary(_resolve_overlay_spec(run))
     elif stage == 4:
-        text = load_prompt("stage4_logo_composite.txt")
+        text = pack.load_prompt("stage4_logo_composite.txt")
     else:
         raise PipelineError(f"invalid stage {stage}")
 
@@ -182,6 +242,24 @@ def build_prompt(run: dict, stage: int, variant: str) -> dict:
     }
 
 
+def _hires_canvas(base_png: bytes, canvas_w: int, canvas_h: int) -> tuple[int, int, float]:
+    """Target render size that preserves the approved image's resolution.
+
+    Keeps the locked aspect ratio (``canvas_w``×``canvas_h`` shape) but scales the
+    pixel dimensions up to the source image's native width — so a 4K Stage-2 photo
+    (and the logo composited later) keep full resolution instead of being forced
+    back to the 1080-px preset. Never downsizes below the preset and is bounded by
+    ``MAX_RENDER_WIDTH``. Returns ``(w, h, px_scale)``."""
+    from PIL import Image
+
+    try:
+        native_w, _native_h = Image.open(BytesIO(base_png)).size
+    except Exception:  # noqa: BLE001 - unreadable base → fall back to the preset
+        return canvas_w, canvas_h, 1.0
+    scale = max(1.0, min(native_w / canvas_w, MAX_RENDER_WIDTH / canvas_w))
+    return round(canvas_w * scale), round(canvas_h * scale), scale
+
+
 def _generate_stage3(run: dict) -> dict:
     """Render the Stage-3 text overlay deterministically onto the approved Stage-2
     image (no model call) — exact sizes, positions, colours; base pixels intact."""
@@ -189,8 +267,11 @@ def _generate_stage3(run: dict) -> dict:
     if base is None:
         raise PipelineError("Stage 3 requires the approved Stage 2 image.")
     spec = _resolve_overlay_spec(run)
-    w, h = _stage_dims(run, 3)
-    png = text_overlay.render_overlay(base, spec, w, h)
+    canvas_w, canvas_h = _stage_dims(run, 3)
+    w, h, px_scale = _hires_canvas(base, canvas_w, canvas_h)
+    png = text_overlay.render_overlay(
+        base, spec, w, h, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id"))
+    )
     summary = text_overlay.overlay_spec_summary(spec)
     attempt_no = len(run["stages"]["3"]["attempts"]) + 1
     rel = save_artifact(run["id"], 3, "T", attempt_no, png)
@@ -232,6 +313,7 @@ def generate(run: dict, stage: int, variant: str | None = None,
     refs = reference_for(run, stage)
     if stage > 1 and not refs:
         raise PipelineError(f"Stage {stage} requires the approved Stage {stage - 1} image.")
+    refs = _shrink_reference(refs)  # smaller upload + faster ingest (Stage 2 base)
 
     built = build_prompt(run, stage, variant)
     if built["negative_prompt"] and not provider.supports_negative:
@@ -284,7 +366,7 @@ def generate_stage4(run: dict, logo_png: bytes, *, use_ai: bool | None = None,
     logo_rel = save_artifact(run["id"], 4, "logo", attempt_no, logo_png)
     if use_ai:
         provider = provider or get_provider(agent_id=GD_AGENT_ID)
-        text = load_prompt("stage4_logo_composite.txt")
+        text = registry.get_pack(run.get("brand_id")).load_prompt("stage4_logo_composite.txt")
         hint = _logo_placement_hint(layout)
         if hint:
             text = f"{text}\n\nLOGO PLACEMENT (follow precisely):\n{hint}"

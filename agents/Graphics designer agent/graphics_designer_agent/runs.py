@@ -15,16 +15,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .compositor import default_logo_layout
-from .tokens import (
-    DEFAULT_AR,
-    DEFAULT_CTA,
-    DEFAULT_CTA_PLACEMENT,
-    DEFAULT_FONT,
-    DEFAULT_HEADLINE,
-    DEFAULT_HIGHLIGHT,
-    DEFAULT_TEXT_PLACEMENT,
-)
-from .variants import default_stage3_styles, default_subheadings
+from .tokens import DEFAULT_AR, DEFAULT_CTA_PLACEMENT, DEFAULT_TEXT_PLACEMENT
+
+# Per-brand factory defaults (font, copy, element styles, sub-headings) come from
+# the resolved BrandPack inside ``create_run`` — see ``registry.get_pack``.
 
 RUNS_ROOT = Path(os.environ.get("GD_RUNS_DIR") or (Path(__file__).resolve().parents[1] / "runs"))
 
@@ -65,24 +59,31 @@ def _empty_stage() -> dict:
 
 
 def create_run(user_id: str, brand_id: str | None = None) -> dict:
+    # Resolve the selected brand's pack so every factory default (font, copy,
+    # element styles, sub-headings) starts from that brand's identity. Falls back
+    # to Legal Soft for None/unknown ids. Imported lazily to avoid an import cycle
+    # (registry imports the content modules that ultimately import runs' siblings).
+    from . import registry
+
+    pack = registry.get_pack(brand_id)
     run = {
         "id": uuid.uuid4().hex[:12],
         "user_id": user_id,
-        "brand_id": brand_id,
+        "brand_id": pack.id,
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "state": "STAGE1_CONFIG",
         "config": {
-            "font": DEFAULT_FONT,
+            "font": pack.default_font,
             "aspect_ratio": DEFAULT_AR,
             "text_placement": DEFAULT_TEXT_PLACEMENT,
             "cta_placement": DEFAULT_CTA_PLACEMENT,
             # Per-element Stage-3 styling for the deterministic renderer: headline +
             # CTA carry font/colour/size/placement/pixel-nudge; highlight is inline
             # (font + colour). Sub-headings are the dynamic list below.
-            "element_styles": default_stage3_styles(),
+            "element_styles": pack.default_stage3_styles(),
             # Stage-3 sub-heading lines (1–5). Each carries its own text + styling.
-            "subheadings": default_subheadings(),
+            "subheadings": pack.default_subheadings(),
             # Stage-4 logo placement controls (deterministic compositor).
             "logo_layout": default_logo_layout(),
             "use_ai_compositor": False,
@@ -96,9 +97,9 @@ def create_run(user_id: str, brand_id: str | None = None) -> dict:
             "custom_element": None,
             # Headline/highlight/CTA text. Sub-heading text lives in ``subheadings``.
             "tokens": {
-                "headline": DEFAULT_HEADLINE,
-                "highlight": DEFAULT_HIGHLIGHT,
-                "cta": DEFAULT_CTA,
+                "headline": pack.default_headline,
+                "highlight": pack.default_highlight,
+                "cta": pack.default_cta,
             },
             "tokens_approved": {"headline": False, "highlight": False, "cta": False},
         },

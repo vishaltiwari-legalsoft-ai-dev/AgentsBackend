@@ -106,9 +106,11 @@ def _flatten_svg_gradients(data: bytes) -> bytes:
 
 def _svg_to_png(data: bytes, file_name: str) -> bytes | None:
     # Best quality when the native cairo lib is present (renders gradients).
+    # Rasterize a vector logo at a high width so it stays crisp when composited
+    # onto a 4K creative (a 1000-px raster looked soft once the canvas grew).
     if _cairosvg is not None:
         try:
-            return _cairosvg.svg2png(bytestring=data, output_width=1000)
+            return _cairosvg.svg2png(bytestring=data, output_width=2048)
         except Exception as exc:  # noqa: BLE001
             logger.warning("cairosvg failed for %s, falling back: %s", file_name, exc)
 
