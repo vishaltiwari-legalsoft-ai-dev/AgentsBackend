@@ -14,8 +14,8 @@ from .providers import ImageProvider, get_provider
 from .runs import (
     STATE_FOR_STAGE_CONFIG,
     STATE_FOR_STAGE_REVIEW,
-    artifact_abspath,
     now_iso,
+    read_artifact,
     save_artifact,
     save_run,
 )
@@ -119,7 +119,7 @@ def _approved_png(run: dict, stage: int) -> bytes | None:
     appr = run["stages"][str(stage)]["approved"]
     if not appr:
         return None
-    return artifact_abspath(run["id"], appr["artifact"]).read_bytes()
+    return read_artifact(run["id"], appr["artifact"])
 
 
 def reference_for(run: dict, stage: int) -> list[tuple[bytes, str]] | None:

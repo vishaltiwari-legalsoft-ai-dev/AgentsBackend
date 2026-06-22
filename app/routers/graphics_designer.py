@@ -79,8 +79,22 @@ def _valid_offset(v, axis: str) -> int:
 
 
 # ── serialization ─────────────────────────────────────────────────────────────
-def _artifact_url(run_id: str, rel: str) -> str:
-    return f"/api/gd/runs/{run_id}/artifact/{rel}"
+def _artifact_url(run_id: str, ref: str) -> str:
+    """Browser-facing URL for a stored artifact reference.
+
+    Cloud artifacts are GCS ``gs://`` URIs → return a short-lived signed URL so the
+    browser pulls straight from GCS (re-signed on every serialization, mirroring
+    ``storage.rehydrate_result``). Filesystem artifacts keep the API byte-proxy.
+    """
+    if ref.startswith("gs://"):
+        from app.services import storage
+
+        try:
+            return storage.signed_url_for_gs_uri(ref)
+        except Exception:  # noqa: BLE001 - fall back to the proxy if signing fails
+            logger.exception("GD: failed to sign artifact URL for %s", ref)
+            return f"/api/gd/runs/{run_id}/artifact/{ref}"
+    return f"/api/gd/runs/{run_id}/artifact/{ref}"
 
 
 def _to_client(run: dict) -> dict:
@@ -562,8 +576,16 @@ def suggest_endpoint(run_id: str, body: SuggestBody, user: dict = Depends(get_cu
 # ── artifact streaming ────────────────────────────────────────────────────────
 @router.get("/gd/runs/{run_id}/artifact/{rel:path}")
 def get_artifact(run_id: str, rel: str, user: dict = Depends(get_current_user)):
-    run = _owned_run(run_id, user)
-    from graphics_designer_agent.runs import artifact_abspath
+    _owned_run(run_id, user)
+    from graphics_designer_agent.runs import artifact_abspath, read_artifact
+
+    # Cloud artifacts (gs:// refs) are normally served as signed URLs; this branch
+    # is the defensive fallback when signing failed at serialization time.
+    if rel.startswith("gs://"):
+        try:
+            return Response(content=read_artifact(run_id, rel), media_type="image/png")
+        except Exception:  # noqa: BLE001
+            raise HTTPException(404, "Artifact not found")
 
     try:
         path = artifact_abspath(run_id, rel)

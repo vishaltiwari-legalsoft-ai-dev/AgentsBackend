@@ -28,8 +28,32 @@ from .variants import default_stage3_styles, default_subheadings
 
 RUNS_ROOT = Path(os.environ.get("GD_RUNS_DIR") or (Path(__file__).resolve().parents[1] / "runs"))
 
+# Storage backend (scalability seam, see runs §). ``fs`` keeps every run manifest
+# and artifact on the local filesystem — correct for tests and single-machine dev,
+# but per-instance and ephemeral on Cloud Run. ``cloud`` persists manifests to the
+# ``gd_runs`` Firestore collection and artifacts to GCS (via ``app.services``), so
+# state is shared across instances and survives redeploys. Default is ``fs`` so the
+# offline test suite and the standalone package are unchanged; Cloud Run sets
+# ``GD_STORAGE_BACKEND=cloud``. App-service imports stay lazy (inside the cloud
+# branch) so the package still imports without the backend app installed.
+GD_STORAGE_BACKEND = (os.environ.get("GD_STORAGE_BACKEND") or "fs").strip().lower()
+
+# GCS object prefix for this agent's artifacts: ``generated/gd/<run_id>/...``.
+_GCS_PARTITION = "gd"
+
 STATE_FOR_STAGE_CONFIG = {1: "STAGE1_CONFIG", 2: "STAGE2_CONFIG", 3: "STAGE3_CONFIG", 4: "STAGE4_CONFIG"}
 STATE_FOR_STAGE_REVIEW = {1: "STAGE1_REVIEW", 2: "STAGE2_REVIEW", 3: "STAGE3_REVIEW", 4: "STAGE4_REVIEW"}
+
+
+def _use_cloud() -> bool:
+    return GD_STORAGE_BACKEND == "cloud"
+
+
+def _gd_runs_collection():
+    """The ``gd_runs`` Firestore collection (lazy — only imported in cloud mode)."""
+    from app.services.firestore_repo import _db
+
+    return _db().collection("gd_runs")
 
 
 def now_iso() -> str:
@@ -96,12 +120,22 @@ def run_json_path(run_id: str) -> Path:
 
 def save_run(run: dict) -> None:
     run["updated_at"] = now_iso()
+    if _use_cloud():
+        # Last-write-wins, matching the existing filesystem semantics. Concurrent
+        # writes to one run are still racy here exactly as they were on the FS; the
+        # transactional attempt-append is the documented next increment and does not
+        # change this storage seam.
+        _gd_runs_collection().document(run["id"]).set(run)
+        return
     d = run_dir(run["id"])
     d.mkdir(parents=True, exist_ok=True)
     run_json_path(run["id"]).write_text(json.dumps(run, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def get_run(run_id: str) -> dict | None:
+    if _use_cloud():
+        doc = _gd_runs_collection().document(run_id).get()
+        return doc.to_dict() if doc.exists else None
     path = run_json_path(run_id)
     if not path.exists():
         return None
@@ -109,7 +143,25 @@ def get_run(run_id: str) -> dict | None:
 
 
 def save_artifact(run_id: str, stage: int, variant: str, attempt: int, png: bytes) -> str:
-    """Persist a generated PNG and return its run-relative path."""
+    """Persist a generated PNG and return an opaque reference to it.
+
+    The reference is stored verbatim on the attempt and round-tripped through
+    ``read_artifact`` / the router. In ``fs`` mode it is the run-relative path
+    (``stage-<n>/<variant>-<attempt>.png``); in ``cloud`` mode it is the GCS
+    ``gs://`` URI returned by the shared storage service.
+    """
+    if _use_cloud():
+        from app.services import storage
+
+        # ``_safe_name`` flattens "/" in the object name, so the per-run folder is
+        # carried in the partition and the stage is folded into a flat file name.
+        gs_uri, _signed = storage.upload_generated(
+            partition=f"{_GCS_PARTITION}/{run_id}",
+            file_name=f"stage-{stage}-{variant}-{attempt}.png",
+            data=png,
+            content_type="image/png",
+        )
+        return gs_uri
     rel = f"stage-{stage}/{variant}-{attempt}.png"
     abspath = run_dir(run_id) / rel
     abspath.parent.mkdir(parents=True, exist_ok=True)
@@ -117,8 +169,17 @@ def save_artifact(run_id: str, stage: int, variant: str, attempt: int, png: byte
     return rel
 
 
+def read_artifact(run_id: str, ref: str) -> bytes:
+    """Read an artifact's bytes from its stored reference (fs path or gs:// URI)."""
+    if ref.startswith("gs://"):
+        from app.services import storage
+
+        return storage.download_bytes(ref)
+    return artifact_abspath(run_id, ref).read_bytes()
+
+
 def artifact_abspath(run_id: str, rel: str) -> Path:
-    # Guard against path traversal.
+    # Guard against path traversal (filesystem backend only).
     base = run_dir(run_id).resolve()
     target = (run_dir(run_id) / rel).resolve()
     if not str(target).startswith(str(base)):
