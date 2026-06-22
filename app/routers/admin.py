@@ -258,6 +258,14 @@ def update_news(body: NewsBody, _creator: dict = Depends(require_creator)) -> di
 # Per-user by default; the creator may request scope=all (everyone aggregated).
 # --------------------------------------------------------------------------- #
 
+def _display_name_from_email(email: str) -> str:
+    """Fallback display name for the leaderboard when no profile name exists:
+    turn ``vishal.tiwari@…`` into ``Vishal Tiwari``."""
+    local = (email or "").split("@")[0]
+    parts = [p for p in local.replace(".", " ").replace("_", " ").split() if p]
+    return " ".join(p.capitalize() for p in parts) or (email or "Unknown")
+
+
 def _usage_payload(user_id: str | None, days: int) -> dict:
     days = max(1, min(days, 365))
     now = datetime.now(timezone.utc)
@@ -270,16 +278,25 @@ def _usage_payload(user_id: str | None, days: int) -> dict:
     agent_creatives: Counter[str] = Counter()  # assets produced per agent
     day_sessions: Counter[str] = Counter()
     day_creatives: Counter[str] = Counter()
+    user_sessions: Counter[str] = Counter()    # per-user leaderboard: runs
+    user_creatives: Counter[str] = Counter()   # per-user leaderboard: assets
+    user_agents: defaultdict[str, set] = defaultdict(set)  # distinct agents/user
+    user_email: dict[str, str] = {}
     for ev in events:
         agent_id = ev.get("agent_id") or ev.get("category") or "unknown"
         day = ev.get("day") or str(ev.get("created_at", ""))[:10]
         count = int(ev.get("count", 1) or 1)
+        uid = str(ev.get("user_id") or "unknown")
+        user_email.setdefault(uid, ev.get("email") or "")
+        user_agents[uid].add(agent_id)
         if ev.get("action") == "session":
             agent_sessions[agent_id] += 1
             day_sessions[day] += 1
+            user_sessions[uid] += 1
         else:  # "generate" (or legacy events without an action)
             agent_creatives[agent_id] += count
             day_creatives[day] += count
+            user_creatives[uid] += count
 
     per_agent = [
         {
@@ -293,6 +310,32 @@ def _usage_payload(user_id: str | None, days: int) -> dict:
         }
         for agent in agent_config.AGENTS
     ]
+
+    # Per-user leaderboard. Real profile names/pictures are only worth the extra
+    # Firestore read on the creator's all-users view; the per-user view is a
+    # single row, so fall back to an email-derived name there.
+    directory: dict[str, dict] = {}
+    if user_id is None:
+        directory = {str(u["id"]): u for u in firestore_repo.list_users()}
+
+    per_user = []
+    for uid in user_agents:
+        profile = directory.get(uid, {})
+        email = profile.get("email") or user_email.get(uid, "")
+        per_user.append(
+            {
+                "user_id": uid,
+                "email": email,
+                "name": profile.get("name") or _display_name_from_email(email),
+                "picture": profile.get("picture", ""),
+                "sessions": int(user_sessions.get(uid, 0)),
+                "creatives": int(user_creatives.get(uid, 0)),
+                "agents_used": len(user_agents.get(uid, set())),
+            }
+        )
+    per_user.sort(
+        key=lambda u: (u["sessions"], u["creatives"], u["agents_used"]), reverse=True
+    )
 
     # Continuous day-by-day series so idle days render as zero on the chart.
     daily = []
@@ -310,6 +353,7 @@ def _usage_payload(user_id: str | None, days: int) -> dict:
         "days": days,
         "scope": "all" if user_id is None else "me",
         "per_agent": per_agent,
+        "per_user": per_user,
         "daily": daily,
         "totals": {
             "sessions": int(sum(agent_sessions.values())),
