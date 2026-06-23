@@ -607,8 +607,11 @@ VIEWABLE_COLLECTIONS: list[dict[str, str]] = [
      "description": "Every Graphics Designer run manifest (cloud storage mode only)."},
     {"name": "reference_creatives", "label": "Reference uploads",
      "description": "User-uploaded reference material."},
-    {"name": "conversations", "label": "Conversations",
-     "description": "Saved chat history, one document per conversation."},
+    # NOTE: "conversations" is deliberately NOT viewable in the admin DB viewer —
+    # chat history is private to each developer and must not be browsable by the
+    # team. Removing it here both hides the tab and makes
+    # /admin/db/collections/conversations return 404 (guarded by
+    # is_viewable_collection). Do not re-add it.
     {"name": "creative_events", "label": "Usage events",
      "description": "Per-action analytics events powering the dashboards."},
     {"name": "app_config", "label": "App config",
