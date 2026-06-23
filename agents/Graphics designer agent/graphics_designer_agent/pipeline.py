@@ -294,6 +294,54 @@ def _generate_stage3(run: dict) -> dict:
     return attempt
 
 
+# Width (px) of the live Stage-3 preview. Small enough to render in well under
+# ~100ms, while keeping geometry identical to the full output: placement zones,
+# margins and font sizes are all percentages of the width, so they are
+# resolution-independent — only the pixel nudges need px_scale.
+PREVIEW_MAX_WIDTH = 760
+
+
+def render_stage3_preview(run: dict, *, tokens: dict | None = None,
+                          subheading_texts: list[str] | None = None,
+                          max_w: int = PREVIEW_MAX_WIDTH) -> bytes:
+    """Render the Stage-3 text overlay for the live editor preview.
+
+    Uses the SAME deterministic renderer as ``_generate_stage3`` (so the preview
+    is pixel-faithful to what Generate will produce — same fonts, placement
+    zones, wrapping and CTA pill) but at a small size and WITHOUT saving an
+    attempt. The not-yet-approved headline/CTA text and sub-heading drafts are
+    merged in via ``tokens`` / ``subheading_texts`` so the preview reflects the
+    user's live edits, not just the last saved state.
+    """
+    base = _approved_png(run, 2)
+    if base is None:
+        raise PipelineError("Stage 3 preview requires the approved Stage 2 image.")
+
+    # Layer the live (unsaved) text over the persisted config, then resolve the
+    # exact spec the renderer consumes.
+    cfg = dict(run["config"])
+    if tokens:
+        merged = dict(cfg.get("tokens") or {})
+        merged.update({k: v for k, v in tokens.items() if v is not None})
+        cfg["tokens"] = merged
+    if subheading_texts is not None:
+        subs = [dict(s) for s in (cfg.get("subheadings") or [])]
+        for i, txt in enumerate(subheading_texts):
+            if i < len(subs):
+                subs[i] = {**subs[i], "text": txt}
+        cfg["subheadings"] = subs
+    view = {**run, "config": cfg}
+
+    spec = _resolve_overlay_spec(view)
+    canvas_w, canvas_h = _stage_dims(view, 3)
+    pw = max(1, min(max_w, canvas_w))
+    ph = max(1, round(canvas_h * pw / canvas_w))
+    px_scale = pw / canvas_w  # the user's pixel nudges are calibrated to canvas_w
+    return text_overlay.render_overlay(
+        base, spec, pw, ph, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id"))
+    )
+
+
 def generate(run: dict, stage: int, variant: str | None = None,
              provider: ImageProvider | None = None) -> dict:
     """Generate an attempt for stage 1–3; chains the approved upstream image."""

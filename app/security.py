@@ -67,13 +67,16 @@ def is_admin(email: str) -> bool:
     return email.lower() in settings.admin_email_set or is_creator(email)
 
 
-def create_token(user_id: str, email: str) -> str:
+def create_token(user_id: str, email: str, session_id: str | None = None) -> str:
     now = int(time.time())
     payload = {
         "sub": user_id,
         "email": email,
         "admin": is_admin(email),
         "creator": is_creator(email),
+        # Session this token belongs to, so each request can be attributed back
+        # to a sign-in (older tokens simply won't carry it).
+        "sid": session_id,
         "iat": now,
         "exp": now + settings.jwt_expires_minutes * 60,
     }
@@ -100,6 +103,7 @@ def get_current_user(
         "email": payload["email"],
         "is_admin": bool(payload.get("admin", False)),
         "is_creator": bool(payload.get("creator", False)),
+        "session_id": payload.get("sid") or "",
     }
 
 

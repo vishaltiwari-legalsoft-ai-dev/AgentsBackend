@@ -395,6 +395,113 @@ def list_users(_admin: dict = Depends(require_admin)) -> dict:
     return {"users": safe, "total": len(safe)}
 
 
+# --------------------------------------------------------------------------- #
+# Database viewer (Super Admin): read-only inspection of the Firestore
+# collections, rendered as tables in the admin UI. Built so the team can *see*
+# that data is genuinely flowing into the database — visual proof — without
+# needing direct access to the GCP console.
+# --------------------------------------------------------------------------- #
+
+# Field names whose values must never be shown in full, wherever they appear
+# (top-level or nested). Secrets are masked to a recognisable hint instead.
+_SENSITIVE_FIELDS = {"openrouter_api_key", "api_key", "google_sub", "jwt_secret"}
+
+# Long text/blobs are truncated per cell so a single huge field (e.g. a base64
+# string) can't bloat the table; the truncation is signalled in the value.
+_MAX_CELL_CHARS = 2000
+
+# Columns surfaced first (when present) so the most useful fields lead the table;
+# everything else follows alphabetically.
+_PREFERRED_COLUMNS = (
+    "id", "email", "name", "action", "agent_name", "status", "stage",
+    "brand", "brand_name", "title", "file_name", "file_type", "agent_id",
+    "category", "request_count", "user_id", "session_id", "brand_id", "ip",
+    "started_at", "last_seen_at", "created_at", "updated_at", "last_login",
+    "day", "year_month", "artifact",
+)
+
+
+def _sanitize(value, *, key: str = ""):
+    """Make a Firestore value JSON-safe, redact secrets, and cap blob sizes."""
+    if value and key in _SENSITIVE_FIELDS and isinstance(value, str):
+        return _mask(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _sanitize(v, key=k) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize(v) for v in value]
+    if isinstance(value, str) and len(value) > _MAX_CELL_CHARS:
+        return f"{value[:_MAX_CELL_CHARS]}… (+{len(value) - _MAX_CELL_CHARS} chars)"
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)  # bytes, GeoPoint, DocumentReference, etc.
+
+
+def _ordered_columns(rows: list[dict]) -> list[str]:
+    """Union of all field names across rows: preferred fields first, then the
+    rest alphabetically — so the table layout is stable run to run."""
+    keys: set[str] = set()
+    for row in rows:
+        keys.update(row.keys())
+    preferred = [c for c in _PREFERRED_COLUMNS if c in keys]
+    rest = sorted(k for k in keys if k not in _PREFERRED_COLUMNS)
+    return preferred + rest
+
+
+@router.get("/admin/db/collections")
+def list_db_collections(_admin: dict = Depends(require_admin)) -> dict:
+    """Super Admin: the inspectable collections with their live document counts.
+
+    ``count`` is ``null`` for any collection whose count couldn't be read; if
+    *every* count is null we report ``connected: false`` so the UI can say
+    "couldn't reach the database" instead of implying everything is empty.
+    """
+    collections = [
+        {**c, "count": firestore_repo.count_collection(c["name"])}
+        for c in firestore_repo.VIEWABLE_COLLECTIONS
+    ]
+    connected = any(c["count"] is not None for c in collections)
+    return {
+        "collections": collections,
+        "connected": connected,
+        "database": settings.firestore_database,
+        "project": settings.gcp_project_id,
+    }
+
+
+@router.get("/admin/db/collections/{name}")
+def get_db_collection(
+    name: str, limit: int = 50, _admin: dict = Depends(require_admin)
+) -> dict:
+    """Super Admin: up to ``limit`` documents from one collection, sanitised and
+    shaped into columns/rows the UI renders as a table (secrets masked)."""
+    if not firestore_repo.is_viewable_collection(name):
+        raise HTTPException(404, f"Collection '{name}' is not available to view.")
+    limit = max(1, min(limit, 500))
+    try:
+        raw = firestore_repo.list_collection_documents(name, limit=limit)
+    except Exception as exc:  # surface the real reason instead of a blank 500
+        logger.warning("DB viewer could not read '%s': %s", name, exc)
+        raise HTTPException(
+            502, f"Could not read '{name}' from the database: {exc}"
+        ) from exc
+    rows = [{k: _sanitize(v, key=k) for k, v in doc.items()} for doc in raw]
+    meta = next(
+        (c for c in firestore_repo.VIEWABLE_COLLECTIONS if c["name"] == name), {}
+    )
+    return {
+        "name": name,
+        "label": meta.get("label", name),
+        "description": meta.get("description", ""),
+        "count": firestore_repo.count_collection(name),
+        "returned": len(rows),
+        "limit": limit,
+        "columns": _ordered_columns(rows),
+        "rows": rows,
+    }
+
+
 @router.get("/admin/analytics")
 def analytics(_admin: dict = Depends(require_admin)) -> dict:
     """Super Admin: month-on-month creative-request volume + breakdowns."""

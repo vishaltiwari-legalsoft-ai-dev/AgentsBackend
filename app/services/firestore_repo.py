@@ -448,6 +448,119 @@ def list_creative_events(limit: int = 5000) -> list[dict[str, Any]]:
     return [doc.to_dict() for doc in docs]
 
 
+# --------------------------------------------------------------------------- #
+# Sessions & requests (session management + request audit trail)
+# --------------------------------------------------------------------------- #
+# Two first-class records so the team can *see* who is using the platform and
+# exactly what each person asked it to do:
+#   sessions  — one document per sign-in (start, last activity, request count).
+#   requests  — one document per agent action (who, what, which brand, outcome).
+# A request also "touches" its parent session so the session row shows live
+# activity. All writes are best-effort: they must never break a login or a
+# generation if Firestore hiccups.
+
+
+def create_session(
+    user_id: str, email: str, name: str, *, ip: str = "", user_agent: str = ""
+) -> str:
+    """Open a session row on sign-in and return its id (embedded in the JWT so
+    later requests can be attributed to it). Returns the id even if the write
+    fails, so login still succeeds."""
+    session_id = uuid.uuid4().hex
+    now = _now()
+    try:
+        _db().collection("sessions").document(session_id).set(
+            {
+                "user_id": user_id,
+                "email": email,
+                "name": name,
+                "ip": ip,
+                "user_agent": user_agent,
+                "provider": "google",
+                "started_at": now,
+                "last_seen_at": now,
+                "request_count": 0,
+                "day": now[:10],
+                "year_month": now[:7],
+            }
+        )
+    except Exception:  # session tracking must never block sign-in
+        pass
+    return session_id
+
+
+def touch_session(session_id: str, *, requests_delta: int = 0) -> None:
+    """Bump a session's last-seen time and (optionally) its request counter."""
+    if not session_id:
+        return
+    try:
+        update: dict[str, Any] = {"last_seen_at": _now()}
+        if requests_delta:
+            update["request_count"] = firestore.Increment(requests_delta)
+        _db().collection("sessions").document(session_id).set(update, merge=True)
+    except Exception:
+        pass
+
+
+def log_request(
+    *,
+    user_id: str,
+    email: str,
+    session_id: str = "",
+    agent_id: str = "",
+    agent_name: str = "",
+    action: str = "",
+    brand: Optional[str] = None,
+    brand_id: Optional[str] = None,
+    aspect_ratio: Optional[str] = None,
+    font: Optional[str] = None,
+    variant: Optional[str] = None,
+    engine: Optional[str] = None,
+    method: Optional[str] = None,
+    stage: Optional[int] = None,
+    status: str = "success",
+    artifact: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Record one request (an agent action) and touch its parent session.
+
+    Captures the full "who asked for what" picture an admin verifies against:
+    the user (``email``/``user_id``), the brand (name + id), the creative spec
+    (``aspect_ratio``, ``font``, ``variant``), how it was produced (``engine``/
+    ``method``) and the outcome (``status``, ``artifact``).
+    """
+    now = _now()
+    request_id = uuid.uuid4().hex
+    try:
+        _db().collection("requests").document(request_id).set(
+            {
+                "user_id": user_id,
+                "email": email,
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "action": action,
+                "brand": brand,
+                "brand_id": brand_id,
+                "aspect_ratio": aspect_ratio,
+                "font": font,
+                "variant": variant,
+                "engine": engine,
+                "method": method,
+                "stage": stage,
+                "status": status,
+                "artifact": artifact,
+                "error": error,
+                "created_at": now,
+                "day": now[:10],
+                "year_month": now[:7],
+            }
+        )
+        touch_session(session_id, requests_delta=1)
+    except Exception:  # the audit trail must never break the request it records
+        pass
+
+
 def list_usage_events(
     user_id: Optional[str], since_iso: str, limit: int = 10000
 ) -> list[dict[str, Any]]:
@@ -470,6 +583,65 @@ def list_usage_events(
         return [doc.to_dict() for doc in query.limit(limit).stream()]
     except Exception:
         return []
+
+
+# --------------------------------------------------------------------------- #
+# Admin database viewer (read-only inspection of raw collections)
+# --------------------------------------------------------------------------- #
+# A whitelist the admin "Database" panel may read so the team can *see* the data
+# really living in Firestore (visual proof), without needing GCP console access.
+# Order here is the order shown in the UI; anything not listed is unreachable.
+
+VIEWABLE_COLLECTIONS: list[dict[str, str]] = [
+    {"name": "sessions", "label": "Sessions",
+     "description": "One row per sign-in: who, when, last activity, request count."},
+    {"name": "requests", "label": "Requests",
+     "description": "One row per agent action: who asked, what, which brand, outcome."},
+    {"name": "users", "label": "Users",
+     "description": "Registered application accounts (Google sign-in)."},
+    {"name": "brands", "label": "Brands",
+     "description": "Brand profiles and their metadata."},
+    {"name": "creatives", "label": "Creatives",
+     "description": "Generated & ingested assets (stores GCS links, not bytes)."},
+    {"name": "gd_runs", "label": "Designer runs",
+     "description": "Every Graphics Designer run manifest (cloud storage mode only)."},
+    {"name": "reference_creatives", "label": "Reference uploads",
+     "description": "User-uploaded reference material."},
+    {"name": "conversations", "label": "Conversations",
+     "description": "Saved chat history, one document per conversation."},
+    {"name": "creative_events", "label": "Usage events",
+     "description": "Per-action analytics events powering the dashboards."},
+    {"name": "app_config", "label": "App config",
+     "description": "Runtime settings (single global document; secrets masked)."},
+]
+
+_VIEWABLE_NAMES = {c["name"] for c in VIEWABLE_COLLECTIONS}
+
+
+def is_viewable_collection(name: str) -> bool:
+    """Whether ``name`` is on the admin-viewer whitelist."""
+    return name in _VIEWABLE_NAMES
+
+
+def count_collection(name: str) -> int | None:
+    """Total document count for a collection (server-side aggregation).
+
+    Returns 0 for a genuinely empty collection, or ``None`` when the count could
+    not be read (Firestore unreachable/unconfigured). The viewer relies on this
+    distinction so "can't connect" is never disguised as "empty".
+    """
+    try:
+        result = _db().collection(name).count().get()
+        return int(result[0][0].value) if result and result[0] else 0
+    except Exception:
+        return None
+
+
+def list_collection_documents(name: str, limit: int = 50) -> list[dict[str, Any]]:
+    """Return up to ``limit`` raw documents from a collection, each carrying its
+    document id under ``id``. The caller is responsible for sanitising values."""
+    docs = _db().collection(name).limit(limit).stream()
+    return [doc.to_dict() | {"id": doc.id} for doc in docs]
 
 
 # --------------------------------------------------------------------------- #

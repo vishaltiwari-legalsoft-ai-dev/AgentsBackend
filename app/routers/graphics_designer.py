@@ -47,6 +47,47 @@ def _log_usage(user: dict, action: str, *, count: int = 1, brand: str | None = N
         brand=brand,
     )
 
+
+def _log_request(
+    user: dict,
+    action: str,
+    *,
+    run: dict | None = None,
+    attempt: dict | None = None,
+    stage: int | None = None,
+) -> None:
+    """Best-effort request-audit row (the Requests table) + session touch.
+
+    Pulls the full spec from the run (brand, aspect ratio, font) and the attempt
+    (variant, engine, artifact) so an admin can verify exactly what each user
+    asked for and how it was produced.
+    """
+    cfg = (run or {}).get("config") or {}
+    brand_name = None
+    if run is not None:
+        try:
+            brand_name = _pack_for_run(run).name
+        except Exception:  # noqa: BLE001 - brand name is decorative, never fatal
+            brand_name = None
+    attempt = attempt or {}
+    firestore_repo.log_request(
+        user_id=str(user["id"]),
+        email=str(user.get("email", "")),
+        session_id=str(user.get("session_id") or ""),
+        agent_id=GD_AGENT_ID,
+        agent_name="Graphics Designer",
+        action=action,
+        brand=brand_name,
+        brand_id=(run or {}).get("brand_id"),
+        aspect_ratio=cfg.get("aspect_ratio"),
+        font=cfg.get("font"),
+        variant=attempt.get("variant"),
+        engine=attempt.get("provider"),
+        method=attempt.get("method"),
+        stage=stage,
+        artifact=attempt.get("artifact"),
+    )
+
 # Headline/highlight/CTA text tokens. Sub-heading text lives in the dynamic
 # ``subheadings`` list, each with its own approval, gated separately.
 CONTENT_TOKENS = ["headline", "highlight", "cta"]
@@ -387,6 +428,7 @@ def create_run_endpoint(body: CreateRunBody = Body(default=CreateRunBody()),
 
     run = create_run(user_id=str(user["id"]), brand_id=body.brand_id)
     _log_usage(user, "session", brand=body.brand_id)  # one run = one GD session
+    _log_request(user, "create_run", run=run)
     return _to_client(run)
 
 
@@ -493,6 +535,28 @@ class GenerateBody(BaseModel):
     variant: str | None = None
 
 
+class TextPreviewBody(BaseModel):
+    # Live, not-yet-approved values, layered over the persisted run config so the
+    # preview matches what Generate would produce.
+    tokens: dict[str, str] | None = None
+    subheading_texts: list[str] | None = None
+
+
+@router.post("/gd/runs/{run_id}/text-preview")
+def text_preview_endpoint(run_id: str, body: TextPreviewBody,
+                          user: dict = Depends(get_current_user)) -> Response:
+    """Live WYSIWYG preview of the Stage-3 text overlay.
+
+    Deterministic (no image model) and unsaved — returns a small PNG rendered by
+    the exact same engine as the final Stage-3 output, so the editor shows where
+    every element lands and whether it fits.
+    """
+    run = _owned_run(run_id, user)
+    png = _guard(lambda: pipeline.render_stage3_preview(
+        run, tokens=body.tokens, subheading_texts=body.subheading_texts))
+    return Response(content=png, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
 @router.post("/gd/runs/{run_id}/generate")
 def generate_endpoint(run_id: str, body: GenerateBody, user: dict = Depends(get_current_user)) -> dict:
     run = _owned_run(run_id, user)
@@ -500,6 +564,7 @@ def generate_endpoint(run_id: str, body: GenerateBody, user: dict = Depends(get_
         raise HTTPException(409, "Approve the headline, highlight, CTA and every sub-heading before generating Stage 3.")
     attempt = _guard(lambda: pipeline.generate(run, body.stage, variant=body.variant))
     _log_usage(user, "generate", brand=run.get("brand_id"))  # one creative produced
+    _log_request(user, "generate", run=run, attempt=attempt, stage=body.stage)
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
 
 
@@ -573,6 +638,7 @@ async def stage4_endpoint(
         )
     attempt = _guard(lambda: pipeline.generate_stage4(run, png, use_ai=use_ai))
     _log_usage(user, "generate", brand=run.get("brand_id"))  # final logo composite
+    _log_request(user, "stage4", run=run, attempt=attempt, stage=4)
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
 
 
