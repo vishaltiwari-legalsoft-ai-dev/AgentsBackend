@@ -48,44 +48,72 @@ def _log_usage(user: dict, action: str, *, count: int = 1, brand: str | None = N
     )
 
 
-def _log_request(
-    user: dict,
-    action: str,
-    *,
-    run: dict | None = None,
-    attempt: dict | None = None,
-    stage: int | None = None,
-) -> None:
-    """Best-effort request-audit row (the Requests table) + session touch.
+# GD runs through 4 stages → status slots A,B,C,D in the run tables.
+GD_STAGE_LABELS = ["Stage 1 · Background", "Stage 2 · Subject",
+                   "Stage 3 · Copy", "Stage 4 · Logo"]
 
-    Pulls the full spec from the run (brand, aspect ratio, font) and the attempt
-    (variant, engine, artifact) so an admin can verify exactly what each user
-    asked for and how it was produced.
-    """
-    cfg = (run or {}).get("config") or {}
-    brand_name = None
-    if run is not None:
-        try:
-            brand_name = _pack_for_run(run).name
-        except Exception:  # noqa: BLE001 - brand name is decorative, never fatal
-            brand_name = None
-    attempt = attempt or {}
-    firestore_repo.log_request(
-        user_id=str(user["id"]),
-        email=str(user.get("email", "")),
-        session_id=str(user.get("session_id") or ""),
+
+def _brand_name(run: dict) -> str | None:
+    try:
+        return _pack_for_run(run).name
+    except Exception:  # noqa: BLE001 - brand name is decorative, never fatal
+        return None
+
+
+def _creative_summary(run: dict) -> str:
+    """A short human summary of what the run is making (brand · AR · headline)."""
+    cfg = run.get("config") or {}
+    tokens = cfg.get("tokens") or {}
+    bits = [b for b in (_brand_name(run), cfg.get("aspect_ratio")) if b]
+    head = (tokens.get("headline") or "").strip()
+    base = " · ".join(bits)
+    return f"{base} — “{head}”" if head else base
+
+
+def _start_run(user: dict, run: dict) -> None:
+    """Open the Table-1 (per-agent) and Table-2 (master) rows for a new GD run."""
+    firestore_repo.start_run(
+        run_id=str(run.get("id")),
         agent_id=GD_AGENT_ID,
         agent_name="Graphics Designer",
-        action=action,
-        brand=brand_name,
-        brand_id=(run or {}).get("brand_id"),
-        aspect_ratio=cfg.get("aspect_ratio"),
-        font=cfg.get("font"),
-        variant=attempt.get("variant"),
-        engine=attempt.get("provider"),
-        method=attempt.get("method"),
-        stage=stage,
-        artifact=attempt.get("artifact"),
+        user_id=str(user["id"]),
+        user=str(user.get("email", "")),
+        session_id=str(user.get("session_id") or ""),
+        timezone=str(user.get("timezone") or "UTC"),
+        brand=_brand_name(run),
+        brand_id=run.get("brand_id"),
+        stages=GD_STAGE_LABELS,
+    )
+
+
+def _advance_run(
+    run: dict,
+    *,
+    stage: int,
+    stage_status: str,
+    attempt: dict | None = None,
+    run_status: str | None = None,
+) -> None:
+    """Update a run's per-stage status + master row as a stage is generated,
+    approved, or the run completes (stage is 1-based; slot index = stage-1)."""
+    asset = None
+    if attempt and attempt.get("artifact"):
+        rid = str(run.get("id"))
+        artifact = attempt["artifact"]
+        asset = {
+            "stage": stage,
+            "variant": attempt.get("variant"),
+            "artifact": artifact,
+            "url": _artifact_url(rid, artifact),
+        }
+    firestore_repo.update_run(
+        run_id=str(run.get("id")),
+        agent_id=GD_AGENT_ID,
+        stage_index=stage - 1,
+        stage_status=stage_status,
+        asset=asset,
+        summary=_creative_summary(run),
+        run_status=run_status,
     )
 
 # Headline/highlight/CTA text tokens. Sub-heading text lives in the dynamic
@@ -428,7 +456,7 @@ def create_run_endpoint(body: CreateRunBody = Body(default=CreateRunBody()),
 
     run = create_run(user_id=str(user["id"]), brand_id=body.brand_id)
     _log_usage(user, "session", brand=body.brand_id)  # one run = one GD session
-    _log_request(user, "create_run", run=run)
+    _start_run(user, run)  # open the Table-1 + Table-2 rows for this run
     return _to_client(run)
 
 
@@ -564,7 +592,7 @@ def generate_endpoint(run_id: str, body: GenerateBody, user: dict = Depends(get_
         raise HTTPException(409, "Approve the headline, highlight, CTA and every sub-heading before generating Stage 3.")
     attempt = _guard(lambda: pipeline.generate(run, body.stage, variant=body.variant))
     _log_usage(user, "generate", brand=run.get("brand_id"))  # one creative produced
-    _log_request(user, "generate", run=run, attempt=attempt, stage=body.stage)
+    _advance_run(run, stage=body.stage, stage_status="generated", attempt=attempt)
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
 
 
@@ -638,7 +666,7 @@ async def stage4_endpoint(
         )
     attempt = _guard(lambda: pipeline.generate_stage4(run, png, use_ai=use_ai))
     _log_usage(user, "generate", brand=run.get("brand_id"))  # final logo composite
-    _log_request(user, "stage4", run=run, attempt=attempt, stage=4)
+    _advance_run(run, stage=4, stage_status="generated", attempt=attempt)
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
 
 
@@ -651,6 +679,14 @@ class ApproveBody(BaseModel):
 def approve_endpoint(run_id: str, body: ApproveBody, user: dict = Depends(get_current_user)) -> dict:
     run = _owned_run(run_id, user)
     _guard(lambda: pipeline.approve(run, body.stage, body.attempt))
+    # Mark this stage approved; approving Stage 4 (the logo composite) completes
+    # the whole run.
+    _advance_run(
+        run,
+        stage=body.stage,
+        stage_status="approved",
+        run_status="completed" if body.stage == 4 else None,
+    )
     return _to_client(run)
 
 

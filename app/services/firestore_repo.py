@@ -449,116 +449,140 @@ def list_creative_events(limit: int = 5000) -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------- #
-# Sessions & requests (session management + request audit trail)
+# Run tracking — Table 1 (per-agent) + Table 2 (master "runs")
 # --------------------------------------------------------------------------- #
-# Two first-class records so the team can *see* who is using the platform and
-# exactly what each person asked it to do:
-#   sessions  — one document per sign-in (start, last activity, request count).
-#   requests  — one document per agent action (who, what, which brand, outcome).
-# A request also "touches" its parent session so the session row shows live
-# activity. All writes are best-effort: they must never break a login or a
-# generation if Firestore hiccups.
+# Two complementary records the admin Database panel renders:
+#   Table 1  agent_runs__<agent_id>  — one row per run for THAT agent, carrying
+#            the per-stage status (A/B/C/D…) and a creative summary. A new
+#            collection is created automatically the first time a new agent runs.
+#   Table 2  runs                    — one master row per run across ALL agents:
+#            overall run status, brand, summary and the produced assets.
+# Both rows share the run id and are updated as the run progresses. All writes
+# are best-effort so tracking never breaks a generation.
+
+# Status slots for Table 1 (GD uses A–D; longer pipelines extend into e/f/…).
+STAGE_SLOTS = ("a", "b", "c", "d", "e", "f", "g", "h")
+
+# Superseded telemetry the admin "purge" clears. Operational collections
+# (users, app_config, brands, creatives, gd_runs, reference_creatives) are never
+# touched here.
+TELEMETRY_COLLECTIONS = ("creative_events", "sessions", "requests", "conversations")
 
 
-def create_session(
-    user_id: str, email: str, name: str, *, ip: str = "", user_agent: str = ""
-) -> str:
-    """Open a session row on sign-in and return its id (embedded in the JWT so
-    later requests can be attributed to it). Returns the id even if the write
-    fails, so login still succeeds."""
-    session_id = uuid.uuid4().hex
+def new_session_id() -> str:
+    """A fresh session id, baked into the JWT at login and referenced by runs."""
+    return uuid.uuid4().hex
+
+
+def agent_runs_collection(agent_id: str) -> str:
+    """Table-1 collection name for an agent (one collection per agent)."""
+    return f"agent_runs__{agent_id}"
+
+
+def list_agent_run_collections() -> list[str]:
+    """Discover the per-agent Table-1 collections that currently exist."""
+    try:
+        return sorted(c.id for c in _db().collections() if c.id.startswith("agent_runs__"))
+    except Exception:
+        return []
+
+
+def start_run(
+    *,
+    run_id: str,
+    agent_id: str,
+    agent_name: str,
+    user_id: str,
+    user: str,
+    session_id: str = "",
+    timezone: str = "UTC",
+    brand: Optional[str] = None,
+    brand_id: Optional[str] = None,
+    stages: Optional[list[str]] = None,
+) -> None:
+    """Create the Table-1 (per-agent) and Table-2 (master) rows for a new run."""
     now = _now()
+    stages = stages or []
+    status = {STAGE_SLOTS[i]: "pending" for i in range(min(len(stages), len(STAGE_SLOTS)))}
+    base = {
+        "run_id": run_id,
+        "date": now[:10],
+        "timezone": timezone,
+        "created_at": now,
+        "session_id": session_id,
+        "user_id": user_id,
+        "user": user,
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "brand": brand,
+        "brand_id": brand_id,
+        "updated_at": now,
+    }
     try:
-        _db().collection("sessions").document(session_id).set(
-            {
-                "user_id": user_id,
-                "email": email,
-                "name": name,
-                "ip": ip,
-                "user_agent": user_agent,
-                "provider": "google",
-                "started_at": now,
-                "last_seen_at": now,
-                "request_count": 0,
-                "day": now[:10],
-                "year_month": now[:7],
-            }
+        _db().collection(agent_runs_collection(agent_id)).document(run_id).set(
+            {**base, "stages": stages, "status": status, "creative_summary": ""}
         )
-    except Exception:  # session tracking must never block sign-in
+    except Exception:
         pass
-    return session_id
-
-
-def touch_session(session_id: str, *, requests_delta: int = 0) -> None:
-    """Bump a session's last-seen time and (optionally) its request counter."""
-    if not session_id:
-        return
     try:
-        update: dict[str, Any] = {"last_seen_at": _now()}
-        if requests_delta:
-            update["request_count"] = firestore.Increment(requests_delta)
-        _db().collection("sessions").document(session_id).set(update, merge=True)
+        _db().collection("runs").document(run_id).set(
+            {**base, "run_status": "in_progress", "run_summary": "", "assets": []}
+        )
     except Exception:
         pass
 
 
-def log_request(
+def update_run(
     *,
-    user_id: str,
-    email: str,
-    session_id: str = "",
-    agent_id: str = "",
-    agent_name: str = "",
-    action: str = "",
-    brand: Optional[str] = None,
-    brand_id: Optional[str] = None,
-    aspect_ratio: Optional[str] = None,
-    font: Optional[str] = None,
-    variant: Optional[str] = None,
-    engine: Optional[str] = None,
-    method: Optional[str] = None,
-    stage: Optional[int] = None,
-    status: str = "success",
-    artifact: Optional[str] = None,
-    error: Optional[str] = None,
+    run_id: str,
+    agent_id: str,
+    stage_index: Optional[int] = None,
+    stage_status: Optional[str] = None,
+    asset: Optional[dict[str, Any]] = None,
+    summary: Optional[str] = None,
+    run_status: Optional[str] = None,
 ) -> None:
-    """Record one request (an agent action) and touch its parent session.
-
-    Captures the full "who asked for what" picture an admin verifies against:
-    the user (``email``/``user_id``), the brand (name + id), the creative spec
-    (``aspect_ratio``, ``font``, ``variant``), how it was produced (``engine``/
-    ``method``) and the outcome (``status``, ``artifact``).
-    """
+    """Advance a run: set one stage's status (Table 1) and append an asset / set
+    the overall status + summary (Table 2)."""
     now = _now()
-    request_id = uuid.uuid4().hex
+    slot = (
+        STAGE_SLOTS[stage_index]
+        if stage_index is not None and 0 <= stage_index < len(STAGE_SLOTS)
+        else None
+    )
     try:
-        _db().collection("requests").document(request_id).set(
-            {
-                "user_id": user_id,
-                "email": email,
-                "session_id": session_id,
-                "agent_id": agent_id,
-                "agent_name": agent_name,
-                "action": action,
-                "brand": brand,
-                "brand_id": brand_id,
-                "aspect_ratio": aspect_ratio,
-                "font": font,
-                "variant": variant,
-                "engine": engine,
-                "method": method,
-                "stage": stage,
-                "status": status,
-                "artifact": artifact,
-                "error": error,
-                "created_at": now,
-                "day": now[:10],
-                "year_month": now[:7],
-            }
-        )
-        touch_session(session_id, requests_delta=1)
-    except Exception:  # the audit trail must never break the request it records
+        upd: dict[str, Any] = {"updated_at": now}
+        if slot and stage_status:
+            upd[f"status.{slot}"] = stage_status
+        if summary is not None:
+            upd["creative_summary"] = summary
+        _db().collection(agent_runs_collection(agent_id)).document(run_id).update(upd)
+    except Exception:
         pass
+    try:
+        upd2: dict[str, Any] = {"updated_at": now}
+        if run_status:
+            upd2["run_status"] = run_status
+        if summary is not None:
+            upd2["run_summary"] = summary
+        if asset:
+            upd2["assets"] = firestore.ArrayUnion([asset])
+        _db().collection("runs").document(run_id).update(upd2)
+    except Exception:
+        pass
+
+
+def purge_telemetry() -> dict[str, int]:
+    """Delete the superseded telemetry collections (Tables 1/2 replace them).
+    Operational collections are never touched. Returns {collection: deleted}
+    (-1 on error)."""
+    result: dict[str, int] = {}
+    for name in TELEMETRY_COLLECTIONS:
+        try:
+            result[name] = _delete_collection(name)
+        except Exception:
+            result[name] = -1
+    return result
 
 
 def list_usage_events(
@@ -593,10 +617,8 @@ def list_usage_events(
 # Order here is the order shown in the UI; anything not listed is unreachable.
 
 VIEWABLE_COLLECTIONS: list[dict[str, str]] = [
-    {"name": "sessions", "label": "Sessions",
-     "description": "One row per sign-in: who, when, last activity, request count."},
-    {"name": "requests", "label": "Requests",
-     "description": "One row per agent action: who asked, what, which brand, outcome."},
+    {"name": "runs", "label": "Runs (all agents)",
+     "description": "Master table: one row per run across every agent — status, brand, summary, assets."},
     {"name": "users", "label": "Users",
      "description": "Registered application accounts (Google sign-in)."},
     {"name": "brands", "label": "Brands",
@@ -604,26 +626,24 @@ VIEWABLE_COLLECTIONS: list[dict[str, str]] = [
     {"name": "creatives", "label": "Creatives",
      "description": "Generated & ingested assets (stores GCS links, not bytes)."},
     {"name": "gd_runs", "label": "Designer runs",
-     "description": "Every Graphics Designer run manifest (cloud storage mode only)."},
+     "description": "Graphics Designer run manifests / live state (cloud storage mode)."},
     {"name": "reference_creatives", "label": "Reference uploads",
      "description": "User-uploaded reference material."},
-    # NOTE: "conversations" is deliberately NOT viewable in the admin DB viewer —
-    # chat history is private to each developer and must not be browsable by the
-    # team. Removing it here both hides the tab and makes
-    # /admin/db/collections/conversations return 404 (guarded by
-    # is_viewable_collection). Do not re-add it.
-    {"name": "creative_events", "label": "Usage events",
-     "description": "Per-action analytics events powering the dashboards."},
     {"name": "app_config", "label": "App config",
      "description": "Runtime settings (single global document; secrets masked)."},
 ]
+# Per-agent Table-1 collections (``agent_runs__<id>``) are created on demand and
+# discovered dynamically by the viewer — see ``list_agent_run_collections``.
+# NOTE: "conversations" is deliberately NOT viewable — chat history is private to
+# each user and must not be browsable. The superseded telemetry collections
+# (creative_events, sessions, requests) are likewise dropped from the viewer.
 
 _VIEWABLE_NAMES = {c["name"] for c in VIEWABLE_COLLECTIONS}
 
 
 def is_viewable_collection(name: str) -> bool:
-    """Whether ``name`` is on the admin-viewer whitelist."""
-    return name in _VIEWABLE_NAMES
+    """Whether ``name`` is on the admin-viewer whitelist (incl. per-agent run tables)."""
+    return name in _VIEWABLE_NAMES or name.startswith("agent_runs__")
 
 
 def count_collection(name: str) -> int | None:

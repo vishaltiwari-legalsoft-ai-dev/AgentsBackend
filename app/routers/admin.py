@@ -461,6 +461,17 @@ def list_db_collections(_admin: dict = Depends(require_admin)) -> dict:
         {**c, "count": firestore_repo.count_collection(c["name"])}
         for c in firestore_repo.VIEWABLE_COLLECTIONS
     ]
+    # Per-agent Table-1 collections (agent_runs__<id>) are created on demand, so
+    # discover them dynamically and label each with its agent's name.
+    agent_names = {str(a["id"]): a["name"] for a in agent_config.AGENTS}
+    for cname in firestore_repo.list_agent_run_collections():
+        agent_id = cname[len("agent_runs__"):]
+        collections.append({
+            "name": cname,
+            "label": f"Runs — {agent_names.get(agent_id, agent_id)}",
+            "description": f"Per-stage run history for agent '{agent_id}' (Table 1).",
+            "count": firestore_repo.count_collection(cname),
+        })
     connected = any(c["count"] is not None for c in collections)
     return {
         "collections": collections,
@@ -500,6 +511,30 @@ def get_db_collection(
         "columns": _ordered_columns(rows),
         "rows": rows,
     }
+
+
+class PurgeTelemetryBody(BaseModel):
+    # Must equal "DELETE" — a deliberate guard against an accidental click.
+    confirm: str = ""
+
+
+@router.post("/admin/db/purge-telemetry")
+def purge_telemetry(
+    body: PurgeTelemetryBody, _admin: dict = Depends(require_admin)
+) -> dict:
+    """Super Admin: delete the superseded telemetry collections (creative_events,
+    sessions, requests, conversations), replaced by the runs tables. Operational
+    data (users, app_config, brands, creatives, gd_runs) is never touched.
+
+    Guarded by ``confirm == "DELETE"``. Note: ``creative_events`` backs the Home
+    and admin analytics dashboards — they reset to empty and refill from new
+    activity after a purge.
+    """
+    if body.confirm != "DELETE":
+        raise HTTPException(400, "Type DELETE to confirm. Nothing was deleted.")
+    deleted = firestore_repo.purge_telemetry()
+    logger.warning("Admin %s purged telemetry collections: %s", _admin.get("email"), deleted)
+    return {"deleted": deleted, "kept": "users, app_config, brands, creatives, gd_runs, reference_creatives"}
 
 
 @router.get("/admin/analytics")
