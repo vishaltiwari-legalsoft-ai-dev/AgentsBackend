@@ -523,6 +523,24 @@ def _pdf_wrap(text: str, width: int) -> list[str]:
     return lines or [""]
 
 
+# Each brochure page is a full photographic 2K–4K composite. Embedding those as
+# lossless PNG produces tens-of-MB PDFs (slow/failed downloads). Downscale to a
+# crisp print resolution and embed as JPEG — a ~10× size cut with no visible loss
+# at brochure scale.
+_PDF_PAGE_MAX_W = 1654   # ~200 DPI at A4 width
+_PDF_JPEG_QUALITY = 85
+
+
+def _compact_page(png_bytes: bytes) -> bytes:
+    """Downscale a page raster to print resolution and re-encode as JPEG."""
+    im = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    if im.width > _PDF_PAGE_MAX_W:
+        im = im.resize((_PDF_PAGE_MAX_W, round(_PDF_PAGE_MAX_W * im.height / im.width)), Image.LANCZOS)
+    out = io.BytesIO()
+    im.save(out, format="JPEG", quality=_PDF_JPEG_QUALITY, optimize=True)
+    return out.getvalue()
+
+
 def _assemble_brochure_pdf(pages: list[tuple]) -> bytes:
     """Place each rendered page image full-bleed, then write the page's text as an
     INVISIBLE layer (PDF text render mode 3) so the document stays selectable and
@@ -538,7 +556,7 @@ def _assemble_brochure_pdf(pages: list[tuple]) -> bytes:
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=(page_w, page_h))
     for png, layout, lines in pages:
-        c.drawImage(ImageReader(io.BytesIO(png)), 0, 0, width=page_w, height=page_h,
+        c.drawImage(ImageReader(io.BytesIO(_compact_page(png))), 0, 0, width=page_w, height=page_h,
                     preserveAspectRatio=False)
         # Invisible, selectable text roughly in the same zone as the visible copy.
         zone = (layout or {}).get("placement", "left")

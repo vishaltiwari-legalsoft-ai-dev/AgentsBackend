@@ -1378,30 +1378,56 @@ def qa_critique(stage: int, *, pack=None) -> dict:
 
 def suggest_placement(run: dict, pack=None) -> dict:
     """§ "AI Suggest Placement" — propose a polished, premium arrangement for the
-    Stage-3 elements that are present (does NOT auto-apply; the caller decides).
+    Stage-3 elements present (does NOT auto-apply; the caller decides).
 
-    Deterministic editorial layout: a left-aligned column — headline up top, any
-    sub-headings stacked beneath, the CTA lower-left, and venue/website as a footer.
-    Returns ``{"layout": {element_id: {x, y, w, anchor}}}`` for every present
-    element so one click pins them all into a clean composition.
+    Composition rules (deterministic, but content-aware):
+    * Text is placed in the NEGATIVE SPACE opposite the Stage-2 subject — subject
+      on the left -> copy column on the right (and vice-versa); subject up top ->
+      copy drops to the lower band. The subject side comes from the Stage-2
+      ``element_placement`` (9-cell); ``auto``/unknown falls back to a wide
+      left-aligned band in the upper area with the CTA pinned low, leaving the
+      centre open for the subject.
+    * Every text element gets a column ``w`` (max width fraction) so the renderer
+      wraps inside the safe column — nothing runs off the canvas edge (the old
+      arranger let copy overflow).
+    * Headline on top, sub-headings stacked with even gaps, CTA anchored low,
+      venue/website as a bottom-corner footer.
+
+    Returns ``{"layout": {element_id: {x, y, w, anchor}}}``.
     """
     from . import layout as _layout
 
-    present = {l["id"] for l in _layout.resolve_layers(run)}
+    ids = {l["id"] for l in _layout.resolve_layers(run)}
+    subj = (run.get("config", {}).get("element_placement") or "auto").lower()
+    on_left = "left" in subj
+    on_right = "right" in subj
+    on_top = subj.startswith("top")
+
+    margin = 0.07
+    # Copy column on the side OPPOSITE the subject; wide band if unknown.
+    if on_left:                      # subject left -> copy on the right
+        col_x, col_w = 0.50, round(1 - margin - 0.50, 3)
+    elif on_right:                   # subject right -> copy on the left
+        col_x, col_w = margin, round(0.50 - margin, 3)
+    else:                            # center / auto -> wide left-aligned band
+        col_x, col_w = margin, round(1 - 2 * margin, 3)
+
+    # Drop the copy to the lower band when the subject is up top.
+    y = 0.40 if on_top else margin
     out: dict[str, dict] = {}
-    y = 0.10
-    if "headline" in present:
-        out["headline"] = {"x": 0.08, "y": y, "w": 0.84, "anchor": "tl"}
+
+    if "headline" in ids:
+        out["headline"] = {"x": col_x, "y": round(y, 3), "w": col_w, "anchor": "tl"}
         y += 0.17
     i = 0
-    while f"subheading-{i}" in present:
-        out[f"subheading-{i}"] = {"x": 0.08, "y": min(y, 0.80), "w": 0.80, "anchor": "tl"}
-        y += 0.085
+    while f"subheading-{i}" in ids:
+        out[f"subheading-{i}"] = {"x": col_x, "y": round(min(y, 0.72), 3), "w": col_w, "anchor": "tl"}
+        y += 0.08
         i += 1
-    if "cta" in present:
-        out["cta"] = {"x": 0.08, "y": 0.90, "w": 0.5, "anchor": "bl"}
-    if "venue" in present:
-        out["venue"] = {"x": 0.08, "y": 0.965, "w": 0.5, "anchor": "bl"}
-    if "website" in present:
-        out["website"] = {"x": 0.92, "y": 0.965, "w": 0.5, "anchor": "br"}
+    if "cta" in ids:
+        out["cta"] = {"x": col_x, "y": 0.88, "w": 0.5, "anchor": "bl"}
+    if "venue" in ids:
+        out["venue"] = {"x": margin, "y": 0.965, "w": 0.5, "anchor": "bl"}
+    if "website" in ids:
+        out["website"] = {"x": round(1 - margin, 3), "y": 0.965, "w": 0.5, "anchor": "br"}
     return {"layout": out}

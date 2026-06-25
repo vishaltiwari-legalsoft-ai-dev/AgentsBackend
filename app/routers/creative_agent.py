@@ -26,8 +26,10 @@ from __future__ import annotations
 
 from typing import Optional
 
+import io
+
 from fastapi import APIRouter, Body, Depends, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from app.security import get_current_user
@@ -209,8 +211,12 @@ def artifact(run_id: str, name: str, user: dict = Depends(get_current_user)) -> 
         data = cruns.read_artifact(run_id, meta["ref"])
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(404, f"Artifact unavailable: {exc}") from exc
-    return Response(
-        content=data,
+    # Stream rather than buffer: Cloud Run caps a buffered response at 32 MiB,
+    # which a large brochure/carousel can exceed — the download then fails
+    # client-side with "Failed to fetch". A StreamingResponse with NO
+    # Content-Length uses chunked transfer encoding, which Cloud Run does not cap.
+    return StreamingResponse(
+        io.BytesIO(data),
         media_type=meta.get("mime", "application/octet-stream"),
         headers={"Content-Disposition": f'attachment; filename="{name}"'},
     )

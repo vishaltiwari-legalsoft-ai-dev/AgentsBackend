@@ -139,6 +139,11 @@ def to_png_logo(data: bytes, file_name: str = "", mime: str = "") -> bytes | Non
         from PIL import Image
 
         image = Image.open(io.BytesIO(data)).convert("RGBA")
+        # Raster logos are frequently delivered on a solid white box (JPEG/PNG
+        # without alpha). Knock that background out so Stage 4 doesn't composite
+        # an ugly white rectangle behind the mark. Safe: _key_white_background
+        # no-ops when the logo already has real transparency or non-white corners.
+        image = _key_white_background(image)
         out = io.BytesIO()
         image.save(out, format="PNG")
         return out.getvalue()
