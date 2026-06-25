@@ -83,6 +83,62 @@ _GENERIC_ONBOARDING = [
      "options": [{"id": "aspiration", "label": "Aspiration"}, {"id": "pain", "label": "Pain-point"}]},
 ]
 
+# Brand-neutral discovery script (same option ids as suggestions.DISCOVERY_QUESTIONS,
+# so the curated heuristics + direction synthesis work unchanged) with wording that
+# doesn't assume a legal audience. Templated brands fall back to this.
+_GENERIC_DISCOVERY = [
+    {"id": "feeling", "group": "intent", "kind": "choice_text",
+     "prompt": "First — what feeling or outcome should this creative land? "
+               "Pick the closest, or tell me in your own words.",
+     "options": [
+         {"id": "trust", "label": "Trust & authority"},
+         {"id": "urgency", "label": "Urgency / act now"},
+         {"id": "warmth", "label": "Warmth & approachability"},
+         {"id": "aspiration", "label": "Aspiration & growth"},
+         {"id": "relief", "label": "Relief from overwhelm"},
+     ],
+     "placeholder": "e.g. calm confidence, “we’ve got your back”"},
+    {"id": "audience", "group": "intent", "kind": "choice_text",
+     "prompt": "Who are we talking to?",
+     "options": [
+         {"id": "solo", "label": "Small teams"},
+         {"id": "partners", "label": "Leadership"},
+         {"id": "inhouse", "label": "In-house teams"},
+         {"id": "growing", "label": "Growing orgs"},
+     ],
+     "placeholder": "Describe the audience"},
+    {"id": "tone", "group": "intent", "kind": "choice",
+     "prompt": "What tone should it strike?",
+     "options": [
+         {"id": "premium", "label": "Premium & polished"},
+         {"id": "bold", "label": "Bold & punchy"},
+         {"id": "friendly", "label": "Friendly & human"},
+         {"id": "formal", "label": "Formal & institutional"},
+     ]},
+    {"id": "style", "group": "intent", "kind": "choice_text", "optional": True,
+     "prompt": "Any visual style you’re leaning toward? (optional)",
+     "options": [
+         {"id": "minimal", "label": "Minimal & clean"},
+         {"id": "editorial", "label": "Editorial"},
+         {"id": "cinematic", "label": "Cinematic"},
+         {"id": "corporate", "label": "Corporate"},
+     ],
+     "placeholder": "Optional — references or styling notes"},
+    {"id": "event", "group": "context", "kind": "choice_text",
+     "prompt": "Is this for a specific event or moment, or is it evergreen?",
+     "options": [
+         {"id": "evergreen", "label": "Evergreen"},
+         {"id": "webinar", "label": "Webinar / event"},
+         {"id": "hiring", "label": "Hiring push"},
+         {"id": "seasonal", "label": "Seasonal / holiday"},
+         {"id": "launch", "label": "Launch / announcement"},
+     ],
+     "placeholder": "Name the event, date or moment"},
+    {"id": "theme", "group": "context", "kind": "text", "optional": True,
+     "prompt": "Last one — anything specific in mind for the theme or message? (optional)",
+     "placeholder": "e.g. a tagline, a campaign name, a seasonal angle"},
+]
+
 
 def _gradient_artifacts(palette: dict):
     """Return (stage1_variants, inline_prompt_map, curated_gradients) for a palette."""
@@ -182,6 +238,7 @@ def build_templated_pack(spec: dict) -> BrandPack:
         default_subtext_2=spec["default_subtext_2"],
         default_cta=spec["default_cta"],
         onboarding_questions=spec.get("onboarding_questions", _GENERIC_ONBOARDING),
+        discovery_questions=spec.get("discovery_questions", _GENERIC_DISCOVERY),
         concept_rationale={e["id"]: e["desc"] for e in elements},
         hooks=spec["hooks"],
         ctas=spec["ctas"],

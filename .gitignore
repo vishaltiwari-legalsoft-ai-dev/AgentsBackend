@@ -13,3 +13,4 @@ gcp-service-account.json
 deploy.env.yaml
 # Graphics Designer generated run artifacts (output, not source)
 agents/**/runs/
+agents/**/creative_runs/

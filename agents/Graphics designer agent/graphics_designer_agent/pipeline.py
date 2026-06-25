@@ -9,12 +9,14 @@ import os
 from dataclasses import asdict
 from io import BytesIO
 
+from . import layout as gd_layout
 from . import registry, text_overlay, variants
 from .compositor import composite_logo, logo_placement
 from .providers import ImageProvider, get_provider
 from .runs import (
     STATE_FOR_STAGE_CONFIG,
     STATE_FOR_STAGE_REVIEW,
+    create_run,
     now_iso,
     read_artifact,
     save_artifact,
@@ -26,6 +28,7 @@ from .tokens import (
     DEFAULT_CTA_PLACEMENT,
     DEFAULT_FONT,
     DEFAULT_TEXT_PLACEMENT,
+    place_subject,
     substitute_stage1,
     substitute_stage2,
 )
@@ -66,6 +69,44 @@ MAX_RENDER_WIDTH = 4096
 # lets the provider resolve this agent's per-agent image-model override set by the
 # creator in the Agent Configuration panel, falling back to the global default.
 GD_AGENT_ID = "a1"
+
+# The studio editor produces vertical social posts, so its reference precedent is
+# drawn from the social-story bucket of the Brand Reference Library.
+STUDIO_CREATIVE_TYPE = "social_story"
+
+
+def _reference_grounding(run: dict) -> str:
+    """On-brand reference precedent for this run, as a prompt-ready block.
+
+    Looks up the run's brand + the studio creative type in the Brand Reference
+    Library (Drive-synced precedent) and returns a grounding block to append to
+    the Stage-2 scene prompt. Fully best-effort: any failure — library not
+    importable, empty index, no GCS — returns ``""`` and never breaks generation.
+    """
+    try:
+        from . import reference_library as rl
+
+        records = rl.load_index(rl.default_base_dir())
+        if not records:
+            return ""
+        cfg = run.get("config") or {}
+        tk = cfg.get("tokens") or {}
+        brief = " ".join(
+            str(tk.get(k, "")) for k in ("headline", "highlight", "subtext1", "subtext2", "cta")
+        ).strip()
+        hits = rl.retrieve_for_generation(
+            records,
+            brand_id=run.get("brand_id"),
+            creative_type=STUDIO_CREATIVE_TYPE,
+            brief=brief,
+            k=3,
+            style_k=2,
+        )
+        if not hits:
+            return ""
+        return rl.summarize_for_prompt(hits)
+    except Exception:  # noqa: BLE001 - grounding is additive; never fail generation
+        return ""
 
 
 class PipelineError(Exception):
@@ -221,10 +262,18 @@ def build_prompt(run: dict, stage: int, variant: str) -> dict:
                 raise PipelineError("Generate an AI element first.")
         else:
             subject = pack.stage2_variant(variant)["subject"]
+        # Prompt-steered placement: when the user picks one of the 9 cells we
+        # append an explicit override clause; "auto"/absent is a strict no-op.
+        subject = place_subject(subject, cfg.get("element_placement"))
         sub = substitute_stage2(
             pack.load_prompt(pack.stage2_blend_prompt), variant, ar, subject=subject
         )
         text, diffs, warnings = sub.text, sub.diffs, list(sub.warnings)
+        # Ground the scene on real, on-brand reference precedent (Drive-synced
+        # Brand Reference Library) when any is indexed for this brand/type.
+        grounding = _reference_grounding(run)
+        if grounding:
+            text = f"{text}\n\n{grounding}"
     elif stage == 3:
         # Stage 3 is rendered deterministically (text_overlay), not by the model,
         # so the "prompt" shown in the audit panel is a readable layout summary.
@@ -266,13 +315,13 @@ def _generate_stage3(run: dict) -> dict:
     base = _approved_png(run, 2)
     if base is None:
         raise PipelineError("Stage 3 requires the approved Stage 2 image.")
-    spec = _resolve_overlay_spec(run)
+    layers = gd_layout.resolve_layers(run)
     canvas_w, canvas_h = _stage_dims(run, 3)
     w, h, px_scale = _hires_canvas(base, canvas_w, canvas_h)
-    png = text_overlay.render_overlay(
-        base, spec, w, h, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id"))
+    png = text_overlay.render_layers(
+        base, layers, w, h, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id"))
     )
-    summary = text_overlay.overlay_spec_summary(spec)
+    summary = text_overlay.overlay_spec_summary(_resolve_overlay_spec(run))
     attempt_no = len(run["stages"]["3"]["attempts"]) + 1
     rel = save_artifact(run["id"], 3, "T", attempt_no, png)
     attempt = {
@@ -332,19 +381,27 @@ def render_stage3_preview(run: dict, *, tokens: dict | None = None,
         cfg["subheadings"] = subs
     view = {**run, "config": cfg}
 
-    spec = _resolve_overlay_spec(view)
+    layers = gd_layout.resolve_layers(view)
     canvas_w, canvas_h = _stage_dims(view, 3)
     pw = max(1, min(max_w, canvas_w))
     ph = max(1, round(canvas_h * pw / canvas_w))
     px_scale = pw / canvas_w  # the user's pixel nudges are calibrated to canvas_w
-    return text_overlay.render_overlay(
-        base, spec, pw, ph, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id"))
+    return text_overlay.render_layers(
+        base, layers, pw, ph, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id"))
     )
 
 
 def generate(run: dict, stage: int, variant: str | None = None,
-             provider: ImageProvider | None = None) -> dict:
-    """Generate an attempt for stage 1–3; chains the approved upstream image."""
+             provider: ImageProvider | None = None,
+             extra_references: list[tuple[bytes, str]] | None = None) -> dict:
+    """Generate an attempt for stage 1–3; chains the approved upstream image.
+
+    ``extra_references`` are additional reference images (e.g. the real on-brand
+    creatives retrieved from the Brand Reference Library) shown to the image model
+    ALONGSIDE the chained upstream image, so Stage 1/2 are grounded VISUALLY on
+    precedent — not just by a text description. Bytes are never persisted on the
+    run (it is JSON-serialised), so they are passed per call.
+    """
     if stage == 4:
         raise PipelineError("Use generate_stage4 for the logo stage.")
     if stage == 3:
@@ -362,6 +419,9 @@ def generate(run: dict, stage: int, variant: str | None = None,
     if stage > 1 and not refs:
         raise PipelineError(f"Stage {stage} requires the approved Stage {stage - 1} image.")
     refs = _shrink_reference(refs)  # smaller upload + faster ingest (Stage 2 base)
+    if extra_references:
+        # Chained upstream first (it sets composition), then on-brand precedent.
+        refs = (refs or []) + (_shrink_reference(extra_references) or [])
 
     built = build_prompt(run, stage, variant)
     if built["negative_prompt"] and not provider.supports_negative:
@@ -493,6 +553,155 @@ def _logo_placement_hint(layout: dict) -> str:
         "Preserve the logo's exact colours, shapes and proportions — do not redraw or restyle it.",
     ]
     return " ".join(bits)
+
+
+# --------------------------------------------------------------------------- #
+# Backbone as a reusable engine for multi-frame / document creative types.
+#
+# A carousel, blog, brochure or deck is NOT a separate generation system — it is
+# the SAME four steps, run to establish one shared on-brand "system" (Stage 1
+# foundation + Stage 2 subject), then Stage 3 (text) + Stage 4 (logo) applied per
+# frame/page/slide. This keeps the anti-hallucination backbone intact and reuses
+# it for every creative type, and is cost-efficient: the image model is called
+# only for the shared base (2 calls), not once per frame.
+# --------------------------------------------------------------------------- #
+
+def establish_base(
+    brand_id: str | None,
+    aspect_ratio: str = "1:1",
+    *,
+    reference_images: list[tuple[bytes, str]] | None = None,
+    stage1_variant: str | None = None,
+    stage2_variant: str | None = None,
+    subject: str | None = None,
+    provider: ImageProvider | None = None,
+    user_id: str = "creative-agent",
+) -> dict:
+    """Run the backbone's Stage 1 (foundation) + Stage 2 (subject) once to create
+    the shared visual system a multi-frame creative is built on.
+
+    Returns the run with an approved Stage-2 base. ``reference_images`` (the real
+    on-brand creatives) are shown to the image model so the base looks like prior
+    work, not a generic gradient.
+
+    Pass ``subject`` (free text) to override the Stage-2 foreground with a custom
+    scene — this is how a carousel gets a DISTINCT image per slide while every base
+    still shares the same brand Stage-1 foundation/palette. It rides the existing
+    custom-element ("AI" variant) path, so no new prompt machinery is needed.
+    """
+    run = create_run(user_id, brand_id)
+    run["config"]["aspect_ratio"] = aspect_ratio if aspect_ratio in ASPECT_RATIOS else DEFAULT_AR
+    pack = registry.get_pack(brand_id)
+    provider = provider or get_provider(agent_id=GD_AGENT_ID)
+
+    v1 = stage1_variant or (pack.stage1_variants[0]["id"] if pack.stage1_variants else "A")
+    generate(run, 1, variant=v1, provider=provider, extra_references=reference_images)
+    approve(run, 1)
+    if subject and subject.strip():
+        run["config"]["custom_element"] = {"subject": subject.strip()}
+        v2 = "AI"
+    else:
+        v2 = stage2_variant or (pack.stage2_variants[0]["id"] if pack.stage2_variants else "A")
+    generate(run, 2, variant=v2, provider=provider, extra_references=reference_images)
+    approve(run, 2)
+    return run
+
+
+def approved_base_png(run: dict) -> bytes | None:
+    """The run's approved Stage-2 base image (the subject on the brand foundation),
+    or None. Public accessor so the creative layer can analyse the base — e.g. the
+    layout brain inspecting where the subject landed — before the text overlay."""
+    return _approved_png(run, 2)
+
+
+def render_frame_on_base(
+    run: dict,
+    *,
+    headline: str = "",
+    highlight: str = "",
+    subheadings: list[str] | None = None,
+    cta: str = "",
+    logo_png: bytes | None = None,
+    logo_layout: dict | None = None,
+    layout: dict | None = None,
+) -> bytes:
+    """Apply Stage 3 (deterministic text) + Stage 4 (logo composite) for ONE frame
+    onto the run's approved Stage-2 base, and return the finished PNG.
+
+    Pure render — it does NOT append attempts or mutate the run's saved state — so
+    it is called once per frame of a carousel/blog/deck without disturbing the
+    shared base. Uses the exact same renderer (``text_overlay``) and compositor
+    (``composite_logo``) as the interactive Stage 3 / Stage 4.
+
+    ``layout`` (optional) overrides where the text sits for THIS frame —
+    ``{"placement": "left|right|top|bottom", "color": "dark|white"}`` — so a
+    per-slide layout brain can steer the headline + body into the negative space
+    away from the subject. The brand font and highlight gradient are untouched.
+    """
+    base = _approved_png(run, 2)
+    if base is None:
+        raise PipelineError("Frame render requires an approved Stage 2 base.")
+
+    cfg = dict(run["config"])
+    merged_tokens = dict(cfg.get("tokens") or {})
+    merged_tokens.update({"headline": headline, "highlight": highlight, "cta": cta})
+    cfg["tokens"] = merged_tokens
+    # Per-frame placement/colour from the layout brain (headline + sub-headings).
+    sub_overrides: dict = {}
+    if layout:
+        placement = layout.get("placement")
+        color = layout.get("color")
+        es = {k: dict(v) for k, v in (cfg.get("element_styles") or {}).items()}
+        head = dict(es.get("headline") or {})
+        if placement:
+            head["placement"] = placement
+            sub_overrides["placement"] = placement
+        if color:
+            head["color"] = color
+            sub_overrides["color"] = color
+        es["headline"] = head
+        cfg["element_styles"] = es
+    if subheadings is not None:
+        base_style = (cfg.get("subheadings") or [{}])[0]
+        cfg["subheadings"] = [
+            {**base_style, **sub_overrides, "text": t}
+            for t in subheadings if (t or "").strip()
+        ]
+    view = {**run, "config": cfg}
+
+    layers = gd_layout.resolve_layers(view)
+    canvas_w, canvas_h = _stage_dims(view, 3)
+    w, h, px_scale = _hires_canvas(base, canvas_w, canvas_h)
+    png = text_overlay.render_layers(
+        base, layers, w, h, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id"))
+    )
+    if logo_png:
+        layout = logo_layout if logo_layout is not None else (run["config"].get("logo_layout") or {})
+        png = composite_logo(png, logo_png, layout)
+    return png
+
+
+def brand_logo_png(brand_id: str | None) -> bytes | None:
+    """Best-effort fetch of a brand's real logo as PNG bytes for Stage 4.
+
+    Pulls the brand's ingested logo from Firestore/GCS and rasterises it. Returns
+    ``None`` on any failure (brand has no logo, backend app/GCS not available,
+    offline tests) so the caller cleanly runs Stages 1–3 without a logo.
+    """
+    pack = registry.get_pack(brand_id)
+    fid = getattr(pack, "firestore_brand_id", None)
+    if not fid:
+        return None
+    try:
+        from app.services import firestore_repo, imaging, storage
+
+        rec = firestore_repo.find_brand_logo(fid)
+        if not rec:
+            return None
+        data = storage.download_bytes(rec["file_url"])
+        return imaging.to_png_logo(data, rec.get("file_name", ""), rec.get("file_type", ""))
+    except Exception:  # noqa: BLE001 - logo is optional; never block generation
+        return None
 
 
 def stage4_logo_preview(run: dict, logo_w: int, logo_h: int) -> dict:

@@ -17,3 +17,8 @@ pypdf>=5.1
 python-docx>=1.1
 svglib>=1.5
 pillow>=10.0
+# Creative Agent — structured layout engine + document reference ingestion.
+reportlab>=4.0          # brochure (PDF) generation
+python-pptx>=0.6.23     # presentation (PPTX) generation
+PyMuPDF>=1.24           # render reference PDF pages for the reference library
+google-api-python-client>=2.130  # Google Drive ingestion for the reference library

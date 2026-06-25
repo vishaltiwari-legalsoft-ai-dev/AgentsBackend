@@ -89,6 +89,14 @@ class Settings(BaseSettings):
     # Ingestion source (the ONLY brand-asset directory the app reads).
     brand_kits_dir: str = ""
 
+    # Brand Reference Library — the Google Drive folder (shared with the service
+    # account) the team drops on-brand reference creatives into. Synced into the
+    # library via POST /api/ref-library/sync-drive. Defaults to the Legal Soft
+    # "Context Files" folder; override with GD_DRIVE_FOLDER_ID.
+    gd_drive_folder_id: str = "1-Uc5z2Rx5TlA3lRFBxDHDIpslVl3r_pG"
+    # Brand all Drive-synced references are filed under (one-brand folder today).
+    gd_drive_brand_name: str = "Legal Soft"
+
     # Brand-wise master prompt library CSV. Empty = use the bundled
     # app/data/Sample_master_prompt_brandwise - Sheet2.csv.
     master_prompts_csv: str = ""

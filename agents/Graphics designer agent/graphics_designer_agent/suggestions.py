@@ -57,6 +57,150 @@ ONBOARDING_QUESTIONS = [
 ]
 
 
+# ── §7.1.0 pre-generation discovery (the "micro-conversation") ────────────────
+# Before any suggestion is surfaced, the agent walks the user through a short,
+# conversational discovery so the output is grounded in INTENT, not generic. Two
+# groups: (1) intent — the feeling/outcome, audience, tone, style; (2) context —
+# is this for an event, and what theme/message is in mind. The answers are stored
+# on the run as ``creative_brief`` and folded into EVERY downstream suggestion
+# (concept, explore, gradient, element, hooks) plus the synthesized direction.
+#
+# ``kind`` drives how the UI renders a turn: ``choice`` = chips only,
+# ``text`` = free text only, ``choice_text`` = chips with a free-text override.
+# Option ids are kept stable across brand wordings so the curated heuristics below
+# (and the legacy goal/angle derivation) work for every pack.
+DISCOVERY_QUESTIONS = [
+    # — Step 1 · Intent —
+    {
+        "id": "feeling", "group": "intent", "kind": "choice_text",
+        "prompt": "First — what feeling or outcome should this creative land? "
+                  "Pick the closest, or tell me in your own words.",
+        "options": [
+            {"id": "trust", "label": "Trust & authority"},
+            {"id": "urgency", "label": "Urgency / act now"},
+            {"id": "warmth", "label": "Warmth & approachability"},
+            {"id": "aspiration", "label": "Aspiration & growth"},
+            {"id": "relief", "label": "Relief from overwhelm"},
+        ],
+        "placeholder": "e.g. calm confidence, “we’ve got your back”",
+    },
+    {
+        "id": "audience", "group": "intent", "kind": "choice_text",
+        "prompt": "Who are we talking to?",
+        "options": [
+            {"id": "solo", "label": "Solo / small attorneys"},
+            {"id": "partners", "label": "Firm partners"},
+            {"id": "inhouse", "label": "In-house legal teams"},
+            {"id": "growing", "label": "Growing firms"},
+        ],
+        "placeholder": "Describe the audience",
+    },
+    {
+        "id": "tone", "group": "intent", "kind": "choice",
+        "prompt": "What tone should it strike?",
+        "options": [
+            {"id": "premium", "label": "Premium & polished"},
+            {"id": "bold", "label": "Bold & punchy"},
+            {"id": "friendly", "label": "Friendly & human"},
+            {"id": "formal", "label": "Formal & institutional"},
+        ],
+    },
+    {
+        "id": "style", "group": "intent", "kind": "choice_text", "optional": True,
+        "prompt": "Any visual style you’re leaning toward? (optional)",
+        "options": [
+            {"id": "minimal", "label": "Minimal & clean"},
+            {"id": "editorial", "label": "Editorial"},
+            {"id": "cinematic", "label": "Cinematic"},
+            {"id": "corporate", "label": "Corporate"},
+        ],
+        "placeholder": "Optional — references or styling notes",
+    },
+    # — Step 2 · Event / campaign context —
+    {
+        "id": "event", "group": "context", "kind": "choice_text",
+        "prompt": "Is this for a specific event or moment, or is it evergreen?",
+        "options": [
+            {"id": "evergreen", "label": "Evergreen"},
+            {"id": "webinar", "label": "Webinar / event"},
+            {"id": "hiring", "label": "Hiring push"},
+            {"id": "seasonal", "label": "Seasonal / holiday"},
+            {"id": "launch", "label": "Launch / announcement"},
+        ],
+        "placeholder": "Name the event, date or moment",
+    },
+    {
+        "id": "theme", "group": "context", "kind": "text", "optional": True,
+        "prompt": "Last one — anything specific in mind for the theme or message? (optional)",
+        "placeholder": "e.g. “year-end caseload crunch”, a tagline, a campaign name",
+    },
+]
+
+# Maps that turn discovery answers into natural language for the direction summary
+# and into the legacy goal/angle keys the curated concept logic already understands.
+_FEELING_PHRASE = {
+    "trust": "earns trust and signals authority",
+    "urgency": "creates urgency to act now",
+    "warmth": "feels warm and approachable",
+    "aspiration": "sells aspiration and growth",
+    "relief": "promises relief from overwhelm",
+}
+_TONE_PHRASE = {
+    "premium": "premium and polished",
+    "bold": "bold and high-contrast",
+    "friendly": "friendly and human",
+    "formal": "formal and institutional",
+}
+_STYLE_PHRASE = {
+    "minimal": "minimal, lots of negative space",
+    "editorial": "editorial and type-led",
+    "cinematic": "cinematic and atmospheric",
+    "corporate": "clean and corporate",
+}
+_EVENT_PHRASE = {
+    "evergreen": "an evergreen always-on creative",
+    "webinar": "tied to a webinar / live event",
+    "hiring": "a hiring / recruitment push",
+    "seasonal": "a seasonal / holiday moment",
+    "launch": "a launch or announcement",
+}
+# Discovery feeling → the legacy "angle" key (pain-point vs aspiration) that
+# recommend_concept already keys off, so the curated A–E logic keeps firing.
+_FEELING_ANGLE = {
+    "urgency": "pain", "relief": "pain",
+    "trust": "aspiration", "warmth": "aspiration", "aspiration": "aspiration",
+}
+# Discovery event → the legacy "goal" key (lead-gen vs brand awareness).
+_EVENT_GOAL = {"hiring": "lead_gen", "launch": "lead_gen", "webinar": "brand", "seasonal": "brand"}
+
+
+def _discovery_label(qid: str, value: str, questions=None) -> str:
+    """Human label for a stored discovery answer (option label, else raw text).
+
+    ``questions`` defaults to the Legal Soft script; pass ``pack.discovery_questions``
+    so a templated brand's own wording is used."""
+    for q in (questions or DISCOVERY_QUESTIONS):
+        if q["id"] == qid:
+            for o in q.get("options", []):
+                if o["id"] == value:
+                    return o["label"]
+    return value
+
+
+def _derive_legacy(brief: dict) -> dict:
+    """Back-fill the legacy goal/angle keys from the richer discovery brief so the
+    existing curated concept heuristics keep working. Non-destructive: an explicit
+    goal/angle in the brief always wins. Returns a NEW merged dict."""
+    merged = dict(brief or {})
+    feeling = merged.get("feeling")
+    if not merged.get("angle") and feeling in _FEELING_ANGLE:
+        merged["angle"] = _FEELING_ANGLE[feeling]
+    event = merged.get("event")
+    if not merged.get("goal") and event in _EVENT_GOAL:
+        merged["goal"] = _EVENT_GOAL[event]
+    return merged
+
+
 def _resolve_pack(pack=None):
     """The active brand pack (defaults to Legal Soft). Lazy import avoids a cycle —
     registry imports this module for the Legal Soft content."""
@@ -92,6 +236,10 @@ def recommend_concept(answers: dict, *, pack=None) -> dict:
     pack = _resolve_pack(pack)
     stage2_variants = pack.stage2_variants
     concept_rationale = pack.concept_rationale
+    # Fold the richer discovery brief (feeling/event/…) into the legacy goal/angle
+    # keys this curated logic already understands, so the conversation steers the
+    # recommendation even when the user never touched the old multiple-choice panel.
+    answers = _derive_legacy(answers)
     angle = answers.get("angle")
     audience = answers.get("audience")
     if angle == "pain":
@@ -117,6 +265,301 @@ def recommend_concept(answers: dict, *, pack=None) -> dict:
             for v in stage2_variants
         ],
     }
+
+
+# ── §7.1.0b — synthesized creative direction (the discovery payoff) ───────────
+# After the micro-conversation, the agent reflects the brief back as ONE short
+# creative direction: which concept it points to, the tone/palette/copy angle to
+# carry, and a couple of next-step nudges. Curated + fully offline; an OpenRouter
+# key rewrites the prose without changing the contract.
+
+
+def _curated_direction(brief: dict, pack) -> dict:
+    """Deterministic creative direction from the discovery brief + brand pack."""
+    concept = recommend_concept(brief, pack=pack)
+    rec = concept["recommended"]
+    idx = _variant_index(pack.stage2_variants)
+    concept_title = idx.get(rec, {}).get("title", rec)
+
+    feeling = brief.get("feeling")
+    tone = brief.get("tone")
+    style = brief.get("style")
+    event = brief.get("event")
+    theme = (brief.get("theme") or "").strip()
+    audience_lbl = (
+        _discovery_label("audience", brief["audience"], pack.discovery_questions)
+        if brief.get("audience") else None
+    )
+
+    # Build a 2–3 sentence direction, only naming the dimensions the user gave.
+    bits = [f"This creative should {_FEELING_PHRASE.get(feeling, 'land your core message')}"]
+    if audience_lbl:
+        bits[0] += f" for {audience_lbl.lower()}"
+    if tone in _TONE_PHRASE:
+        bits.append(f"Keep the tone {_TONE_PHRASE[tone]}")
+    if style in _STYLE_PHRASE:
+        bits.append(f"lean {_STYLE_PHRASE[style]}")
+    sentence1 = (bits[0] + ".").replace("..", ".")
+    sentence2 = (", ".join(bits[1:]) + ".") if len(bits) > 1 else ""
+    direction = f"I’d point this at concept {rec} — {concept_title}: {concept['rationale']}"
+    if event and event != "evergreen" and event in _EVENT_PHRASE:
+        direction += f" Frame it as {_EVENT_PHRASE[event]}"
+        direction += f" around “{theme}”." if theme else "."
+    elif theme:
+        direction += f" Centre the message on “{theme}”."
+
+    grad = pack.locked_colors.get("gradient", [])
+    palette_hint = (
+        "Stay on the brand blue/white gradient"
+        + (f" ({grad[0]} → {grad[-1]})" if len(grad) >= 2 else "")
+        + "; reserve the brand accent for the CTA only."
+    )
+    # Copy angle: urgency/relief → problem-first; otherwise outcome-first.
+    copy_angle = (
+        "Open on the pain, then the relief — a short, punchy headline with one highlighted phrase."
+        if _FEELING_ANGLE.get(feeling) == "pain"
+        else "Lead with the outcome — an aspirational headline with one highlighted phrase."
+    )
+    highlights = [h for h in (sentence1, sentence2) if h]
+
+    return {
+        "type": "direction",
+        "state": "proposed",
+        "source": "agent",
+        "summary": " ".join([s for s in (sentence1, sentence2, direction) if s]),
+        "concept": rec,
+        "concept_title": concept_title,
+        "concept_rationale": concept["rationale"],
+        "tone": _TONE_PHRASE.get(tone, tone or ""),
+        "palette_hint": palette_hint,
+        "copy_angle": copy_angle,
+        "highlights": highlights,
+    }
+
+
+def synthesize_direction(brief: dict | None, *, pack=None) -> dict:
+    """Reflect the discovery brief back as a single creative direction (§7.1.0b).
+
+    Curated + deterministic so it works fully offline; when an OpenRouter key is
+    configured the prose is rewritten by the model (best-effort — any failure
+    silently falls back to the curated direction). The recommended concept and
+    contract shape are unchanged by the LLM."""
+    pack = _resolve_pack(pack)
+    curated = _curated_direction(brief or {}, pack)
+    return _enrich_direction_with_llm(brief or {}, curated, pack) or curated
+
+
+def _enrich_direction_with_llm(brief: dict, curated: dict, pack) -> dict | None:
+    """Best-effort LLM rewrite of the direction prose. Keeps the curated concept
+    pick + palette hint; only the summary/copy_angle prose may change. Returns
+    None on any problem so the caller keeps the curated direction."""
+    try:
+        from app.services.openrouter import get_llm  # lazy — package works without the app
+    except Exception:
+        logger.debug("OpenRouter not importable; using curated direction fallback")
+        return None
+    readable = {
+        k: _discovery_label(k, v, pack.discovery_questions) if isinstance(v, str) else v
+        for k, v in brief.items()
+    }
+    prompt = (
+        "You are a creative director for premium "
+        f"{pack.name} ad creatives. A short discovery conversation produced this "
+        f"brief: {json.dumps(readable)}.\n\n"
+        f"The chosen concept is {curated['concept']} — {curated['concept_title']}: "
+        f"{curated['concept_rationale']}. The palette is locked: {curated['palette_hint']}\n\n"
+        "Write a crisp creative direction that reflects the brief back to the user. "
+        "Do NOT change the concept or palette. Return ONLY minified JSON: "
+        '{"summary":"2-3 sentences of direction","copy_angle":"one sentence on the '
+        'headline/copy approach"}'
+    )
+    try:
+        msg = get_llm(temperature=0.6, fast=True).invoke(prompt)
+        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        match = re.search(r"\{.*\}", content, re.S)
+        if not match:
+            return None
+        data = json.loads(match.group(0))
+        summary = str(data.get("summary") or "").strip()
+        if not summary:
+            return None
+        return {
+            **curated,
+            "source": "agent+llm",
+            "summary": summary,
+            "copy_angle": str(data.get("copy_angle") or curated["copy_angle"]).strip(),
+        }
+    except Exception:
+        logger.warning("LLM direction enrichment failed; using curated fallback", exc_info=True)
+        return None
+
+
+# ── §7.1.0c — the conversation itself (agent talks WITH the user) ─────────────
+# A genuine back-and-forth strategist chat (not a fixed questionnaire). The agent
+# greets, reads each free-text reply, acknowledges it, pulls intent out of it, and
+# asks the next thing — adapting when an OpenRouter key is configured, and still
+# holding a real turn-by-turn dialogue offline. When it has enough, it hands back
+# the synthesized direction. The frontend keeps the transcript and replays the
+# full ``history`` each turn, so this stays stateless server-side.
+
+# Keyword → option-id hints, so the OFFLINE agent can extract intent from a
+# free-text reply (the LLM path classifies on its own). Ids are stable across
+# brands, so one map serves every pack.
+_BRIEF_SYNONYMS = {
+    "trust": ["trust", "authority", "credib", "reliable", "trusted", "expert"],
+    "urgency": ["urgent", "now", "fast", "quick", "immediately", "deadline", "asap", "hurry"],
+    "warmth": ["warm", "friendly", "approach", "human", "welcoming", "caring", "personable"],
+    "aspiration": ["aspir", "growth", "ambiti", "success", "elevate", "dream", "premium"],
+    "relief": ["relief", "overwhelm", "stress", "burnout", "tired", "calm", "peace", "breathe"],
+    "solo": ["solo", "small", "individual", "startup", "myself", "single"],
+    "partners": ["partner", "firm", "leadership", "executive", "decision", "principal"],
+    "inhouse": ["in-house", "in house", "internal", "counsel", "corporate legal"],
+    "growing": ["growing", "scal", "expand", "mid-size", "midsize", "growth-stage"],
+    "premium": ["premium", "polished", "luxur", "high-end", "sophisticat", "refined"],
+    "bold": ["bold", "punchy", "loud", "striking", "dramatic", "high-contrast", "edgy"],
+    "friendly": ["friendly", "human", "casual", "warm", "approach", "conversational"],
+    "formal": ["formal", "institution", "serious", "professional", "conservative", "corporate"],
+    "minimal": ["minimal", "clean", "simple", "whitespace", "negative space", "uncluttered"],
+    "editorial": ["editorial", "magazine", "type-led", "typographic", "layout"],
+    "cinematic": ["cinematic", "dramatic", "moody", "atmospher", "film", "lighting"],
+    "corporate": ["corporate", "business", "professional"],
+    "evergreen": ["evergreen", "always", "general", "no event", "none", "ongoing", "anytime"],
+    "webinar": ["webinar", "event", "conference", "workshop", "seminar", "live", "summit"],
+    "hiring": ["hiring", "recruit", "job", "careers", "talent", "vacanc", "we're hiring"],
+    "seasonal": ["season", "holiday", "christmas", "new year", "summer", "winter", "festive"],
+    "launch": ["launch", "announce", "release", "unveil", "introduc", "new service"],
+}
+# Short acknowledgments the offline agent rotates through so each turn feels like a
+# reply, not a form. Chosen deterministically from the reply length (no randomness,
+# so resumes/tests stay stable).
+_ACKS = ["Got it.", "Love that.", "Makes sense.", "Perfect.", "Great —", "Noted."]
+# How many user turns before the offline agent wraps up even if a field is blank.
+_CHAT_MAX_USER_TURNS = 8
+
+
+def _match_option(question: dict, text: str) -> str | None:
+    """Best-effort map a free-text reply to one of a discovery question's option
+    ids, via the option label words + the synonym hints. None if nothing fits."""
+    low = (text or "").lower()
+    for opt in question.get("options", []):
+        oid = opt["id"]
+        label_hit = any(w for w in opt["label"].lower().replace("&", " ").split() if len(w) > 3 and w in low)
+        syn_hit = any(s in low for s in _BRIEF_SYNONYMS.get(oid, []))
+        if label_hit or syn_hit:
+            return oid
+    return None
+
+
+def _ack(text: str) -> str:
+    return _ACKS[len(text or "") % len(_ACKS)]
+
+
+def _chat_messages(history):
+    return [m for m in (history or []) if m.get("role") in ("agent", "user")]
+
+
+def _converse_offline(history, brief, pack) -> dict:
+    """Deterministic, offline strategist conversation. Walks the discovery
+    dimensions in order but as a dialogue: it fills the dimension the previous
+    turn asked about from the user's latest reply, acknowledges it, then asks the
+    next open question — or wraps up with the synthesized direction."""
+    qs = pack.discovery_questions
+    msgs = _chat_messages(history)
+    agent_turns = [m for m in msgs if m["role"] == "agent"]
+    user_turns = [m for m in msgs if m["role"] == "user"]
+    n = len(agent_turns)  # questions asked so far
+
+    brief = dict(brief or {})
+    # The user's latest reply answers the most-recently-asked question.
+    if user_turns and 1 <= n <= len(qs):
+        q = qs[n - 1]
+        last = (user_turns[-1].get("text") or "").strip()
+        if last:
+            brief[q["id"]] = _match_option(q, last) or last
+
+    last_user = (user_turns[-1]["text"] if user_turns else "") or ""
+    ack = _ack(last_user) if user_turns else ""
+    wrap = n >= len(qs) or len(user_turns) >= _CHAT_MAX_USER_TURNS
+
+    if not wrap and n < len(qs):
+        nextq = qs[n]
+        if n == 0:
+            reply = (f"Hi! I’m your {pack.name} creative strategist. Before I suggest "
+                     f"anything, I want to get what you’re going for. {nextq['prompt']}")
+        else:
+            reply = f"{ack} {nextq['prompt']}".strip()
+        return {"type": "chat", "state": "proposed", "source": "agent",
+                "reply": reply, "brief": brief, "done": False, "direction": None}
+
+    direction = synthesize_direction(brief, pack=pack)
+    reply = (f"{ack} Here’s the direction I’d take: {direction['summary']} "
+             "Want me to run with concept "
+             f"{direction['concept']}, or tweak anything?").strip()
+    return {"type": "chat", "state": "proposed", "source": "agent",
+            "reply": reply, "brief": brief, "done": True, "direction": direction}
+
+
+def _converse_with_llm(history, brief, pack) -> dict | None:
+    """Adaptive LLM strategist turn. Returns None (caller falls back to offline)
+    when OpenRouter isn't configured or anything goes wrong."""
+    try:
+        from app.services.openrouter import get_llm  # lazy — package works without the app
+    except Exception:
+        logger.debug("OpenRouter not importable; using offline strategist conversation")
+        return None
+    msgs = _chat_messages(history)
+    system = (
+        f"You are a warm, sharp creative strategist for premium {pack.name} ad "
+        "creatives. You are having a SHORT chat to understand the user's intent "
+        "BEFORE any design is generated. Ask ONE question per turn, acknowledge "
+        "what they just said, and keep replies to 1–2 sentences. Gather: the "
+        "feeling/outcome they want, the audience, the tone, optionally a visual "
+        "style, whether it's for an event, and any theme/message. When you have "
+        "enough (at least feeling + audience + (event or theme)), set done=true "
+        "and stop asking.\n\n"
+        "Return ONLY minified JSON: {\"reply\":\"your next message\","
+        "\"brief\":{\"feeling\":\"\",\"audience\":\"\",\"tone\":\"\",\"style\":\"\","
+        "\"event\":\"\",\"theme\":\"\"},\"done\":false}. In brief, prefer these tags "
+        "when they fit, else free text — feeling: trust|urgency|warmth|aspiration|"
+        "relief; audience: solo|partners|inhouse|growing; tone: premium|bold|"
+        "friendly|formal; style: minimal|editorial|cinematic|corporate; event: "
+        "evergreen|webinar|hiring|seasonal|launch. Omit a brief key you don't know."
+    )
+    chat = [("system", system)]
+    for m in msgs:
+        chat.append(("ai" if m["role"] == "agent" else "human", m.get("text") or ""))
+    if not msgs:
+        chat.append(("human", "Start the conversation."))
+    try:
+        out = get_llm(temperature=0.6).invoke(chat)
+        content = out.content if isinstance(out.content, str) else str(out.content)
+        match = re.search(r"\{.*\}", content, re.S)
+        if not match:
+            return None
+        data = json.loads(match.group(0))
+        reply = str(data.get("reply") or "").strip()
+        if not reply:
+            return None
+        merged = dict(brief or {})
+        for k, v in (data.get("brief") or {}).items():
+            if isinstance(v, str) and v.strip():
+                merged[k] = v.strip()
+        done = bool(data.get("done")) or len([m for m in msgs if m["role"] == "user"]) >= _CHAT_MAX_USER_TURNS
+        direction = synthesize_direction(merged, pack=pack) if done else None
+        return {"type": "chat", "state": "proposed", "source": "agent+llm",
+                "reply": reply, "brief": merged, "done": done, "direction": direction}
+    except Exception:
+        logger.warning("LLM strategist turn failed; using offline conversation", exc_info=True)
+        return None
+
+
+def converse(history=None, brief=None, *, pack=None) -> dict:
+    """One strategist turn. LLM-driven when configured, deterministic offline
+    fallback otherwise. ``history`` is the full transcript so far (list of
+    ``{role: 'agent'|'user', text}``); returns the agent's next ``reply``, the
+    updated ``brief``, whether it's ``done``, and the ``direction`` when done."""
+    pack = _resolve_pack(pack)
+    return _converse_with_llm(history, brief, pack) or _converse_offline(history, brief, pack)
 
 
 # ── §7.1.1b — element explorer ("let the agent play with new elements") ───────
@@ -931,3 +1374,34 @@ def qa_critique(stage: int, *, pack=None) -> dict:
     """§7.1.5 — advisory only, never auto-regenerates."""
     qa = _resolve_pack(pack).qa
     return {"type": "qa", "state": "proposed", "source": "agent", "stage": stage, "note": qa.get(stage, "")}
+
+
+def suggest_placement(run: dict, pack=None) -> dict:
+    """§ "AI Suggest Placement" — propose a polished, premium arrangement for the
+    Stage-3 elements that are present (does NOT auto-apply; the caller decides).
+
+    Deterministic editorial layout: a left-aligned column — headline up top, any
+    sub-headings stacked beneath, the CTA lower-left, and venue/website as a footer.
+    Returns ``{"layout": {element_id: {x, y, w, anchor}}}`` for every present
+    element so one click pins them all into a clean composition.
+    """
+    from . import layout as _layout
+
+    present = {l["id"] for l in _layout.resolve_layers(run)}
+    out: dict[str, dict] = {}
+    y = 0.10
+    if "headline" in present:
+        out["headline"] = {"x": 0.08, "y": y, "w": 0.84, "anchor": "tl"}
+        y += 0.17
+    i = 0
+    while f"subheading-{i}" in present:
+        out[f"subheading-{i}"] = {"x": 0.08, "y": min(y, 0.80), "w": 0.80, "anchor": "tl"}
+        y += 0.085
+        i += 1
+    if "cta" in present:
+        out["cta"] = {"x": 0.08, "y": 0.90, "w": 0.5, "anchor": "bl"}
+    if "venue" in present:
+        out["venue"] = {"x": 0.08, "y": 0.965, "w": 0.5, "anchor": "bl"}
+    if "website" in present:
+        out["website"] = {"x": 0.92, "y": 0.965, "w": 0.5, "anchor": "br"}
+    return {"layout": out}

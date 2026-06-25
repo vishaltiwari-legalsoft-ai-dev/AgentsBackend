@@ -72,6 +72,9 @@ class BrandPack:
 
     # suggestion content (advisory copy, tuned per brand)
     onboarding_questions: list = field(default_factory=list)
+    # Pre-generation discovery script (the "micro-conversation"). Defaults to the
+    # generic set for templated brands; Legal Soft supplies its own flavoured copy.
+    discovery_questions: list = field(default_factory=list)
     concept_rationale: dict = field(default_factory=dict)
     hooks: dict = field(default_factory=dict)
     ctas: list = field(default_factory=list)
@@ -170,6 +173,7 @@ def _build_legalsoft() -> BrandPack:
         default_subtext_2=_t.DEFAULT_SUBTEXT_2,
         default_cta=_t.DEFAULT_CTA,
         onboarding_questions=_s.ONBOARDING_QUESTIONS,
+        discovery_questions=_s.DISCOVERY_QUESTIONS,
         concept_rationale=_s._CONCEPT_RATIONALE,
         hooks=_s._HOOKS,
         ctas=_s._CTAS,

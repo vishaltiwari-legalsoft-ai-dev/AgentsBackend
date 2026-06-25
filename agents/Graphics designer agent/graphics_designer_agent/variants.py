@@ -402,7 +402,7 @@ def text_color_phrase(key: str) -> str:
 STAGE3_ELEMENTS = [
     {"key": "headline",  "label": "Heading",         "token": "headline",  "placeable": True,  "colorable": True,  "sizable": True,  "placement_kind": "text"},
     {"key": "highlight", "label": "Hook / highlight", "token": "highlight", "placeable": False, "colorable": True,  "sizable": False, "placement_kind": "text"},
-    {"key": "cta",       "label": "CTA button",      "token": "cta",       "placeable": True,  "colorable": False, "sizable": True,  "placement_kind": "cta"},
+    {"key": "cta",       "label": "CTA button",      "token": "cta",       "placeable": True,  "colorable": True,  "sizable": True,  "placement_kind": "cta"},
 ]
 
 # ── Stage 3 — deterministic renderer bounds (size slider + pixel nudge) ────────
@@ -438,6 +438,23 @@ def font_file(name: str) -> str:
 # ── Stage 4 — logo placement grid (UI) ────────────────────────────────────────
 # The 3×3 grid the studio renders as the logo placement guide. ``key`` matches
 # compositor.LOGO_POSITION_KEYS; row/col drive the grid layout.
+# Stage-2 subject placement (prompt-steered, spec §5.2b). "auto" preserves each
+# subject's built-in framing (a strict no-op); the 9 cells inject an explicit
+# override clause. Grid keys mirror LOGO_POSITIONS so the picker reuses the same
+# 3×3 component; "auto" is the leading default chip above the grid.
+STAGE2_PLACEMENTS = [
+    {"key": "auto", "label": "Auto", "row": -1, "col": -1},
+    {"key": "top-left", "label": "Top left", "row": 0, "col": 0},
+    {"key": "top-center", "label": "Top", "row": 0, "col": 1},
+    {"key": "top-right", "label": "Top right", "row": 0, "col": 2},
+    {"key": "middle-left", "label": "Left", "row": 1, "col": 0},
+    {"key": "middle-center", "label": "Middle", "row": 1, "col": 1},
+    {"key": "middle-right", "label": "Right", "row": 1, "col": 2},
+    {"key": "bottom-left", "label": "Bottom left", "row": 2, "col": 0},
+    {"key": "bottom-center", "label": "Bottom", "row": 2, "col": 1},
+    {"key": "bottom-right", "label": "Bottom right", "row": 2, "col": 2},
+]
+
 LOGO_POSITIONS = [
     {"key": "top-left", "label": "Top left", "row": 0, "col": 0},
     {"key": "top-center", "label": "Top center", "row": 0, "col": 1},

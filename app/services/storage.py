@@ -130,6 +130,40 @@ def upload_generated(
     )
 
 
+# Cloud Storage namespace for the Brand Reference Library (Drive-synced
+# precedent + its index). Kept separate from brand kits, references and
+# generated output so it is never confused with — or pruned alongside — them.
+REFERENCE_LIBRARY_PREFIX = "reference_library"
+REFERENCE_INDEX_OBJECT = f"{REFERENCE_LIBRARY_PREFIX}/reference_index.json"
+
+
+def upload_reference_library_asset(
+    brand_id: str, creative_type: str, file_name: str, data: bytes, content_type: str
+) -> tuple[str, str]:
+    """Mirror a reference-library asset to
+    ``reference_library/<brand_id>/<creative_type>/<file>`` and return
+    ``(gs_uri, signed_url)``."""
+    object_path = (
+        f"{REFERENCE_LIBRARY_PREFIX}/{brand_id}/{creative_type}/{_safe_name(file_name)}"
+    )
+    return _upload(object_path, data, content_type)
+
+
+def write_reference_index(data: bytes) -> str:
+    """Persist the reference index JSON to GCS; returns its ``gs://`` URI."""
+    gs_uri, _ = _upload(REFERENCE_INDEX_OBJECT, data, "application/json")
+    return gs_uri
+
+
+def read_reference_index() -> Optional[bytes]:
+    """Read the reference index JSON from GCS, or ``None`` if it does not exist."""
+    bucket_name = settings.require("gcs_bucket_name")
+    blob = _storage().bucket(bucket_name).blob(REFERENCE_INDEX_OBJECT)
+    if not blob.exists():
+        return None
+    return blob.download_as_bytes()
+
+
 def signed_url_for_gs_uri(gs_uri: str, expires_in_hours: int = 1) -> str:
     """Convert a `gs://bucket/object` URI into a time-limited HTTPS view URL."""
     if not gs_uri.startswith("gs://"):

@@ -16,6 +16,9 @@ from pydantic import BaseModel, Field
 from app.security import get_current_user
 from app.services import firestore_repo, imaging, storage
 
+from graphics_designer_agent import icons as icons_mod
+from graphics_designer_agent import layout as gd_layout
+from graphics_designer_agent import shapes as shapes_mod
 from graphics_designer_agent import pipeline, registry, suggestions, variants
 from graphics_designer_agent.pipeline import PipelineError
 from graphics_designer_agent.runs import get_run, log_manifest, save_run
@@ -151,6 +154,13 @@ def _valid_offset(v, axis: str) -> int:
     return v
 
 
+def _valid_color(v) -> str:
+    """A named swatch (dark/white/gradient/cta) or a #RRGGBB hex — full palette."""
+    if gd_layout.is_valid_color(v):
+        return v
+    raise HTTPException(400, f"Unknown colour '{v}' (use a named swatch or #RRGGBB)")
+
+
 # ── serialization ─────────────────────────────────────────────────────────────
 def _artifact_url(run_id: str, ref: str) -> str:
     """Browser-facing URL for a stored artifact reference.
@@ -210,7 +220,6 @@ def _apply_element_styles(cfg: dict, incoming: dict, pack) -> None:
     """
     elements = {e["key"]: e for e in variants.STAGE3_ELEMENTS}
     fonts = set(pack.font_names())
-    color_keys = set(variants.TEXT_COLOR_KEYS)
     text_places = {p["key"] for p in variants.TEXT_PLACEMENTS}
     cta_places = {p["key"] for p in variants.CTA_PLACEMENTS}
     styles = cfg.setdefault("element_styles", {})
@@ -229,9 +238,7 @@ def _apply_element_styles(cfg: dict, incoming: dict, pack) -> None:
         if "color" in patch:
             if not meta["colorable"]:
                 raise HTTPException(400, f"Element '{key}' has a locked colour.")
-            if patch["color"] not in color_keys:
-                raise HTTPException(400, f"Unknown text colour '{patch['color']}'")
-            cur["color"] = patch["color"]
+            cur["color"] = _valid_color(patch["color"])
         if "placement" in patch:
             if not meta["placeable"]:
                 raise HTTPException(400, f"Element '{key}' has no placement control.")
@@ -263,7 +270,6 @@ def _apply_subheadings(cfg: dict, incoming: list, pack) -> None:
             f"{variants.SUBHEADING_MAX}.")
     fonts = set(pack.font_names())
     text_places = {p["key"] for p in variants.TEXT_PLACEMENTS}
-    color_keys = set(variants.TEXT_COLOR_KEYS)
     out: list[dict] = []
     for item in incoming:
         if not isinstance(item, dict):
@@ -276,9 +282,7 @@ def _apply_subheadings(cfg: dict, incoming: list, pack) -> None:
             raise HTTPException(
                 400, f"Font is locked to the {pack.font_family} family; "
                 f"'{font}' is not allowed.")
-        color = item.get("color", "dark")
-        if color not in color_keys:
-            raise HTTPException(400, f"Unknown text colour '{color}'")
+        color = _valid_color(item.get("color", "dark"))
         placement = item.get("placement", "left")
         if placement not in text_places:
             raise HTTPException(400, f"Unknown placement '{placement}'")
@@ -387,6 +391,29 @@ def _apply_logo_layout(cfg: dict, patch: dict) -> None:
     cfg["logo_layout"] = cur
 
 
+def _apply_layout(cfg: dict, patch: dict | None) -> None:
+    """Validate + merge Stage-3 free-drag coordinates into the run config.
+
+    ``patch`` maps an element id (headline / subheading-N / cta / shape id) to a
+    coord entry ``{x,y,w,anchor}``. Each entry is clamped to safe ranges; passing
+    an explicit ``null`` for an id removes its pin (the element returns to ``auto``
+    legacy placement). Passing ``{}``/``None`` for the whole patch is a no-op.
+    """
+    if not patch:
+        return
+    if not isinstance(patch, dict):
+        raise HTTPException(400, "layout must be an object")
+    cur = dict(cfg.get("layout") or {})
+    for elem_id, entry in patch.items():
+        if entry is None:
+            cur.pop(elem_id, None)
+        elif isinstance(entry, dict):
+            cur[elem_id] = gd_layout.clamp_entry(entry)
+        else:
+            raise HTTPException(400, f"layout['{elem_id}'] must be an object or null")
+    cfg["layout"] = cur
+
+
 # ── brand selection (multi-brand hub) ─────────────────────────────────────────
 @router.get("/gd/brands")
 def gd_brands(_user: dict = Depends(get_current_user)) -> dict:
@@ -404,6 +431,7 @@ def gd_config(brand: str | None = None, _user: dict = Depends(get_current_user))
         "stage1_variants": pack.stage1_variants,
         "stage2_variants": pack.stage2_variants,
         "stage2_categories": pack.stage2_categories,
+        "stage2_placements": variants.STAGE2_PLACEMENTS,
         "fonts": pack.font_names(),
         "font_family": pack.font_family,
         "font_variants": pack.font_variants,
@@ -417,6 +445,9 @@ def gd_config(brand: str | None = None, _user: dict = Depends(get_current_user))
         "text_offset_px_range": variants.TEXT_OFFSET_PX_RANGE,
         "subheading_min": variants.SUBHEADING_MIN,
         "subheading_max": variants.SUBHEADING_MAX,
+        "anchors": list(gd_layout.ANCHORS),
+        "shape_kinds": list(shapes_mod.SHAPE_KINDS),
+        "icon_keys": list(icons_mod.ICON_KEYS),
         "logo_positions": variants.LOGO_POSITIONS,
         "logo_size_pct_min": variants.LOGO_SIZE_PCT_MIN,
         "logo_size_pct_max": variants.LOGO_SIZE_PCT_MAX,
@@ -426,6 +457,7 @@ def gd_config(brand: str | None = None, _user: dict = Depends(get_current_user))
         "locked_colors": pack.locked_colors,
         "stage1_source_note": pack.source_note_stage1,
         "onboarding_questions": pack.onboarding_questions,
+        "discovery_questions": pack.discovery_questions,
         "content_tokens": CONTENT_TOKENS,
     }
 
@@ -470,16 +502,26 @@ class ConfigBody(BaseModel):
     aspect_ratio: str | None = None
     text_placement: str | None = None
     cta_placement: str | None = None
+    # Stage-2 subject placement (prompt-steered): "auto" or one of the 9 cells.
+    element_placement: str | None = None
     # Per-element Stage-3 styling: element key -> {font?, color?, placement?, size_pct?, offset_x?, offset_y?}.
     element_styles: dict[str, dict] | None = None
     # Stage-3 sub-heading lines (1–5). Full-list replace.
     subheadings: list[dict] | None = None
+    # Stage-3 free-drag coordinates: {element_id: {x,y,w,anchor} | null}.
+    layout: dict | None = None
+    # Stage-3 shapes / infographic elements (full-list replace).
+    shapes: list | None = None
     # Stage-4 logo placement: {position?, size_pct?, margin_pct?, offset_x?, offset_y?}.
     logo_layout: dict | None = None
     # Per-creative temporary AI gradient (Stage 1). Explicit null clears it.
     custom_gradient: dict | None = None
     # Per-creative temporary AI element (Stage 2). Explicit null clears it.
     custom_element: dict | None = None
+    # Pre-generation discovery brief (feeling/audience/tone/style/event/theme).
+    # Shallow-merged onto the run so the conversation is durable + reaches every
+    # suggestion. Keys with empty values are dropped (lets the UI clear an answer).
+    creative_brief: dict | None = None
     use_ai_compositor: bool | None = None
     tokens: dict[str, str] | None = None
     # token -> {approved: bool, source: "user"|"agent", original_suggestion?: str}
@@ -523,10 +565,22 @@ def update_config(run_id: str, body: ConfigBody, user: dict = Depends(get_curren
         if body.cta_placement not in allowed:
             raise HTTPException(400, f"Unknown CTA placement '{body.cta_placement}'")
         cfg["cta_placement"] = body.cta_placement
+    if body.element_placement is not None:
+        allowed = {p["key"] for p in variants.STAGE2_PLACEMENTS}
+        if body.element_placement not in allowed:
+            raise HTTPException(400, f"Unknown subject placement '{body.element_placement}'")
+        cfg["element_placement"] = body.element_placement
     if body.element_styles is not None:
         _apply_element_styles(cfg, body.element_styles, pack)
     if body.subheadings is not None:
         _apply_subheadings(cfg, body.subheadings, pack)
+    if body.layout is not None:
+        _apply_layout(cfg, body.layout)
+    if body.shapes is not None:
+        try:
+            cfg["shapes"] = gd_layout.sanitize_shapes(body.shapes)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     if body.logo_layout is not None:
         _apply_logo_layout(cfg, body.logo_layout)
     # Use the field-set so an explicit ``null`` clears the gradient (omission
@@ -535,11 +589,22 @@ def update_config(run_id: str, body: ConfigBody, user: dict = Depends(get_curren
         _apply_custom_gradient(cfg, body.custom_gradient, pack)
     if "custom_element" in body.model_fields_set:
         _apply_custom_element(cfg, body.custom_element)
+    if body.creative_brief is not None:
+        brief = dict(cfg.get("creative_brief") or {})
+        for k, v in body.creative_brief.items():
+            text = (v or "").strip() if isinstance(v, str) else v
+            if text:
+                brief[k] = text
+            else:
+                brief.pop(k, None)  # empty value clears that answer
+        cfg["creative_brief"] = brief
     if body.use_ai_compositor is not None:
         cfg["use_ai_compositor"] = bool(body.use_ai_compositor)
     if body.tokens:
         for k, v in body.tokens.items():
-            if k in cfg["tokens"]:
+            # Known token or an optional detail field (venue/website may be absent
+            # on runs created before those fields existed).
+            if k in cfg["tokens"] or k in ("venue", "website"):
                 cfg["tokens"][k] = v
     if body.token_approvals:
         for token, info in body.token_approvals.items():
@@ -583,6 +648,18 @@ def text_preview_endpoint(run_id: str, body: TextPreviewBody,
     png = _guard(lambda: pipeline.render_stage3_preview(
         run, tokens=body.tokens, subheading_texts=body.subheading_texts))
     return Response(content=png, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@router.post("/gd/runs/{run_id}/suggest-placement")
+def suggest_placement_endpoint(run_id: str, user: dict = Depends(get_current_user)) -> dict:
+    """Propose a polished, premium arrangement for the Stage-3 elements present.
+
+    A one-click refinement: returns ``{layout, shapes?}`` but does NOT persist it.
+    The client previews the proposal and chooses to apply (via the config patch)
+    or discard, so the AI arranger never overrides the user's flow by default.
+    """
+    run = _owned_run(run_id, user)
+    return suggestions.suggest_placement(run, _pack_for_run(run))
 
 
 @router.post("/gd/runs/{run_id}/generate")
@@ -713,8 +790,14 @@ def prompt_preview(run_id: str, stage: int, variant: str = "A",
 
 # ── suggestions (approval-gated) ──────────────────────────────────────────────
 class SuggestBody(BaseModel):
-    kind: str  # concept | explore | gradient | element | aspect_ratio | hooks | font | qa
+    kind: str  # chat | discovery | concept | explore | gradient | element | aspect_ratio | hooks | font | qa
     answers: dict | None = None
+    # Pre-generation discovery brief; merged with the run's persisted brief and the
+    # legacy ``answers`` so every suggestion is grounded in the conversation.
+    brief: dict | None = None
+    # Strategist conversation transcript so far (list of {role:'agent'|'user',text})
+    # for kind=="chat". The agent is stateless — the full history is replayed.
+    history: list | None = None
     placement: str | None = None
     concept: str | None = None
     stage: int | None = None
@@ -726,17 +809,25 @@ class SuggestBody(BaseModel):
 def suggest_endpoint(run_id: str, body: SuggestBody, user: dict = Depends(get_current_user)) -> dict:
     run = _owned_run(run_id, user)
     pack = _pack_for_run(run)
+    # The effective brief: the run's persisted discovery answers, overlaid with any
+    # brief/answers sent on this call (request wins). Passed as ``answers`` so the
+    # existing curated heuristics (which read goal/audience/angle) keep working.
+    brief = {**(run["config"].get("creative_brief") or {}), **(body.brief or {}), **(body.answers or {})}
+    if body.kind == "chat":
+        return suggestions.converse(body.history, brief, pack=pack)
+    if body.kind == "discovery":
+        return suggestions.synthesize_direction(brief, pack=pack)
     if body.kind == "concept":
-        return suggestions.recommend_concept(body.answers or {}, pack=pack)
+        return suggestions.recommend_concept(brief, pack=pack)
     if body.kind == "explore":
-        return suggestions.explore_elements(body.answers or {}, exclude=body.exclude, pack=pack)
+        return suggestions.explore_elements(brief, exclude=body.exclude, pack=pack)
     if body.kind == "gradient":
         return suggestions.suggest_gradient(
-            body.answers or {}, steer=body.steer, exclude=body.exclude, pack=pack
+            brief, steer=body.steer, exclude=body.exclude, pack=pack
         )
     if body.kind == "element":
         return suggestions.suggest_element(
-            body.answers or {}, steer=body.steer, exclude=body.exclude, pack=pack
+            brief, steer=body.steer, exclude=body.exclude, pack=pack
         )
     if body.kind == "aspect_ratio":
         return suggestions.recommend_aspect_ratio(body.placement)

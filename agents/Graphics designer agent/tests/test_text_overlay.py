@@ -67,6 +67,77 @@ def test_pixel_offset_changes_output():
     assert a != b
 
 
+# ── coordinate (free-drag) layer path ─────────────────────────────────────────
+def test_render_layers_matches_legacy_for_default_placement():
+    # The new layer path, fed all-auto layers from a legacy spec, must produce
+    # BYTE-IDENTICAL output to the old renderer. This is the engine-safety gate.
+    base = _base_png(480, 600)
+    legacy = text_overlay.render_overlay(base, _spec(2), 480, 600)
+    layers = text_overlay._layers_from_spec(_spec(2))
+    assert text_overlay.render_layers(base, layers, 480, 600) == legacy
+
+
+def test_pinned_layer_moves_output():
+    base = _base_png(480, 600)
+    layers = text_overlay._layers_from_spec(_spec(2))
+    auto = text_overlay.render_layers(base, layers, 480, 600)
+    head = next(l for l in layers if l["id"] == "headline")
+    head.update({"pinned": True, "x": 0.8, "y": 0.1, "w": 0.4, "anchor": "tr"})
+    moved = text_overlay.render_layers(base, layers, 480, 600)
+    assert moved != auto
+
+
+def test_pinned_multiline_renders_png():
+    base = _base_png(480, 600)
+    layers = text_overlay._layers_from_spec(_spec(1))
+    head = next(l for l in layers if l["id"] == "headline")
+    head.update({"pinned": True, "text": "Line one\nLine two\nLine three"})
+    img = Image.open(BytesIO(text_overlay.render_layers(base, layers, 480, 600)))
+    assert img.size == (480, 600) and img.format == "PNG"
+
+
+# ── shapes / infographic layers ───────────────────────────────────────────────
+def test_shape_layer_changes_output_absence_is_unchanged():
+    base = _base_png(480, 600)
+    layers = text_overlay._layers_from_spec(_spec(1))
+    out0 = text_overlay.render_layers(base, layers, 480, 600)
+    layers.append({"type": "shape", "id": "shape-0", "kind": "circle", "x": 0.5, "y": 0.5,
+                   "w": 0.3, "h": 0.3, "anchor": "mc", "fill": "#FF0000", "stroke": None,
+                   "stroke_w": 0, "radius": 0, "icon": None, "text": "", "z": 5, "pinned": True})
+    assert text_overlay.render_layers(base, layers, 480, 600) != out0
+
+
+def test_icon_layer_renders():
+    base = _base_png(480, 600)
+    layers = text_overlay._layers_from_spec(_spec(1))
+    layers.append({"type": "shape", "id": "shape-1", "kind": "icon", "icon": "star", "x": 0.5,
+                   "y": 0.3, "w": 0.2, "h": 0.2, "anchor": "mc", "fill": "#1746A2", "stroke": None,
+                   "stroke_w": 0, "radius": 0, "text": "", "z": 6, "pinned": True})
+    img = Image.open(BytesIO(text_overlay.render_layers(base, layers, 480, 600)))
+    assert img.size == (480, 600)
+
+
+# ── per-element colour (incl. CTA, hex) ───────────────────────────────────────
+def test_cta_hex_color_changes_output_but_default_unchanged():
+    base = _base_png(480, 600)
+    default = text_overlay.render_overlay(base, _spec(1), 480, 600)
+    spec = _spec(1)
+    spec["cta"]["color"] = "#00AA00"
+    assert text_overlay.render_overlay(base, spec, 480, 600) != default
+    # explicit "cta" default token == no colour key (byte-identical safety)
+    spec2 = _spec(1)
+    spec2["cta"]["color"] = "cta"
+    assert text_overlay.render_overlay(base, spec2, 480, 600) == default
+
+
+def test_headline_hex_color_changes_output():
+    base = _base_png(480, 600)
+    default = text_overlay.render_overlay(base, _spec(1), 480, 600)
+    spec = _spec(1)
+    spec["headline"]["color"] = "#C81E1E"
+    assert text_overlay.render_overlay(base, spec, 480, 600) != default
+
+
 # ── pipeline end-to-end (mock provider for stages 1–2, deterministic stage 3) ──
 def _seed_to_stage3(run):
     pipeline.generate(run, 1, variant="A")
@@ -94,6 +165,26 @@ def test_stage3_renders_one_and_five_subheadings():
         save_run(run)
         attempt = pipeline.generate(run, 3)
         assert attempt["variant"] == "T"
+
+
+def test_pipeline_pinned_coords_move_output_but_default_unchanged():
+    run = create_run("u-coord")
+    _seed_to_stage3(run)
+    run["config"]["tokens"]["headline"] = "Move Me"
+    save_run(run)
+    a = artifact_abspath(run["id"], pipeline.generate(run, 3)["artifact"]).read_bytes()
+    run["config"]["layout"] = {"headline": {"x": 0.8, "y": 0.1, "w": 0.4, "anchor": "tr"}}
+    save_run(run)
+    b = artifact_abspath(run["id"], pipeline.generate(run, 3)["artifact"]).read_bytes()
+    assert a != b
+
+
+def test_pipeline_multiline_headline_renders():
+    run = create_run("u-ml")
+    _seed_to_stage3(run)
+    run["config"]["tokens"]["headline"] = "Line one\nLine two"
+    save_run(run)
+    assert pipeline.generate(run, 3)["variant"] == "T"
 
 
 def test_resolve_overlay_spec_supports_legacy_runs():

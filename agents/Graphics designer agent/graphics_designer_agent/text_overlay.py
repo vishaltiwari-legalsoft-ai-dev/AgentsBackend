@@ -23,6 +23,7 @@ from typing import Callable
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+from . import icons, layout, shapes
 from .variants import LOCKED_COLORS, font_file
 
 FONT_DIR = Path(__file__).resolve().parents[1] / "Causten Font Family"
@@ -211,7 +212,7 @@ def _render_text_elements(canvas, elements, base_w, base_h, theme: _Theme, px_sc
             y += lay["height"] + gap
 
 
-def _draw_cta(canvas, cta: dict, base_w, base_h, theme: _Theme, px_scale=1.0):
+def _draw_cta(canvas, cta: dict, base_w, base_h, theme: _Theme, px_scale=1.0, coords=None):
     label = cta["text"].rstrip() + "  →"
     font = _font(cta["font"], cta["size_pct"] / 100 * base_w, theme)
     asc, desc = font.getmetrics()
@@ -222,84 +223,268 @@ def _draw_cta(canvas, cta: dict, base_w, base_h, theme: _Theme, px_scale=1.0):
     radius = ph // 2
     mx, my = int(0.06 * base_w), int(0.06 * base_h)
 
-    place = cta["placement"]
-    if place == "left":
-        x = mx
-    elif place == "right":
-        x = base_w - mx - pw
-    else:  # center / top / bottom → horizontally centered
-        x = (base_w - pw) // 2
-    y = my if place == "top" else base_h - my - ph  # default sits low
+    if coords is not None:  # pinned → absolute anchor placement
+        x, y = layout.anchor_to_xy(coords["x"], coords["y"], pw, ph, coords["anchor"], base_w, base_h)
+    else:
+        place = cta["placement"]
+        if place == "left":
+            x = mx
+        elif place == "right":
+            x = base_w - mx - pw
+        else:  # center / top / bottom → horizontally centered
+            x = (base_w - pw) // 2
+        y = my if place == "top" else base_h - my - ph  # default sits low
     x += round(cta["offset"][0] * px_scale)
     y += round(cta["offset"][1] * px_scale)
 
-    # Soft orange-tinted drop shadow (blurred rounded rect, slight downward offset).
-    # The absolute padding/blur/offset scale with the canvas so the shadow keeps
-    # the same softness on a hi-res render as in the 1080-px preview.
+    # Pill fill: the "cta" token keeps the locked brand gradient; a solid token
+    # ("white"/"dark") or a #RRGGBB hex paints a solid pill. The shadow tints to
+    # the fill's representative colour so any colour reads as one coherent button.
+    fill = layout.resolve_color(cta.get("color", "cta"), _theme_dict(theme), "cta")
+    if fill[0] == "grad":
+        c0, c1 = fill[1]
+        body = _gradient(pw, ph, c0, c1).convert("RGBA")
+        shadow_rgb = c1
+    else:
+        shadow_rgb = fill[1]
+        body = Image.new("RGBA", (pw, ph), shadow_rgb + (255,))
+
+    # Soft drop shadow (blurred rounded rect, slight downward offset). The
+    # absolute padding/blur/offset scale with the canvas so the shadow keeps the
+    # same softness on a hi-res render as in the 1080-px preview.
     pad = max(1, round(40 * px_scale))
     blur = max(1, round(14 * px_scale))
     drop = max(1, round(10 * px_scale))
     shadow = Image.new("RGBA", (pw + 2 * pad, ph + 2 * pad), (0, 0, 0, 0))
     ImageDraw.Draw(shadow).rounded_rectangle(
-        [pad, pad, pad + pw, pad + ph], radius=radius, fill=theme.cta_grad[1] + (90,))
+        [pad, pad, pad + pw, pad + ph], radius=radius, fill=shadow_rgb + (90,))
     shadow = shadow.filter(ImageFilter.GaussianBlur(blur))
     canvas.alpha_composite(shadow, (x - pad, y - pad + drop))
 
-    # Gradient-filled pill.
-    grad = _gradient(pw, ph, theme.cta_grad[0], theme.cta_grad[1]).convert("RGBA")
+    # Filled pill (gradient or solid), clipped to the rounded-rect mask.
     mask = Image.new("L", (pw, ph), 0)
     ImageDraw.Draw(mask).rounded_rectangle([0, 0, pw - 1, ph - 1], radius=radius, fill=255)
-    canvas.paste(grad, (x, y), mask)
+    canvas.paste(body, (x, y), mask)
 
     _draw_run(canvas, x + pad_x, y + pad_y, label, font, ("solid", theme.white))
+
+
+def _theme_dict(theme: _Theme) -> dict:
+    """View of a ``_Theme`` for ``layout.resolve_color`` (named tokens + hex)."""
+    return {"dark": theme.dark, "white": theme.white,
+            "grad": theme.grad_text, "cta": theme.cta_grad}
+
+
+def _headline_element(h: dict, theme: _Theme) -> dict:
+    """Legacy element dict (with ``color_for``) for the headline."""
+    td = _theme_dict(theme)
+    main = layout.resolve_color(h.get("color", "dark"), td, "dark")
+    hl = layout.resolve_color(h.get("highlight_color", "gradient"), td, "gradient")
+    return {
+        "tokens": _headline_tokens(h["text"], h.get("highlight", "")),
+        "font": h["font"], "size_pct": h["size_pct"],
+        "placement": h.get("placement", "left"), "offset": h.get("offset", (0, 0)),
+        "line_gap": 1.15, "color_for": (lambda t, m=main, g=hl: g if t[1] else m),
+    }
+
+
+def _sub_element(sh: dict, theme: _Theme) -> dict:
+    """Legacy element dict (with ``color_for``) for one sub-heading."""
+    td = _theme_dict(theme)
+    fill = layout.resolve_color(sh.get("color", "dark"), td, "dark")
+    return {
+        "tokens": [(w, False) for w in sh["text"].split()] or [("", False)],
+        "font": sh["font"], "size_pct": sh["size_pct"],
+        "placement": sh.get("placement", "left"), "offset": sh.get("offset", (0, 0)),
+        "line_gap": 1.4, "color_for": (lambda t, f=fill: f),
+    }
+
+
+def _render_parts(canvas, headline, subheadings, cta, base_w, base_h, theme: _Theme, px_scale):
+    """Render the (optional) headline + sub-headings via the legacy zone+stack
+    path, then the (optional) CTA. Shared by ``render_overlay`` and the auto path
+    of ``render_layers`` so both produce identical pixels for the same input."""
+    elements = []
+    if headline is not None:
+        elements.append(_headline_element(headline, theme))
+    for sh in subheadings:
+        elements.append(_sub_element(sh, theme))
+    if elements:
+        _render_text_elements(canvas, elements, base_w, base_h, theme, px_scale)
+    if cta and cta.get("text"):
+        _draw_cta(canvas, cta, base_w, base_h, theme, px_scale)
+
+
+def _base_canvas(base_png: bytes, base_w: int, base_h: int) -> Image.Image:
+    base = Image.open(BytesIO(base_png)).convert("RGBA")
+    if base.size != (base_w, base_h):
+        base = base.resize((base_w, base_h), Image.LANCZOS)
+    return base.copy()
 
 
 def render_overlay(base_png: bytes, spec: dict, base_w: int, base_h: int,
                    *, px_scale: float = 1.0, pack=None) -> bytes:
     """Render the Stage-3 text overlay onto the base image and return PNG bytes.
 
-    ``spec`` shape::
-
-        {
-          "headline":  {"text","highlight","font","size_pct","color",
-                        "highlight_color","placement","offset":(x,y)},
-          "subheadings":[{"text","font","size_pct","color","placement","offset":(x,y)}],
-          "cta":       {"text","font","size_pct","placement","offset":(x,y)},
-        }
-
-    ``px_scale`` (>1 when ``base_w/base_h`` exceed the 1080-px UI reference) scales
-    the user's pixel nudges + the CTA shadow so a hi-res render matches the preview.
-    Font sizes and margins are already percentages of the width, so they scale on
-    their own; only the absolute pixel values need ``px_scale``.
+    Legacy ``spec`` API (headline / subheadings / cta dicts). Kept intact and
+    delegating to the shared part renderer; ``render_layers`` is the coordinate
+    (free-drag) API built on the same primitives.
     """
     theme = _theme_from_pack(pack) if pack is not None else _default_theme()
-    base = Image.open(BytesIO(base_png)).convert("RGBA")
-    if base.size != (base_w, base_h):
-        base = base.resize((base_w, base_h), Image.LANCZOS)
-    canvas = base.copy()
+    canvas = _base_canvas(base_png, base_w, base_h)
+    _render_parts(canvas, spec["headline"], spec.get("subheadings", []),
+                  spec.get("cta"), base_w, base_h, theme, px_scale)
+    out = BytesIO()
+    canvas.convert("RGB").save(out, format="PNG")
+    return out.getvalue()
 
+
+def _draw_text_abs(canvas, layer: dict, base_w, base_h, theme: _Theme, px_scale):
+    """Draw a PINNED text layer at its absolute anchor coords. Honors ``\\n`` as
+    hard line breaks (multi-line) and word-wraps each segment to ``w``."""
+    td = _theme_dict(theme)
+    font = _font(layer["font"], layer["size_pct"] / 100 * base_w, theme)
+    max_w = max(1, int(layer["w"] * base_w))
+    is_head = layer["id"] == "headline"
+    main = layout.resolve_color(layer.get("color", "dark"), td, "dark")
+    hl = layout.resolve_color(layer.get("highlight_color", "gradient"), td, "gradient")
+    asc, desc = font.getmetrics()
+    space = font.getlength(" ")
+    lh = int((asc + desc) * (1.15 if is_head else 1.4))
+
+    lines: list = []
+    for seg in (layer["text"] or "").split("\n"):
+        if is_head and layer.get("highlight"):
+            toks = _headline_tokens(seg, layer["highlight"])
+        else:
+            toks = [(w, False) for w in seg.split()]
+        lines.extend(_wrap(toks, font, max_w) if toks else [[("", False)]])
+
+    widths = [sum(font.getlength(t[0]) for t in ln) + space * max(0, len(ln) - 1) for ln in lines]
+    box_w = max(widths) if widths else 1
+    box_h = lh * len(lines)
+    left, top = layout.anchor_to_xy(layer["x"], layer["y"], box_w, box_h, layer["anchor"], base_w, base_h)
+    left += round(layer["offset"][0] * px_scale)
+    top += round(layer["offset"][1] * px_scale)
+    for i, ln in enumerate(lines):
+        cx, yy = left, top + i * lh
+        for tok in ln:
+            fill = hl if (is_head and tok[1]) else main
+            _draw_run(canvas, int(cx), int(yy), tok[0], font, fill)
+            cx += font.getlength(tok[0]) + space
+
+
+def _layers_from_spec(spec: dict) -> list[dict]:
+    """All-``auto`` layers from a legacy spec (parity helper for render_layers)."""
+    layers = []
     h = spec["headline"]
-    head_fill = _resolve_color(h.get("color", "dark"), theme)
-    hl_fill = _resolve_color(h.get("highlight_color", "gradient"), theme)
-    elements = [{
-        "tokens": _headline_tokens(h["text"], h.get("highlight", "")),
-        "font": h["font"], "size_pct": h["size_pct"], "placement": h.get("placement", "left"),
-        "offset": h.get("offset", (0, 0)), "line_gap": 1.15,
-        "color_for": (lambda t: hl_fill if t[1] else head_fill),
-    }]
-    for sh in spec.get("subheadings", []):
-        fill = _resolve_color(sh.get("color", "dark"), theme)
-        elements.append({
-            "tokens": [(w, False) for w in sh["text"].split()] or [("", False)],
-            "font": sh["font"], "size_pct": sh["size_pct"],
-            "placement": sh.get("placement", "left"), "offset": sh.get("offset", (0, 0)),
-            "line_gap": 1.4, "color_for": (lambda t, f=fill: f),
-        })
+    layers.append({"type": "text", "id": "headline", "text": h["text"],
+                   "highlight": h.get("highlight", ""), "font": h["font"],
+                   "size_pct": h["size_pct"], "color": h.get("color", "dark"),
+                   "highlight_color": h.get("highlight_color", "gradient"),
+                   "placement": h.get("placement", "left"), "offset": h.get("offset", (0, 0)),
+                   "z": 10, "pinned": False, **layout.default_coords(h.get("placement", "left"), "text")})
+    for i, sh in enumerate(spec.get("subheadings", [])):
+        layers.append({"type": "text", "id": f"subheading-{i}", "text": sh["text"],
+                       "highlight": "", "font": sh["font"], "size_pct": sh["size_pct"],
+                       "color": sh.get("color", "dark"), "highlight_color": "gradient",
+                       "placement": sh.get("placement", "left"), "offset": sh.get("offset", (0, 0)),
+                       "z": 11 + i, "pinned": False,
+                       **layout.default_coords(sh.get("placement", "left"), "text")})
+    c = spec.get("cta") or {}
+    if c.get("text"):
+        layers.append({"type": "cta", "id": "cta", "text": c["text"], "font": c["font"],
+                       "size_pct": c["size_pct"], "color": c.get("color", "cta"),
+                       "placement": c.get("placement", "bottom"), "offset": c.get("offset", (0, 0)),
+                       "z": 20, "pinned": False, **layout.default_coords(c.get("placement", "bottom"), "cta")})
+    return layers
 
-    _render_text_elements(canvas, elements, base_w, base_h, theme, px_scale)
-    if spec.get("cta", {}).get("text"):
-        _draw_cta(canvas, spec["cta"], base_w, base_h, theme, px_scale)
 
+def _parts_from_layers(layers: list[dict]):
+    """Reconstruct (headline|None, subheadings, cta|None) from auto text/cta layers."""
+    head = next((l for l in layers if l["id"] == "headline" and l["type"] == "text"), None)
+    subs = [l for l in layers if l["type"] == "text" and l["id"].startswith("subheading-")]
+    cta = next((l for l in layers if l["type"] == "cta"), None)
+    h = None
+    if head:
+        h = {"text": head["text"], "highlight": head.get("highlight", ""), "font": head["font"],
+             "size_pct": head["size_pct"], "color": head["color"],
+             "highlight_color": head.get("highlight_color", "gradient"),
+             "placement": head["placement"], "offset": head["offset"]}
+    sh = [{"text": s["text"], "font": s["font"], "size_pct": s["size_pct"], "color": s["color"],
+           "placement": s["placement"], "offset": s["offset"]} for s in subs]
+    c = None
+    if cta:
+        c = {"text": cta["text"], "font": cta["font"], "size_pct": cta["size_pct"],
+             "placement": cta["placement"], "offset": cta["offset"]}
+    return h, sh, c
+
+
+def _solid_rgb(fill):
+    """Representative RGB for a renderer fill (gradient → its start colour)."""
+    return fill[1][0] if fill[0] == "grad" else fill[1]
+
+
+def _draw_callout_text(canvas, text: str, box, theme: _Theme):
+    """Single line of dark text centered in a callout box (best-effort)."""
+    x0, y0, x1, y1 = box
+    ph = y1 - y0
+    try:
+        font = _font("Causten Bold", ph * 0.4, theme)
+    except Exception:  # noqa: BLE001 - brand without that face → skip the text
+        return
+    tw = font.getlength(text)
+    asc, desc = font.getmetrics()
+    cx = x0 + ((x1 - x0) - tw) / 2
+    cy = y0 + (ph - (asc + desc)) / 2
+    _draw_run(canvas, int(cx), int(cy), text, font, ("solid", theme.dark))
+
+
+def _draw_shape(canvas, l: dict, base_w, base_h, theme: _Theme, px_scale):
+    """Draw a PINNED shape / icon / divider / callout layer at its anchor box."""
+    td = _theme_dict(theme)
+    pw = max(1, int(l["w"] * base_w))
+    ph = max(1, int(l["h"] * base_h))
+    left, top = layout.anchor_to_xy(l["x"], l["y"], pw, ph, l["anchor"], base_w, base_h)
+    box = (left, top, left + pw, top + ph)
+    fill = _solid_rgb(layout.resolve_color(l.get("fill", "#FFFFFF"), td, "white"))
+    stroke = _solid_rgb(layout.resolve_color(l["stroke"], td, "dark")) if l.get("stroke") else None
+    sw = round((l.get("stroke_w") or 0) * px_scale)
+    if l["kind"] == "icon":
+        icons.draw_icon(canvas, l.get("icon") or "dot", box, fill)
+    else:
+        shapes.draw(canvas, l["kind"], box, fill=fill, stroke=stroke, stroke_w=sw,
+                    radius=round(l.get("radius", 0) * px_scale))
+        if l["kind"] == "callout" and (l.get("text") or "").strip():
+            _draw_callout_text(canvas, l["text"], box, theme)
+
+
+def render_layers(base_png: bytes, layers: list[dict], base_w: int, base_h: int,
+                  *, px_scale: float = 1.0, pack=None) -> bytes:
+    """Render Stage-3 from coordinate layers. Draw order: shapes (behind, by z),
+    then ``auto`` text via the legacy zone+stack path (byte-identical to
+    ``render_overlay``), then ``pinned`` text/cta at absolute coords by z."""
+    theme = _theme_from_pack(pack) if pack is not None else _default_theme()
+    canvas = _base_canvas(base_png, base_w, base_h)
+
+    shape_layers = [l for l in layers if l.get("type") == "shape"]
+    text_layers = [l for l in layers if l.get("type") != "shape"]
+    for l in sorted(shape_layers, key=lambda x: x.get("z", 0)):
+        _draw_shape(canvas, l, base_w, base_h, theme, px_scale)
+
+    auto = [l for l in text_layers if not l.get("pinned")]
+    pinned = [l for l in text_layers if l.get("pinned")]
+    if auto:
+        h, sh, c = _parts_from_layers(auto)
+        _render_parts(canvas, h, sh, c, base_w, base_h, theme, px_scale)
+    for l in sorted(pinned, key=lambda x: x.get("z", 0)):
+        if l["type"] == "cta":
+            _draw_cta(canvas, {"text": l["text"], "font": l["font"], "size_pct": l["size_pct"],
+                               "placement": l["placement"], "offset": l["offset"]},
+                      base_w, base_h, theme, px_scale,
+                      coords={"x": l["x"], "y": l["y"], "anchor": l["anchor"]})
+        else:
+            _draw_text_abs(canvas, l, base_w, base_h, theme, px_scale)
     out = BytesIO()
     canvas.convert("RGB").save(out, format="PNG")
     return out.getvalue()

@@ -95,11 +95,19 @@ def create_run(user_id: str, brand_id: str | None = None) -> dict:
             # agent-proposed foreground subject stored ONLY here, never added to
             # STAGE2_VARIANTS. None until proposed. Selected with variant "AI".
             "custom_element": None,
+            # Pre-generation discovery brief (the "micro-conversation" answers:
+            # feeling/audience/tone/style/event/theme). Folded into every suggestion
+            # so the agent gathers intent BEFORE proposing. Empty until answered.
+            "creative_brief": {},
             # Headline/highlight/CTA text. Sub-heading text lives in ``subheadings``.
             "tokens": {
                 "headline": pack.default_headline,
                 "highlight": pack.default_highlight,
                 "cta": pack.default_cta,
+                # Optional Stage-3 detail fields — empty until the user fills them;
+                # become draggable text layers only when non-empty.
+                "venue": "",
+                "website": "",
             },
             "tokens_approved": {"headline": False, "highlight": False, "cta": False},
         },

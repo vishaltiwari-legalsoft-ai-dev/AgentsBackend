@@ -6,7 +6,7 @@ Google Cloud Run.
 ## Layout
 
 ```
-app/
+app/   
   main.py              FastAPI app, CORS, error handler, router mounting
   config.py            Typed settings (pydantic-settings) from .env
   models.py            Pydantic request/response schemas
