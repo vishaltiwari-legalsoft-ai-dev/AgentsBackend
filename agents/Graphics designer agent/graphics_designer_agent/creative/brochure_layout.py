@@ -7,7 +7,7 @@ primitive calls) returning a finished page PNG. No I/O, no provider.
 from __future__ import annotations
 
 import io
-from typing import Callable, Optional
+from typing import Callable
 
 from PIL import Image
 
@@ -80,7 +80,6 @@ def _t_cover(p: dict, x: _Ctx) -> None:
 def _t_card_grid(p: dict, x: _Ctx) -> None:
     g = x.g
     head_f = x.font(int(g.w * 0.050), "Causten Bold")
-    title_f = x.font(int(g.w * 0.026), "Causten Bold")
     bullet_f = x.font(int(g.w * 0.019), None)
     top = br.draw_heading(x.c, g.span(0, 12)[:1] + (int(g.h * 0.06),), p.get("heading", ""),
                           head_f, x.deep, max_w=g.span(0, 12)[1],
