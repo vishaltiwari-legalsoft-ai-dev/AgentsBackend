@@ -62,11 +62,16 @@ def create_run(
     brand_id: Optional[str] = None,
     brief: str = "",
     autonomous: bool = False,
+    text_mode: str = "text",
 ) -> dict:
     from .. import reference_library as rl
     from .. import registry
 
     pack = registry.get_pack(brand_id)
+    # How a carousel renders its slides: "text" (per-slide copy overlaid) or
+    # "images_only" (the on-brand image with only the brand logo, no copy). Other
+    # creative types ignore this and always carry their text.
+    text_mode = text_mode if text_mode in ("text", "images_only") else "text"
     run = {
         "id": uuid.uuid4().hex[:12],
         "user_id": user_id,
@@ -74,6 +79,7 @@ def create_run(
         "brand_name": pack.name,
         "creative_type": creative_type,
         "output_format": rl.output_format_for(creative_type),
+        "text_mode": text_mode,
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "autonomous": bool(autonomous),

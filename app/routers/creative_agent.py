@@ -93,6 +93,9 @@ class CreateBody(BaseModel):
     brand_id: Optional[str] = None
     brief: str = ""
     autonomous: bool = False
+    # Carousel only: "text" (per-slide copy on the images) or "images_only" (the
+    # on-brand images with just the brand logo, no copy).
+    text_mode: str = "text"
 
 
 @router.post("/creative/runs")
@@ -108,6 +111,7 @@ def create(body: CreateBody, user: dict = Depends(get_current_user)) -> dict:
     run = cruns.create_run(
         str(user["id"]), body.creative_type,
         brand_id=body.brand_id, brief=body.brief, autonomous=body.autonomous,
+        text_mode=body.text_mode,
     )
     return _to_client(run)
 
@@ -145,6 +149,23 @@ def plan(run_id: str, body: PlanBody = Body(default=PlanBody()),
     run = _owned(run_id, user)
     try:
         return _to_client(pipeline.make_plan(run, count=body.count, use_llm=body.use_llm))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class PlanTextBody(BaseModel):
+    # Per-slide copy edits: [{ "index": 1, "headline": "...", "body": "..." }]
+    frames: list[dict] = []
+
+
+@router.post("/creative/runs/{run_id}/plan/text")
+def plan_text(run_id: str, body: PlanTextBody,
+              user: dict = Depends(get_current_user)) -> dict:
+    """Apply the user's exact per-slide headline/sub-text to a carousel plan before
+    generation (text mode)."""
+    run = _owned(run_id, user)
+    try:
+        return _to_client(pipeline.update_plan_text(run, body.frames))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 

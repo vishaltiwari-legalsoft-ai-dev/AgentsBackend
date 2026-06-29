@@ -104,10 +104,42 @@ def make_plan(run: dict, *, count: Optional[int] = None, use_llm: bool = True) -
         brand_name=run.get("brand_name", _pack(run).name),
         grounding=run.get("grounding", ""), count=count, use_llm=use_llm,
     )
+    # Carry the run's text mode on the plan so the document builder knows whether to
+    # overlay per-slide copy or render images with the logo only.
+    p["text_mode"] = run.get("text_mode", "text")
     run["plan"] = p
     run["plan_approved"] = False
     cruns.log_decisions(run, p.get("decisions", []))
     cruns.advance_to(run, "layout")
+    cruns.save_run(run)
+    return run
+
+
+def update_plan_text(run: dict, frames: list[dict], *, source: str = "user") -> dict:
+    """Merge user-edited per-slide copy (``[{index, headline, body}]``) into the
+    carousel plan before generation, so the finished slides carry the EXACT text the
+    user typed. The accent ``highlight`` is re-derived from each edited headline so
+    the renderer still colours a sensible key phrase. Only valid for carousels with a
+    frame-based plan; a no-op otherwise."""
+    from .planner import _highlight
+
+    plan = run.get("plan") or {}
+    existing = {f.get("index"): f for f in plan.get("frames", []) or []}
+    if not existing:
+        raise ValueError("There is no carousel plan to edit yet — plan first.")
+    for edit in frames or []:
+        fr = existing.get(edit.get("index"))
+        if not fr:
+            continue
+        if "headline" in edit:
+            fr["headline"] = (edit.get("headline") or "").strip()
+            fr["highlight"] = _highlight(fr["headline"])
+        if "body" in edit:
+            fr["body"] = (edit.get("body") or "").strip()
+    run["plan"] = plan
+    cruns.log_decision(run, "layout", "Edited slide copy",
+                       "User set the exact headline/sub-text for the carousel slides.",
+                       source=source)
     cruns.save_run(run)
     return run
 

@@ -231,17 +231,23 @@ _MAX_GENERATED_FRAMES = 10
 _CAROUSEL_CONCURRENCY = 5
 
 
-def _carousel_text_fallback(pack: Any, fr: dict, idx: int) -> Artifact:
+def _carousel_text_fallback(pack: Any, fr: dict, idx: int,
+                            images_only: bool = False) -> Artifact:
     """Local Pillow gradient frame — used when a slide's image generation fails so
-    the user still gets a downloadable, on-brand frame instead of nothing."""
+    the user still gets a downloadable, on-brand frame instead of nothing. In
+    ``images_only`` mode the frame carries no copy (just the brand gradient), to
+    match the "images with logo only" choice."""
     from .. import reference_library as rl
     w, h = rl.type_spec("carousel").get("target_dims", (1080, 1080))
     role = fr.get("role", "body")
-    png = _render_text_frame(
-        pack, (w, h), headline=fr.get("headline", ""), body=fr.get("body", ""),
-        role=role, footer=f"{getattr(pack, 'name', 'Brand')} · {idx}",
-        cta=fr.get("headline", "") if role == "cta" else "",
-    )
+    if images_only:
+        png = _render_text_frame(pack, (w, h), headline="", body="", role="cover")
+    else:
+        png = _render_text_frame(
+            pack, (w, h), headline=fr.get("headline", ""), body=fr.get("body", ""),
+            role=role, footer=f"{getattr(pack, 'name', 'Brand')} · {idx}",
+            cta=fr.get("headline", "") if role == "cta" else "",
+        )
     return (f"frame-{idx:02d}.png", png, "image/png")
 
 
@@ -269,12 +275,17 @@ def build_carousel_frames(plan: dict[str, Any], pack: Any,
     frames = (plan.get("frames", []) or [])[:_MAX_GENERATED_FRAMES]
     brief = plan.get("rationale", "") or ""
     brand_id = getattr(pack, "id", None)
+    # "images_only" → each slide is the on-brand AI image with ONLY the brand logo
+    # composited; no headline/body/CTA copy is drawn. "text" (default) overlays the
+    # per-slide copy via the deterministic Stage-3 renderer.
+    images_only = plan.get("text_mode") == "images_only"
     try:
         refs = rl.reference_images_for(brand_id, "carousel", brief=brief, k=2)
         logo = pipeline.brand_logo_png(brand_id)
     except Exception as exc:  # noqa: BLE001 - setup failed → all-text fallback
         logger.warning("carousel setup failed (%s); using text-frame fallback", exc)
-        return _emit(on_artifact, [_carousel_text_fallback(pack, fr, fr.get("index", i + 1))
+        return _emit(on_artifact, [_carousel_text_fallback(pack, fr, fr.get("index", i + 1),
+                                                           images_only)
                                    for i, fr in enumerate(frames)])
 
     def _render_slide(ordinal: int, fr: dict) -> tuple[int, Artifact]:
@@ -285,8 +296,17 @@ def build_carousel_frames(plan: dict[str, Any], pack: Any,
                 brand_id, "1:1", reference_images=refs,
                 subject=fr.get("subject") or None,
             )
+            if images_only:
+                # No copy — composite just the logo onto the approved base image.
+                # ``subheadings=[]`` clears the run's default sub-text so nothing but
+                # the logo is drawn (headline/cta are already empty here).
+                png = pipeline.render_frame_on_base(run, logo_png=logo, subheadings=[])
+                return idx, (f"frame-{idx:02d}.png", png, "image/png")
             # Layout brain: look at THIS slide's image and place the text in the
             # clean negative space away from the subject (font + gradient stay locked).
+            # Carousel text is pinned to a left/right side column (``sides_only``) so a
+            # multi-line headline + body can never overflow downward into the subject's
+            # face/body — the failure mode of a full-width top/bottom band.
             base_png = pipeline.approved_base_png(run)
             layout = (
                 layout_brain.decide_placement(
@@ -294,6 +314,7 @@ def build_carousel_frames(plan: dict[str, Any], pack: Any,
                     headline=fr.get("headline", ""),
                     body=fr.get("body", ""),
                     has_cta=(role == "cta"),
+                    sides_only=True,
                 )
                 if base_png else None
             )
@@ -309,7 +330,7 @@ def build_carousel_frames(plan: dict[str, Any], pack: Any,
             return idx, (f"frame-{idx:02d}.png", png, "image/png")
         except Exception as exc:  # noqa: BLE001 - one slide failing ≠ whole set
             logger.warning("slide %s generation failed (%s); text-frame fallback", idx, exc)
-            return idx, _carousel_text_fallback(pack, fr, idx)
+            return idx, _carousel_text_fallback(pack, fr, idx, images_only)
 
     workers = max(1, min(_CAROUSEL_CONCURRENCY, len(frames)))
     results: list[tuple[int, Artifact]] = []

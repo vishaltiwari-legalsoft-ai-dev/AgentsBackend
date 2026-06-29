@@ -39,18 +39,25 @@ _VISION_MAX_DIM = 768
 
 
 def decide_placement(image_bytes: bytes, *, headline: str = "", body: str = "",
-                     has_cta: bool = False) -> dict:
+                     has_cta: bool = False, sides_only: bool = False) -> dict:
     """Return ``{"placement", "color", "source"}`` for the text on THIS image.
 
-    Tries the vision model first; falls back to deterministic pixel analysis."""
+    Tries the vision model first; falls back to deterministic pixel analysis.
+
+    ``sides_only`` restricts the choice to the ``left``/``right`` vertical columns.
+    A carousel subject is almost always a centred or standing person, so a full-width
+    ``top``/``bottom`` band lets a multi-line headline + body block overflow downward
+    into the subject's face/body. The narrow side column beside the subject is the one
+    zone that reliably stays in clean negative space, so the carousel pins text there
+    and only lets the brain choose WHICH side (and the text colour)."""
     return (
-        _vision_placement(image_bytes, headline, body, has_cta)
-        or _pixel_placement(image_bytes)
+        _vision_placement(image_bytes, headline, body, has_cta, sides_only)
+        or _pixel_placement(image_bytes, sides_only)
     )
 
 
 def _vision_placement(image_bytes: bytes, headline: str, body: str,
-                      has_cta: bool) -> Optional[dict]:
+                      has_cta: bool, sides_only: bool = False) -> Optional[dict]:
     try:
         from app.services.openrouter import analyze_images  # lazy — works without app
     except Exception:
@@ -64,18 +71,25 @@ def _vision_placement(image_bytes: bytes, headline: str, body: str,
     if has_cta:
         pieces.append("a CTA button")
     block = ", ".join(pieces)
+    zone_opts = "left|right" if sides_only else "left|right|top|bottom"
+    side_rule = (
+        " The text sits in a tall, narrow column down one SIDE, so choose whichever "
+        "side — left or right — has the most empty space beside the subject."
+        if sides_only else ""
+    )
     prompt = (
         "You are a senior art director laying out a square (1:1) social ad. The "
         "attached image is the FINISHED background — a brand gradient with a "
         "subject (usually a person or object). A text block (" + block + ") must "
         "be placed in the CLEAN negative space so it NEVER overlaps the subject's "
-        "face or body and the composition looks professionally balanced.\n\n"
+        "face or body and the composition looks professionally balanced." + side_rule + "\n\n"
         "Pick the zone with the most empty space, and decide whether the text "
         "should be dark (over a light area) or light (over a dark or busy area) "
         "for maximum legibility.\n\n"
-        'Reply with ONLY minified JSON: {"zone":"left|right|top|bottom",'
+        'Reply with ONLY minified JSON: {"zone":"' + zone_opts + '",'
         '"color":"dark|light"}. No prose.'
     )
+    allowed = ("left", "right") if sides_only else _VALID_PLACEMENTS
     try:
         out = analyze_images(prompt, [(small, "image/png")])
         match = re.search(r"\{.*\}", out, re.S)
@@ -83,7 +97,7 @@ def _vision_placement(image_bytes: bytes, headline: str, body: str,
             return None
         data = json.loads(match.group(0))
         zone = str(data.get("zone", "")).strip().lower()
-        if zone not in _VALID_PLACEMENTS:
+        if zone not in allowed:
             return None
         color = "white" if str(data.get("color", "")).strip().lower().startswith("l") else "dark"
         return {"placement": zone, "color": color, "source": "vision"}
@@ -92,11 +106,12 @@ def _vision_placement(image_bytes: bytes, headline: str, body: str,
         return None
 
 
-def _pixel_placement(image_bytes: bytes) -> dict:
+def _pixel_placement(image_bytes: bytes, sides_only: bool = False) -> dict:
     """Deterministic negative-space finder. Splits the image into left/right (and
     top/bottom) regions, scores each by edge density (the subject is busy, empty
     space is calm), and places the text in the calmest edge zone. Text colour is
-    chosen from that zone's mean brightness."""
+    chosen from that zone's mean brightness. ``sides_only`` limits the scoring to
+    the left/right columns (see ``decide_placement``)."""
     try:
         from PIL import Image, ImageFilter, ImageStat
     except Exception:
@@ -112,19 +127,17 @@ def _pixel_placement(image_bytes: bytes) -> dict:
     def busy(box):
         return ImageStat.Stat(edges.crop(box)).mean[0]
 
-    candidates = {
-        "left": busy((0, 0, w // 2, h)),
-        "right": busy((w // 2, 0, w, h)),
-        "top": busy((0, 0, w, h // 2)),
-        "bottom": busy((0, h // 2, w, h)),
-    }
-    placement = min(candidates, key=candidates.get)  # the calmest (emptiest) zone
-    box = {
+    boxes = {
         "left": (0, 0, w // 2, h),
         "right": (w // 2, 0, w, h),
         "top": (0, 0, w, h // 2),
         "bottom": (0, h // 2, w, h),
-    }[placement]
+    }
+    if sides_only:
+        boxes = {"left": boxes["left"], "right": boxes["right"]}
+    candidates = {k: busy(b) for k, b in boxes.items()}
+    placement = min(candidates, key=candidates.get)  # the calmest (emptiest) zone
+    box = boxes[placement]
     brightness = ImageStat.Stat(img.crop(box).convert("L")).mean[0]
     color = "dark" if brightness >= 140 else "white"
     return {"placement": placement, "color": color, "source": "fallback"}
