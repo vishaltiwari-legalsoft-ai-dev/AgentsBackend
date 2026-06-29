@@ -1,5 +1,4 @@
 # tests/test_brochure_render.py
-import io
 from PIL import Image, ImageFont
 from graphics_designer_agent.creative import brochure_render as br
 

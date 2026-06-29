@@ -61,7 +61,7 @@ def draw_card(canvas: Image.Image, box, *, fill: RGB = (255, 255, 255),
     text sits on. Shadow is a blurred dark rounded rect, offset down/right."""
     x0, y0, x1, y1 = [int(v) for v in box]
     if shadow:
-        pad, blur, drop = 26, 18, 10
+        blur, drop = 18, 10
         sh = Image.new("RGBA", (canvas.width, canvas.height), (0, 0, 0, 0))
         ImageDraw.Draw(sh).rounded_rectangle(
             [x0, y0 + drop, x1, y1 + drop], radius=radius,
@@ -166,10 +166,10 @@ def draw_circular(canvas: Image.Image, center, radius: int, *,
     else a filled circle with centered initials (the offline placeholder)."""
     cx, cy = int(center[0]), int(center[1])
     box = [cx - radius, cy - radius, cx + radius, cy + radius]
-    mask = Image.new("L", (2 * radius, 2 * radius), 0)
-    ImageDraw.Draw(mask).ellipse([0, 0, 2 * radius - 1, 2 * radius - 1], fill=255)
     if image_png:
         try:
+            mask = Image.new("L", (2 * radius, 2 * radius), 0)
+            ImageDraw.Draw(mask).ellipse([0, 0, 2 * radius - 1, 2 * radius - 1], fill=255)
             im = Image.open(io.BytesIO(image_png)).convert("RGBA").resize(
                 (2 * radius, 2 * radius), Image.LANCZOS)
             canvas.paste(im, (cx - radius, cy - radius), mask)
