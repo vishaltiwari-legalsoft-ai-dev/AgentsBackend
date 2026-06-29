@@ -138,29 +138,31 @@ def _presentation_plan(brief: str, brand_name: str, count: int) -> dict[str, Any
 
 def _brochure_plan(brief: str, brand_name: str, count: int) -> dict[str, Any]:
     topic = _topic(brief, brand_name)
-    kws = _keywords(brief, count) or ["services", "approach", "why-us"]
-    sections: list[dict[str, Any]] = []
-    for i in range(count):
-        kw = kws[i % len(kws)].title()
-        heading = kw
-        sections.append({
-            "heading": heading,
-            "highlight": _highlight(heading),
-            # Distinct on-brand subject per page → each page is a designed spread,
-            # not a blank text block (the brochure now rides the image spine).
-            "subject": _SUBJECT_ROTATION[(i + 1) % len(_SUBJECT_ROTATION)],
-            "body": f"{brand_name} provides {kw.lower()} tailored to your needs.",
-            "bullets": [f"{kw} benefit one", f"{kw} benefit two", f"{kw} benefit three"],
-        })
+    kws = _keywords(brief, max(3, count)) or ["services", "approach", "support"]
+    # A real brochure: a roles/feature card grid, a 3-step "how it works", a
+    # testimonial, and a contact CTA — not N identical text sections.
+    cards = [{
+        "title": kw.title()[:24],
+        "bullets": [f"{kw.title()} benefit one", f"{kw.title()} benefit two"],
+        "initials": "".join(w[0] for w in kw.split()[:2]).upper() or kw[:2].upper(),
+    } for kw in kws[:6]]
+    pages = [
+        {"template": "card_grid", "heading": "What We Offer",
+         "highlight": "Offer", "cards": cards},
+        {"template": "steps", "heading": "How It Works",
+         "steps": [{"title": "Tell us your needs", "desc": f"Share your goals with {brand_name}."},
+                   {"title": "We match you", "desc": "Get the right fit, fast."},
+                   {"title": "Start delegating", "desc": "Boost output from day one."}]},
+        {"template": "testimonial",
+         "quote": f"{brand_name} delivered exactly what we needed — highly recommended.",
+         "author": "A Happy Client"},
+        {"template": "cta_contact", "heading": "Ready To Start?",
+         "contact": {"website": f"{brand_name.lower().replace(' ', '')}.com"}},
+    ]
     return {
-        "cover": {
-            "title": topic,
-            "highlight": _highlight(topic),
-            "subject": _SUBJECT_ROTATION[0],
-            "subtitle": f"A {brand_name} brochure",
-        },
-        "sections": sections,
-        "contact": {"line": f"{brand_name} — get in touch to learn more."},
+        "cover": {"title": topic, "highlight": _highlight(topic),
+                  "subtitle": f"A {brand_name} brochure"},
+        "pages": pages,
     }
 
 
@@ -209,7 +211,7 @@ def _llm_plan(
     shape = {
         "carousel": '{"frames":[{"index":1,"role":"hook|body|cta","headline":"...","highlight":"<key phrase that appears verbatim in headline>","body":"...","subject":"<a DISTINCT on-brand foreground subject for THIS slide, different from every other slide, with generous negative space on one side for text>","visual":"..."}]}',
         "presentation": '{"slides":[{"index":1,"title":"...","bullets":["..."],"notes":"..."}]}',
-        "brochure": '{"cover":{"title":"...","highlight":"<key phrase verbatim in title>","subtitle":"...","subject":"<a distinct on-brand cover photo subject>"},"sections":[{"heading":"...","highlight":"<key phrase verbatim in heading>","subject":"<a DISTINCT on-brand photo subject for THIS page>","body":"...","bullets":["..."]}],"contact":{"line":"..."}}',
+        "brochure": '{"cover":{"title":"...","highlight":"<key phrase verbatim in title>","subtitle":"..."},"pages":[{"template":"card_grid","heading":"...","highlight":"<verbatim>","cards":[{"title":"...","bullets":["...","..."],"initials":"AB"}]},{"template":"steps","heading":"...","steps":[{"title":"...","desc":"..."}]},{"template":"testimonial","quote":"...","author":"..."},{"template":"cta_contact","heading":"...","contact":{"phone":"...","email":"...","website":"..."}}]}',
         "blog": '{"cover":{"title":"...","subtitle":"...","visual":"..."},"inline":[{"caption":"...","visual":"..."}]}',
     }[creative_type]
     carousel_note = (
@@ -270,7 +272,7 @@ def plan(
         if enriched:
             # Trust the model's structure but keep a sane floor: only adopt it if it
             # carries the expected top-level body key.
-            expected_key = "sections" if creative_type == "brochure" else (
+            expected_key = "pages" if creative_type == "brochure" else (
                 "cover" if creative_type == "blog" else
                 "slides" if creative_type == "presentation" else "frames")
             if expected_key in enriched:

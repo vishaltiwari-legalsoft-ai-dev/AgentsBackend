@@ -92,8 +92,9 @@ def test_presentation_and_brochure_and_blog_shapes():
 
     br = planner.plan("brochure", "practice areas", brand_name="Legal Soft",
                       count=3, use_llm=False)
-    assert br["cover"]["title"] and len(br["sections"]) == 3
-    assert all({"heading", "body", "bullets"} <= set(s) for s in br["sections"])
+    assert br["cover"]["title"] and "pages" in br
+    templates = [pg["template"] for pg in br["pages"]]
+    assert "card_grid" in templates and "cta_contact" in templates
 
     blog = planner.plan("blog", "legal tech trends", brand_name="Legal Soft",
                         count=3, use_llm=False)
