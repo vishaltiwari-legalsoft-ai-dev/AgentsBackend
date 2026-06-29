@@ -24,6 +24,8 @@ from typing import Any, Callable, Optional
 
 from PIL import Image, ImageDraw, ImageFont
 
+from . import brochure_layout, brochure_render
+
 logger = logging.getLogger("graphics_designer.creative.document_builder")
 
 # An artifact is (filename, bytes, mime-type).
@@ -437,97 +439,43 @@ def _study_brand_brochures(brand_id: Optional[str]) -> str:
 
 def build_brochure_pdf(plan: dict[str, Any], pack: Any,
                        on_artifact: OnArtifact = None) -> list[Artifact]:
-    """Designed brochure: an on-brand generated image per page (subject + gradient,
-    grounded in the brand's real brochures) with the brand-font text composited on
-    top, assembled into a PDF that keeps an invisible selectable text layer.
-
-    Falls back to the plain text brochure if image generation isn't available, so a
-    plan always yields a downloadable PDF (and tests/offline still pass)."""
+    """Designed brochure: cards on a calm brand background, composed on a grid and
+    assembled into a selectable-text PDF. Fully deterministic (no image provider),
+    so it never silently degrades to plain text."""
     if not _reportlab_available():
         raise RuntimeError(
             "Brochure (PDF) generation needs reportlab — add it to requirements "
             "and `pip install reportlab`."
         )
-    try:
-        return _emit(on_artifact, [_designed_brochure_pdf(plan, pack)])
-    except Exception as exc:  # noqa: BLE001 - never leave the user without a PDF
-        logger.warning("designed brochure failed (%s); using text-only brochure", exc,
-                       exc_info=True)
-        return _emit(on_artifact, [_text_brochure_pdf(plan, pack)])
+    artifact, _rasters = _designed_brochure_pdf(plan, pack)
+    return _emit(on_artifact, [artifact])
 
 
-def _designed_brochure_pdf(plan: dict[str, Any], pack: Any) -> Artifact:
-    """Generate one branded image per page (cover + sections), overlay the brand
-    text via the shared spine + layout brain, and assemble the hybrid PDF."""
-    import concurrent.futures
+def _designed_brochure_pdf(plan: dict[str, Any], pack: Any, *,
+                           logo_png: Optional[bytes] = None) -> tuple[Artifact, list[bytes]]:
+    """Compose the plan into templated pages, render each to a PNG via the brochure
+    layout engine, and assemble the hybrid (image + invisible selectable text) PDF.
+    Returns the PDF artifact and the per-page rasters (for page caching)."""
+    palette = _brand_palette(pack)
+    pages = brochure_layout.compose_brochure(plan)
 
-    from .. import pipeline, reference_library as rl
-    from . import layout_brain
+    def _fonts(size: int, name: Optional[str] = None):
+        return _load_font(pack, size, name)
 
-    brand_id = getattr(pack, "id", None)
+    rasters: list[bytes] = []
+    assembled: list[tuple] = []
+    for page in pages:
+        png = brochure_layout.render_page(
+            page, size=brochure_render._BROCHURE_PAGE, palette=palette,
+            font_loader=_fonts, logo_png=logo_png,
+        )
+        rasters.append(png)
+        assembled.append((png, {}, page.get("text_lines", [])))
+
+    pdf = _assemble_brochure_pdf(assembled)
     cover = plan.get("cover", {})
-    sections = (plan.get("sections", []) or [])[:_MAX_GENERATED_FRAMES]
-
-    # 1) Study the real brand brochures (vision) + load them as visual references.
-    study = _study_brand_brochures(brand_id)
-    try:
-        refs = rl.reference_images_for(brand_id, "brochure",
-                                       brief=plan.get("rationale", ""), k=3)
-    except Exception:  # noqa: BLE001
-        refs = []
-    try:
-        logo = pipeline.brand_logo_png(brand_id)
-    except Exception:  # noqa: BLE001
-        logo = None
-
-    specs = [{
-        "heading": cover.get("title", getattr(pack, "name", "Brochure")),
-        "highlight": cover.get("highlight", ""),
-        "body": cover.get("subtitle", ""),
-        "bullets": [],
-        "subject": cover.get("subject"),
-    }]
-    for s in sections:
-        specs.append({
-            "heading": s.get("heading", ""),
-            "highlight": s.get("highlight", ""),
-            "body": s.get("body", ""),
-            "bullets": s.get("bullets") or [],
-            "subject": s.get("subject"),
-        })
-
-    def _page(idx: int, spec: dict):
-        subject = (spec.get("subject") or "").strip()
-        if study:
-            subject = f"{subject}. Match this brand brochure style: {study}".strip(". ")
-        run = pipeline.establish_base(brand_id, _BROCHURE_AR,
-                                      reference_images=refs, subject=subject or None)
-        base = pipeline.approved_base_png(run)
-        layout = (
-            layout_brain.decide_placement(base, headline=spec["heading"],
-                                          body=spec["body"], has_cta=False)
-            if base else None
-        )
-        subs = ([spec["body"]] if spec["body"] else []) + ["•  " + b for b in spec["bullets"]]
-        png = pipeline.render_frame_on_base(
-            run, headline=spec["heading"], highlight=spec["highlight"],
-            subheadings=subs or None, logo_png=logo, layout=layout,
-        )
-        text_lines = ([spec["heading"]] + ([spec["body"]] if spec["body"] else [])
-                      + ["• " + b for b in spec["bullets"]])
-        return idx, png, (layout or {}), text_lines
-
-    workers = max(1, min(_BROCHURE_CONCURRENCY, len(specs)))
-    pages: list[tuple] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(_page, i, sp) for i, sp in enumerate(specs)]
-        for fut in concurrent.futures.as_completed(futures):
-            pages.append(fut.result())
-    pages.sort(key=lambda t: t[0])
-
-    pdf = _assemble_brochure_pdf([(p[1], p[2], p[3]) for p in pages])
     fname = _slug(cover.get("title", "brochure")) + ".pdf"
-    return (fname, pdf, "application/pdf")
+    return (fname, pdf, "application/pdf"), rasters
 
 
 def _pdf_wrap(text: str, width: int) -> list[str]:
@@ -592,74 +540,6 @@ def _assemble_brochure_pdf(pages: list[tuple]) -> bytes:
         c.showPage()
     c.save()
     return buf.getvalue()
-
-
-def _text_brochure_pdf(plan: dict[str, Any], pack: Any) -> Artifact:
-    """Plain text brochure (the original reportlab layout) — the safe fallback when
-    image generation isn't available."""
-    from reportlab.lib.colors import HexColor
-    from reportlab.lib.enums import TA_LEFT
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import ParagraphStyle
-    from reportlab.lib.units import cm
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-    from reportlab.platypus import (ListFlowable, ListItem, Paragraph,
-                                     SimpleDocTemplate, Spacer)
-
-    pal = _brand_palette(pack)
-    deep, accent, ink = HexColor(pal["deep"]), HexColor(pal["accent"]), HexColor(pal["text"])
-
-    # Try to register the brand font (OTFs with CFF outlines aren't supported by
-    # reportlab's TTFont — fall back to Helvetica cleanly if so).
-    body_font = "Helvetica"
-    head_font = "Helvetica-Bold"
-    path = _font_path(pack)
-    if path:
-        try:
-            pdfmetrics.registerFont(TTFont("BrandFont", path))
-            body_font = head_font = "BrandFont"
-        except Exception:  # noqa: BLE001
-            logger.info("brand font not embeddable in PDF; using Helvetica")
-
-    cover = plan.get("cover", {})
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=2 * cm, rightMargin=2 * cm,
-                            topMargin=2.2 * cm, bottomMargin=2 * cm,
-                            title=cover.get("title", "Brochure"),
-                            author=getattr(pack, "name", "Brand"))
-    H1 = ParagraphStyle("H1", fontName=head_font, fontSize=30, leading=34,
-                        textColor=deep, spaceAfter=6)
-    SUB = ParagraphStyle("SUB", fontName=body_font, fontSize=14, leading=18,
-                         textColor=accent, spaceAfter=24)
-    H2 = ParagraphStyle("H2", fontName=head_font, fontSize=17, leading=21,
-                        textColor=deep, spaceBefore=14, spaceAfter=6)
-    BODY = ParagraphStyle("BODY", fontName=body_font, fontSize=11, leading=16,
-                          textColor=ink, alignment=TA_LEFT, spaceAfter=6)
-    BULLET = ParagraphStyle("BULLET", fontName=body_font, fontSize=11, leading=15,
-                            textColor=ink)
-
-    story: list[Any] = [Spacer(1, 4 * cm),
-                        Paragraph(cover.get("title", "Brochure"), H1),
-                        Paragraph(cover.get("subtitle", getattr(pack, "name", "")), SUB)]
-    for sec in plan.get("sections", []):
-        story.append(Paragraph(sec.get("heading", ""), H2))
-        if sec.get("body"):
-            story.append(Paragraph(sec["body"], BODY))
-        bullets = sec.get("bullets") or []
-        if bullets:
-            story.append(ListFlowable(
-                [ListItem(Paragraph(b, BULLET), leftIndent=10) for b in bullets],
-                bulletColor=accent, bulletType="bullet", start="•"))
-        story.append(Spacer(1, 0.3 * cm))
-    contact = (plan.get("contact") or {}).get("line")
-    if contact:
-        story.append(Spacer(1, 0.6 * cm))
-        story.append(Paragraph(contact, SUB))
-
-    doc.build(story)
-    fname = _slug(cover.get("title", "brochure")) + ".pdf"
-    return (fname, buf.getvalue(), "application/pdf")
 
 
 def build_presentation_pptx(plan: dict[str, Any], pack: Any,
