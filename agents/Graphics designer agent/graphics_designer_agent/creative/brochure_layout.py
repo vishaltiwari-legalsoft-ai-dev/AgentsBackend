@@ -210,3 +210,93 @@ def render_page(page: dict, *, size, palette: dict, font_loader, logo_png=None) 
     out = io.BytesIO()
     bg.convert("RGB").save(out, format="PNG")
     return out.getvalue()
+
+
+# --- appended: plan → pages composer ---
+
+_CONTACT_HINTS = ("contact", "get in touch", "reach", "email", "call", "phone")
+_QUOTE_HINTS = ("client", "testimonial", "say", "review", "quote")
+
+
+def _infer_template(section: dict) -> str:
+    """Pick a template for a legacy/hint-less section by its content shape."""
+    if section.get("steps"):
+        return "steps"
+    if section.get("cards"):
+        return "card_grid"
+    if section.get("quote") or section.get("author"):
+        return "testimonial"
+    if section.get("contact"):
+        return "cta_contact"
+    blob = " ".join(str(section.get(k, "")) for k in ("heading", "body")).lower()
+    if any(h in blob for h in _QUOTE_HINTS):
+        return "testimonial"
+    if any(h in blob for h in _CONTACT_HINTS):
+        return "cta_contact"
+    # A section that is mostly a list of short items reads best as cards.
+    bullets = section.get("bullets") or []
+    if len(bullets) >= 3:
+        return "card_grid"
+    return "feature"
+
+
+def _page_text_lines(page: dict) -> list[str]:
+    """Flatten a page's copy for the invisible, selectable PDF text layer."""
+    lines: list[str] = []
+    for key in ("heading", "subtitle", "body", "quote", "author"):
+        if page.get(key):
+            lines.append(str(page[key]))
+    for card in page.get("cards") or []:
+        lines.append(str(card.get("title", "")))
+        lines.extend(str(b) for b in (card.get("bullets") or []))
+    for step in page.get("steps") or []:
+        lines.append(f"{step.get('title', '')} — {step.get('desc', '')}")
+    lines.extend(str(b) for b in (page.get("bullets") or []))
+    contact = page.get("contact") or {}
+    lines.extend(str(v) for v in contact.values() if v)
+    return [ln for ln in lines if ln.strip()]
+
+
+def _cards_from_bullets(section: dict) -> list[dict]:
+    """A legacy section's bullets become simple titled cards."""
+    out = []
+    for b in section.get("bullets") or []:
+        title = str(b).split("—")[0].split(":")[0].strip()[:28] or "Detail"
+        out.append({"title": title, "bullets": [str(b)],
+                    "initials": "".join(w[0] for w in title.split()[:2]).upper()})
+    return out
+
+
+def compose_brochure(plan: dict) -> list[dict]:
+    """Map a brochure plan to renderable page dicts (cover first). Accepts the new
+    ``pages`` shape or the legacy ``sections`` shape."""
+    cover_src = plan.get("cover") or {}
+    pages: list[dict] = [{
+        "template": "cover",
+        "heading": cover_src.get("title", ""),
+        "highlight": cover_src.get("highlight", ""),
+        "subtitle": cover_src.get("subtitle", ""),
+    }]
+
+    if plan.get("pages"):
+        for pg in plan["pages"]:
+            page = dict(pg)
+            page.setdefault("template", _infer_template(page))
+            pages.append(page)
+    else:
+        for section in plan.get("sections", []) or []:
+            template = _infer_template(section)
+            page = {"template": template, "heading": section.get("heading", ""),
+                    "highlight": section.get("highlight", ""), "body": section.get("body", ""),
+                    "bullets": section.get("bullets") or []}
+            if template == "card_grid":
+                page["cards"] = section.get("cards") or _cards_from_bullets(section)
+            pages.append(page)
+        contact = plan.get("contact") or {}
+        if contact.get("line"):
+            pages.append({"template": "cta_contact", "heading": "Get in touch",
+                          "contact": {"website": contact["line"]}})
+
+    for page in pages:
+        page["text_lines"] = _page_text_lines(page)
+    return pages
