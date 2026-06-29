@@ -61,46 +61,78 @@ class _Ctx:
 
 
 # --------------------------------------------------------------------------- #
+# Layout measurement helpers (so content blocks can be vertically centered in
+# their cards / the page, instead of clustering at the top with empty space
+# below). They re-use the renderer's own word-wrap so the estimate matches what
+# actually gets drawn.
+# --------------------------------------------------------------------------- #
+
+def _line_h(font, gap: float = 1.4) -> int:
+    asc, desc = font.getmetrics()
+    return int((asc + desc) * gap)
+
+
+def _text_h(font, text: str, max_w: int, gap: float) -> int:
+    """Estimated drawn height of ``text`` wrapped to ``max_w`` at ``gap`` spacing."""
+    lines = br._wrap(font, text or "", max_w)
+    return _line_h(font, gap) * max(1, len(lines))
+
+
+# --------------------------------------------------------------------------- #
 # Templates — each draws onto ctx.c and returns None.
 # --------------------------------------------------------------------------- #
 
 def _t_cover(p: dict, x: _Ctx) -> None:
     g = x.g
-    title_f = x.font(int(g.w * 0.072), "Causten Bold")
-    sub_f = x.font(int(g.w * 0.030), None)
+    title_f = x.font(int(g.w * 0.078), "Causten Bold")
+    sub_f = x.font(int(g.w * 0.032), None)
     left, width = g.span(0, 12)
-    y = int(g.h * 0.30)
+    head_h = _text_h(title_f, p.get("heading", ""), width, 1.12)
+    sub_h = _text_h(sub_f, p.get("subtitle", ""), width, 1.4) if p.get("subtitle") else 0
+    block_h = head_h + 38 + (64 + sub_h if sub_h else 0)
+    # Center the title block vertically so the page doesn't read top-heavy.
+    y = max(int(g.h * 0.28), (g.h - block_h) // 2)
     y = br.draw_heading(x.c, (left, y), p.get("heading", ""), title_f, x.deep,
                         max_w=width, highlight=p.get("highlight") or None,
                         highlight_color=x.accent)
+    # A short accent rule under the title (a small brand flourish).
+    br.draw_card(x.c, (left, y + 26, left + int(width * 0.16), y + 38),
+                 fill=x.accent, radius=6, shadow=False)
     if p.get("subtitle"):
-        br.draw_paragraph(x.c, (left, y + 24), p["subtitle"], sub_f, x.accent, max_w=width)
+        br.draw_paragraph(x.c, (left, y + 64), p["subtitle"], sub_f, x.accent, max_w=width)
 
 
 def _t_card_grid(p: dict, x: _Ctx) -> None:
     g = x.g
     head_f = x.font(int(g.w * 0.050), "Causten Bold")
-    bullet_f = x.font(int(g.w * 0.019), None)
-    top = br.draw_heading(x.c, g.span(0, 12)[:1] + (int(g.h * 0.06),), p.get("heading", ""),
-                          head_f, x.deep, max_w=g.span(0, 12)[1],
+    pill_f = x.font(int(g.w * 0.017), "Causten Bold")
+    bullet_f = x.font(int(g.w * 0.0195), None)
+    av_f = x.font(int(g.w * 0.022), "Causten Bold")
+    left, width = g.span(0, 12)
+    top = br.draw_heading(x.c, (left, int(g.h * 0.06)), p.get("heading", ""),
+                          head_f, x.deep, max_w=width,
                           highlight=p.get("highlight") or None, highlight_color=x.accent)
-    cards = p.get("cards") or []
+    cards = (p.get("cards") or [])[:6]
     cols = g.columns(2)
-    card_h = int(g.h * 0.20)
-    pad = 28
-    for i, card in enumerate(cards[:6]):
+    rows = max(1, (len(cards) + 1) // 2)
+    gap = 30
+    card_h = int(g.h * 0.205)
+    band_top, band_bottom = top + 44, g.h - g.margin
+    total = rows * card_h + (rows - 1) * gap
+    grid_top = band_top + max(0, (band_bottom - band_top - total) // 2)
+    pad = 34
+    for i, card in enumerate(cards):
         col_x, col_w = cols[i % 2]
-        row = i // 2
-        cy = top + 40 + row * (card_h + 30)
+        cy = grid_top + (i // 2) * (card_h + gap)
         br.draw_card(x.c, (col_x, cy, col_x + col_w, cy + card_h))
-        br.draw_circular(x.c, (col_x + pad + 34, cy + pad + 34), 34,
-                         initials=card.get("initials", ""), fill=x.deep,
-                         font=x.font(int(g.w * 0.022), "Causten Bold"))
-        tx = col_x + pad + 88
-        br.draw_pill(x.c, (tx, cy + pad), card.get("title", ""),
-                     x.font(int(g.w * 0.017), "Causten Bold"), fill=x.accent)
-        br.draw_bullets(x.c, (col_x + pad, cy + pad + 78), card.get("bullets") or [],
-                        bullet_f, x.ink, accent=x.accent, max_w=col_w - 2 * pad)
+        bullets = card.get("bullets") or []
+        block_h = 72 + 16 + _line_h(bullet_f, 1.45) * max(1, len(bullets))
+        bt = cy + max(pad, (card_h - block_h) // 2)
+        br.draw_circular(x.c, (col_x + pad + 30, bt + 30), 30,
+                         initials=card.get("initials", ""), fill=x.deep, font=av_f)
+        br.draw_pill(x.c, (col_x + pad + 76, bt + 6), card.get("title", ""), pill_f, fill=x.accent)
+        br.draw_bullets(x.c, (col_x + pad, bt + 88), bullets, bullet_f, x.ink,
+                        accent=x.accent, max_w=col_w - 2 * pad)
 
 
 def _t_steps(p: dict, x: _Ctx) -> None:
@@ -108,57 +140,75 @@ def _t_steps(p: dict, x: _Ctx) -> None:
     head_f = x.font(int(g.w * 0.050), "Causten Bold")
     title_f = x.font(int(g.w * 0.024), "Causten Bold")
     body_f = x.font(int(g.w * 0.018), None)
+    badge_f = x.font(int(g.w * 0.026), "Causten Bold")
     top = br.draw_heading(x.c, (g.margin, int(g.h * 0.06)), p.get("heading", ""), head_f,
                           x.deep, max_w=g.content_w, highlight=p.get("highlight") or None,
                           highlight_color=x.accent)
     steps = (p.get("steps") or [])[:3]
     cols = g.columns(max(1, len(steps)))
-    card_h = int(g.h * 0.34)
-    cy = top + 50
+    card_h = int(g.h * 0.30)
+    band_top, band_bottom = top + 44, g.h - g.margin
+    cy = band_top + max(0, (band_bottom - band_top - card_h) // 2)
     for i, step in enumerate(steps):
         col_x, col_w = cols[i]
+        inner = col_w - 56
+        block_h = (60 + 22 + _text_h(title_f, step.get("title", ""), inner, 1.15)
+                   + 12 + _text_h(body_f, step.get("desc", ""), inner, 1.4))
+        bt = cy + max(40, (card_h - block_h) // 2)
         br.draw_card(x.c, (col_x, cy, col_x + col_w, cy + card_h))
-        br.draw_circular(x.c, (col_x + 44, cy + 48), 30, initials=str(i + 1),
-                         fill=x.accent, font=x.font(int(g.w * 0.026), "Causten Bold"))
-        ty = br.draw_heading(x.c, (col_x + 28, cy + 100), step.get("title", ""), title_f,
-                             x.deep, max_w=col_w - 56)
+        br.draw_circular(x.c, (col_x + 58, bt + 30), 30, initials=str(i + 1),
+                         fill=x.accent, font=badge_f)
+        ty = br.draw_heading(x.c, (col_x + 28, bt + 82), step.get("title", ""), title_f,
+                             x.deep, max_w=inner)
         br.draw_paragraph(x.c, (col_x + 28, ty + 12), step.get("desc", ""), body_f,
-                          x.ink, max_w=col_w - 56)
+                          x.ink, max_w=inner)
 
 
 def _t_cta_contact(p: dict, x: _Ctx) -> None:
     g = x.g
     head_f = x.font(int(g.w * 0.050), "Causten Bold")
-    line_f = x.font(int(g.w * 0.026), "Causten Bold")
+    msg_f = x.font(int(g.w * 0.030), "Causten Bold")
+    line_f = x.font(int(g.w * 0.026), None)
     if p.get("heading"):
         br.draw_heading(x.c, (g.margin, int(g.h * 0.10)), p["heading"], head_f, x.deep,
                         max_w=g.content_w, highlight=p.get("highlight") or None,
                         highlight_color=x.accent)
-    # Solid brand CTA card with white contact lines.
-    cy0 = int(g.h * 0.40)
-    br.draw_card(x.c, (g.margin, cy0, g.w - g.margin, cy0 + int(g.h * 0.30)),
+    cy0, panel_h = int(g.h * 0.34), int(g.h * 0.42)
+    br.draw_card(x.c, (g.margin, cy0, g.w - g.margin, cy0 + panel_h),
                  fill=x.deep, radius=36, shadow=True)
+    inner = g.content_w - 120
+    msg = p.get("body") or ("Ready to streamline your firm with expert virtual "
+                            "legal staff? Contact us today.")
     contact = p.get("contact") or {}
-    y = cy0 + 60
-    for key in ("phone", "email", "website"):
-        if contact.get(key):
-            br.draw_paragraph(x.c, (g.margin + 60, y), str(contact[key]), line_f,
-                              (255, 255, 255), max_w=g.content_w - 120)
-            y += int(g.h * 0.06)
+    lines = [str(contact[k]) for k in ("phone", "email", "website") if contact.get(k)]
+    line_step = _line_h(line_f, 1.0) + 24
+    block_h = _text_h(msg_f, msg, inner, 1.3) + (44 + line_step * len(lines) if lines else 0)
+    y = cy0 + max(50, (panel_h - block_h) // 2)
+    y = br.draw_paragraph(x.c, (g.margin + 60, y), msg, msg_f, (255, 255, 255),
+                          max_w=inner, line_gap=1.3)
+    y += 44
+    for ln in lines:
+        br.draw_paragraph(x.c, (g.margin + 60, y), ln, line_f, (255, 255, 255), max_w=inner)
+        y += line_step
 
 
 def _t_testimonial(p: dict, x: _Ctx) -> None:
     g = x.g
     quote_f = x.font(int(g.w * 0.034), None)
     name_f = x.font(int(g.w * 0.026), "Causten Bold")
-    cy0 = int(g.h * 0.22)
-    br.draw_card(x.c, (g.margin, cy0, g.w - g.margin, cy0 + int(g.h * 0.42)), radius=32)
-    y = br.draw_paragraph(x.c, (g.margin + 60, cy0 + 70), '"' + p.get("quote", "") + '"',
-                          quote_f, x.ink, max_w=g.content_w - 120, line_gap=1.5)
-    br.draw_circular(x.c, (g.margin + 100, y + 80), 44,
+    cy0, card_h = int(g.h * 0.22), int(g.h * 0.44)
+    br.draw_card(x.c, (g.margin, cy0, g.w - g.margin, cy0 + card_h), radius=32)
+    inner = g.content_w - 120
+    quote = '"' + p.get("quote", "") + '"'
+    block_h = _text_h(quote_f, quote, inner, 1.5) + 80 + 88
+    y = cy0 + max(60, (card_h - block_h) // 2)
+    y = br.draw_paragraph(x.c, (g.margin + 60, y), quote, quote_f, x.ink,
+                          max_w=inner, line_gap=1.5)
+    av_y = y + 70
+    br.draw_circular(x.c, (g.margin + 100, av_y), 44,
                      initials="".join(w[0] for w in (p.get("author", "").split()[:2])).upper(),
                      fill=x.deep, font=x.font(int(g.w * 0.026), "Causten Bold"))
-    br.draw_heading(x.c, (g.margin + 170, y + 60), p.get("author", ""), name_f, x.accent,
+    br.draw_heading(x.c, (g.margin + 170, av_y - 20), p.get("author", ""), name_f, x.accent,
                     max_w=g.content_w - 220)
 
 
@@ -170,15 +220,15 @@ def _t_feature(p: dict, x: _Ctx) -> None:
     top = br.draw_heading(x.c, (g.margin, int(g.h * 0.08)), p.get("heading", ""), head_f,
                           x.deep, max_w=g.content_w, highlight=p.get("highlight") or None,
                           highlight_color=x.accent)
-    cy0 = top + 50
-    br.draw_card(x.c, (g.margin, cy0, g.w - g.margin, int(g.h * 0.80)), radius=32)
-    y = cy0 + 50
+    cy0, cy1 = top + 50, int(g.h * 0.86)
+    br.draw_card(x.c, (g.margin, cy0, g.w - g.margin, cy1), radius=32)
+    inner = g.content_w - 100
+    y = cy0 + 60
     if p.get("body"):
-        y = br.draw_paragraph(x.c, (g.margin + 50, y), p["body"], body_f, x.ink,
-                              max_w=g.content_w - 100)
+        y = br.draw_paragraph(x.c, (g.margin + 50, y), p["body"], body_f, x.ink, max_w=inner)
     if p.get("bullets"):
         br.draw_bullets(x.c, (g.margin + 50, y + 30), p["bullets"], bullet_f, x.ink,
-                        accent=x.accent, max_w=g.content_w - 100)
+                        accent=x.accent, max_w=inner)
 
 
 _TEMPLATES: dict[str, Callable[[dict, _Ctx], None]] = {
