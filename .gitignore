@@ -14,3 +14,5 @@ deploy.env.yaml
 # Graphics Designer generated run artifacts (output, not source)
 agents/**/runs/
 agents/**/creative_runs/
+# npm scratch installs used to vendor static assets (not project deps)
+node_modules/
