@@ -101,3 +101,35 @@ def test_draw_element_never_raises_on_bad_ref():
              "w": 0.2, "h": 0.2, "anchor": "mc", "z": 5, "rotation": 0.0,
              "opacity": 1.0, "fill": "#1746A2"}
     elements.draw_element(cv, layer, 400, 400)  # must not raise
+
+
+from graphics_designer_agent import layout, text_overlay
+
+
+def _base_png(w=400, h=400) -> bytes:
+    buf = BytesIO()
+    Image.new("RGB", (w, h), (255, 255, 255)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_element_position_resolution_independent():
+    """An emoji at x=0.75 lands at the same fractional column at 400px and 800px —
+    this is what guarantees the browser (fractional) canvas matches the final PNG."""
+    run = {"brand_id": None, "config": {
+        "tokens": {}, "aspect_ratio": "1:1",
+        "elements": [{"kind": "emoji", "ref": "😀", "x": 0.75, "y": 0.5,
+                      "w": 0.2, "h": 0.2, "anchor": "mc"}],
+    }}
+    layers = layout.resolve_layers(run)
+    base_small = _base_png(400, 400)
+    base_big = _base_png(800, 800)
+    small = Image.open(BytesIO(text_overlay.render_layers(base_small, layers, 400, 400)))
+    big = Image.open(BytesIO(text_overlay.render_layers(base_big, layers, 800, 800)))
+
+    def emoji_centroid_x(img):
+        gray = img.convert("L")
+        px = gray.load()
+        xs = [x for x in range(img.width) for y in range(img.height) if px[x, y] < 250]
+        return (sum(xs) / len(xs)) / img.width if xs else 0.5
+
+    assert abs(emoji_centroid_x(small) - emoji_centroid_x(big)) < 0.03
