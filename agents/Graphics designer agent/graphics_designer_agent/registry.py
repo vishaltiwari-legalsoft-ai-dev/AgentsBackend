@@ -70,6 +70,17 @@ class BrandPack:
     # the engine ``id`` above is a stable pack id, not the Firestore uuid.
     firestore_brand_id: str | None = None
 
+    # Optional bundled brand logo, used at Stage 4 when the brand isn't (yet)
+    # ingested into Firestore/GCS — e.g. local dev or an offline run. The
+    # Firestore logo always takes precedence; this is a filesystem fallback so
+    # Stage 4 still composites the real brand logo without a manual upload.
+    logo_path: Path | None = None
+
+    # Optional directory of on-brand logo VARIANTS (e.g. combined/favicon ×
+    # gradient/neutral/solid). Stage 4 shows them as a pick-a-logo library so the
+    # user chooses the variant they like instead of being forced onto one.
+    logo_dir: Path | None = None
+
     # suggestion content (advisory copy, tuned per brand)
     onboarding_questions: list = field(default_factory=list)
     # Pre-generation discovery script (the "micro-conversation"). Defaults to the
@@ -156,6 +167,8 @@ def _build_legalsoft() -> BrandPack:
         fonts_dir=_AGENT_ROOT / "Causten Font Family",
         canonical_sha256=CANONICAL_SHA256,
         firestore_brand_id="9717e502d6774c57a458771d1bd7c281",
+        logo_path=_AGENT_ROOT / "assets" / "brand-logos" / "legalsoft" / "combined-solid.png",
+        logo_dir=_AGENT_ROOT / "assets" / "brand-logos" / "legalsoft",
         locked_colors=_v.LOCKED_COLORS,
         brand_kit_block=_v.BRAND_KIT_BLOCK,
         source_note_stage1=_v.SOURCE_NOTE_STAGE1,

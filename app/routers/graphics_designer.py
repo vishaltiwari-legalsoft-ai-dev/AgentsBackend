@@ -7,6 +7,7 @@ frontend never needs direct storage access.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import logging
 
@@ -710,20 +711,91 @@ def generate_endpoint(run_id: str, body: GenerateBody, user: dict = Depends(get_
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
 
 
-def _brand_logo_png(run: dict) -> bytes | None:
-    """PNG bytes for the run brand's resolved logo (None if unmapped / not found)."""
-    fb_id = _pack_for_run(run).firestore_brand_id
-    if not fb_id:
-        return None
-    rec = firestore_repo.find_brand_logo(fb_id)
-    if not rec:
+def _local_logo_png(pack) -> bytes | None:
+    """PNG bytes for a brand's BUNDLED logo file — the Stage-4 fallback used when
+    the brand isn't ingested into Firestore/GCS (e.g. local dev). None if the pack
+    has no bundled logo or it can't be read."""
+    p = getattr(pack, "logo_path", None)
+    if not p or not p.exists():
         return None
     try:
-        raw = storage.download_bytes(rec["file_url"])
-    except Exception:  # noqa: BLE001 - treat an unreadable logo as "no logo"
-        logger.exception("GD: failed to download brand logo %s", rec.get("file_url"))
+        return imaging.to_png_logo(p.read_bytes(), file_name=p.name, mime="image/png")
+    except Exception:  # noqa: BLE001 - unreadable bundled logo → treat as no logo
+        logger.exception("GD: failed to read bundled brand logo %s", p)
         return None
-    return imaging.to_png_logo(raw, file_name=rec.get("file_name", ""), mime=rec.get("file_type", ""))
+
+
+def _resolve_logo_variant(pack, logo_id: str | None):
+    """Path to a specific bundled logo VARIANT by id (its filename stem), safely
+    constrained to the brand's ``logo_dir`` (rejects any path-traversal). None if
+    the brand has no library or the id is unknown."""
+    d = getattr(pack, "logo_dir", None)
+    if not d or not logo_id or "/" in logo_id or "\\" in logo_id or ".." in logo_id:
+        return None
+    p = d / f"{logo_id}.png"
+    try:
+        if p.exists() and p.resolve().parent == d.resolve():
+            return p
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _thumb_data_url(path, max_px: int = 200) -> str:
+    """A small transparent-PNG thumbnail of a logo file, inline as a data URL."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    im = Image.open(path).convert("RGBA")
+    im.thumbnail((max_px, max_px), Image.LANCZOS)
+    buf = BytesIO()
+    im.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _list_brand_logos(pack) -> list[dict]:
+    """The brand's on-brand logo variants (from ``logo_dir``) as a pickable
+    library: ``[{id, name, thumb}]``. Empty when the brand ships no library."""
+    d = getattr(pack, "logo_dir", None)
+    out: list[dict] = []
+    if not d or not d.exists():
+        return out
+    for p in sorted(d.glob("*.png")):
+        try:
+            out.append({"id": p.stem, "name": p.stem.replace("-", " ").title(),
+                        "thumb": _thumb_data_url(p)})
+        except Exception:  # noqa: BLE001 - skip an unreadable variant, never 500
+            logger.exception("GD: failed to thumbnail brand logo %s", p)
+    return out
+
+
+def _brand_logo_png(run: dict, logo_id: str | None = None) -> bytes | None:
+    """PNG bytes for the run brand's resolved logo, or None. Resolution order:
+    the user-picked variant (``logo_id``) → the brand's Firestore/GCS logo
+    (production) → the bundled default. So Stage 4 composites the chosen on-brand
+    logo, and still works offline / before the kit is ingested."""
+    pack = _pack_for_run(run)
+    variant = _resolve_logo_variant(pack, logo_id)
+    if variant:
+        try:
+            png = imaging.to_png_logo(variant.read_bytes(), file_name=variant.name, mime="image/png")
+            if png:
+                return png
+        except Exception:  # noqa: BLE001 - fall through to the other sources
+            logger.exception("GD: failed to read picked logo variant %s", variant)
+    fb_id = pack.firestore_brand_id
+    if fb_id:
+        rec = firestore_repo.find_brand_logo(fb_id)
+        if rec:
+            try:
+                raw = storage.download_bytes(rec["file_url"])
+                png = imaging.to_png_logo(raw, file_name=rec.get("file_name", ""), mime=rec.get("file_type", ""))
+                if png:
+                    return png
+            except Exception:  # noqa: BLE001 - unreadable remote logo → try local
+                logger.exception("GD: failed to download brand logo %s", rec.get("file_url"))
+    return _local_logo_png(pack)
 
 
 @router.get("/gd/runs/{run_id}/brand-logo")
@@ -736,22 +808,41 @@ def brand_logo_status(run_id: str, user: dict = Depends(get_current_user)) -> di
     run = _owned_run(run_id, user)
     pack = _pack_for_run(run)
     fb_id = pack.firestore_brand_id
-    if not fb_id:
-        return {"available": False, "view_url": None, "file_name": None, "brand_name": pack.name}
-    rec = firestore_repo.find_brand_logo(fb_id)
-    if not rec:
-        return {"available": False, "view_url": None, "file_name": None, "brand_name": pack.name}
-    view_url = None
-    try:
-        view_url = storage.signed_url_for_gs_uri(rec["file_url"])
-    except Exception:  # noqa: BLE001
-        logger.exception("GD: failed to sign brand logo for run %s", run_id)
-    return {
-        "available": True,
-        "view_url": view_url,
-        "file_name": rec.get("file_name"),
-        "brand_name": pack.name,
-    }
+    rec = firestore_repo.find_brand_logo(fb_id) if fb_id else None
+    if rec:
+        view_url = None
+        try:
+            view_url = storage.signed_url_for_gs_uri(rec["file_url"])
+        except Exception:  # noqa: BLE001
+            logger.exception("GD: failed to sign brand logo for run %s", run_id)
+        return {
+            "available": True,
+            "view_url": view_url,
+            "file_name": rec.get("file_name"),
+            "brand_name": pack.name,
+        }
+    # Fallback: a bundled local logo (dev / brand not yet ingested in Firestore).
+    # Returned inline as a data URL so the UI preview needs no extra auth'd fetch.
+    local = _local_logo_png(pack)
+    if local:
+        b64 = base64.b64encode(local).decode("ascii")
+        return {
+            "available": True,
+            "view_url": f"data:image/png;base64,{b64}",
+            "file_name": pack.logo_path.name if getattr(pack, "logo_path", None) else "brand-logo.png",
+            "brand_name": pack.name,
+        }
+    return {"available": False, "view_url": None, "file_name": None, "brand_name": pack.name}
+
+
+@router.get("/gd/runs/{run_id}/brand-logos")
+def brand_logo_library(run_id: str, user: dict = Depends(get_current_user)) -> dict:
+    """The brand's pickable logo library for Stage 4 — every on-brand variant
+    (combined/favicon × gradient/neutral/solid, etc.) with a thumbnail, so the
+    user selects the one they like instead of being forced onto a single logo."""
+    run = _owned_run(run_id, user)
+    pack = _pack_for_run(run)
+    return {"logos": _list_brand_logos(pack), "brand_name": pack.name}
 
 
 @router.post("/gd/runs/{run_id}/stage4")
@@ -759,6 +850,7 @@ async def stage4_endpoint(
     run_id: str,
     logo: UploadFile | None = File(default=None),
     use_ai: bool = Form(default=False),
+    logo_id: str | None = Form(default=None),
     user: dict = Depends(get_current_user),
 ) -> dict:
     run = _owned_run(run_id, user)
@@ -772,7 +864,7 @@ async def stage4_endpoint(
             if not png:
                 raise HTTPException(415, f"Couldn't read '{logo.filename}' as an image (PNG/JPG/SVG).")
     if png is None:
-        png = _brand_logo_png(run)
+        png = _brand_logo_png(run, logo_id=logo_id)
     if png is None:
         raise HTTPException(
             400,

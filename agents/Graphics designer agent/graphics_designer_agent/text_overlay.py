@@ -417,6 +417,7 @@ def _parts_from_layers(layers: list[dict]):
     c = None
     if cta:
         c = {"text": cta["text"], "font": cta["font"], "size_pct": cta["size_pct"],
+             "color": cta.get("color", "cta"),
              "placement": cta["placement"], "offset": cta["offset"]}
     return h, sh, c
 
@@ -485,6 +486,7 @@ def render_layers(base_png: bytes, layers: list[dict], base_w: int, base_h: int,
     for l in sorted(pinned, key=lambda x: x.get("z", 0)):
         if l["type"] == "cta":
             _draw_cta(canvas, {"text": l["text"], "font": l["font"], "size_pct": l["size_pct"],
+                               "color": l.get("color", "cta"),
                                "placement": l["placement"], "offset": l["offset"]},
                       base_w, base_h, theme, px_scale,
                       coords={"x": l["x"], "y": l["y"], "anchor": l["anchor"]})
