@@ -23,7 +23,13 @@ from graphics_designer_agent import layout as gd_layout
 from graphics_designer_agent import shapes as shapes_mod
 from graphics_designer_agent import pipeline, registry, suggestions, variants
 from graphics_designer_agent.pipeline import PipelineError
-from graphics_designer_agent.runs import get_run, log_manifest, save_artifact, save_run
+from graphics_designer_agent.runs import (
+    get_run,
+    is_own_artifact_ref,
+    log_manifest,
+    save_artifact,
+    save_run,
+)
 from graphics_designer_agent.tokens import ASPECT_RATIOS
 
 router = APIRouter()
@@ -598,9 +604,20 @@ def update_config(run_id: str, body: ConfigBody, user: dict = Depends(get_curren
             raise HTTPException(400, str(exc)) from exc
     if body.elements is not None:
         try:
-            cfg["elements"] = elements_mod.sanitize_elements(body.elements)
+            sanitized = elements_mod.sanitize_elements(body.elements)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        # C1 fix: an "image" element's ``ref`` must be an artifact this run owns
+        # (e.g. from /gd/runs/{run_id}/elements/upload). Without this check a
+        # user could point ``ref`` at another run's — or any SA-readable —
+        # ``gs://`` object and have it fetched with the server's credentials
+        # at render time (see graphics_designer_agent.runs.is_own_artifact_ref).
+        for el in sanitized:
+            if el["kind"] == "image" and not is_own_artifact_ref(run_id, el["ref"]):
+                raise HTTPException(
+                    400, f"Invalid image element ref (not owned by this run): {el['ref']!r}"
+                )
+        cfg["elements"] = sanitized
     if body.logo_layout is not None:
         _apply_logo_layout(cfg, body.logo_layout)
     # Use the field-set so an explicit ``null`` clears the gradient (omission

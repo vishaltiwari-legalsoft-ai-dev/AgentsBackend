@@ -128,3 +128,46 @@ def test_element_upload_same_bytes_dedupe_to_same_ref(a_run_id):
     assert r1.status_code == 200, r1.text
     assert r2.status_code == 200, r2.text
     assert r1.json()["ref"] == r2.json()["ref"]
+
+
+# ── C1 regression: cross-run / arbitrary GCS object read ──────────────────────
+# An "image" element's ``ref`` used to be accepted as any non-empty string, so a
+# user could point it at another run's (or any SA-readable) ``gs://`` object and
+# have the server fetch it with its own credentials at render time. The config
+# endpoint must now reject an "image" element whose ``ref`` isn't owned by this
+# run — a foreign ``gs://`` ref is unambiguous regardless of the active storage
+# backend (fs here), since a legitimate ref never carries a ``gs://`` scheme
+# from an fs-backed run.
+def test_config_rejects_foreign_gs_ref_image_element(a_run_id):
+    r = client.post(
+        f"/api/gd/runs/{a_run_id}/config",
+        json={"elements": [{
+            "kind": "image",
+            "ref": "gs://some-other-bucket/gd/deadbeef00cafe/stage-3-upload-x.png",
+            "x": 0.5, "y": 0.5,
+        }]},
+    )
+    assert r.status_code == 400, r.text
+    # And it must NOT have been persisted onto the run's config.
+    got = client.get(f"/api/gd/runs/{a_run_id}")
+    assert got.json()["config"].get("elements") in (None, [])
+
+
+def test_config_accepts_own_uploaded_image_element(a_run_id):
+    """Legitimate path stays green: an uploaded artifact's own ref, used as an
+    image element, is accepted and round-trips onto the run's config."""
+    red = _png_bytes((255, 0, 0, 255))
+    up = client.post(
+        f"/api/gd/runs/{a_run_id}/elements/upload",
+        files={"file": ("red.png", io.BytesIO(red), "image/png")},
+    )
+    assert up.status_code == 200, up.text
+    ref = up.json()["ref"]
+
+    r = client.post(
+        f"/api/gd/runs/{a_run_id}/config",
+        json={"elements": [{"kind": "image", "ref": ref, "x": 0.5, "y": 0.5}]},
+    )
+    assert r.status_code == 200, r.text
+    els = r.json()["config"]["elements"]
+    assert len(els) == 1 and els[0]["kind"] == "image" and els[0]["ref"] == ref

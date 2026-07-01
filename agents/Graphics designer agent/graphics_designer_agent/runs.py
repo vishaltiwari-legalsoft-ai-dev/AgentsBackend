@@ -178,8 +178,70 @@ def save_artifact(run_id: str, stage: int, variant: str, attempt: int, png: byte
     return rel
 
 
+def _gcs_partition_prefix(run_id: str) -> str:
+    """The GCS object prefix (no bucket) that ``save_artifact`` writes this run's
+    artifacts under: ``generated/gd/<run_id>/``. Any legitimate ``gs://`` ref for
+    this run MUST live under this prefix — see ``upload_generated`` in
+    ``app.services.storage`` (``generated/<partition>/<file_name>``)."""
+    return f"generated/{_GCS_PARTITION}/{run_id}/"
+
+
+def is_own_artifact_ref(run_id: str, ref: str) -> bool:
+    """Whether ``ref`` points inside ``run_id``'s own artifact space.
+
+    fs mode: any relative path — real containment is enforced by
+    ``artifact_abspath``'s path-traversal guard, so a bare non-empty relative
+    ref is accepted here (the traversal guard runs at read time).
+
+    cloud mode: the object path must sit under this run's own
+    ``generated/gd/<run_id>/`` partition (the prefix ``save_artifact`` writes
+    to via ``upload_generated``). A ref naming a different run — or any other
+    GCS object entirely — is rejected. This is the fix for the cross-run /
+    arbitrary GCS-read vulnerability (C1): without this check, any
+    authenticated user could set an ``image`` element's ``ref`` to another
+    run's (or any SA-readable) ``gs://`` object and have the server fetch it
+    with its own service-account credentials.
+
+    The bucket itself is additionally pinned to the configured
+    ``gcs_bucket_name`` when that setting is available, as defense in depth
+    against a ref pointing at a *different* bucket; the partition-prefix
+    check above is the primary (and only strictly required) gate, so this
+    stays safe to run even where settings aren't wired up (e.g. tests that
+    fake only ``app.services.storage``).
+    """
+    if not isinstance(ref, str) or not ref.strip():
+        return False
+    if not ref.startswith("gs://"):
+        # fs-mode relative ref — containment checked by artifact_abspath at read time.
+        return True
+    rest = ref[len("gs://"):]
+    bucket, _, object_path = rest.partition("/")
+    if not bucket or not object_path:
+        return False
+    if not object_path.startswith(_gcs_partition_prefix(run_id)):
+        return False
+    try:
+        from app.config import settings
+
+        expected_bucket = getattr(settings, "gcs_bucket_name", "") or ""
+    except Exception:  # noqa: BLE001 - settings unavailable outside the backend app
+        expected_bucket = ""
+    if expected_bucket and bucket != expected_bucket:
+        return False
+    return True
+
+
 def read_artifact(run_id: str, ref: str) -> bytes:
-    """Read an artifact's bytes from its stored reference (fs path or gs:// URI)."""
+    """Read an artifact's bytes from its stored reference (fs path or gs:// URI).
+
+    Enforces that ``ref`` belongs to ``run_id``'s own artifact partition (cloud
+    mode) — see ``is_own_artifact_ref`` — so a foreign/cross-run ``gs://`` ref
+    can never be fetched with the server's service-account credentials (C1
+    fix). Every legitimate caller already only ever reads its own run's
+    artifacts, so this check is safe to apply unconditionally.
+    """
+    if not is_own_artifact_ref(run_id, ref):
+        raise ValueError(f"artifact ref does not belong to run {run_id!r}")
     if ref.startswith("gs://"):
         from app.services import storage
 
