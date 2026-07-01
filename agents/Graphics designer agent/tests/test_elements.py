@@ -41,3 +41,15 @@ def test_sanitize_caps_count():
 def test_sanitize_icon_fill_validated():
     out = elements.sanitize_elements([{"kind": "icon", "ref": "rocket", "fill": "not-a-color"}])
     assert out[0]["fill"] == "#1746A2"  # invalid → brand default
+
+
+def test_emoji_catalog_nonempty_and_shaped():
+    cat = elements.emoji_catalog()
+    assert len(cat) > 100
+    row = cat[0]
+    assert set(row) >= {"char", "name", "category", "file"}
+
+
+def test_emoji_png_path_resolves_for_grinning():
+    p = elements._emoji_png_path("😀")
+    assert p is not None and p.exists()
