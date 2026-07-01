@@ -150,3 +150,82 @@ def _icon_svg_path(key: str):
 def _sticker_svg_path(sid: str):
     p = _STICKER_DIR / f"{sid}.svg"
     return p if p.exists() else None
+
+
+from io import BytesIO
+
+from PIL import Image
+
+
+def _hex_rgb(value: str):
+    v = (value or "").lstrip("#")
+    if len(v) != 6:
+        return (23, 70, 162)
+    return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
+
+
+def _raster_svg(path, px_w: int, px_h: int, tint=None):
+    """Rasterize an SVG to an RGBA image at px size, optional solid tint.
+    Uses cairosvg when available; falls back to None (caller no-ops)."""
+    try:
+        import cairosvg
+    except Exception:
+        return None
+    try:
+        png = cairosvg.svg2png(url=str(path), output_width=px_w, output_height=px_h)
+        img = Image.open(BytesIO(png)).convert("RGBA")
+    except Exception:  # noqa: BLE001
+        return None
+    if tint is not None:
+        r, g, b = _hex_rgb(tint) if isinstance(tint, str) else tint
+        solid = Image.new("RGBA", img.size, (r, g, b, 0))
+        solid.putalpha(img.split()[3])  # keep the SVG's alpha, replace colour
+        return solid
+    return img
+
+
+def _load_element_image(layer: dict, px_w: int, px_h: int, image_loader):
+    kind = layer["kind"]
+    if kind == "emoji":
+        p = _emoji_png_path(layer["ref"])
+        if not p:
+            return None
+        return Image.open(p).convert("RGBA").resize((px_w, px_h), Image.LANCZOS)
+    if kind == "icon":
+        p = _icon_svg_path(layer["ref"])
+        return _raster_svg(p, px_w, px_h, tint=layer.get("fill")) if p else None
+    if kind == "sticker":
+        p = _sticker_svg_path(layer["ref"])
+        return _raster_svg(p, px_w, px_h) if p else None
+    if kind == "image":
+        if not image_loader:
+            return None
+        data = image_loader(layer["ref"])
+        if not data:
+            return None
+        return Image.open(BytesIO(data)).convert("RGBA").resize((px_w, px_h), Image.LANCZOS)
+    return None
+
+
+def draw_element(canvas, layer: dict, base_w: int, base_h: int, *, image_loader=None) -> None:
+    """Draw one element layer onto the RGBA canvas. Fully best-effort — any failure
+    (missing asset, no rasterizer, bad bytes) is a silent no-op so a stale element
+    can never crash a render."""
+    try:
+        pw = max(1, int(layer["w"] * base_w))
+        ph = max(1, int(layer["h"] * base_h))
+        img = _load_element_image(layer, pw, ph, image_loader)
+        if img is None:
+            return
+        opacity = float(layer.get("opacity", 1.0))
+        if opacity < 1.0:
+            a = img.split()[3].point(lambda v: int(v * opacity))
+            img.putalpha(a)
+        rot = float(layer.get("rotation", 0.0))
+        if rot:
+            img = img.rotate(-rot, expand=True, resample=Image.BICUBIC)
+        left, top = layout.anchor_to_xy(layer["x"], layer["y"], img.width, img.height,
+                                        layer.get("anchor", "mc"), base_w, base_h)
+        canvas.alpha_composite(img, (int(left), int(top)))
+    except Exception:  # noqa: BLE001 - an element never breaks the whole render
+        return

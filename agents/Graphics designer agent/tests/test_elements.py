@@ -65,3 +65,39 @@ def test_icon_catalog_lists_svg_stems():
 def test_sticker_catalog_shape():
     cat = elements.sticker_catalog()
     assert isinstance(cat, list)
+
+
+from io import BytesIO
+from PIL import Image
+
+
+def _canvas(w=400, h=400):
+    return Image.new("RGBA", (w, h), (255, 255, 255, 255))
+
+
+def test_draw_emoji_changes_pixels():
+    cv = _canvas()
+    before = cv.tobytes()
+    layer = elements.sanitize_elements([
+        {"kind": "emoji", "ref": "😀", "x": 0.5, "y": 0.5, "w": 0.3, "h": 0.3},
+    ])[0]
+    elements.draw_element(cv, layer, 400, 400)
+    assert cv.tobytes() != before  # something was drawn
+
+
+def test_draw_image_missing_loader_is_noop():
+    cv = _canvas()
+    before = cv.tobytes()
+    layer = elements.sanitize_elements([
+        {"kind": "image", "ref": "runs/x/y.png", "x": 0.5, "y": 0.5, "w": 0.3, "h": 0.3},
+    ])[0]
+    elements.draw_element(cv, layer, 400, 400, image_loader=None)
+    assert cv.tobytes() == before  # no loader → safe no-op
+
+
+def test_draw_element_never_raises_on_bad_ref():
+    cv = _canvas()
+    layer = {"kind": "icon", "ref": "no-such-icon", "x": 0.5, "y": 0.5,
+             "w": 0.2, "h": 0.2, "anchor": "mc", "z": 5, "rotation": 0.0,
+             "opacity": 1.0, "fill": "#1746A2"}
+    elements.draw_element(cv, layer, 400, 400)  # must not raise
