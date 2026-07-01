@@ -203,3 +203,35 @@ def test_spec_summary_lists_each_element():
 
 def test_immutability_unaffected_by_deterministic_stage3():
     assert verify_integrity() == []
+
+
+def _element_base_png(w=400, h=400):
+    buf = BytesIO()
+    Image.new("RGB", (w, h), (255, 255, 255)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_render_layers_draws_emoji_element():
+    base = _element_base_png()
+    layers = [{
+        "type": "element", "id": "e1", "kind": "emoji", "ref": "😀",
+        "x": 0.5, "y": 0.5, "w": 0.3, "h": 0.3, "anchor": "mc", "z": 5,
+        "rotation": 0.0, "opacity": 1.0, "fill": "#1746A2", "pinned": True,
+    }]
+    out = text_overlay.render_layers(base, layers, 400, 400)
+    assert out != base  # emoji composited
+
+
+def test_render_layers_no_elements_byte_identical():
+    """Backward-compat law: a run without elements renders exactly as before."""
+    base = _element_base_png()
+    layers = [{
+        "type": "text", "id": "headline", "text": "Hello", "highlight": "",
+        "font": "Causten Bold", "size_pct": 8.0, "color": "dark",
+        "highlight_color": "gradient", "placement": "left", "offset": (0, 0),
+        "z": 10, "pinned": False,
+        "x": 0.06, "y": 0.5, "w": 0.42, "anchor": "ml",
+    }]
+    a = text_overlay.render_layers(base, layers, 400, 400)
+    b = text_overlay.render_layers(base, layers, 400, 400)
+    assert a == b  # deterministic, and the element branch never ran

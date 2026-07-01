@@ -23,6 +23,7 @@ from typing import Callable
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+from . import elements as gd_elements
 from . import icons, layout, shapes
 from .variants import LOCKED_COLORS, font_file
 
@@ -460,17 +461,21 @@ def _draw_shape(canvas, l: dict, base_w, base_h, theme: _Theme, px_scale):
 
 
 def render_layers(base_png: bytes, layers: list[dict], base_w: int, base_h: int,
-                  *, px_scale: float = 1.0, pack=None) -> bytes:
-    """Render Stage-3 from coordinate layers. Draw order: shapes (behind, by z),
-    then ``auto`` text via the legacy zone+stack path (byte-identical to
-    ``render_overlay``), then ``pinned`` text/cta at absolute coords by z."""
+                  *, px_scale: float = 1.0, pack=None, image_loader=None) -> bytes:
+    """Render Stage-3 from coordinate layers. Draw order: shapes and elements
+    (behind, by z), then ``auto`` text via the legacy zone+stack path
+    (byte-identical to ``render_overlay``), then ``pinned`` text/cta at
+    absolute coords by z."""
     theme = _theme_from_pack(pack) if pack is not None else _default_theme()
     canvas = _base_canvas(base_png, base_w, base_h)
 
     shape_layers = [l for l in layers if l.get("type") == "shape"]
-    text_layers = [l for l in layers if l.get("type") != "shape"]
+    element_layers = [l for l in layers if l.get("type") == "element"]
+    text_layers = [l for l in layers if l.get("type") not in ("shape", "element")]
     for l in sorted(shape_layers, key=lambda x: x.get("z", 0)):
         _draw_shape(canvas, l, base_w, base_h, theme, px_scale)
+    for l in sorted(element_layers, key=lambda x: x.get("z", 0)):
+        gd_elements.draw_element(canvas, l, base_w, base_h, image_loader=image_loader)
 
     auto = [l for l in text_layers if not l.get("pinned")]
     pinned = [l for l in text_layers if l.get("pinned")]
