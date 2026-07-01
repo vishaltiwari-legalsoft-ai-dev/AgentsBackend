@@ -16,12 +16,13 @@ from pydantic import BaseModel, Field
 from app.security import get_current_user
 from app.services import firestore_repo, imaging, storage
 
+from graphics_designer_agent import elements as elements_mod
 from graphics_designer_agent import icons as icons_mod
 from graphics_designer_agent import layout as gd_layout
 from graphics_designer_agent import shapes as shapes_mod
 from graphics_designer_agent import pipeline, registry, suggestions, variants
 from graphics_designer_agent.pipeline import PipelineError
-from graphics_designer_agent.runs import get_run, log_manifest, save_run
+from graphics_designer_agent.runs import get_run, log_manifest, save_artifact, save_run
 from graphics_designer_agent.tokens import ASPECT_RATIOS
 
 router = APIRouter()
@@ -462,6 +463,17 @@ def gd_config(brand: str | None = None, _user: dict = Depends(get_current_user))
     }
 
 
+@router.get("/gd/elements")
+def gd_elements(_user: dict = Depends(get_current_user)) -> dict:
+    """Element Library catalogs for the Stage-3 picker: emoji, rich icons, stickers."""
+    return {
+        "emoji": elements_mod.emoji_catalog(),
+        "icons": elements_mod.icon_catalog(),
+        "stickers": elements_mod.sticker_catalog(),
+        "max_elements": elements_mod.MAX_ELEMENTS,
+    }
+
+
 @router.get("/gd/prompts")
 def gd_prompts(brand: str | None = None, _user: dict = Depends(get_current_user)) -> dict:
     """Canonical prompt integrity report (audit panel) for the selected brand."""
@@ -512,6 +524,8 @@ class ConfigBody(BaseModel):
     layout: dict | None = None
     # Stage-3 shapes / infographic elements (full-list replace).
     shapes: list | None = None
+    # Stage-3 rich elements (emoji/icon/sticker/image) — full-list replace.
+    elements: list | None = None
     # Stage-4 logo placement: {position?, size_pct?, margin_pct?, offset_x?, offset_y?}.
     logo_layout: dict | None = None
     # Per-creative temporary AI gradient (Stage 1). Explicit null clears it.
@@ -579,6 +593,11 @@ def update_config(run_id: str, body: ConfigBody, user: dict = Depends(get_curren
     if body.shapes is not None:
         try:
             cfg["shapes"] = gd_layout.sanitize_shapes(body.shapes)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    if body.elements is not None:
+        try:
+            cfg["elements"] = elements_mod.sanitize_elements(body.elements)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
     if body.logo_layout is not None:
@@ -745,6 +764,23 @@ async def stage4_endpoint(
     _log_usage(user, "generate", brand=run.get("brand_id"))  # final logo composite
     _advance_run(run, stage=4, stage_status="generated", attempt=attempt)
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
+
+
+@router.post("/gd/runs/{run_id}/elements/upload")
+async def gd_element_upload(run_id: str, file: UploadFile = File(...),
+                            user: dict = Depends(get_current_user)) -> dict:
+    """Upload a transparent PNG/WebP to use as an ``image`` element. Returns the
+    artifact ref the client stores as the element's ``ref``."""
+    run = _owned_run(run_id, user)
+    if (file.content_type or "") not in ("image/png", "image/webp"):
+        raise HTTPException(400, "Only PNG/WebP uploads are supported.")
+    data = await file.read()
+    if len(data) > 8 * 1024 * 1024:
+        raise HTTPException(400, "Image too large (max 8 MB).")
+    # Reuse the run artifact store; stage=3, kind="upload".
+    n = len(run.get("uploads", []) if isinstance(run.get("uploads"), list) else [])
+    rel = save_artifact(run["id"], 3, "upload", n + 1, data)
+    return {"ref": rel}
 
 
 class ApproveBody(BaseModel):

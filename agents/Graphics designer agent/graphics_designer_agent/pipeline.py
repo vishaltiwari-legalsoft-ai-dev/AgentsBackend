@@ -319,7 +319,8 @@ def _generate_stage3(run: dict) -> dict:
     canvas_w, canvas_h = _stage_dims(run, 3)
     w, h, px_scale = _hires_canvas(base, canvas_w, canvas_h)
     png = text_overlay.render_layers(
-        base, layers, w, h, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id"))
+        base, layers, w, h, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id")),
+        image_loader=lambda ref: read_artifact(run["id"], ref),
     )
     summary = text_overlay.overlay_spec_summary(_resolve_overlay_spec(run))
     attempt_no = len(run["stages"]["3"]["attempts"]) + 1
@@ -387,7 +388,8 @@ def render_stage3_preview(run: dict, *, tokens: dict | None = None,
     ph = max(1, round(canvas_h * pw / canvas_w))
     px_scale = pw / canvas_w  # the user's pixel nudges are calibrated to canvas_w
     return text_overlay.render_layers(
-        base, layers, pw, ph, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id"))
+        base, layers, pw, ph, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id")),
+        image_loader=lambda ref: read_artifact(run["id"], ref),
     )
 
 
