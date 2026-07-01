@@ -53,3 +53,15 @@ def test_emoji_catalog_nonempty_and_shaped():
 def test_emoji_png_path_resolves_for_grinning():
     p = elements._emoji_png_path("😀")
     assert p is not None and p.exists()
+
+
+def test_icon_catalog_lists_svg_stems():
+    cat = elements.icon_catalog()
+    assert isinstance(cat, list) and all(isinstance(k, str) for k in cat)
+    if cat:
+        assert elements._icon_svg_path(cat[0]) is not None
+
+
+def test_sticker_catalog_shape():
+    cat = elements.sticker_catalog()
+    assert isinstance(cat, list)

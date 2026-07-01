@@ -122,3 +122,31 @@ def emoji_catalog() -> list[dict]:
                 rows.append({"char": ch, "name": name, "category": cat,
                              "file": f"{_char_to_codepoints(ch)}.png"})
     return rows
+
+
+_ICON_DIR = ASSET_DIR / "icons"
+_STICKER_DIR = ASSET_DIR / "stickers"
+
+
+@lru_cache(maxsize=1)
+def icon_catalog() -> list[str]:
+    if not _ICON_DIR.exists():
+        return []
+    return sorted(p.stem for p in _ICON_DIR.glob("*.svg"))
+
+
+@lru_cache(maxsize=1)
+def sticker_catalog() -> list[str]:
+    if not _STICKER_DIR.exists():
+        return []
+    return sorted(p.stem for p in _STICKER_DIR.glob("*.svg"))
+
+
+def _icon_svg_path(key: str):
+    p = _ICON_DIR / f"{key}.svg"
+    return p if p.exists() else None
+
+
+def _sticker_svg_path(sid: str):
+    p = _STICKER_DIR / f"{sid}.svg"
+    return p if p.exists() else None
