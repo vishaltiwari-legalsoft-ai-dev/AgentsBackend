@@ -285,4 +285,20 @@ def resolve_layers(run: dict) -> list[dict]:
             "z": int(sh.get("z", 5)), "pinned": True,
         })
 
+    # Rich elements (emoji / icon / sticker / image) — absolute, drawn by z like
+    # shapes. Additive: a run with no ``elements`` is unaffected (backward-compat).
+    for i, el in enumerate(cfg.get("elements") or []):
+        layers.append({
+            "type": "element", "id": el.get("id", f"el-{i}"),
+            "kind": el.get("kind", "emoji"),
+            "x": float(el.get("x", 0.5)), "y": float(el.get("y", 0.5)),
+            "w": float(el.get("w", 0.18)), "h": float(el.get("h", 0.18)),
+            "anchor": el.get("anchor", "mc"),
+            "z": int(el.get("z", 5) or 5),
+            "rotation": float(el.get("rotation", 0.0) or 0.0),
+            "opacity": float(el.get("opacity", 1.0) or 1.0),
+            "ref": el.get("ref", ""), "fill": el.get("fill", "#1746A2"),
+            "pinned": True,
+        })
+
     return layers

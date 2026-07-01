@@ -150,3 +150,28 @@ def test_resolve_layers_includes_cta_and_subheadings():
     run["config"]["subheadings"] = [{"text": "one"}, {"text": "two"}]
     ids = {l["id"] for l in layout.resolve_layers(run)}
     assert {"headline", "cta", "subheading-0", "subheading-1"} <= ids
+
+
+def _run_with(cfg_extra):
+    cfg = {"tokens": {"headline": "Hi"}, "aspect_ratio": "1:1"}
+    cfg.update(cfg_extra)
+    return {"brand_id": None, "config": cfg}
+
+
+def test_resolve_layers_appends_elements():
+    run = _run_with({"elements": [
+        {"id": "e1", "kind": "emoji", "ref": "😀", "x": 0.5, "y": 0.5,
+         "w": 0.2, "h": 0.2, "anchor": "mc", "z": 7, "rotation": 0.0,
+         "opacity": 1.0, "fill": "#1746A2"},
+    ]})
+    layers = layout.resolve_layers(run)
+    els = [l for l in layers if l.get("type") == "element"]
+    assert len(els) == 1
+    assert els[0]["kind"] == "emoji" and els[0]["ref"] == "😀"
+    assert els[0]["pinned"] is True
+
+
+def test_resolve_layers_no_elements_unchanged():
+    run = _run_with({})
+    layers = layout.resolve_layers(run)
+    assert all(l.get("type") != "element" for l in layers)
