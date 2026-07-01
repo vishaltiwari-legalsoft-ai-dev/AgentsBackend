@@ -7,6 +7,7 @@ frontend never needs direct storage access.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
@@ -777,9 +778,11 @@ async def gd_element_upload(run_id: str, file: UploadFile = File(...),
     data = await file.read()
     if len(data) > 8 * 1024 * 1024:
         raise HTTPException(400, "Image too large (max 8 MB).")
-    # Reuse the run artifact store; stage=3, kind="upload".
-    n = len(run.get("uploads", []) if isinstance(run.get("uploads"), list) else [])
-    rel = save_artifact(run["id"], 3, "upload", n + 1, data)
+    # Reuse the run artifact store; stage=3, kind="upload". Name the artifact by
+    # a content hash (not a dead upload counter) so distinct images never
+    # collide on the same path and identical re-uploads dedupe to one file.
+    token = hashlib.sha256(data).hexdigest()[:16]
+    rel = save_artifact(run["id"], 3, "upload", token, data)
     return {"ref": rel}
 
 
