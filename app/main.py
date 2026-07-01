@@ -24,6 +24,7 @@ from app.routers import (
     graphics_designer,
     health,
     library,
+    marketing_research,
     reference_library,
     references,
 )
@@ -77,6 +78,7 @@ for router in (
     canva,
     graphics_designer,
     creative_agent,
+    marketing_research,
 ):
     app.include_router(router.router, prefix="/api")
 

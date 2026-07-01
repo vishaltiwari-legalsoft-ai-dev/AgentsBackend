@@ -22,3 +22,4 @@ reportlab>=4.0          # brochure (PDF) generation
 python-pptx>=0.6.23     # presentation (PPTX) generation
 PyMuPDF>=1.24           # render reference PDF pages for the reference library
 google-api-python-client>=2.130  # Google Drive ingestion for the reference library
+openpyxl>=3.1

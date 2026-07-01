@@ -1,0 +1,10 @@
+You are Legal Soft's analytics lead. From the JSON below, write a UTM
+Attribution Summary:
+
+- What share of leads/bookings are attributed to a source (target: 100%).
+- Conversion rate by channel (lead -> booked -> qualified).
+- The highest-converting practice areas.
+- Any channels with high lead volume but low booking rate.
+
+Plain text, <=200 words, no preamble. Data:
+{data}
