@@ -60,3 +60,53 @@ def test_draw_circular_with_initials_paints_inside_circle():
     inside = c.convert("RGB").getpixel((200, 200))
     corner = c.convert("RGB").getpixel((5, 5))
     assert inside != corner  # circle drew over the white background
+
+
+import io
+
+
+def _photo_bytes(w=200, h=200, color=(200, 60, 60)):
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_photo_background_strong_is_page_size_rgba():
+    bg = br.photo_background((300, 500), _photo_bytes(), mode="strong",
+                             light=(240, 246, 255), deep=(23, 70, 162))
+    assert bg is not None
+    assert bg.size == (300, 500)
+    assert bg.mode == "RGBA"
+
+
+def test_photo_background_strong_scrim_is_bottom_heavy():
+    # A flat red photo under a deep-blue bottom-heavy scrim: the bottom pixel
+    # must be pulled toward the deep colour more than the top pixel.
+    bg = br.photo_background((300, 500), _photo_bytes(), mode="strong",
+                             light=(240, 246, 255), deep=(23, 70, 162))
+    top = bg.convert("RGB").getpixel((150, 5))
+    bot = bg.convert("RGB").getpixel((150, 495))
+    assert bot[2] > top[2]      # more blue (deep) at the bottom
+    assert bot[0] < top[0]      # less of the photo's red at the bottom
+
+
+def test_photo_background_soft_is_lighter_than_strong():
+    strong = br.photo_background((300, 500), _photo_bytes(), mode="strong",
+                                 light=(240, 246, 255), deep=(23, 70, 162))
+    soft = br.photo_background((300, 500), _photo_bytes(), mode="soft",
+                               light=(240, 246, 255), deep=(23, 70, 162))
+    s_px = soft.convert("RGB").getpixel((150, 250))
+    st_px = strong.convert("RGB").getpixel((150, 250))
+    assert sum(s_px) > sum(st_px)   # the light wash brightens the mid-page
+
+
+def test_photo_background_bad_bytes_returns_none():
+    assert br.photo_background((300, 500), b"not-a-png", mode="strong",
+                               light=(240, 246, 255), deep=(23, 70, 162)) is None
+
+
+def test_photo_background_cover_crops_wide_image():
+    # A very wide photo must fill a portrait page edge-to-edge (no letterbox).
+    bg = br.photo_background((300, 500), _photo_bytes(w=800, h=100), mode="soft",
+                             light=(240, 246, 255), deep=(23, 70, 162))
+    assert bg.size == (300, 500)

@@ -54,6 +54,48 @@ def calm_background(size: tuple[int, int], light: RGB, deep: RGB, *,
     return bg
 
 
+def _cover_crop(im: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """Scale-to-fill then center-crop (CSS ``object-fit: cover``)."""
+    w, h = size
+    scale = max(w / im.width, h / im.height)
+    im = im.resize((max(1, round(im.width * scale)), max(1, round(im.height * scale))),
+                   Image.LANCZOS)
+    x0 = (im.width - w) // 2
+    y0 = (im.height - h) // 2
+    return im.crop((x0, y0, x0 + w, y0 + h))
+
+
+def photo_background(size: tuple[int, int], image_png: bytes, *, mode: str,
+                     light: RGB, deep: RGB) -> Optional[Image.Image]:
+    """A full-bleed photographic page background with a legibility treatment.
+
+    ``mode="strong"`` (cover / CTA pages): the photo as-is under a bottom-heavy
+    scrim in the deep brand colour, so white text stays crisp.
+    ``mode="soft"`` (content pages): the photo slightly blurred beneath a light
+    brand wash, so it reads as texture and the white cards keep their contrast.
+    Returns ``None`` when the bytes can't be decoded — the caller falls back to
+    :func:`calm_background`.
+    """
+    try:
+        im = Image.open(io.BytesIO(image_png)).convert("RGB")
+    except Exception:  # noqa: BLE001 - undecodable image → gradient fallback
+        return None
+    bg = _cover_crop(im, size).convert("RGBA")
+    w, h = size
+    overlay = Image.new("RGBA", size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(overlay)
+    if mode == "strong":
+        # Scrim ramps from ~10% at the top to ~55% at the bottom.
+        for y in range(h):
+            a = round(255 * (0.10 + 0.45 * (y / max(1, h - 1))))
+            d.line([(0, y), (w, y)], fill=deep + (a,))
+    else:
+        bg = bg.filter(ImageFilter.GaussianBlur(6))
+        d.rectangle([0, 0, w, h], fill=light + (round(255 * 0.80),))
+    bg.alpha_composite(overlay)
+    return bg
+
+
 def draw_card(canvas: Image.Image, box, *, fill: RGB = (255, 255, 255),
               radius: int = 28, shadow: bool = True, shadow_opacity: int = 45,
               stroke: Optional[RGB] = None, stroke_w: int = 0) -> None:
