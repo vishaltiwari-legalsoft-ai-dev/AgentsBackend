@@ -25,6 +25,7 @@ from typing import Any, Callable, Optional
 from PIL import Image, ImageDraw, ImageFont
 
 from . import brochure_layout, brochure_render
+from .. import providers
 
 logger = logging.getLogger("graphics_designer.creative.document_builder")
 
@@ -468,11 +469,63 @@ def _study_brand_brochures(brand_id: Optional[str]) -> str:
         return ""
 
 
+# Guard clauses appended to every background prompt — backgrounds must never
+# carry their own copy or branding; the engine draws those on top.
+_BG_GUARD = ("editorial photography, natural light, generous negative space, "
+             "no text, no words, no logos, no watermarks")
+
+
+def _bg_prompt(page: dict[str, Any], palette: dict[str, Any], style_note: str) -> str:
+    """The full image-model prompt for one page's background."""
+    scene = (page.get("bg") or page.get("heading") or "abstract professional scene").strip()
+    if page.get("template") in ("cover", "cta_contact"):
+        mood = "hero-grade, cinematic, high production value"
+    else:
+        mood = "calm understated backdrop, muted, low contrast"
+    parts = [scene, mood,
+             f"brand palette around {palette['deep']} and {palette['light']}",
+             _BG_GUARD]
+    if style_note:
+        parts.append(f"House style: {style_note}")
+    return ". ".join(parts)
+
+
+def _render_brochure_backgrounds(pages: list[dict[str, Any]], pack: Any,
+                                 style_note: str) -> list[Optional[bytes]]:
+    """One background PNG per page via the GD image provider, generated in
+    parallel. ``None`` entries (no provider / a failed generation) make that page
+    fall back to the calm gradient — one failure never sinks the document."""
+    try:
+        provider = providers.get_provider(agent_id="a1")
+    except Exception as exc:  # noqa: BLE001 - offline → all-gradient brochure
+        logger.warning("brochure: no image provider (%s); gradient backgrounds", exc)
+        return [None] * len(pages)
+    palette = _brand_palette(pack)
+    w, h = brochure_render._BROCHURE_PAGE
+
+    def _one(page: dict[str, Any]) -> Optional[bytes]:
+        try:
+            png, _mime = provider.generate(
+                _bg_prompt(page, palette, style_note),
+                width=w, height=h, aspect_ratio=_BROCHURE_AR, image_size="2K",
+            )
+            return png
+        except Exception:  # noqa: BLE001 - page falls back to the gradient
+            logger.warning("brochure background failed for template=%s; gradient fallback",
+                           page.get("template"), exc_info=True)
+            return None
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=_BROCHURE_CONCURRENCY) as pool:
+        return list(pool.map(_one, pages))
+
+
 def build_brochure_pdf(plan: dict[str, Any], pack: Any,
                        on_artifact: OnArtifact = None) -> list[Artifact]:
-    """Designed brochure: cards on a calm brand background, composed on a grid and
-    assembled into a selectable-text PDF. Fully deterministic (no image provider),
-    so it never silently degrades to plain text."""
+    """Designed brochure: cards over AI-generated on-brand background photos
+    (strong hero treatment on cover/CTA, soft texture under content pages),
+    assembled into a selectable-text PDF. With no image provider every page
+    falls back to the calm gradient — never plain text."""
     if not _reportlab_available():
         raise RuntimeError(
             "Brochure (PDF) generation needs reportlab — add it to requirements "
@@ -489,16 +542,18 @@ def _designed_brochure_pdf(plan: dict[str, Any], pack: Any, *,
     Returns the PDF artifact and the per-page rasters (for page caching)."""
     palette = _brand_palette(pack)
     pages = brochure_layout.compose_brochure(plan)
+    style_note = _study_brand_brochures(getattr(pack, "id", None))
+    backgrounds = _render_brochure_backgrounds(pages, pack, style_note)
 
     def _fonts(size: int, name: Optional[str] = None):
         return _load_font(pack, size, name)
 
     rasters: list[bytes] = []
     assembled: list[tuple] = []
-    for page in pages:
+    for page, bg in zip(pages, backgrounds):
         png = brochure_layout.render_page(
             page, size=brochure_render._BROCHURE_PAGE, palette=palette,
-            font_loader=_fonts, logo_png=logo_png,
+            font_loader=_fonts, logo_png=logo_png, bg_png=bg,
         )
         rasters.append(png)
         assembled.append((png, {}, page.get("text_lines", [])))
