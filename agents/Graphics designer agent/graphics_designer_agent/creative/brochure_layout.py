@@ -46,10 +46,15 @@ class Grid:
         return [(int(self.margin + i * (width + gut)), int(width)) for i in range(n)]
 
 
+# Templates that carry a STRONG photographic background (hero pages); everything
+# else gets the soft texture treatment so white cards stay crisp.
+_PHOTO_STRONG = {"cover", "cta_contact"}
+
+
 class _Ctx:
     """Resolved drawing context handed to every template."""
 
-    def __init__(self, canvas, grid, palette, font_loader, logo_png):
+    def __init__(self, canvas, grid, palette, font_loader, logo_png, on_photo=False):
         self.c = canvas
         self.g = grid
         self.deep = _rgb(palette["deep"])
@@ -58,6 +63,7 @@ class _Ctx:
         self.light = _rgb(palette["light"])
         self.font = font_loader
         self.logo = logo_png
+        self.on_photo = on_photo
 
 
 # --------------------------------------------------------------------------- #
@@ -92,14 +98,16 @@ def _t_cover(p: dict, x: _Ctx) -> None:
     block_h = head_h + 38 + (64 + sub_h if sub_h else 0)
     # Center the title block vertically so the page doesn't read top-heavy.
     y = max(int(g.h * 0.28), (g.h - block_h) // 2)
-    y = br.draw_heading(x.c, (left, y), p.get("heading", ""), title_f, x.deep,
+    title_color = (255, 255, 255) if x.on_photo else x.deep
+    sub_color = (255, 255, 255) if x.on_photo else x.accent
+    y = br.draw_heading(x.c, (left, y), p.get("heading", ""), title_f, title_color,
                         max_w=width, highlight=p.get("highlight") or None,
                         highlight_color=x.accent)
     # A short accent rule under the title (a small brand flourish).
     br.draw_card(x.c, (left, y + 26, left + int(width * 0.16), y + 38),
                  fill=x.accent, radius=6, shadow=False)
     if p.get("subtitle"):
-        br.draw_paragraph(x.c, (left, y + 64), p["subtitle"], sub_f, x.accent, max_w=width)
+        br.draw_paragraph(x.c, (left, y + 64), p["subtitle"], sub_f, sub_color, max_w=width)
 
 
 def _t_card_grid(p: dict, x: _Ctx) -> None:
@@ -170,7 +178,8 @@ def _t_cta_contact(p: dict, x: _Ctx) -> None:
     msg_f = x.font(int(g.w * 0.030), "Causten Bold")
     line_f = x.font(int(g.w * 0.026), None)
     if p.get("heading"):
-        br.draw_heading(x.c, (g.margin, int(g.h * 0.10)), p["heading"], head_f, x.deep,
+        head_color = (255, 255, 255) if x.on_photo else x.deep
+        br.draw_heading(x.c, (g.margin, int(g.h * 0.10)), p["heading"], head_f, head_color,
                         max_w=g.content_w, highlight=p.get("highlight") or None,
                         highlight_color=x.accent)
     cy0, panel_h = int(g.h * 0.34), int(g.h * 0.42)
@@ -241,13 +250,24 @@ _TEMPLATES: dict[str, Callable[[dict, _Ctx], None]] = {
 }
 
 
-def render_page(page: dict, *, size, palette: dict, font_loader, logo_png=None) -> bytes:
-    """Render one brochure page to PNG bytes: calm background → template cards →
-    optional logo corner. Unknown templates fall back to ``feature``."""
-    bg = br.calm_background(size, _rgb(palette["light"]), _rgb(palette["deep"]))
+def render_page(page: dict, *, size, palette: dict, font_loader, logo_png=None,
+                bg_png: bytes | None = None) -> bytes:
+    """Render one brochure page to PNG bytes: photographic background (with a
+    legibility treatment) when ``bg_png`` is given, else the calm gradient →
+    template cards → optional logo corner. Unknown templates fall back to
+    ``feature``."""
+    template_name = page.get("template", "")
+    bg = None
+    if bg_png:
+        mode = "strong" if template_name in _PHOTO_STRONG else "soft"
+        bg = br.photo_background(size, bg_png, mode=mode,
+                                 light=_rgb(palette["light"]), deep=_rgb(palette["deep"]))
+    on_photo = bg is not None and template_name in _PHOTO_STRONG
+    if bg is None:
+        bg = br.calm_background(size, _rgb(palette["light"]), _rgb(palette["deep"]))
     grid = Grid(size[0], size[1])
-    ctx = _Ctx(bg, grid, palette, font_loader, logo_png)
-    template = _TEMPLATES.get(page.get("template", ""), _t_feature)
+    ctx = _Ctx(bg, grid, palette, font_loader, logo_png, on_photo=on_photo)
+    template = _TEMPLATES.get(template_name, _t_feature)
     template(page, ctx)
     if logo_png:
         try:

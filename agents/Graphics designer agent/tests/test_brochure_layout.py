@@ -53,3 +53,45 @@ def test_unknown_template_falls_back_to_feature_and_still_renders():
     data = bl.render_page({"template": "nope", "heading": "X"},
                           size=br._BROCHURE_PAGE, palette=PAL, font_loader=_fonts)
     assert _png_size(data) == br._BROCHURE_PAGE
+
+
+def _bg_bytes(color=(180, 40, 40)):
+    buf = io.BytesIO()
+    Image.new("RGB", (200, 250), color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+_PAGE = {"template": "cover", "heading": "Hello World", "subtitle": "Sub"}
+_PALETTE = {"deep": "#1746A2", "accent": "#5B8DEF", "text": "#0F0F0F", "light": "#F0F6FF"}
+
+
+def _fl(size, name=None):
+    return ImageFont.load_default()
+
+
+def test_render_page_with_bg_differs_from_without():
+    plain = bl.render_page(_PAGE, size=(310, 388), palette=_PALETTE, font_loader=_fl)
+    photo = bl.render_page(_PAGE, size=(310, 388), palette=_PALETTE,
+                                        font_loader=_fl, bg_png=_bg_bytes())
+    assert photo != plain
+
+
+def test_render_page_bad_bg_falls_back_byte_identical():
+    plain = bl.render_page(_PAGE, size=(310, 388), palette=_PALETTE, font_loader=_fl)
+    broken = bl.render_page(_PAGE, size=(310, 388), palette=_PALETTE,
+                                         font_loader=_fl, bg_png=b"garbage")
+    assert broken == plain
+
+
+def test_strong_templates_are_cover_and_cta():
+    assert bl._PHOTO_STRONG == {"cover", "cta_contact"}
+
+
+def test_content_page_gets_soft_treatment_pixels():
+    # card_grid page over a red photo: after the ~80% light wash the corner pixel
+    # must be much lighter than the raw photo colour.
+    page = {"template": "card_grid", "heading": "Grid", "cards": []}
+    png = bl.render_page(page, size=(310, 388), palette=_PALETTE,
+                                      font_loader=_fl, bg_png=_bg_bytes())
+    im = Image.open(io.BytesIO(png)).convert("RGB")
+    assert sum(im.getpixel((5, 380))) > sum((180, 40, 40))
