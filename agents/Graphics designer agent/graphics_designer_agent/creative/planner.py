@@ -136,6 +136,15 @@ def _presentation_plan(brief: str, brand_name: str, count: int) -> dict[str, Any
     return {"slides": slides}
 
 
+# Default background scenes per brochure template — short, photographic, no text.
+_PAGE_BG = {
+    "card_grid": "clean modern office environment, soft depth of field",
+    "steps": "collaborative professional team at work, bright workspace",
+    "testimonial": "warm professional setting, soft window light",
+    "cta_contact": "confident city skyline at dusk",
+}
+
+
 def _brochure_plan(brief: str, brand_name: str, count: int) -> dict[str, Any]:
     topic = _topic(brief, brand_name)
     kws = _keywords(brief, max(3, count)) or ["services", "approach", "support"]
@@ -159,9 +168,12 @@ def _brochure_plan(brief: str, brand_name: str, count: int) -> dict[str, Any]:
         {"template": "cta_contact", "heading": "Ready To Start?",
          "contact": {"website": f"{brand_name.lower().replace(' ', '')}.com"}},
     ]
+    for pg in pages:
+        pg["bg"] = f"{_PAGE_BG.get(pg['template'], 'abstract professional backdrop')}, evoking {topic}"
     return {
         "cover": {"title": topic, "highlight": _highlight(topic),
-                  "subtitle": f"A {brand_name} brochure"},
+                  "subtitle": f"A {brand_name} brochure",
+                  "bg": f"wide editorial photograph evoking {topic}, professional, cinematic"},
         "pages": pages,
     }
 
@@ -211,7 +223,7 @@ def _llm_plan(
     shape = {
         "carousel": '{"frames":[{"index":1,"role":"hook|body|cta","headline":"...","highlight":"<key phrase that appears verbatim in headline>","body":"...","subject":"<a DISTINCT on-brand foreground subject for THIS slide, different from every other slide, with generous negative space on one side for text>","visual":"..."}]}',
         "presentation": '{"slides":[{"index":1,"title":"...","bullets":["..."],"notes":"..."}]}',
-        "brochure": '{"cover":{"title":"...","highlight":"<key phrase verbatim in title>","subtitle":"..."},"pages":[{"template":"card_grid","heading":"...","highlight":"<verbatim>","cards":[{"title":"...","bullets":["...","..."],"initials":"AB"}]},{"template":"steps","heading":"...","steps":[{"title":"...","desc":"..."}]},{"template":"testimonial","quote":"...","author":"..."},{"template":"cta_contact","heading":"...","contact":{"phone":"...","email":"...","website":"..."}}]}',
+        "brochure": '{"cover":{"title":"...","highlight":"<key phrase verbatim in title>","subtitle":"...","bg":"<short photographic scene for the cover background — no text, no logos>"},"pages":[{"template":"card_grid","heading":"...","highlight":"<verbatim>","bg":"<short photographic scene for this page background — no text, no logos>","cards":[{"title":"...","bullets":["...","..."],"initials":"AB"}]},{"template":"steps","heading":"...","bg":"...","steps":[{"title":"...","desc":"..."}]},{"template":"testimonial","quote":"...","author":"...","bg":"..."},{"template":"cta_contact","heading":"...","bg":"...","contact":{"phone":"...","email":"...","website":"..."}}]}',
         "blog": '{"cover":{"title":"...","subtitle":"...","visual":"..."},"inline":[{"caption":"...","visual":"..."}]}',
     }[creative_type]
     carousel_note = (

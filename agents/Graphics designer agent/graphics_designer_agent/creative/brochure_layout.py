@@ -346,6 +346,7 @@ def compose_brochure(plan: dict) -> list[dict]:
         "heading": cover_src.get("title", ""),
         "highlight": cover_src.get("highlight", ""),
         "subtitle": cover_src.get("subtitle", ""),
+        "bg": cover_src.get("bg", ""),
     }]
 
     if plan.get("pages"):
