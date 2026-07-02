@@ -353,20 +353,51 @@ def build_carousel_frames(plan: dict[str, Any], pack: Any,
 
 def build_blog_images(plan: dict[str, Any], pack: Any,
                       on_artifact: OnArtifact = None) -> list[Artifact]:
-    from .. import reference_library as rl
+    """Real, photorealistic blog imagery — one AI-generated image per visual in
+    the plan (cover + in-article), straight from the plan's rich ``visual``
+    prompts. A blog hero/section image is just a clean editorial photo: NO brand
+    gradient, NO baked-in text — exactly what a good single prompt produces.
 
-    w, h = rl.type_spec("blog").get("target_dims", (1600, 900))
+    Falls back to a branded gradient frame PER image only if generation is
+    unavailable (no provider / API error), so the user always gets a downloadable
+    asset instead of nothing.
+    """
+    from .. import providers, reference_library as rl
+
+    spec = rl.type_spec("blog")
+    w, h = spec.get("target_dims", (1600, 900))
+    ar = spec.get("aspect_ratio", "16:9")
+    try:
+        provider = providers.get_provider(agent_id="a1")  # the GD agent's image model
+    except Exception as exc:  # noqa: BLE001 - no provider configured → all fallback
+        logger.warning("blog: no image provider (%s); using gradient frames", exc)
+        provider = None
+
+    def _image(prompt: str, fb_head: str, fb_body: str, role: str) -> bytes:
+        """A real generated image for ``prompt``; a branded gradient frame if that
+        isn't possible (so one failure never sinks the set)."""
+        if provider is not None and (prompt or "").strip():
+            try:
+                png, _mime = provider.generate(
+                    prompt, width=w, height=h, aspect_ratio=ar, image_size="2K",
+                )
+                return png
+            except Exception as exc:  # noqa: BLE001 - one image failing ≠ whole set
+                logger.warning("blog image generation failed (%s); gradient fallback", exc)
+        return _render_text_frame(pack, (w, h), headline=fb_head, body=fb_body,
+                                  role=role, footer=getattr(pack, "name", ""))
+
     out: list[Artifact] = []
     cover = plan.get("cover", {})
-    out.append(("cover.png", _render_text_frame(
-        pack, (w, h), headline=cover.get("title", "Blog"),
-        body=cover.get("subtitle", ""), role="cover",
-        footer=getattr(pack, "name", "")), "image/png"))
+    out.append(("cover.png",
+                _image(cover.get("visual", ""), cover.get("title", "Blog"),
+                       cover.get("subtitle", ""), "cover"),
+                "image/png"))
     for i, inl in enumerate(plan.get("inline", []), 1):
-        out.append((f"inline-{i:02d}.png", _render_text_frame(
-            pack, (w, h), headline=inl.get("caption", f"Figure {i}"),
-            body=inl.get("visual", ""), role="body",
-            footer=f"{getattr(pack, 'name', '')} · figure {i}"), "image/png"))
+        out.append((f"inline-{i:02d}.png",
+                    _image(inl.get("visual", ""), inl.get("caption", f"Figure {i}"),
+                           inl.get("visual", ""), "body"),
+                    "image/png"))
     return _emit(on_artifact, out)
 
 
