@@ -9,8 +9,8 @@ test("health responds ok", async () => {
   assert.deepEqual(res.json(), { ok: true });
 });
 
-test("render is wired (501 until the scene builder lands)", async () => {
+test("render rejects an unknown contract version", async () => {
   const app = buildApp();
-  const res = await app.inject({ method: "POST", url: "/render", payload: { v: 1 } });
-  assert.equal(res.statusCode, 501);
+  const res = await app.inject({ method: "POST", url: "/render", payload: { v: 99 } });
+  assert.equal(res.statusCode, 400);
 });
