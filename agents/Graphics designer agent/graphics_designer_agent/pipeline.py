@@ -10,7 +10,7 @@ from dataclasses import asdict
 from io import BytesIO
 
 from . import layout as gd_layout
-from . import registry, text_overlay, variants
+from . import registry, render, text_overlay, variants
 from .compositor import composite_logo, logo_placement
 from .providers import ImageProvider, get_provider
 from .runs import (
@@ -318,7 +318,7 @@ def _generate_stage3(run: dict) -> dict:
     layers = gd_layout.resolve_layers(run)
     canvas_w, canvas_h = _stage_dims(run, 3)
     w, h, px_scale = _hires_canvas(base, canvas_w, canvas_h)
-    png = text_overlay.render_layers(
+    png = render.render_layers(
         base, layers, w, h, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id")),
         image_loader=lambda ref: read_artifact(run["id"], ref),
     )
@@ -387,7 +387,7 @@ def render_stage3_preview(run: dict, *, tokens: dict | None = None,
     pw = max(1, min(max_w, canvas_w))
     ph = max(1, round(canvas_h * pw / canvas_w))
     px_scale = pw / canvas_w  # the user's pixel nudges are calibrated to canvas_w
-    return text_overlay.render_layers(
+    return render.render_layers(
         base, layers, pw, ph, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id")),
         image_loader=lambda ref: read_artifact(run["id"], ref),
     )
@@ -674,7 +674,7 @@ def render_frame_on_base(
     layers = gd_layout.resolve_layers(view)
     canvas_w, canvas_h = _stage_dims(view, 3)
     w, h, px_scale = _hires_canvas(base, canvas_w, canvas_h)
-    png = text_overlay.render_layers(
+    png = render.render_layers(
         base, layers, w, h, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id"))
     )
     if logo_png:
