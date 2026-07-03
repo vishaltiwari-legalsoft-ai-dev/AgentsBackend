@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
-import { createCanvas } from "canvas";
+import { createCanvas, loadImage } from "canvas";
 import { buildApp } from "../src/app.js";
 
 const FONTS = fileURLToPath(
@@ -68,4 +68,40 @@ test("raster layers composite in z order without error", async () => {
   const app = buildApp({ fontsDir: FONTS });
   const res = await app.inject({ method: "POST", url: "/render", payload: makeReq([raster]) });
   assert.equal(res.statusCode, 200);
+});
+
+async function pixelAt(buf, x, y, w, h) {
+  const img = await loadImage(buf);
+  const c = createCanvas(w, h);
+  const cx = c.getContext("2d");
+  cx.drawImage(img, 0, 0);
+  return cx.getImageData(x, y, 1, 1).data;
+}
+
+test("a default CTA paints an orange pill at bottom-center", async () => {
+  const cta = { type: "cta", id: "cta", text: "Book a call", font: "Causten Bold",
+                font_file: "Causten-Bold.otf", size_pct: 3.4, color: "cta",
+                placement: "bottom", offset: [0, 0], z: 20, pinned: false,
+                x: 0.5, y: 0.94, w: 0.88, anchor: "bc" };
+  const app = buildApp({ fontsDir: FONTS });
+  const res = await app.inject({ method: "POST", url: "/render",
+                                 payload: makeReq([cta], 400, 500) });
+  assert.equal(res.statusCode, 200);
+  // Pill sits at bottom center: sample a pixel just inside its left half.
+  // my = trunc(0.06*500)=30 → pill bottom at 470; probe ~20px above bottom, center x.
+  const [r, g, b] = await pixelAt(res.rawPayload, 200, 450, 400, 500);
+  assert.ok(r > 180 && r > b, `expected orange-ish pill pixel, got rgb(${r},${g},${b})`);
+});
+
+test("a hex CTA color changes the pill pixels", async () => {
+  const base = { type: "cta", id: "cta", text: "Book a call", font: "Causten Bold",
+                 font_file: "Causten-Bold.otf", size_pct: 3.4, placement: "bottom",
+                 offset: [0, 0], z: 20, pinned: false,
+                 x: 0.5, y: 0.94, w: 0.88, anchor: "bc" };
+  const app = buildApp({ fontsDir: FONTS });
+  const orange = await app.inject({ method: "POST", url: "/render",
+    payload: makeReq([{ ...base, color: "cta" }], 400, 500) });
+  const green = await app.inject({ method: "POST", url: "/render",
+    payload: makeReq([{ ...base, color: "#00AA00" }], 400, 500) });
+  assert.notDeepEqual(green.rawPayload, orange.rawPayload);
 });
