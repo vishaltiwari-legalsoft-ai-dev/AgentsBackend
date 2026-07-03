@@ -3,6 +3,6 @@
   "private": true,
   "type": "module",
   "engines": { "node": ">=20" },
-  "scripts": { "start": "node src/server.js", "test": "node --test test/" },
+  "scripts": { "start": "node src/server.js", "test": "node --test" },
   "dependencies": { "canvas": "^3.0.0", "fastify": "^4.28.1", "konva": "^9.3.14" }
 }
