@@ -6,7 +6,11 @@ side only renders text/CTA and composites images."""
 from __future__ import annotations
 
 import base64
+from io import BytesIO
 
+from PIL import Image
+
+from . import elements as gd_elements
 from . import text_overlay
 from .variants import LOCKED_COLORS, font_file as default_font_file
 
@@ -46,4 +50,13 @@ def build_render_request(base_png: bytes, layers: list, base_w: int, base_h: int
 
 
 def _raster_entry(layer, base_w, base_h, px_scale, pack, image_loader) -> dict:
-    raise NotImplementedError  # Task 2
+    canvas = Image.new("RGBA", (base_w, base_h), (0, 0, 0, 0))
+    if layer["type"] == "shape":
+        theme = text_overlay.theme_for_pack(pack)
+        text_overlay.draw_shape_layer(canvas, layer, base_w, base_h, theme, px_scale)
+    else:
+        gd_elements.draw_element(canvas, layer, base_w, base_h, image_loader=image_loader)
+    out = BytesIO()
+    canvas.save(out, format="PNG")
+    return {"type": "raster", "group": layer["type"], "z": int(layer.get("z", 0)),
+            "png_b64": base64.b64encode(out.getvalue()).decode("ascii")}
