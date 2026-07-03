@@ -523,3 +523,13 @@ def overlay_spec_summary(spec: dict) -> str:
             f"nudge {tuple(c.get('offset', (0, 0)))} · locked orange pill"
         )
     return "\n".join(lines)
+
+
+def theme_for_pack(pack=None) -> _Theme:
+    """Public theme resolver for the render contract (Konva migration)."""
+    return _theme_from_pack(pack) if pack is not None else _default_theme()
+
+
+# Public alias so render_contract can rasterize shape layers without reaching
+# into a private. Same code path the Pillow engine uses — parity by construction.
+draw_shape_layer = _draw_shape
