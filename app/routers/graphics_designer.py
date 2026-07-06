@@ -257,6 +257,13 @@ def _apply_element_styles(cfg: dict, incoming: dict, pack) -> None:
             if patch["placement"] not in allowed:
                 raise HTTPException(400, f"Unknown placement '{patch['placement']}' for '{key}'")
             cur["placement"] = patch["placement"]
+        if "align" in patch:
+            if patch["align"] not in (None, "left", "center", "right"):
+                raise HTTPException(400, "align must be left, center or right")
+            if patch["align"] is None:
+                cur.pop("align", None)
+            else:
+                cur["align"] = patch["align"]
         if "size_pct" in patch:
             if not meta.get("sizable"):
                 raise HTTPException(400, f"Element '{key}' has no size control.")
@@ -297,12 +304,16 @@ def _apply_subheadings(cfg: dict, incoming: list, pack) -> None:
         placement = item.get("placement", "left")
         if placement not in text_places:
             raise HTTPException(400, f"Unknown placement '{placement}'")
+        align = item.get("align")
+        if align not in (None, "left", "center", "right"):
+            raise HTTPException(400, "align must be left, center or right")
         out.append({
             "text": text,
             "font": font,
             "color": color,
             "size_pct": _valid_size_pct(item.get("size_pct", text_opts.DEFAULT_TEXT_SIZE_PCT["subheading"])),
             "placement": placement,
+            **({"align": align} if align else {}),
             "offset_x": _valid_offset(item.get("offset_x", 0), "offset_x"),
             "offset_y": _valid_offset(item.get("offset_y", 0), "offset_y"),
             "approved": bool(item.get("approved", False)),
@@ -482,6 +493,26 @@ def gd_elements(_user: dict = Depends(get_current_user)) -> dict:
         "stickers": elements_mod.sticker_catalog(),
         "max_elements": elements_mod.MAX_ELEMENTS,
     }
+
+
+@router.get("/gd/fonts/{font_name}")
+def gd_font_endpoint(font_name: str, brand: str | None = None,
+                     user: dict = Depends(get_current_user)):
+    """Serve one brand font file so the V2 editor canvas renders TRUE brand
+    typography client-side. Names are validated against the pack's catalog
+    (no path traversal); files are immutable, so cache hard."""
+    from fastapi import Response
+
+    from graphics_designer_agent import registry
+
+    pack = registry.get_pack(brand)
+    if font_name not in set(pack.font_names()):
+        raise HTTPException(404, f"Unknown font '{font_name}'")
+    path = pack.fonts_dir / pack.font_file(font_name)
+    if not path.exists():
+        raise HTTPException(404, "Font file missing on the server.")
+    return Response(content=path.read_bytes(), media_type="font/otf",
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 @router.get("/gd/prompts")

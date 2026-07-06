@@ -150,6 +150,7 @@ def _resolve_overlay_spec(run: dict) -> dict:
         "size_pct": float(hs.get("size_pct", sizes["headline"])),
         "color": hs.get("color", "dark"),
         "highlight_color": his.get("color", "gradient"),
+        "align": hs.get("align"),
         "placement": hs.get("placement", DEFAULT_TEXT_PLACEMENT),
         "offset": off(hs),
     }
@@ -162,6 +163,7 @@ def _resolve_overlay_spec(run: dict) -> dict:
             "text": s["text"], "font": s.get("font") or base_font,
             "size_pct": float(s.get("size_pct", sizes["subheading"])),
             "color": s.get("color", "dark"),
+            "align": s.get("align"),
             "placement": s.get("placement", DEFAULT_TEXT_PLACEMENT),
             "offset": off(s),
         }

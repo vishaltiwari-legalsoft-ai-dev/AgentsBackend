@@ -160,6 +160,9 @@ def _headline_tokens(text: str, highlight: str):
 def _element_layout(elem: dict, base_w: int, base_h: int, mx: int, theme: _Theme):
     font = _font(elem["font"], elem["size_pct"] / 100 * base_w, theme)
     max_w, ha, va = _zone(elem["placement"], base_w, base_h, mx)
+    # Optional per-element alignment override (left/center/right). Absent →
+    # the zone default, keeping every existing render byte-identical.
+    ha = elem.get("align") or ha
     lines = _wrap(elem["tokens"], font, max_w)
     asc, desc = font.getmetrics()
     lh = int((asc + desc) * elem.get("line_gap", 1.3))
@@ -283,7 +286,7 @@ def _headline_element(h: dict, theme: _Theme) -> dict:
     hl = layout.resolve_color(h.get("highlight_color", "gradient"), td, "gradient")
     return {
         "tokens": _headline_tokens(h["text"], h.get("highlight", "")),
-        "font": h["font"], "size_pct": h["size_pct"],
+        "font": h["font"], "size_pct": h["size_pct"], "align": h.get("align"),
         "placement": h.get("placement", "left"), "offset": h.get("offset", (0, 0)),
         "line_gap": 1.15, "color_for": (lambda t, m=main, g=hl: g if t[1] else m),
     }
@@ -295,7 +298,7 @@ def _sub_element(sh: dict, theme: _Theme) -> dict:
     fill = layout.resolve_color(sh.get("color", "dark"), td, "dark")
     return {
         "tokens": [(w, False) for w in sh["text"].split()] or [("", False)],
-        "font": sh["font"], "size_pct": sh["size_pct"],
+        "font": sh["font"], "size_pct": sh["size_pct"], "align": sh.get("align"),
         "placement": sh.get("placement", "left"), "offset": sh.get("offset", (0, 0)),
         "line_gap": 1.4, "color_for": (lambda t, f=fill: f),
     }
@@ -367,8 +370,17 @@ def _draw_text_abs(canvas, layer: dict, base_w, base_h, theme: _Theme, px_scale)
     left, top = layout.anchor_to_xy(layer["x"], layer["y"], box_w, box_h, layer["anchor"], base_w, base_h)
     left += round(layer["offset"][0] * px_scale)
     top += round(layer["offset"][1] * px_scale)
+    # Per-line alignment inside the wrapped box. Default "left" is the
+    # historical behavior, so runs without ``align`` stay byte-identical.
+    align = layer.get("align") or "left"
     for i, ln in enumerate(lines):
-        cx, yy = left, top + i * lh
+        if align == "center":
+            cx = left + (box_w - widths[i]) / 2
+        elif align == "right":
+            cx = left + (box_w - widths[i])
+        else:
+            cx = left
+        yy = top + i * lh
         for tok in ln:
             fill = hl if (is_head and tok[1]) else main
             _draw_run(canvas, int(cx), int(yy), tok[0], font, fill)
@@ -383,12 +395,14 @@ def _layers_from_spec(spec: dict) -> list[dict]:
                    "highlight": h.get("highlight", ""), "font": h["font"],
                    "size_pct": h["size_pct"], "color": h.get("color", "dark"),
                    "highlight_color": h.get("highlight_color", "gradient"),
+                   "align": h.get("align"),
                    "placement": h.get("placement", "left"), "offset": h.get("offset", (0, 0)),
                    "z": 10, "pinned": False, **layout.default_coords(h.get("placement", "left"), "text")})
     for i, sh in enumerate(spec.get("subheadings", [])):
         layers.append({"type": "text", "id": f"subheading-{i}", "text": sh["text"],
                        "highlight": "", "font": sh["font"], "size_pct": sh["size_pct"],
                        "color": sh.get("color", "dark"), "highlight_color": "gradient",
+                       "align": sh.get("align"),
                        "placement": sh.get("placement", "left"), "offset": sh.get("offset", (0, 0)),
                        "z": 11 + i, "pinned": False,
                        **layout.default_coords(sh.get("placement", "left"), "text")})
@@ -411,8 +425,10 @@ def _parts_from_layers(layers: list[dict]):
         h = {"text": head["text"], "highlight": head.get("highlight", ""), "font": head["font"],
              "size_pct": head["size_pct"], "color": head["color"],
              "highlight_color": head.get("highlight_color", "gradient"),
+             "align": head.get("align"),
              "placement": head["placement"], "offset": head["offset"]}
     sh = [{"text": s["text"], "font": s["font"], "size_pct": s["size_pct"], "color": s["color"],
+           "align": s.get("align"),
            "placement": s["placement"], "offset": s["offset"]} for s in subs]
     c = None
     if cta:
