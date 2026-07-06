@@ -501,14 +501,41 @@ def gd_prompts(brand: str | None = None, _user: dict = Depends(get_current_user)
 # ── run lifecycle ─────────────────────────────────────────────────────────────
 class CreateRunBody(BaseModel):
     brand_id: str | None = None
+    # Optional setup-screen fields (V2 UI) — applied atomically at creation so
+    # the strategist + suggestions are grounded from the very first call.
+    aspect_ratio: str | None = None
+    creative_type: str | None = None
+    creative_brief: dict[str, str] | None = None
 
 
 @router.post("/gd/runs")
 def create_run_endpoint(body: CreateRunBody = Body(default=CreateRunBody()),
                         user: dict = Depends(get_current_user)) -> dict:
-    from graphics_designer_agent.runs import create_run
+    from graphics_designer_agent.runs import create_run, save_run
+
+    if body.aspect_ratio is not None and body.aspect_ratio not in ASPECT_RATIOS:
+        raise HTTPException(400, f"Unknown aspect ratio '{body.aspect_ratio}'")
 
     run = create_run(user_id=str(user["id"]), brand_id=body.brand_id)
+    changed = False
+    if body.aspect_ratio is not None:
+        run["config"]["aspect_ratio"] = body.aspect_ratio
+        changed = True
+    if body.creative_type is not None:
+        # Informational for now — this pipeline renders social creatives; other
+        # types route to the Creative Agent rail.
+        run["config"]["creative_type"] = body.creative_type
+        changed = True
+    if body.creative_brief:
+        brief = dict(run["config"].get("creative_brief") or {})
+        for k, v in body.creative_brief.items():
+            text = (v or "").strip()
+            if text:
+                brief[k] = text
+        run["config"]["creative_brief"] = brief
+        changed = True
+    if changed:
+        save_run(run)
     _log_usage(user, "session", brand=body.brand_id)  # one run = one GD session
     _start_run(user, run)  # open the Table-1 + Table-2 rows for this run
     return _to_client(run)
@@ -542,6 +569,9 @@ class ConfigBody(BaseModel):
     custom_gradient: dict | None = None
     # Per-creative temporary AI element (Stage 2). Explicit null clears it.
     custom_element: dict | None = None
+    # Uploaded Stage-2 subject (composite mode, variant "UPLOAD"). Must be an
+    # artifact ref owned by this run (from /subject/upload). Explicit null clears.
+    subject_asset_ref: str | None = None
     # Pre-generation discovery brief (feeling/audience/tone/style/event/theme).
     # Shallow-merged onto the run so the conversation is durable + reaches every
     # suggestion. Keys with empty values are dropped (lets the UI clear an answer).
@@ -629,6 +659,16 @@ def update_config(run_id: str, body: ConfigBody, user: dict = Depends(get_curren
         _apply_custom_gradient(cfg, body.custom_gradient, pack)
     if "custom_element" in body.model_fields_set:
         _apply_custom_element(cfg, body.custom_element)
+    if "subject_asset_ref" in body.model_fields_set:
+        if body.subject_asset_ref is None:
+            cfg["subject_asset_ref"] = None
+        else:
+            # Same C1 rule as image elements: the ref must belong to this run.
+            if not is_own_artifact_ref(run_id, body.subject_asset_ref):
+                raise HTTPException(
+                    400, f"Invalid subject ref (not owned by this run): {body.subject_asset_ref!r}"
+                )
+            cfg["subject_asset_ref"] = body.subject_asset_ref
     if body.creative_brief is not None:
         brief = dict(cfg.get("creative_brief") or {})
         for k, v in body.creative_brief.items():
@@ -894,6 +934,38 @@ async def gd_element_upload(run_id: str, file: UploadFile = File(...),
     # collide on the same path and identical re-uploads dedupe to one file.
     token = hashlib.sha256(data).hexdigest()[:16]
     rel = save_artifact(run["id"], 3, "upload", token, data)
+    return {"ref": rel}
+
+
+@router.post("/gd/runs/{run_id}/subject/upload")
+async def gd_subject_upload(run_id: str, file: UploadFile = File(...),
+                            user: dict = Depends(get_current_user)) -> dict:
+    """Upload an image to use as the Stage-2 subject (composite mode).
+
+    Unlike ``/elements/upload`` (Stage-3 overlay stickers, PNG/WebP only) this
+    accepts JPEG too and normalizes everything to PNG. The returned ``ref`` is
+    stored via config ``subject_asset_ref`` and consumed by Stage-2 variant
+    ``UPLOAD``."""
+    run = _owned_run(run_id, user)
+    if (file.content_type or "") not in ("image/png", "image/webp", "image/jpeg"):
+        raise HTTPException(400, "Only PNG, WebP or JPEG uploads are supported.")
+    data = await file.read()
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(400, "Image too large (max 10 MB).")
+    # Normalize to PNG so the artifact store serves one consistent format.
+    from io import BytesIO
+
+    from PIL import Image, UnidentifiedImageError
+
+    try:
+        img = Image.open(BytesIO(data))
+        buf = BytesIO()
+        img.convert("RGBA").save(buf, format="PNG")
+        data = buf.getvalue()
+    except UnidentifiedImageError as exc:
+        raise HTTPException(400, "That file doesn't look like a valid image.") from exc
+    token = hashlib.sha256(data).hexdigest()[:16]
+    rel = save_artifact(run["id"], 2, "subject", token, data)
     return {"ref": rel}
 
 

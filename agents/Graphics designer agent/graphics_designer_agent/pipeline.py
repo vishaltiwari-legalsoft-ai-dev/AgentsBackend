@@ -410,6 +410,12 @@ def generate(run: dict, stage: int, variant: str | None = None,
     if stage == 3:
         # Deterministic text overlay — no image model, no upstream prompt.
         return _generate_stage3(run)
+    if stage == 2 and (variant or "").strip().upper() == "UPLOAD":
+        # Composite mode: the user's uploaded subject is pasted onto the
+        # approved Stage-1 image deterministically — no image model. Only
+        # reachable via variant "UPLOAD"; every other variant keeps the
+        # byte-identical AI-generation path.
+        return _generate_stage2_composite(run)
     provider = provider or get_provider(agent_id=GD_AGENT_ID)
     key = str(stage)
 
@@ -460,6 +466,53 @@ def generate(run: dict, stage: int, variant: str | None = None,
     st["attempts"].append(attempt)
     st["variant"] = variant
     run["state"] = STATE_FOR_STAGE_REVIEW[stage]
+    save_run(run)
+    return attempt
+
+
+def _generate_stage2_composite(run: dict) -> dict:
+    """Stage-2 attempt from the user's uploaded subject (variant ``UPLOAD``).
+
+    Deterministic: approved Stage-1 image + ``config.subject_asset_ref`` are
+    composited with Pillow, honoring the ``element_placement`` grid. No image
+    model is involved, so the result is instant and free.
+    """
+    from .runs import read_artifact
+    from .stage2_element.composite import paste_subject
+
+    base = _approved_png(run, 1)
+    if base is None:
+        raise PipelineError("Stage 2 requires the approved Stage 1 image.")
+    ref = (run.get("config") or {}).get("subject_asset_ref")
+    if not ref:
+        raise PipelineError(
+            "Variant UPLOAD needs an uploaded subject — POST /subject/upload first."
+        )
+    try:
+        subject = read_artifact(run["id"], ref)
+    except ValueError as exc:
+        raise PipelineError(str(exc)) from exc
+
+    png = paste_subject(base, subject, run["config"].get("element_placement"))
+    key = "2"
+    attempt_no = len(run["stages"][key]["attempts"]) + 1
+    rel = save_artifact(run["id"], 2, "UPLOAD", attempt_no, png)
+    attempt = {
+        "attempt": attempt_no,
+        "variant": "UPLOAD",
+        "artifact": rel,
+        "prompt": "(deterministic composite of the uploaded subject — no image model)",
+        "prompt_hash": _sha(f"upload-composite:{ref}"),
+        "diffs": [],
+        "warnings": [],
+        "provider": "upload-composite",
+        "method": "deterministic",
+        "created_at": now_iso(),
+    }
+    st = run["stages"][key]
+    st["attempts"].append(attempt)
+    st["variant"] = "UPLOAD"
+    run["state"] = STATE_FOR_STAGE_REVIEW[2]
     save_run(run)
     return attempt
 
