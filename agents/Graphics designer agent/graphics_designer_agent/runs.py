@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .compositor import default_logo_layout
+from .stage4_logo.compositor import default_logo_layout
 from .tokens import DEFAULT_AR, DEFAULT_CTA_PLACEMENT, DEFAULT_TEXT_PLACEMENT
 
 # Per-brand factory defaults (font, copy, element styles, sub-headings) come from

@@ -8,8 +8,8 @@ untouched unless the user opts in.
 
 from graphics_designer_agent import pipeline
 from graphics_designer_agent.runs import create_run
-from graphics_designer_agent.tokens import place_subject
-from graphics_designer_agent.variants import STAGE2_PLACEMENTS, STAGE2_VARIANTS
+from graphics_designer_agent.stage2_element import place_subject
+from graphics_designer_agent.stage2_element import STAGE2_PLACEMENTS, STAGE2_VARIANTS
 
 _KEYS = {p["key"] for p in STAGE2_PLACEMENTS}
 _CELLS = _KEYS - {"auto"}

@@ -18,11 +18,7 @@ from pydantic import BaseModel, Field
 from app.security import get_current_user
 from app.services import firestore_repo, imaging, storage
 
-from graphics_designer_agent import elements as elements_mod
-from graphics_designer_agent import icons as icons_mod
-from graphics_designer_agent import layout as gd_layout
-from graphics_designer_agent import shapes as shapes_mod
-from graphics_designer_agent import pipeline, registry, suggestions, variants
+from graphics_designer_agent import pipeline, registry, stage2_element, suggestions, variants
 from graphics_designer_agent.pipeline import PipelineError
 from graphics_designer_agent.runs import (
     get_run,
@@ -31,6 +27,12 @@ from graphics_designer_agent.runs import (
     save_artifact,
     save_run,
 )
+from graphics_designer_agent.stage3_text import elements as elements_mod
+from graphics_designer_agent.stage3_text import icons as icons_mod
+from graphics_designer_agent.stage3_text import layout as gd_layout
+from graphics_designer_agent.stage3_text import shapes as shapes_mod
+from graphics_designer_agent.stage3_text import style_options as text_opts
+from graphics_designer_agent.stage4_logo import options as logo_opts
 from graphics_designer_agent.tokens import ASPECT_RATIOS
 
 router = APIRouter()
@@ -146,10 +148,10 @@ def _valid_size_pct(v) -> float:
         v = float(v)
     except (TypeError, ValueError):
         raise HTTPException(400, "size_pct must be a number")
-    if not variants.TEXT_SIZE_PCT_MIN <= v <= variants.TEXT_SIZE_PCT_MAX:
+    if not text_opts.TEXT_SIZE_PCT_MIN <= v <= text_opts.TEXT_SIZE_PCT_MAX:
         raise HTTPException(
-            400, f"size_pct must be between {variants.TEXT_SIZE_PCT_MIN} and "
-            f"{variants.TEXT_SIZE_PCT_MAX}")
+            400, f"size_pct must be between {text_opts.TEXT_SIZE_PCT_MIN} and "
+            f"{text_opts.TEXT_SIZE_PCT_MAX}")
     return round(v, 2)
 
 
@@ -158,7 +160,7 @@ def _valid_offset(v, axis: str) -> int:
         v = int(round(float(v)))
     except (TypeError, ValueError):
         raise HTTPException(400, f"{axis} must be an integer")
-    if abs(v) > variants.TEXT_OFFSET_PX_RANGE:
+    if abs(v) > text_opts.TEXT_OFFSET_PX_RANGE:
         raise HTTPException(400, f"{axis} out of range")
     return v
 
@@ -227,10 +229,10 @@ def _apply_element_styles(cfg: dict, incoming: dict, pack) -> None:
     placement key, placeable elements only). Unknown elements/attributes or
     out-of-family values are rejected so the prompt only ever sees valid input.
     """
-    elements = {e["key"]: e for e in variants.STAGE3_ELEMENTS}
+    elements = {e["key"]: e for e in text_opts.STAGE3_ELEMENTS}
     fonts = set(pack.font_names())
-    text_places = {p["key"] for p in variants.TEXT_PLACEMENTS}
-    cta_places = {p["key"] for p in variants.CTA_PLACEMENTS}
+    text_places = {p["key"] for p in text_opts.TEXT_PLACEMENTS}
+    cta_places = {p["key"] for p in text_opts.CTA_PLACEMENTS}
     styles = cfg.setdefault("element_styles", {})
 
     for key, patch in incoming.items():
@@ -273,12 +275,12 @@ def _apply_subheadings(cfg: dict, incoming: list, pack) -> None:
     nudge so the deterministic renderer can place it exactly."""
     if not isinstance(incoming, list):
         raise HTTPException(400, "subheadings must be a list")
-    if not variants.SUBHEADING_MIN <= len(incoming) <= variants.SUBHEADING_MAX:
+    if not text_opts.SUBHEADING_MIN <= len(incoming) <= text_opts.SUBHEADING_MAX:
         raise HTTPException(
-            400, f"Sub-headings must number {variants.SUBHEADING_MIN}–"
-            f"{variants.SUBHEADING_MAX}.")
+            400, f"Sub-headings must number {text_opts.SUBHEADING_MIN}–"
+            f"{text_opts.SUBHEADING_MAX}.")
     fonts = set(pack.font_names())
-    text_places = {p["key"] for p in variants.TEXT_PLACEMENTS}
+    text_places = {p["key"] for p in text_opts.TEXT_PLACEMENTS}
     out: list[dict] = []
     for item in incoming:
         if not isinstance(item, dict):
@@ -299,7 +301,7 @@ def _apply_subheadings(cfg: dict, incoming: list, pack) -> None:
             "text": text,
             "font": font,
             "color": color,
-            "size_pct": _valid_size_pct(item.get("size_pct", variants.DEFAULT_TEXT_SIZE_PCT["subheading"])),
+            "size_pct": _valid_size_pct(item.get("size_pct", text_opts.DEFAULT_TEXT_SIZE_PCT["subheading"])),
             "placement": placement,
             "offset_x": _valid_offset(item.get("offset_x", 0), "offset_x"),
             "offset_y": _valid_offset(item.get("offset_y", 0), "offset_y"),
@@ -362,9 +364,9 @@ def _apply_custom_element(cfg: dict, patch: dict | None) -> None:
 
 def _apply_logo_layout(cfg: dict, patch: dict) -> None:
     """Validate + merge the Stage-4 logo placement controls into the run config."""
-    from graphics_designer_agent.compositor import default_logo_layout
+    from graphics_designer_agent.stage4_logo.compositor import default_logo_layout
 
-    positions = {p["key"] for p in variants.LOGO_POSITIONS}
+    positions = {p["key"] for p in logo_opts.LOGO_POSITIONS}
     cur = {**default_logo_layout(), **(cfg.get("logo_layout") or {})}
 
     if "position" in patch:
@@ -395,7 +397,7 @@ def _apply_logo_layout(cfg: dict, patch: dict) -> None:
                 cur[axis] = int(round(float(patch[axis])))
             except (TypeError, ValueError):
                 raise HTTPException(400, f"logo {axis} must be an integer")
-            if abs(cur[axis]) > variants.LOGO_OFFSET_PX_RANGE:
+            if abs(cur[axis]) > logo_opts.LOGO_OFFSET_PX_RANGE:
                 raise HTTPException(400, f"logo {axis} out of range")
     cfg["logo_layout"] = cur
 
@@ -440,27 +442,27 @@ def gd_config(brand: str | None = None, _user: dict = Depends(get_current_user))
         "stage1_variants": pack.stage1_variants,
         "stage2_variants": pack.stage2_variants,
         "stage2_categories": pack.stage2_categories,
-        "stage2_placements": variants.STAGE2_PLACEMENTS,
+        "stage2_placements": stage2_element.STAGE2_PLACEMENTS,
         "fonts": pack.font_names(),
         "font_family": pack.font_family,
         "font_variants": pack.font_variants,
-        "text_placements": variants.TEXT_PLACEMENTS,
-        "cta_placements": variants.CTA_PLACEMENTS,
+        "text_placements": text_opts.TEXT_PLACEMENTS,
+        "cta_placements": text_opts.CTA_PLACEMENTS,
         "text_colors": pack.text_colors,
-        "stage3_elements": variants.STAGE3_ELEMENTS,
-        "text_size_pct_min": variants.TEXT_SIZE_PCT_MIN,
-        "text_size_pct_max": variants.TEXT_SIZE_PCT_MAX,
-        "default_text_size_pct": variants.DEFAULT_TEXT_SIZE_PCT,
-        "text_offset_px_range": variants.TEXT_OFFSET_PX_RANGE,
-        "subheading_min": variants.SUBHEADING_MIN,
-        "subheading_max": variants.SUBHEADING_MAX,
+        "stage3_elements": text_opts.STAGE3_ELEMENTS,
+        "text_size_pct_min": text_opts.TEXT_SIZE_PCT_MIN,
+        "text_size_pct_max": text_opts.TEXT_SIZE_PCT_MAX,
+        "default_text_size_pct": text_opts.DEFAULT_TEXT_SIZE_PCT,
+        "text_offset_px_range": text_opts.TEXT_OFFSET_PX_RANGE,
+        "subheading_min": text_opts.SUBHEADING_MIN,
+        "subheading_max": text_opts.SUBHEADING_MAX,
         "anchors": list(gd_layout.ANCHORS),
         "shape_kinds": list(shapes_mod.SHAPE_KINDS),
         "icon_keys": list(icons_mod.ICON_KEYS),
-        "logo_positions": variants.LOGO_POSITIONS,
-        "logo_size_pct_min": variants.LOGO_SIZE_PCT_MIN,
-        "logo_size_pct_max": variants.LOGO_SIZE_PCT_MAX,
-        "logo_offset_px_range": variants.LOGO_OFFSET_PX_RANGE,
+        "logo_positions": logo_opts.LOGO_POSITIONS,
+        "logo_size_pct_min": logo_opts.LOGO_SIZE_PCT_MIN,
+        "logo_size_pct_max": logo_opts.LOGO_SIZE_PCT_MAX,
+        "logo_offset_px_range": logo_opts.LOGO_OFFSET_PX_RANGE,
         "aspect_ratios": variants.ASPECT_RATIO_PRESETS,
         "brand_kit_block": pack.brand_kit_block,
         "locked_colors": pack.locked_colors,
@@ -578,17 +580,17 @@ def update_config(run_id: str, body: ConfigBody, user: dict = Depends(get_curren
             )
         cfg["aspect_ratio"] = body.aspect_ratio
     if body.text_placement is not None:
-        allowed = {p["key"] for p in variants.TEXT_PLACEMENTS}
+        allowed = {p["key"] for p in text_opts.TEXT_PLACEMENTS}
         if body.text_placement not in allowed:
             raise HTTPException(400, f"Unknown text placement '{body.text_placement}'")
         cfg["text_placement"] = body.text_placement
     if body.cta_placement is not None:
-        allowed = {p["key"] for p in variants.CTA_PLACEMENTS}
+        allowed = {p["key"] for p in text_opts.CTA_PLACEMENTS}
         if body.cta_placement not in allowed:
             raise HTTPException(400, f"Unknown CTA placement '{body.cta_placement}'")
         cfg["cta_placement"] = body.cta_placement
     if body.element_placement is not None:
-        allowed = {p["key"] for p in variants.STAGE2_PLACEMENTS}
+        allowed = {p["key"] for p in stage2_element.STAGE2_PLACEMENTS}
         if body.element_placement not in allowed:
             raise HTTPException(400, f"Unknown subject placement '{body.element_placement}'")
         cfg["element_placement"] = body.element_placement

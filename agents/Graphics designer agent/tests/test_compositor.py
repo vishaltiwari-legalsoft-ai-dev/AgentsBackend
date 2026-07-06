@@ -4,7 +4,7 @@ from io import BytesIO
 
 from PIL import Image
 
-from graphics_designer_agent.compositor import (
+from graphics_designer_agent.stage4_logo.compositor import (
     composite_logo,
     logo_placement,
     pixels_identical_outside_box,

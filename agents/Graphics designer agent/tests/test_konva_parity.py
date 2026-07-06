@@ -9,7 +9,7 @@ from io import BytesIO
 import pytest
 from PIL import Image, ImageChops, ImageStat
 
-from graphics_designer_agent import render, render_contract, text_overlay
+from graphics_designer_agent.stage3_text import render, render_contract, text_overlay
 
 URL = os.environ.get("GD_RENDERER_URL", "").strip()
 pytestmark = pytest.mark.skipif(not URL, reason="GD_RENDERER_URL not set")

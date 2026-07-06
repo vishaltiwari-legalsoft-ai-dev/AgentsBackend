@@ -1,19 +1,17 @@
 """§9.2 — each whitelisted token changes ONLY its own occurrences (isolation)."""
 
 from graphics_designer_agent.prompts import load_prompt
-from graphics_designer_agent.tokens import (
+from graphics_designer_agent.stage2_element import STAGE2_BLEND_PROMPT, substitute_stage2
+from graphics_designer_agent.stage3_text.prompting import (
     DEFAULT_CTA,
     DEFAULT_HEADLINE,
     DEFAULT_HIGHLIGHT,
     DEFAULT_SUBTEXT_1,
     DEFAULT_SUBTEXT_2,
     STAGE3_STYLE_ANCHORS,
-    default_element_styles,
-    substitute_stage2,
     substitute_stage3,
 )
-
-from graphics_designer_agent.variants import STAGE2_BLEND_PROMPT
+from graphics_designer_agent.tokens import default_element_styles
 
 S3 = load_prompt("stage3_text_overlay.txt")
 S2 = load_prompt(STAGE2_BLEND_PROMPT)

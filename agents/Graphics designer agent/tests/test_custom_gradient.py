@@ -4,7 +4,7 @@ NON-canonical: it must never touch prompts/ or the frozen hash baseline."""
 from graphics_designer_agent import pipeline, suggestions
 from graphics_designer_agent.prompts import CANONICAL_SHA256, PROMPT_DIR, verify_integrity
 from graphics_designer_agent.runs import create_run, save_run
-from graphics_designer_agent.tokens import STAGE1_AR_ANCHOR
+from graphics_designer_agent.stage1_gradient import STAGE1_AR_ANCHOR
 
 
 def _propose(run, steer="more minimal", exclude=None):

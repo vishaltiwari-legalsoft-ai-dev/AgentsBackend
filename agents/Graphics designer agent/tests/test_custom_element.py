@@ -4,7 +4,7 @@ NON-canonical: it must never be added to STAGE2_VARIANTS or the frozen prompts."
 from graphics_designer_agent import pipeline, suggestions
 from graphics_designer_agent.prompts import CANONICAL_SHA256, verify_integrity
 from graphics_designer_agent.runs import create_run, save_run
-from graphics_designer_agent.variants import STAGE2_CATEGORIES, STAGE2_VARIANTS
+from graphics_designer_agent.stage2_element import STAGE2_CATEGORIES, STAGE2_VARIANTS
 
 
 def _seed_stage1(run):

@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import re
 
-from . import registry, variants
+from .. import registry
+from . import style_options
 from .icons import ICON_KEYS
 from .shapes import SHAPE_KINDS
-from .tokens import DEFAULT_CTA_PLACEMENT, DEFAULT_TEXT_PLACEMENT
+from ..tokens import DEFAULT_CTA_PLACEMENT, DEFAULT_TEXT_PLACEMENT
 
 _ALL_SHAPE_KINDS = set(SHAPE_KINDS) | {"icon"}
 MAX_SHAPES = 30
@@ -198,7 +199,7 @@ def resolve_layers(run: dict) -> list[dict]:
     styles = cfg.get("element_styles") or {}
     cfg_layout = cfg.get("layout") or {}
     base_font = cfg.get("font") or pack.default_font
-    sizes = variants.DEFAULT_TEXT_SIZE_PCT
+    sizes = style_options.DEFAULT_TEXT_SIZE_PCT
 
     def off(s: dict):
         return (int(s.get("offset_x", 0) or 0), int(s.get("offset_y", 0) or 0))

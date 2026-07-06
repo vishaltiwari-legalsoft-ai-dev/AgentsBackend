@@ -9,9 +9,7 @@ import os
 from dataclasses import asdict
 from io import BytesIO
 
-from . import layout as gd_layout
-from . import registry, render, text_overlay, variants
-from .compositor import composite_logo, logo_placement
+from . import registry
 from .providers import ImageProvider, get_provider
 from .runs import (
     STATE_FOR_STAGE_CONFIG,
@@ -22,15 +20,18 @@ from .runs import (
     save_artifact,
     save_run,
 )
+from .stage1_gradient import substitute_stage1
+from .stage2_element import place_subject, substitute_stage2
+from .stage3_text import layout as gd_layout
+from .stage3_text import render, text_overlay
+from .stage3_text.style_options import DEFAULT_TEXT_SIZE_PCT
+from .stage4_logo.compositor import composite_logo, logo_placement
 from .tokens import (
     ASPECT_RATIOS,
     DEFAULT_AR,
     DEFAULT_CTA_PLACEMENT,
     DEFAULT_FONT,
     DEFAULT_TEXT_PLACEMENT,
-    place_subject,
-    substitute_stage1,
-    substitute_stage2,
 )
 
 # Resolution requested from the image model per stage (OpenRouter image_config
@@ -134,7 +135,7 @@ def _resolve_overlay_spec(run: dict) -> dict:
     tk = cfg.get("tokens") or {}
     styles = cfg.get("element_styles") or {}
     base_font = cfg.get("font") or pack.default_font
-    sizes = variants.DEFAULT_TEXT_SIZE_PCT
+    sizes = DEFAULT_TEXT_SIZE_PCT
 
     def off(s: dict) -> tuple[int, int]:
         return (int(s.get("offset_x", 0) or 0), int(s.get("offset_y", 0) or 0))

@@ -6,7 +6,8 @@ from io import BytesIO
 import pytest
 from PIL import Image
 
-from graphics_designer_agent import pipeline, registry, suggestions, text_overlay
+from graphics_designer_agent import pipeline, registry, suggestions
+from graphics_designer_agent.stage3_text import text_overlay
 from graphics_designer_agent.runs import create_run
 
 TEMPLATED = ["medvirtual", "remote_attorneys"]

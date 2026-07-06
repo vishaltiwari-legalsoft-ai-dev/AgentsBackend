@@ -1,5 +1,5 @@
 import pytest
-from graphics_designer_agent import elements
+from graphics_designer_agent.stage3_text import elements
 
 
 def test_sanitize_elements_none_returns_empty():
@@ -103,7 +103,7 @@ def test_draw_element_never_raises_on_bad_ref():
     elements.draw_element(cv, layer, 400, 400)  # must not raise
 
 
-from graphics_designer_agent import layout, text_overlay
+from graphics_designer_agent.stage3_text import layout, text_overlay
 
 
 def _base_png(w=400, h=400) -> bytes:

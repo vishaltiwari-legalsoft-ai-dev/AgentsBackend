@@ -6,7 +6,7 @@ width; anchor ∈ ANCHORS. Elements with NO explicit coords stay "auto" (rendere
 by the legacy zone+stack path) so existing runs are byte-identical.
 """
 
-from graphics_designer_agent import layout
+from graphics_designer_agent.stage3_text import layout
 from graphics_designer_agent.runs import create_run
 
 

@@ -6,12 +6,13 @@ gradient prompts, the Stage-2 element library, the font family, the default copy
 and the suggestion content — lives in a per-brand ``BrandPack``. The engine asks
 ``get_pack(brand_id)`` for the active brand and never hard-codes one.
 
-Phase A note: Legal Soft's data still physically lives in ``variants.py`` /
-``tokens.py`` / ``suggestions.py`` / ``prompts/`` — the legalsoft pack simply
-*references* it, so introducing this seam changes no behaviour and keeps the
-canonical prompts byte-identical. New brands ship their own ``brands/<id>/`` data
-module; relocating Legal Soft's content into ``brands/legalsoft/`` is a later,
-behaviour-neutral cleanup.
+Phase A note: Legal Soft's data still physically lives in the shared modules
+(``variants.py`` / ``tokens.py`` / ``suggestions.py`` / ``prompts/``) and the
+per-stage packages (``stage1_gradient`` / ``stage2_element`` / ``stage3_text``)
+— the legalsoft pack simply *references* it, so this seam changes no behaviour
+and keeps the canonical prompts byte-identical. New brands ship their own
+``brands/<id>/`` data module; relocating Legal Soft's content into
+``brands/legalsoft/`` is a later, behaviour-neutral cleanup.
 """
 
 from __future__ import annotations
@@ -24,6 +25,10 @@ from . import suggestions as _s
 from . import tokens as _t
 from . import variants as _v
 from .prompts import CANONICAL_SHA256, PROMPT_DIR
+from .stage1_gradient import variants as _stage1
+from .stage2_element import variants as _stage2
+from .stage3_text import prompting as _stage3_prompting
+from .stage3_text import style_options as _stage3
 
 # The default brand when a run carries no ``brand_id`` (back-compat + Legal Soft).
 DEFAULT_BRAND_ID = "legalsoft"
@@ -139,7 +144,7 @@ class BrandPack:
 
     # ── factory config defaults (used by runs.create_run) ──────────────────────
     def default_stage3_styles(self) -> dict:
-        sizes = _v.DEFAULT_TEXT_SIZE_PCT
+        sizes = _stage3.DEFAULT_TEXT_SIZE_PCT
         return {
             "headline": {"font": self.default_font, "color": "dark",
                          "size_pct": sizes["headline"],
@@ -152,7 +157,7 @@ class BrandPack:
     def default_subheadings(self) -> list:
         def line(text: str) -> dict:
             return {"text": text, "font": self.default_font, "color": "dark",
-                    "size_pct": _v.DEFAULT_TEXT_SIZE_PCT["subheading"],
+                    "size_pct": _stage3.DEFAULT_TEXT_SIZE_PCT["subheading"],
                     "placement": _t.DEFAULT_TEXT_PLACEMENT, "offset_x": 0, "offset_y": 0,
                     "approved": False}
         return [line(self.default_subtext_1), line(self.default_subtext_2)]
@@ -171,20 +176,20 @@ def _build_legalsoft() -> BrandPack:
         logo_dir=_AGENT_ROOT / "assets" / "brand-logos" / "legalsoft",
         locked_colors=_v.LOCKED_COLORS,
         brand_kit_block=_v.BRAND_KIT_BLOCK,
-        source_note_stage1=_v.SOURCE_NOTE_STAGE1,
-        text_colors=_v.TEXT_COLORS,
-        stage1_variants=_v.STAGE1_VARIANTS,
-        stage2_variants=_v.STAGE2_VARIANTS,
-        stage2_blend_prompt=_v.STAGE2_BLEND_PROMPT,
-        stage2_categories=_v.STAGE2_CATEGORIES,
+        source_note_stage1=_stage1.SOURCE_NOTE_STAGE1,
+        text_colors=_stage3.TEXT_COLORS,
+        stage1_variants=_stage1.STAGE1_VARIANTS,
+        stage2_variants=_stage2.STAGE2_VARIANTS,
+        stage2_blend_prompt=_stage2.STAGE2_BLEND_PROMPT,
+        stage2_categories=_stage2.STAGE2_CATEGORIES,
         font_family=_v.FONT_FAMILY,
         font_variants=_v.FONT_VARIANTS,
         default_font=_t.DEFAULT_FONT,
-        default_headline=_t.DEFAULT_HEADLINE,
-        default_highlight=_t.DEFAULT_HIGHLIGHT,
-        default_subtext_1=_t.DEFAULT_SUBTEXT_1,
-        default_subtext_2=_t.DEFAULT_SUBTEXT_2,
-        default_cta=_t.DEFAULT_CTA,
+        default_headline=_stage3_prompting.DEFAULT_HEADLINE,
+        default_highlight=_stage3_prompting.DEFAULT_HIGHLIGHT,
+        default_subtext_1=_stage3_prompting.DEFAULT_SUBTEXT_1,
+        default_subtext_2=_stage3_prompting.DEFAULT_SUBTEXT_2,
+        default_cta=_stage3_prompting.DEFAULT_CTA,
         onboarding_questions=_s.ONBOARDING_QUESTIONS,
         discovery_questions=_s.DISCOVERY_QUESTIONS,
         concept_rationale=_s._CONCEPT_RATIONALE,

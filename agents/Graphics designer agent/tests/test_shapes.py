@@ -2,7 +2,7 @@
 
 from PIL import Image
 
-from graphics_designer_agent import icons, shapes
+from graphics_designer_agent.stage3_text import icons, shapes
 
 
 def _canvas(w=100, h=100):

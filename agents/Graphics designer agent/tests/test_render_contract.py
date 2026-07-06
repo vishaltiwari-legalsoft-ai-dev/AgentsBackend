@@ -4,7 +4,7 @@ from io import BytesIO
 
 from PIL import Image
 
-from graphics_designer_agent import render_contract
+from graphics_designer_agent.stage3_text import render_contract
 
 
 def _png(w: int, h: int) -> bytes:

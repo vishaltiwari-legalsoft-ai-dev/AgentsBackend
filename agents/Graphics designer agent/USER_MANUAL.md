@@ -484,14 +484,17 @@ agent.
 
 ```
 backend/agents/Graphics designer agent/graphics_designer_agent/
+  stage1_gradient/         # Step 1 — background: prompting + gradient cards
+  stage2_element/          # Step 2 — subject: prompting + element library
+  stage3_text/             # Step 3 — text overlay: renderer, layout, elements, styles
+  stage4_logo/             # Step 4 — logo: compositor + placement options
   prompts/                 # immutable master prompts (byte-frozen)
   prompts.py               # prompt loading + SHA-256 integrity baseline
-  tokens.py                # token substitution (the only permitted prompt edits)
-  variants.py              # UI metadata: gradients, elements, fonts, colors, logo grid
+  tokens.py                # shared substitution engine + AR presets
+  variants.py              # shared brand kit: locked colors, Causten fonts
   runs.py                  # run/config creation + persistence
   pipeline.py              # the stage state machine + generation
   providers.py             # mock + OpenRouter image providers
-  compositor.py            # deterministic Stage-4 logo compositor
   suggestions.py           # the agent's proposal layer
 backend/app/routers/graphics_designer.py   # the /api/gd API
 backend/app/services/openrouter.py         # OpenRouter image/LLM calls

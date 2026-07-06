@@ -5,7 +5,8 @@ from io import BytesIO
 
 from PIL import Image
 
-from graphics_designer_agent import pipeline, text_overlay
+from graphics_designer_agent import pipeline
+from graphics_designer_agent.stage3_text import text_overlay
 from graphics_designer_agent.prompts import verify_integrity
 from graphics_designer_agent.runs import artifact_abspath, create_run, save_run
 

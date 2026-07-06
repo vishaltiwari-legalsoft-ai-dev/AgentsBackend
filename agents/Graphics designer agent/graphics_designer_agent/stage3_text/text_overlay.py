@@ -25,9 +25,9 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from . import elements as gd_elements
 from . import icons, layout, shapes
-from .variants import LOCKED_COLORS, font_file
+from ..variants import LOCKED_COLORS, font_file
 
-FONT_DIR = Path(__file__).resolve().parents[1] / "Causten Font Family"
+FONT_DIR = Path(__file__).resolve().parents[2] / "Causten Font Family"  # at the agent root
 
 
 def _hex(h: str) -> tuple[int, int, int]:

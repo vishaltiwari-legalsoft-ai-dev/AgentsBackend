@@ -12,7 +12,7 @@ from PIL import Image
 
 from . import elements as gd_elements
 from . import text_overlay
-from .variants import LOCKED_COLORS, font_file as default_font_file
+from ..variants import LOCKED_COLORS, font_file as default_font_file
 
 CONTRACT_VERSION = 1
 

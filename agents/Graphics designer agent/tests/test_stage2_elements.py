@@ -2,11 +2,11 @@
 
 from graphics_designer_agent import suggestions
 from graphics_designer_agent.prompts import CANONICAL_SHA256, load_prompt
-from graphics_designer_agent.tokens import substitute_stage2
-from graphics_designer_agent.variants import (
+from graphics_designer_agent.stage2_element import (
     STAGE2_BLEND_PROMPT,
     STAGE2_CATEGORIES,
     STAGE2_VARIANTS,
+    substitute_stage2,
 )
 
 _IDS = {v["id"] for v in STAGE2_VARIANTS}

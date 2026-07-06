@@ -68,7 +68,7 @@ def sanitize_elements(items, max_n: int = MAX_ELEMENTS) -> list[dict]:
     return out
 
 
-ASSET_DIR = Path(__file__).resolve().parents[1] / "assets"
+ASSET_DIR = Path(__file__).resolve().parents[2] / "assets"  # <agent root>/assets
 _EMOJI_DIR = ASSET_DIR / "emoji" / "apple"
 
 

@@ -19,23 +19,21 @@ import re
 logger = logging.getLogger("agentos.gd.suggestions")
 
 from .prompts import load_prompt
-from .tokens import (
+from .stage1_gradient import (
+    SOURCE_NOTE_STAGE1,
+    STAGE1_AR_ANCHOR,
+    STAGE1_VARIANTS,
+)
+from .stage2_element import STAGE2_CATEGORIES, STAGE2_VARIANTS
+from .stage3_text.prompting import (
     DEFAULT_CTA,
     DEFAULT_HEADLINE,
     DEFAULT_HIGHLIGHT,
     DEFAULT_SUBTEXT_1,
     DEFAULT_SUBTEXT_2,
-    STAGE1_AR_ANCHOR,
     validate_stage3_tokens,
 )
-from .variants import (
-    BRAND_KIT_BLOCK,
-    LOCKED_COLORS,
-    SOURCE_NOTE_STAGE1,
-    STAGE1_VARIANTS,
-    STAGE2_CATEGORIES,
-    STAGE2_VARIANTS,
-)
+from .variants import BRAND_KIT_BLOCK, LOCKED_COLORS
 
 # ── §7.1.1 onboarding questions ───────────────────────────────────────────────
 ONBOARDING_QUESTIONS = [
@@ -1395,7 +1393,7 @@ def suggest_placement(run: dict, pack=None) -> dict:
 
     Returns ``{"layout": {element_id: {x, y, w, anchor}}}``.
     """
-    from . import layout as _layout
+    from .stage3_text import layout as _layout
 
     ids = {l["id"] for l in _layout.resolve_layers(run)}
     subj = (run.get("config", {}).get("element_placement") or "auto").lower()

@@ -2,7 +2,7 @@ from io import BytesIO
 
 from PIL import Image
 
-from graphics_designer_agent import render, text_overlay
+from graphics_designer_agent.stage3_text import render, text_overlay
 
 
 def _png(w: int, h: int) -> bytes:
