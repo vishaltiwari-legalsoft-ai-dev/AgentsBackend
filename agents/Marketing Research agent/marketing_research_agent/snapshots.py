@@ -350,3 +350,124 @@ def capture_workbook(grids, *, year: int, today: date) -> list[dict]:
             logger.exception("snapshot capture failed for tab %s", g.title)
             results.append({"tab": g.title, "error": str(exc)})
     return results
+
+
+# --- delta engine (computed on read) -----------------------------------------
+
+# A leaf is non-additive (a rate) when its path matches one of these tokens.
+_RATE_TOKENS = ("_pct", "ratio", "cost_", "average", "goal", "roas", "cac", "rate")
+
+# Rates the engine can recompute from day components: path -> (numerator, denominator, scale)
+_RECOMPUTE = {
+    "cost_metrics.cost_per_lead_performance": ("spend.performance", "leads.total", 1.0),
+    "cost_metrics.cost_per_lead": ("spend.performance", "leads.total", 1.0),
+    "cost_metrics.cost_per_qualified_lead": ("spend.performance", "leads.qualified", 1.0),
+    "cost_per_demo.demo_booked_all": ("spend.performance", "demos.total_booked_all", 1.0),
+    "cost_per_demo.demo_completed_all": ("spend.performance", "demos.completed_all", 1.0),
+    "leads.qualified_ratio_pct": ("leads.qualified", "leads.total", 100.0),
+    "demos.show_up_rate_all_pct": ("demos.completed_all", "demos.total_booked_all", 100.0),
+}
+
+
+def _leaves(node: dict, prefix: str = "") -> dict[str, float | None]:
+    """Flatten a canonical block to dot-path -> numeric leaf."""
+    out: dict[str, float | None] = {}
+    for k, v in (node or {}).items():
+        path = f"{prefix}{k}"
+        if isinstance(v, dict):
+            out.update(_leaves(v, path + "."))
+        else:
+            out[path] = v
+    return out
+
+
+def _is_rate(path: str) -> bool:
+    return any(t in path for t in _RATE_TOKENS)
+
+
+def _block_delta(curr_block: dict, prev_block: dict | None) -> dict:
+    cur = _leaves(curr_block)
+    prv = _leaves(prev_block or {})
+    additive: dict = {}
+    rates: dict = {}
+    day: dict[str, float | None] = {}
+    for path, value in cur.items():
+        if _is_rate(path):
+            continue
+        prev_v = prv.get(path)
+        if value is None and prev_v is None:
+            delta = None
+        elif prev_v is None:
+            delta = value
+        elif value is None:
+            delta = None
+        else:
+            delta = round(value - prev_v, 2)
+        day[path] = delta
+        additive[path] = {"delta": delta, "mtd": value,
+                          "corrected": bool(delta is not None and delta < 0)}
+    for path, value in cur.items():
+        if not _is_rate(path):
+            continue
+        rule = _RECOMPUTE.get(path)
+        if rule:
+            num, den, scale = rule
+            n, d = day.get(num), day.get(den)
+            v = round(n / d * scale, 2) if (n is not None and d not in (None, 0)) else None
+            rates[path] = {"value": v, "mode": "recomputed"}
+        else:
+            rates[path] = {"value": value, "mode": "mtd"}
+    return {"additive": additive, "rates": rates}
+
+
+def compute_delta(curr: dict, prev: dict | None) -> dict:
+    """Movement between two snapshots of the same vendor (prev may be None at
+    month start). Never fabricates per-day numbers across gaps — `days` says
+    how many days the delta spans."""
+    month_start = prev is None
+    days = 0 if month_start else (
+        (date.fromisoformat(curr["date"]) - date.fromisoformat(prev["date"])).days)
+    blocks = {"team_overall": _block_delta(
+        curr["canonical"].get("team_overall", {}),
+        (prev or {}).get("canonical", {}).get("team_overall"))}
+    channels = {}
+    for name, block in (curr["canonical"].get("channels") or {}).items():
+        channels[name] = _block_delta(
+            block, ((prev or {}).get("canonical", {}).get("channels") or {}).get(name))
+    blocks["channels"] = channels
+    corrected = any(
+        f["corrected"] for f in blocks["team_overall"]["additive"].values()
+    ) or any(
+        f["corrected"] for ch in channels.values() for f in ch["additive"].values()
+    )
+    return {
+        "vendor": curr["vendor"],
+        "vendor_slug": curr["vendor_slug"],
+        "date": curr["date"],
+        "since": None if month_start else prev["date"],
+        "days": days,
+        "month_start": month_start,
+        "corrected": corrected,
+        "blocks": blocks,
+    }
+
+
+def deltas_for(date_iso: str | None = None) -> list[dict]:
+    """Per-vendor movement for `date_iso` (default: latest captured date)."""
+    all_snaps = list_snapshots()
+    if not all_snaps:
+        return []
+    if date_iso is None:
+        date_iso = max(s["date"] for s in all_snaps)
+    out = []
+    by_vendor: dict[str, list[dict]] = {}
+    for s in all_snaps:
+        by_vendor.setdefault(s["vendor_slug"], []).append(s)
+    for slug, snaps in sorted(by_vendor.items()):
+        curr = next((s for s in snaps if s["date"] == date_iso), None)
+        if curr is None:
+            continue
+        prior = [s for s in snaps if s["month"] == curr["month"] and s["date"] < date_iso]
+        prev = max(prior, key=lambda s: s["date"]) if prior else None
+        out.append(compute_delta(curr, prev))
+    return out
