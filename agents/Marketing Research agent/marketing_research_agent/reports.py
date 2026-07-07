@@ -196,3 +196,25 @@ def build(kind: str, dataset: dict, user_id: str) -> dict:
     }
     runs.save_run(report)
     return report
+
+
+def overview(ds: dict) -> dict:
+    """Live dashboard state for /mr/overview — latest-month KPIs vs goals.
+
+    Pure read: reuses the campaign aggregation but never persists a run."""
+    metrics = ds.get("metrics", [])
+    sources = ds.get("sources", [])
+    if not metrics:
+        return {"has_data": False, "month": None, "totals": None,
+                "channels": {}, "flag_summary": [], "sources": sources}
+    latest = max((m.date.year, m.date.month) for m in metrics)
+    month_metrics = [m for m in metrics if (m.date.year, m.date.month) == latest]
+    s = _campaign_structured({**ds, "metrics": month_metrics})
+    return {
+        "has_data": True,
+        "month": f"{latest[0]:04d}-{latest[1]:02d}",
+        "totals": s["totals"],
+        "channels": s["channels"],
+        "flag_summary": s["flag_summary"],
+        "sources": sources,
+    }
