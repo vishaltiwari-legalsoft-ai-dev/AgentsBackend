@@ -80,7 +80,12 @@ def _load_dataset(user_id: str) -> dict:
     for run in latest.values():
         metrics.extend(_rehydrate_metrics(run.get("metrics", [])))
         leads.extend(_rehydrate_leads(run.get("leads", [])))
-    return {"metrics": metrics, "leads": leads, "today": date.today()}
+    sources = [
+        {"platform": plat, "generated_at": run.get("generated_at"),
+         "metrics": len(run.get("metrics", [])), "leads": len(run.get("leads", []))}
+        for plat, run in sorted(latest.items())
+    ]
+    return {"metrics": metrics, "leads": leads, "today": date.today(), "sources": sources}
 
 
 @router.post("/mr/ingest")
@@ -193,6 +198,12 @@ def datasets(user=Depends(get_current_user)):
         for r in runs.list_runs(user["id"])
         if r.get("kind") == "dataset"
     ]
+
+
+@router.get("/mr/overview")
+def overview(user=Depends(get_current_user)):
+    """Live dashboard state — latest-month KPIs vs 2026 goals. Persists nothing."""
+    return reports.overview(_load_dataset(user["id"]))
 
 
 def _workbook_grids():

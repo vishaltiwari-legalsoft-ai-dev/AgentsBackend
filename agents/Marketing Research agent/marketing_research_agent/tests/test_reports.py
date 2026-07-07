@@ -35,3 +35,13 @@ def test_all_kinds_build_without_error(monkeypatch, tmp_path):
     for kind in reports.KINDS:
         r = reports.build(kind, _dataset(), user_id="u1")
         assert r["markdown"]
+
+
+def test_report_stamps_sources(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    ds = _dataset()
+    ds["sources"] = [{"platform": "sheets:123", "generated_at": "2026-07-07T00:00:00+00:00",
+                      "metrics": 1, "leads": 1}]
+    r = reports.build("daily_summary", ds, user_id="u1")
+    assert r["sources"] == ds["sources"]

@@ -190,6 +190,7 @@ def build(kind: str, dataset: dict, user_id: str) -> dict:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "user_id": user_id,
         "agent_id": "a6",
+        "sources": dataset.get("sources", []),
         "structured": structured,
         "markdown": markdown,
         "html": _md_to_html(markdown),
