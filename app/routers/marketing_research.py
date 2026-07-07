@@ -232,6 +232,15 @@ def snapshots_deltas(date_iso: str | None = None, user=Depends(get_current_user)
     return mr_snapshots.deltas_for(date_iso)
 
 
+@router.get("/mr/snapshots/vendor/{slug}")
+def snapshots_vendor(slug: str, date_iso: str | None = None, user=Depends(get_current_user)):
+    """Full per-vendor dossier: dates, the day's snapshot, its movement."""
+    out = mr_snapshots.vendor_detail(slug, date_iso)
+    if out is None:
+        raise HTTPException(404, f"no snapshots for vendor '{slug}'")
+    return out
+
+
 def _workbook_grids():
     return mr_workbook.fetch_workbook(mr_config.SHEETS_SPREADSHEET_ID)
 

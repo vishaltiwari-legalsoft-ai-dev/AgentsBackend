@@ -473,6 +473,24 @@ def deltas_for(date_iso: str | None = None) -> list[dict]:
     return out
 
 
+def vendor_detail(slug: str, date_iso: str | None = None) -> dict | None:
+    """One vendor's dossier: all captured dates + the requested (default latest)
+    snapshot with its day movement. Pure read."""
+    snaps = list_snapshots(slug=slug)
+    if not snaps:
+        return None
+    dates = [s["date"] for s in snaps]
+    if date_iso is None:
+        date_iso = dates[-1]
+    curr = next((s for s in snaps if s["date"] == date_iso), None)
+    if curr is None:
+        return None
+    prior = [s for s in snaps if s["month"] == curr["month"] and s["date"] < date_iso]
+    prev = max(prior, key=lambda s: s["date"]) if prior else None
+    return {"vendor": curr["vendor"], "vendor_slug": slug, "gid": curr["gid"],
+            "dates": dates, "snapshot": curr, "delta": compute_delta(curr, prev)}
+
+
 # --- GCS export (the user's per-vendor month JSON) ----------------------------
 
 _SCHEMA_VERSION = "1.0.0"
