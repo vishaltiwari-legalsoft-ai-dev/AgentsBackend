@@ -137,7 +137,7 @@ _CHANNEL_MAP: list[tuple[str, str, int, str]] = [
     ("demos.total_completed_direct", "total demos completed (direct)", 1, "first"),
     ("demos.completed_all", "demos completed (sdr+vapi+direct)", 1, "first"),
     ("demos.show_up_rate_all_pct", "total show up rate (%) (sdr+vapi+direct)", 1, "first"),
-    ("demos.show_up_rate_qualified_pct", "total show up rate (%) (qualified)", 1, "first"),
+    ("demos.show_up_rate_qualified_pct", "total show up rate (%) (qualified demos)", 1, "first"),
     ("demo_outcomes.no_show", "no show", 1, "first"),
     ("demo_outcomes.canceled", "canceled", 1, "first"),
     ("cost_per_demo.qualified_demo_booked_direct", "cost per qualified demo booked (direct)", 1, "first"),
