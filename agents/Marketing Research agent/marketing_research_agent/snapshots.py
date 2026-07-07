@@ -273,3 +273,80 @@ def capture_tab(rows: list[list[str]], *, title: str, gid: int, year: int, today
         "canonical": canonical,
         "prev_month_raw": prev_raw,
     }
+
+
+# --- store (disk source of truth; Firestore mirrored when cloud-configured) ---
+
+def _root() -> Path:
+    root = Path(os.environ.get("MR_SNAPSHOTS_DIR") or _DEFAULT_DIR).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _use_cloud() -> bool:
+    if os.environ.get("MR_OFFLINE") == "1":
+        return False
+    try:
+        from app.services import firestore_repo  # noqa: F401
+        return bool(os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT"))
+    except Exception:
+        return False
+
+
+def _doc_id(slug: str, date_iso: str) -> str:
+    return f"{slug}_{date_iso}"
+
+
+def save_snapshot(snap: dict) -> None:
+    doc_id = _doc_id(snap["vendor_slug"], snap["date"])
+    (_root() / f"{doc_id}.json").write_text(
+        json.dumps(snap, default=str, indent=1), encoding="utf-8")
+    if _use_cloud():
+        try:
+            from app.services import firestore_repo
+            firestore_repo._db().collection(_COLLECTION).document(doc_id).set(snap)
+        except Exception:
+            logger.warning("snapshot cloud save failed for %s", doc_id)
+
+
+def get_snapshot(slug: str, date_iso: str) -> dict | None:
+    p = _root() / f"{_doc_id(slug, date_iso)}.json"
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return None
+
+
+def list_snapshots(slug: str | None = None, month: str | None = None,
+                   meta_only: bool = False) -> list[dict]:
+    out = []
+    for p in sorted(_root().glob("*.json")):
+        try:
+            snap = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if slug and snap.get("vendor_slug") != slug:
+            continue
+        if month and snap.get("month") != month:
+            continue
+        if meta_only:
+            snap = {k: snap.get(k) for k in ("vendor", "vendor_slug", "gid", "date", "month", "captured_at")}
+        out.append(snap)
+    out.sort(key=lambda s: (s.get("vendor_slug") or "", s.get("date") or ""))
+    return out
+
+
+def capture_workbook(grids, *, year: int, today: date) -> list[dict]:
+    """Capture every tracker-format tab; skip the rest; never abort the run."""
+    results = []
+    for g in grids:
+        try:
+            snap = capture_tab(g.rows, title=g.title, gid=g.gid, year=year, today=today)
+            if snap is None:
+                results.append({"tab": g.title, "skipped": True})
+                continue
+            save_snapshot(snap)
+            results.append({"tab": g.title, "slug": snap["vendor_slug"], "captured": True})
+        except Exception as exc:  # one bad tab must not kill the daily run
+            logger.exception("snapshot capture failed for tab %s", g.title)
+            results.append({"tab": g.title, "error": str(exc)})
+    return results
