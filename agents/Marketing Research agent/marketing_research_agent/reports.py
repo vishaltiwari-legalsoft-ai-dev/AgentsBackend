@@ -24,6 +24,7 @@ KINDS = [
     "opportunity_report",
     "utm_attribution",
     "icp_signal",
+    "daily_movement",
 ]
 
 
@@ -154,6 +155,8 @@ def _structured(kind: str, ds: dict) -> dict:
             "stale": [o.name for o in orr.stale_outreach(opps, today)],
             "placement_issues": [o.name for o in orr.placement_issues(opps)],
         }
+    if kind == "daily_movement":
+        return {"vendors": ds.get("snapshot_deltas", [])}
     return {}
 
 
@@ -168,6 +171,20 @@ def _narration_input(kind: str, s: dict) -> dict:
             "totals": {k: (s.get("totals") or {}).get(k) for k in ("spend", "demos_completed", "cost_per_demo_completed", "qualified_leads")},
             "channels": {ch: {k: a.get(k) for k in keep} for ch, a in (s.get("channels") or {}).items()},
             "issues": s.get("flag_summary", []),
+        }
+    if kind == "daily_movement":
+        return {
+            "vendors": [
+                {
+                    "vendor": v.get("vendor"),
+                    "days": v.get("days"),
+                    "corrected": v.get("corrected"),
+                    "moves": {p: f.get("delta")
+                              for p, f in (v.get("blocks", {}).get("team_overall", {}).get("additive") or {}).items()
+                              if f.get("delta")},
+                }
+                for v in s.get("vendors", [])
+            ]
         }
     return s
 

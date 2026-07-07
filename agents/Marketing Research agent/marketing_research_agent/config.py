@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import os
 
-# Legal Soft's live performance tracker (Google Sheet). The service account
-# `lsagent@…` has viewer access; data is pulled via the authenticated Drive
-# CSV-export endpoint (no Sheets API enablement required). One tab per brand;
-# each tab is a transposed monthly grid parsed by `sources/sheets_source.py`.
+# Legal Soft's live performance tracker (Google Sheet) — the "View Copy ...
+# (For AI Agent Use)" workbook, the designated fetch source since 2026-07-08.
+# One tab per vendor engagement + the consolidated Overall Report tab; each is
+# a transposed monthly grid parsed by `sources/sheets_source.py`.
 SHEETS_SPREADSHEET_ID = os.environ.get(
-    "MR_SHEETS_ID", "18MCXdQ2LIJdJtjpk51SY1ouRrSmoy0xjIOF2yf9FlgM"
+    "MR_SHEETS_ID", "1bYObEifoIh7zbJsLh9sPJDSkLe3oMvKixv-jdA4Tfg0"
 )
 # The grid has no year column; performance is tracked for the current plan year.
 SHEETS_YEAR = int(os.environ.get("MR_SHEETS_YEAR", "2026"))

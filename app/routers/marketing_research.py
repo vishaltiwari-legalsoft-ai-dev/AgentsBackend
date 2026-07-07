@@ -23,6 +23,7 @@ from marketing_research_agent import config as mr_config
 from marketing_research_agent import insight as mr_insight
 from marketing_research_agent import profiles as mr_profiles
 from marketing_research_agent import reports, runs, schedule
+from marketing_research_agent import snapshots as mr_snapshots
 from marketing_research_agent import workbook as mr_workbook
 from marketing_research_agent.config import COLUMN_MAPS
 from marketing_research_agent.schemas import CampaignMetric, DateRange, Lead
@@ -206,6 +207,31 @@ def overview(user=Depends(get_current_user)):
     return reports.overview(_load_dataset(user["id"]))
 
 
+@router.post("/mr/snapshots/capture")
+def snapshots_capture(user=Depends(get_current_user)):
+    """Freeze today's MTD state of every tracker tab + refresh the GCS export.
+    The daily cron target AND the UI's 'Snapshot now' button."""
+    today = date.today()
+    try:
+        grids = _workbook_grids()
+    except Exception as exc:
+        raise HTTPException(502, f"Could not read the spreadsheet: {exc}")
+    results = mr_snapshots.capture_workbook(grids, year=mr_config.SHEETS_YEAR, today=today)
+    exported = mr_snapshots.export_all_to_gcs(today)
+    return {"date": today.isoformat(), "tabs": results, "exported": exported}
+
+
+@router.get("/mr/snapshots")
+def snapshots_list(vendor: str | None = None, month: str | None = None,
+                   user=Depends(get_current_user)):
+    return mr_snapshots.list_snapshots(slug=vendor, month=month, meta_only=True)
+
+
+@router.get("/mr/snapshots/deltas")
+def snapshots_deltas(date_iso: str | None = None, user=Depends(get_current_user)):
+    return mr_snapshots.deltas_for(date_iso)
+
+
 def _workbook_grids():
     return mr_workbook.fetch_workbook(mr_config.SHEETS_SPREADSHEET_ID)
 
@@ -313,6 +339,8 @@ def get_config(user=Depends(get_current_user)):
 def make_report(kind: str, user=Depends(get_current_user)):
     if kind not in reports.KINDS:
         raise HTTPException(404, f"unknown report kind '{kind}' (expected one of {reports.KINDS})")
+    if kind == "daily_movement":
+        return reports.build(kind, {"snapshot_deltas": mr_snapshots.deltas_for()}, user_id=user["id"])
     return reports.build(kind, _load_dataset(user["id"]), user_id=user["id"])
 
 

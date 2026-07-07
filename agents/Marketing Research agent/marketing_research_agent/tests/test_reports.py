@@ -37,6 +37,21 @@ def test_all_kinds_build_without_error(monkeypatch, tmp_path):
         assert r["markdown"]
 
 
+def test_daily_movement_report_builds(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    deltas = [{"vendor": "Meta 360 RA", "vendor_slug": "meta-360-ra", "date": "2026-02-07",
+               "since": "2026-02-06", "days": 1, "month_start": False, "corrected": False,
+               "blocks": {"team_overall": {"additive": {"spend.performance": {"delta": 100.0, "mtd": 300.0, "corrected": False},
+                                                        "leads.total": {"delta": 2, "mtd": 5, "corrected": False}},
+                                           "rates": {}},
+                          "channels": {}}}]
+    r = reports.build("daily_movement", {"snapshot_deltas": deltas}, user_id="u1")
+    assert r["kind"] == "daily_movement"
+    assert r["structured"]["vendors"][0]["vendor"] == "Meta 360 RA"
+    assert r["markdown"]
+
+
 def test_report_stamps_sources(monkeypatch, tmp_path):
     monkeypatch.setenv("MR_OFFLINE", "1")
     monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))

@@ -84,3 +84,10 @@ def test_capture_none_when_month_missing():
     # July requested but grid only has Jan/Feb -> no current-month column
     assert snapshots.capture_tab(_grid(), title="Meta 360 RA", gid=1,
                                  year=2026, today=date(2026, 7, 7)) is None
+
+
+def test_config_points_at_view_copy():
+    import importlib
+    from marketing_research_agent import config as mr_config
+    importlib.reload(mr_config)
+    assert mr_config.SHEETS_SPREADSHEET_ID == "1bYObEifoIh7zbJsLh9sPJDSkLe3oMvKixv-jdA4Tfg0"
