@@ -471,3 +471,75 @@ def deltas_for(date_iso: str | None = None) -> list[dict]:
         prev = max(prior, key=lambda s: s["date"]) if prior else None
         out.append(compute_delta(curr, prev))
     return out
+
+
+# --- GCS export (the user's per-vendor month JSON) ----------------------------
+
+_SCHEMA_VERSION = "1.0.0"
+
+
+def month_export(slug: str, month: str) -> dict | None:
+    """One vendor-month in the user's snapshot schema (see spec: hand-made JSON
+    is the golden shape). Regenerable at any time from the store."""
+    snaps = list_snapshots(slug=slug, month=month)
+    if not snaps:
+        return None
+    latest = snaps[-1]
+    team = latest["canonical"].get("team_overall", {})
+    kpis = team.get("kpis") or {}
+    budget = team.get("budget") or {}
+    return {
+        "metadata": {
+            "schema_version": _SCHEMA_VERSION,
+            "vendor": latest["vendor"],
+            "vendor_slug": slug,
+            "description": ("Daily marketing performance tracker. Each daily_snapshots entry "
+                            "holds cumulative month-to-date values captured from the spreadsheet. "
+                            "Subtract the previous day's snapshot to get a single day's movement."),
+            "last_updated": latest["date"],
+            "months_tracked": [month],
+        },
+        "months": {
+            month: {
+                "label": datetime.strptime(month, "%Y-%m").strftime("%B %Y"),
+                "targets": {
+                    "budget_performance": budget.get("performance"),
+                    "budget_investment": budget.get("investment"),
+                    "revenue_sold_goal": kpis.get("revenue_sold_goal"),
+                },
+                "daily_snapshots": {
+                    s["date"]: {"team_overall": s["canonical"].get("team_overall", {}),
+                                "channels": s["canonical"].get("channels", {})}
+                    for s in snaps
+                },
+            }
+        },
+    }
+
+
+def export_all_to_gcs(today: date) -> list[str]:
+    """Write mr-snapshots/<slug>/<month>.json for every vendor captured this
+    month. Export failure never fails a capture — files are regenerable."""
+    if os.environ.get("MR_OFFLINE") == "1":
+        return []
+    try:
+        from app.services import storage
+        if not storage.is_configured():
+            logger.info("snapshot export skipped: GCS not configured")
+            return []
+    except Exception:
+        return []
+    month = f"{today.year:04d}-{today.month:02d}"
+    written = []
+    slugs = sorted({s["vendor_slug"] for s in list_snapshots(month=month, meta_only=True)})
+    for slug in slugs:
+        doc = month_export(slug, month)
+        if doc is None:
+            continue
+        path = f"mr-snapshots/{slug}/{month}.json"
+        try:
+            storage._upload(path, json.dumps(doc, indent=1).encode("utf-8"), "application/json")
+            written.append(path)
+        except Exception:
+            logger.warning("snapshot GCS export failed for %s (will rebuild next capture)", path)
+    return written
