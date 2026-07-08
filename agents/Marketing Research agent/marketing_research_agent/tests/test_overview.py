@@ -41,6 +41,22 @@ def test_overview_passes_sources_through():
     assert out["sources"] == src
 
 
+def test_overview_ignores_future_months():
+    """Vendor tabs pre-fill retainer fees into future months (spend, no leads).
+    The dashboard must anchor to the latest month <= today, not September."""
+    ds = {"metrics": [_metric(6), _metric(9, spend=2200.0)], "leads": [],
+          "today": date(2026, 7, 8)}
+    out = reports.overview(ds)
+    assert out["month"] == "2026-06"
+    assert out["totals"]["spend"] == 1200.0
+
+
+def test_overview_all_future_falls_back_to_earliest():
+    ds = {"metrics": [_metric(9), _metric(8)], "leads": [], "today": date(2026, 7, 8)}
+    out = reports.overview(ds)
+    assert out["month"] == "2026-08"
+
+
 def test_overview_persists_no_run(monkeypatch, tmp_path):
     monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
     reports.overview({"metrics": [_metric(6)], "leads": []})

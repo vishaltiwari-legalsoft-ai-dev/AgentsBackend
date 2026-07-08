@@ -219,13 +219,19 @@ def build(kind: str, dataset: dict, user_id: str) -> dict:
 def overview(ds: dict) -> dict:
     """Live dashboard state for /mr/overview — latest-month KPIs vs goals.
 
-    Pure read: reuses the campaign aggregation but never persists a run."""
+    Anchored to the latest month NOT after today: vendor tabs pre-fill retainer
+    fees into future months (spend, no activity), which would otherwise make the
+    dashboard land on an empty September. Pure read: reuses the campaign
+    aggregation but never persists a run."""
     metrics = ds.get("metrics", [])
     sources = ds.get("sources", [])
     if not metrics:
         return {"has_data": False, "month": None, "totals": None,
                 "channels": {}, "flag_summary": [], "sources": sources}
-    latest = max((m.date.year, m.date.month) for m in metrics)
+    today = ds.get("today") or date.today()
+    months = {(m.date.year, m.date.month) for m in metrics}
+    current = {ym for ym in months if ym <= (today.year, today.month)}
+    latest = max(current) if current else min(months)
     month_metrics = [m for m in metrics if (m.date.year, m.date.month) == latest]
     s = _campaign_structured({**ds, "metrics": month_metrics})
     return {
