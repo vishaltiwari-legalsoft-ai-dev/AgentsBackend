@@ -309,21 +309,47 @@ def save_snapshot(snap: dict) -> None:
             logger.warning("snapshot cloud save failed for %s", doc_id)
 
 
+def _cloud_get(doc_id: str) -> dict | None:
+    try:
+        from app.services import firestore_repo
+        doc = firestore_repo._db().collection(_COLLECTION).document(doc_id).get()
+        return doc.to_dict() if doc.exists else None
+    except Exception:
+        return None
+
+
+def _cloud_list() -> list[dict]:
+    try:
+        from app.services import firestore_repo
+        return [d.to_dict() for d in firestore_repo._db().collection(_COLLECTION).stream()]
+    except Exception:
+        logger.warning("snapshot cloud list failed")
+        return []
+
+
 def get_snapshot(slug: str, date_iso: str) -> dict | None:
     p = _root() / f"{_doc_id(slug, date_iso)}.json"
     if p.exists():
         return json.loads(p.read_text(encoding="utf-8"))
+    if _use_cloud():  # disk is ephemeral on Cloud Run — Firestore is durable
+        return _cloud_get(_doc_id(slug, date_iso))
     return None
 
 
 def list_snapshots(slug: str | None = None, month: str | None = None,
                    meta_only: bool = False) -> list[dict]:
-    out = []
+    by_id: dict[str, dict] = {}
+    if _use_cloud():  # durable history first; local same-day copies override
+        for snap in _cloud_list():
+            if isinstance(snap, dict) and snap.get("vendor_slug") and snap.get("date"):
+                by_id[_doc_id(snap["vendor_slug"], snap["date"])] = snap
     for p in sorted(_root().glob("*.json")):
         try:
-            snap = json.loads(p.read_text(encoding="utf-8"))
+            by_id[p.stem] = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             continue
+    out = []
+    for snap in by_id.values():
         if slug and snap.get("vendor_slug") != slug:
             continue
         if month and snap.get("month") != month:

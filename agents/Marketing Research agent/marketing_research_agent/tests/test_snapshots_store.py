@@ -40,6 +40,35 @@ def test_list_filters_by_month(monkeypatch, tmp_path):
     assert [s["date"] for s in feb] == ["2026-02-06", "2026-02-07"]
 
 
+def test_get_snapshot_falls_back_to_cloud(monkeypatch, tmp_path):
+    """Cloud Run has ephemeral disk — a doc missing locally must be readable
+    from Firestore."""
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_SNAPSHOTS_DIR", str(tmp_path))
+    monkeypatch.setattr(snapshots, "_use_cloud", lambda: True)
+    monkeypatch.setattr(
+        snapshots, "_cloud_get",
+        lambda doc_id: _snap() if doc_id == "meta-360-ra_2026-02-07" else None)
+    got = snapshots.get_snapshot("meta-360-ra", "2026-02-07")
+    assert got["vendor_slug"] == "meta-360-ra"
+    assert snapshots.get_snapshot("meta-360-ra", "2026-02-01") is None
+
+
+def test_list_snapshots_merges_cloud_disk_wins(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_SNAPSHOTS_DIR", str(tmp_path))
+    snapshots.save_snapshot(_snap(d="2026-02-07", spend=250.0))  # disk copy
+    monkeypatch.setattr(snapshots, "_use_cloud", lambda: True)
+    monkeypatch.setattr(snapshots, "_cloud_list", lambda: [
+        _snap(d="2026-02-06", spend=100.0),          # cloud-only day
+        _snap(d="2026-02-07", spend=999.0),          # stale cloud copy of a disk day
+    ])
+    out = snapshots.list_snapshots(slug="meta-360-ra")
+    assert [s["date"] for s in out] == ["2026-02-06", "2026-02-07"]
+    # same-day conflict: the local (freshest) copy wins
+    assert out[1]["canonical"]["team_overall"]["spend"]["performance"] == 250.0
+
+
 def test_capture_workbook_filters_and_reports(monkeypatch, tmp_path):
     monkeypatch.setenv("MR_OFFLINE", "1")
     monkeypatch.setenv("MR_SNAPSHOTS_DIR", str(tmp_path))
