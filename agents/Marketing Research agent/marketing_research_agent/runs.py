@@ -31,9 +31,12 @@ def _use_cloud() -> bool:
     if os.environ.get("MR_OFFLINE") == "1":
         return False
     try:
+        # Same source of truth firestore_repo connects with (GCP_PROJECT_ID env);
+        # Cloud Run does NOT set GOOGLE_CLOUD_PROJECT/GCP_PROJECT.
+        from app.config import settings
         from app.services import firestore_repo  # noqa: F401
 
-        return bool(os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT"))
+        return bool(settings.gcp_project_id)
     except Exception:
         return False
 
@@ -85,13 +88,27 @@ def delete_run(run_id: str) -> None:
             logger.warning("MR cloud delete failed for run %s", run_id)
 
 
+def _cloud_list() -> list[dict]:
+    try:
+        return [d.to_dict() for d in _collection().stream()]
+    except Exception:
+        logger.warning("MR cloud list failed")
+        return []
+
+
 def list_runs(user_id: str | None = None) -> list[dict]:
-    out = []
+    by_id: dict[str, dict] = {}
+    if _use_cloud():  # durable history first; local same-id copies override
+        for run in _cloud_list():
+            if isinstance(run, dict) and run.get("id"):
+                by_id[run["id"]] = run
     for p in _root().glob("*.json"):
         try:
-            run = json.loads(p.read_text(encoding="utf-8"))
+            by_id[p.stem] = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             continue
+    out = []
+    for run in by_id.values():
         if user_id is None or run.get("user_id") == user_id:
             out.append(run)
     out.sort(key=lambda r: r.get("generated_at") or "", reverse=True)

@@ -40,6 +40,21 @@ def test_list_filters_by_month(monkeypatch, tmp_path):
     assert [s["date"] for s in feb] == ["2026-02-06", "2026-02-07"]
 
 
+def test_use_cloud_respects_app_settings(monkeypatch):
+    """Cloud Run doesn't set GOOGLE_CLOUD_PROJECT/GCP_PROJECT — the gate must key
+    off the same config firestore_repo uses (settings.gcp_project_id)."""
+    from app.config import settings
+
+    monkeypatch.delenv("MR_OFFLINE", raising=False)
+    monkeypatch.setattr(settings, "gcp_project_id", "some-project")
+    assert snapshots._use_cloud() is True
+    monkeypatch.setattr(settings, "gcp_project_id", "")
+    assert snapshots._use_cloud() is False
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setattr(settings, "gcp_project_id", "some-project")
+    assert snapshots._use_cloud() is False
+
+
 def test_get_snapshot_falls_back_to_cloud(monkeypatch, tmp_path):
     """Cloud Run has ephemeral disk — a doc missing locally must be readable
     from Firestore."""

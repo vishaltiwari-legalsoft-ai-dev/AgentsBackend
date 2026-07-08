@@ -287,8 +287,11 @@ def _use_cloud() -> bool:
     if os.environ.get("MR_OFFLINE") == "1":
         return False
     try:
+        # Same source of truth firestore_repo connects with (GCP_PROJECT_ID env);
+        # Cloud Run does NOT set GOOGLE_CLOUD_PROJECT/GCP_PROJECT.
+        from app.config import settings
         from app.services import firestore_repo  # noqa: F401
-        return bool(os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT"))
+        return bool(settings.gcp_project_id)
     except Exception:
         return False
 
