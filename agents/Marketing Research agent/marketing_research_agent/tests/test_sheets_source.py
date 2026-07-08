@@ -94,26 +94,42 @@ class _FakeService:
         return self._s
 
 
-def test_fetch_all_trackers_via_sheets_api_skips_non_trackers():
-    """Primary discovery path (Sheets API): a tracker tab + a junk tab -> only
-    the tracker is returned, with its gid. Uses an injected fake service."""
+def test_fetch_all_trackers_via_sheets_api_skips_non_trackers_and_rollups():
+    """Primary discovery path (Sheets API): a vendor tracker + the consolidated
+    roll-up + a junk tab -> only the vendor tracker is ingested (the roll-up
+    duplicates the vendors' numbers and would double-count)."""
     from marketing_research_agent.sources.sheets_source import fetch_all_trackers
 
     tabs = [
-        {"gid": 2088778899, "title": "Overall Report"},
+        {"gid": 559258152, "title": "Meta 360 RA"},
+        {"gid": 2088778899, "title": "Marketing 2026 Overall Report"},
         {"gid": 12345, "title": "Raw Notes"},
     ]
     by_title = {
-        "Overall Report": _rows(),
+        "Meta 360 RA": _rows(),
+        "Marketing 2026 Overall Report": _rows(),  # parses fine; skipped by title
         "Raw Notes": [["just", "notes"], ["no", "months"]],
     }
     found = fetch_all_trackers("sheet1", 2026, service=_FakeService(tabs, by_title))
     assert len(found) == 1
-    assert found[0]["tab"] == "Overall Report" and found[0]["gid"] == 2088778899
+    assert found[0]["tab"] == "Meta 360 RA" and found[0]["gid"] == 559258152
     assert len(found[0]["metrics"]) == 4
 
 
-def test_xlsx_discovery_fallback():
+def test_is_rollup_tab():
+    from marketing_research_agent.sources.sheets_source import is_rollup_tab
+
+    # title match survives whatever the dropdown left in A1
+    assert is_rollup_tab("Marketing 2026 Overall Report", [["Meta 360 RA"]]) is True
+    # A1 scope says it's the consolidated view
+    assert is_rollup_tab("Some Tab", [["All", "Jan (Performance)"]]) is True
+    assert is_rollup_tab("Some Tab", [["Overall"]]) is True
+    # a plain vendor tab is not a roll-up
+    assert is_rollup_tab("Meta 360 RA", [["Meta 360 RA"]]) is False
+    assert is_rollup_tab("Meta 360 RA", []) is False
+
+
+def test_xlsx_discovery_fallback_skips_rollups():
     """Fallback discovery path (whole-workbook xlsx via openpyxl)."""
     import io as _io
 
@@ -123,9 +139,12 @@ def test_xlsx_discovery_fallback():
 
     wb = openpyxl.Workbook()
     tracker = wb.active
-    tracker.title = "Overall Report"
+    tracker.title = "Meta 360 RA"
     for r in _rows():
         tracker.append(r)
+    rollup = wb.create_sheet("Marketing 2026 Overall Report")
+    for r in _rows():
+        rollup.append(r)
     junk = wb.create_sheet("Raw Notes")
     junk.append(["just", "some", "notes"])
     buf = _io.BytesIO()
@@ -133,4 +152,4 @@ def test_xlsx_discovery_fallback():
     data = buf.getvalue()
 
     found = _fetch_all_trackers_xlsx("sheet1", 2026, xlsx_fetcher=lambda sid: data)
-    assert len(found) == 1 and found[0]["tab"] == "Overall Report"
+    assert len(found) == 1 and found[0]["tab"] == "Meta 360 RA"

@@ -284,6 +284,17 @@ def _default_xlsx_fetcher(spreadsheet_id: str) -> bytes:
     return resp.content
 
 
+def is_rollup_tab(title: str, rows: list[list[str]]) -> bool:
+    """True for the consolidated roll-up tab (e.g. "Marketing 2026 Overall
+    Report"). Its numbers are the sum of the vendor tabs, so ingesting it
+    alongside them double-counts every dollar. Matched by title (stable even
+    when the dropdown re-scopes A1) or by an "All"/"Overall" A1 scope."""
+    if "overall" in (title or "").lower():
+        return True
+    a1 = (rows[0][0] if rows and rows[0] else "").strip().lower()
+    return a1 in ("all", "overall")
+
+
 def fetch_all_trackers(
     spreadsheet_id: str,
     year: int,
@@ -303,6 +314,8 @@ def fetch_all_trackers(
         out: list[dict] = []
         for tab in list_tabs(spreadsheet_id, service=svc):
             rows = fetch_tab_values(spreadsheet_id, tab["title"], service=svc)[:max_rows]
+            if is_rollup_tab(tab["title"], rows):
+                continue
             metrics, gaps = parse_tracker(rows, year)
             if metrics:
                 out.append({"tab": tab["title"], "gid": tab["gid"], "metrics": metrics, "gaps": gaps})
@@ -337,6 +350,8 @@ def _fetch_all_trackers_xlsx(
             rows.append(["" if c is None else str(c) for c in row])
             if len(rows) >= max_rows:
                 break
+        if is_rollup_tab(name, rows):
+            continue
         metrics, gaps = parse_tracker(rows, year)
         if metrics:
             out.append({"tab": name, "metrics": metrics, "gaps": gaps})
