@@ -520,6 +520,73 @@ def vendor_detail(slug: str, date_iso: str | None = None) -> dict | None:
             "dates": dates, "snapshot": curr, "delta": compute_delta(curr, prev)}
 
 
+def portfolio(date_iso: str | None = None) -> dict | None:
+    """Official cross-vendor totals for the Vendors tab summary bar.
+
+    Paid vendors only (the Overall roll-up snapshot is excluded), each vendor's
+    latest snapshot, summed on the Performance basis — the way the team reads
+    the sheet's "official" figures."""
+    import calendar as _cal
+
+    latest: dict[str, dict] = {}
+    for s in list_snapshots():
+        if "overall" in s["vendor_slug"]:
+            continue
+        if date_iso and s["date"] > date_iso:
+            continue
+        latest[s["vendor_slug"]] = s  # list is date-sorted per vendor; last wins
+    if not latest:
+        return None
+
+    def val(node: dict, *path, pair: bool = False) -> float:
+        cur = node
+        for p in path:
+            cur = (cur or {}).get(p)
+        if pair and isinstance(cur, dict):
+            v = cur.get("performance")
+            cur = v if v is not None else cur.get("investment")
+        return float(cur or 0)
+
+    budget = spend = 0.0
+    leads = qualified = qdb = completed = sold = 0
+    newest = max(s["date"] for s in latest.values())
+    for s in latest.values():
+        t = s["canonical"].get("team_overall", {})
+        budget += val(t, "budget", pair=True)
+        spend += val(t, "spend", pair=True)
+        leads += int(val(t, "leads", "total"))
+        qualified += int(val(t, "leads", "qualified"))
+        b = val(t, "demos", "qualified_booked_all")
+        qdb += int(b if b else val(t, "demos", "total_booked_all"))
+        completed += int(val(t, "demos", "completed_all"))
+        sold += int(val(t, "actualized_revenue", "services_sold"))
+
+    div = lambda n, d: round(n / d, 2) if d else None
+    day = int(newest[8:10])
+    year, month = int(newest[:4]), int(newest[5:7])
+    days_in_month = _cal.monthrange(year, month)[1]
+    return {
+        "date": newest,
+        "month": newest[:7],
+        "vendors": len(latest),
+        "total_budget": round(budget, 2),
+        "total_spend": round(spend, 2),
+        "budget_utilized_pct": div(spend * 100, budget),
+        "leads": leads,
+        "qualified_leads": qualified,
+        "cost_per_qualified_lead": div(spend, qualified),
+        "qual_demos_booked": qdb,
+        "cost_per_qual_demo_booked": div(spend, qdb),
+        "demos_completed": completed,
+        "show_rate_pct": div(completed * 100, qdb),
+        "services_sold": sold,
+        "pacing": {"day": day, "days_in_month": days_in_month,
+                   "expected_pct": round(day / days_in_month * 100)},
+        "benchmarks": {"cpqdb_max": 500, "ql_ratio_min": 40,
+                       "show_rate_min": 80, "cac_target": 2500, "cpql_red": 600},
+    }
+
+
 # --- GCS export (the user's per-vendor month JSON) ----------------------------
 
 _SCHEMA_VERSION = "1.0.0"

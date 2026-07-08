@@ -248,6 +248,15 @@ def snapshots_deltas(date_iso: str | None = None, user=Depends(get_current_user)
     return mr_snapshots.deltas_for(date_iso)
 
 
+@router.get("/mr/snapshots/portfolio")
+def snapshots_portfolio(user=Depends(get_current_user)):
+    """Official cross-vendor totals for the Vendors tab summary bar."""
+    out = mr_snapshots.portfolio()
+    if out is None:
+        raise HTTPException(404, "no vendor snapshots yet")
+    return out
+
+
 @router.get("/mr/snapshots/vendor/{slug}")
 def snapshots_vendor(slug: str, date_iso: str | None = None, user=Depends(get_current_user)):
     """Full per-vendor dossier: dates, the day's snapshot, its movement."""
