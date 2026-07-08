@@ -24,6 +24,7 @@ from marketing_research_agent import insight as mr_insight
 from marketing_research_agent import profiles as mr_profiles
 from marketing_research_agent import reports, runs, schedule
 from marketing_research_agent import snapshots as mr_snapshots
+from marketing_research_agent import trends as mr_trends
 from marketing_research_agent import workbook as mr_workbook
 from marketing_research_agent.config import COLUMN_MAPS
 from marketing_research_agent.schemas import CampaignMetric, DateRange, Lead
@@ -62,12 +63,9 @@ def _rehydrate_leads(rows: list[dict]) -> list[Lead]:
     return out
 
 
-def _load_dataset(user_id: str) -> dict:
-    """Reassemble the user's ingested data into one dataset.
-
-    Keeps only the most recent dataset per ``platform`` so that re-pulling the
-    same sheet tab / re-uploading the same export supersedes the prior copy
-    rather than double-counting it."""
+def _latest_datasets(user_id: str) -> dict[str, dict]:
+    """Newest dataset run per ``platform`` so a re-pull supersedes the prior
+    copy rather than double-counting it."""
     latest: dict[str, dict] = {}
     for run in runs.list_runs(user_id):
         if run.get("kind") != "dataset":
@@ -76,6 +74,12 @@ def _load_dataset(user_id: str) -> dict:
         prev = latest.get(plat)
         if prev is None or run.get("generated_at", "") > prev.get("generated_at", ""):
             latest[plat] = run
+    return latest
+
+
+def _load_dataset(user_id: str) -> dict:
+    """Reassemble the user's ingested data into one dataset."""
+    latest = _latest_datasets(user_id)
     metrics: list[CampaignMetric] = []
     leads: list[Lead] = []
     for run in latest.values():
@@ -205,6 +209,18 @@ def datasets(user=Depends(get_current_user)):
 def overview(user=Depends(get_current_user)):
     """Live dashboard state — latest-month KPIs vs 2026 goals. Persists nothing."""
     return reports.overview(_load_dataset(user["id"]))
+
+
+@router.get("/mr/trends")
+def trends_endpoint(user=Depends(get_current_user)):
+    """Monthly rollups + deterministic desk insights for the Overview board."""
+    latest = _latest_datasets(user["id"])
+    vendor_datasets = [
+        {"vendor": plat[7:] if str(plat).startswith("sheets:") else str(plat),
+         "metrics": _rehydrate_metrics(run.get("metrics", []))}
+        for plat, run in sorted(latest.items())
+    ]
+    return mr_trends.build(vendor_datasets, today=date.today())
 
 
 @router.post("/mr/snapshots/capture")
