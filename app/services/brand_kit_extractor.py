@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 import fitz  # PyMuPDF — existing backend dependency
+from PIL import Image  # Pillow — existing backend dependency
 
 _HEX_RE = re.compile(r"#([0-9A-Fa-f]{6})\b")
 _BARE_HEX_RE = re.compile(r"\b([0-9A-Fa-f]{6})\b")
@@ -53,6 +55,25 @@ def _add(hits: list[ColorHit], seen: set[str], raw: str, page_no: int, line: str
         hits.append(ColorHit(hex=hx, page=page_no, context=line.strip()))
 
 
+def extract_svg_colors(svg_path: Path) -> list[ColorHit]:
+    """Regex-scan an SVG's raw XML text for hex color literals (vector
+    fill/stroke values). Deduped, first-seen order. An unreadable file
+    (missing, permission error, etc.) yields an empty list rather than
+    raising — SVGs are one rung of an optional source ladder."""
+    try:
+        text = Path(svg_path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+    hits: list[ColorHit] = []
+    seen: set[str] = set()
+    for m in _HEX_RE.finditer(text):
+        hx = f"#{m.group(1).upper()}"
+        if hx not in seen:
+            seen.add(hx)
+            hits.append(ColorHit(hex=hx, page=0, context=f"svg:{svg_path.name}"))
+    return hits
+
+
 _SUBSET_RE = re.compile(r"^[A-Z]{6}\+")
 
 
@@ -90,6 +111,43 @@ def extract_fonts(pdf_path: Path) -> list[FontHit]:
     return list(found.values())
 
 
+_SIZE_TOKEN_RE = re.compile(r"\b\d+pt\b", re.I)
+
+
+def _parse_font_filename(stem: str) -> tuple[str, str]:
+    """Split a font filename stem into (family, style).
+
+    Rule: split on the LAST '-'; the trailing segment is the style (else
+    "Regular" if no '-' at all). When there is no '-', split on the LAST '_'
+    instead. The remaining (family) portion has '_' turned into spaces and
+    any "NNpt" size tokens dropped.
+    """
+    if "-" in stem:
+        family_raw, _, style = stem.rpartition("-")
+    elif "_" in stem:
+        family_raw, _, style = stem.rpartition("_")
+    else:
+        family_raw, style = stem, "Regular"
+    family_raw = family_raw.replace("_", " ")
+    family_raw = _SIZE_TOKEN_RE.sub("", family_raw)
+    family = re.sub(r"\s+", " ", family_raw).strip()
+    return family, (style or "Regular")
+
+
+def fonts_from_files(paths: list[Path]) -> list[FontHit]:
+    """Derive FontHits purely from filenames (no font file is opened) —
+    used when a brand-kit dir has loose .ttf/.otf files but no PDF/SVG that
+    names them. Deduped on (family, style); first occurrence wins."""
+    found: dict[tuple[str, str], FontHit] = {}
+    for path in paths:
+        family, style = _parse_font_filename(path.stem)
+        key = (family, style)
+        found.setdefault(key, FontHit(
+            family=family, style=style, raw_name=path.name,
+            embedded=True, pages=[]))
+    return list(found.values())
+
+
 def _rgb(hx: str) -> tuple[float, float, float]:
     return tuple(int(hx[i:i + 2], 16) / 255 for i in (1, 3, 5))
 
@@ -120,6 +178,40 @@ def derive_palette(hexes: list[str]) -> dict:
         "light": light, "mid": mid, "deep": deep, "accent": accent, "ink": ink,
         "hl_from": accent, "hl_to": deep, "cta_from": mid, "cta_to": deep,
     }
+
+
+def extract_pixel_colors(image_paths: list[Path], min_share: float = 0.02) -> list[ColorHit]:
+    """Flat-pixel frequency analysis across ALL given images: exact observed
+    RGB values (no quantization) that cover >= min_share of the combined
+    pixel count. Images are downscaled (long side <= 256px, deterministic
+    ``Image.thumbnail``) purely for speed before counting. ``#FFFFFF`` is
+    excluded as an assumed background color. Corrupt/unreadable images are
+    skipped silently rather than raising, since this rung of the source
+    ladder runs over a whole folder of creatives of unknown provenance.
+    Returned in descending share order.
+    """
+    counts: Counter[tuple[int, int, int]] = Counter()
+    for path in image_paths:
+        try:
+            with Image.open(path) as img:
+                rgb = img.convert("RGB")
+                rgb.thumbnail((256, 256))
+                counts.update(rgb.get_flattened_data())
+        except Exception:
+            continue
+    total = sum(counts.values())
+    if not total:
+        return []
+    scored: list[tuple[float, ColorHit]] = []
+    for (r, g, b), n in counts.items():
+        hx = f"#{r:02X}{g:02X}{b:02X}"
+        if hx == "#FFFFFF":
+            continue
+        share = n / total
+        if share >= min_share:
+            scored.append((share, ColorHit(hex=hx, page=0, context=f"pixel-share={share:.1%}")))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [hit for _, hit in scored]
 
 
 @dataclass
@@ -186,27 +278,71 @@ def _label_with_llm(colors, fonts, llm) -> dict | None:
     return out
 
 
+def _merge_color_hits(*groups: list[ColorHit]) -> list[ColorHit]:
+    """Dedupe on hex across priority-ordered groups — the first group that
+    contains a given hex wins (its page/context is kept)."""
+    merged: list[ColorHit] = []
+    seen: set[str] = set()
+    for group in groups:
+        for hit in group:
+            if hit.hex not in seen:
+                seen.add(hit.hex)
+                merged.append(hit)
+    return merged
+
+
+def _merge_font_hits(*groups: list[FontHit]) -> list[FontHit]:
+    """Dedupe on (family, style) across priority-ordered groups — the first
+    group that contains a given key wins."""
+    merged: list[FontHit] = []
+    seen: set[tuple[str, str]] = set()
+    for group in groups:
+        for hit in group:
+            key = (hit.family, hit.style)
+            if key not in seen:
+                seen.add(key)
+                merged.append(hit)
+    return merged
+
+
 def build_profile(brand_name: str, sources: KitSources,
                   llm: Callable[[str], str] | None = None) -> BrandKitProfile:
-    """Assemble a BrandKitProfile from a brand-kit PDF (Amendment A extends
-    this to merge SVG/font-file/pixel sources; see the source-ladder cycle)."""
-    colors = extract_colors(sources.kit_pdf) if sources.kit_pdf else []
-    fonts = extract_fonts(sources.kit_pdf) if sources.kit_pdf else []
-    roles, matched = _label_by_context(colors)
+    """Assemble a BrandKitProfile via the extraction source ladder (highest
+    fidelity first): brand-kit PDF text/fonts > SVG vector fills > font-file
+    names > flat-pixel frequency analysis of PNG creatives. Colors and fonts
+    from higher-priority sources win on collision (dedupe on hex / on
+    (family, style) respectively). LLM role/tone labeling may only ever pick
+    from hexes actually extracted, across the union of all sources
+    (anti-hallucination invariant)."""
+    pdf_colors = extract_colors(sources.kit_pdf) if sources.kit_pdf else []
+    pdf_fonts = extract_fonts(sources.kit_pdf) if sources.kit_pdf else []
+    svg_colors = [hit for svg in sources.svg_files for hit in extract_svg_colors(svg)]
+    pixel_colors = extract_pixel_colors(sources.image_files)
+    file_fonts = fonts_from_files(sources.font_files)
+
+    colors = _merge_color_hits(pdf_colors, svg_colors, pixel_colors)
+    fonts = _merge_font_hits(file_fonts, pdf_fonts)
+
+    roles, _matched = _label_by_context(colors)
     tone = None
     if llm is not None:
         labeled = _label_with_llm(colors, fonts, llm)
         if labeled:
             tone = labeled.pop("tone_of_voice")
             if any(labeled.values()):
-                roles, matched = labeled, True
+                roles = labeled
     all_hexes = [c.hex for c in colors]
     palette = derive_palette(all_hexes) if len(all_hexes) >= 3 else {}
     family = None
     if fonts:
         best = max(fonts, key=lambda f: (f.embedded, len(f.pages)))
         family = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", best.family)  # BeVietnamPro → Be Vietnam Pro
-    confidence = "high" if matched else ("medium" if colors else "low")
+    if pdf_colors or svg_colors:
+        confidence = "high"
+    elif pixel_colors:
+        confidence = "medium"
+    else:
+        confidence = "low"
     return BrandKitProfile(
         brand_name=brand_name, colors=colors, fonts=fonts,
         primary_colors=roles["primary"], secondary_colors=roles["secondary"],
