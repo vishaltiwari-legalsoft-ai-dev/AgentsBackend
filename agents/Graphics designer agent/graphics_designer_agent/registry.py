@@ -18,8 +18,11 @@ and keeps the canonical prompts byte-identical. New brands ship their own
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from . import suggestions as _s
 from . import tokens as _t
@@ -34,6 +37,8 @@ from .stage3_text import style_options as _stage3
 DEFAULT_BRAND_ID = "legalsoft"
 
 _AGENT_ROOT = Path(__file__).resolve().parents[1]
+
+logger = logging.getLogger("graphics_designer.registry")
 
 
 @dataclass(frozen=True)
@@ -207,6 +212,27 @@ def _build_legalsoft() -> BrandPack:
 # Registry of available brands. New brands register their pack here.
 _PACKS: dict[str, BrandPack] = {}
 
+# App-level injection point (Stage 4): a callable returning templated-brand
+# spec dicts (the templated_brands.SPECS contract), set by the app at startup.
+# None means "no dynamic source" — keeps this package free of Firestore/app
+# imports; the callable itself is the only seam.
+_DYNAMIC_SOURCE: Callable[[], list[dict]] | None = None
+
+
+def register_dynamic_source(fn: Callable[[], list[dict]] | None) -> None:
+    """App-level injection point: a callable returning templated-brand spec
+    dicts (the templated_brands.SPECS contract). Keeps this package free of
+    Firestore/app imports. Pass None to detach."""
+    global _DYNAMIC_SOURCE
+    _DYNAMIC_SOURCE = fn
+    refresh()
+
+
+def refresh() -> None:
+    """Drop the pack cache; next access rebuilds (call after enrichment runs)."""
+    global _PACKS
+    _PACKS = {}
+
 
 def _registry() -> dict[str, BrandPack]:
     if not _PACKS:
@@ -217,6 +243,19 @@ def _registry() -> dict[str, BrandPack]:
 
         for pack in templated_brands.build_all():
             _PACKS[pack.id] = pack
+
+        # Dynamic brands (Stage 4, Firestore-backed). Flag-gated so the registry
+        # is byte-identical to today when unset, and fault-isolated: one bad
+        # spec is logged and skipped, never fatal to the whole registry. Static
+        # packs always win on id collision (setdefault).
+        if _DYNAMIC_SOURCE is not None and os.getenv("GD_DYNAMIC_BRANDS") == "1":
+            for spec in _DYNAMIC_SOURCE():
+                try:
+                    pack = templated_brands.build_templated_pack(spec)
+                except Exception as exc:  # one bad brand must not kill the registry
+                    logger.warning("dynamic brand %r skipped: %s", spec.get("id"), exc)
+                    continue
+                _PACKS.setdefault(pack.id, pack)  # static packs win on collision
     return _PACKS
 
 
