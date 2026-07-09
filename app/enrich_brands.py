@@ -64,21 +64,29 @@ def main() -> None:
     ap.add_argument("--brand", help="only this brand folder name (--root mode only)")
     ap.add_argument("--report", type=Path, default=Path("enrichment_report.json"))
     args = ap.parse_args()
+    if args.backfill_static and args.brand:
+        ap.error("--brand only applies to --root mode, not --backfill-static")
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    if args.backfill_static:
-        try:
-            reports = [backfill_static(args.backfill_static, dry_run=not args.write,
-                                        now_iso=now_iso)]
-        except ValueError as exc:
-            raise SystemExit(f"[enrich_brands] {exc}")
-    else:
-        reports = enrich_root(args.root, dry_run=not args.write, now_iso=now_iso)
-        if args.brand:
-            reports = [r for r in reports if r["brand_name"].lower() == args.brand.lower()]
+    reports: list[dict] = []
+    try:
+        if args.backfill_static:
+            try:
+                reports.append(backfill_static(args.backfill_static,
+                                               dry_run=not args.write, now_iso=now_iso))
+            except ValueError as exc:
+                raise SystemExit(f"[enrich_brands] {exc}")
+        else:
+            for r in enrich_root(args.root, dry_run=not args.write, now_iso=now_iso):
+                if not args.brand or r["brand_name"].lower() == args.brand.lower():
+                    reports.append(r)
+    finally:
+        # Always leave an inspectable artifact — even when a run aborts
+        # mid-way, whatever was gathered is written before the error surfaces.
+        args.report.write_text(json.dumps(reports, indent=2, default=str),
+                               encoding="utf-8")
 
-    args.report.write_text(json.dumps(reports, indent=2, default=str), encoding="utf-8")
     _print_report(reports)
     print(f"\nreport -> {args.report}")
 

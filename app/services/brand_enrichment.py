@@ -4,7 +4,8 @@
 
 The ONLY module in this feature allowed to touch Firestore/GCS. Extraction
 and scanning stay pure so they test offline; this module wraps its calls
-with a fake Firestore / fake `_upload_file` in tests, never the real thing.
+with a fake Firestore / fake upload seam in tests, never the real thing.
+Dry-run performs ZERO Firestore/GCS calls — not even reads.
 
 Also implements the Amendment-A rung-5 static backfill (`backfill_static`)
 for brands whose exact palette/fonts are already hardcoded in
@@ -22,9 +23,6 @@ from app.services.brand_kit_extractor import BrandKitProfile, KitSources, build_
 # Images considered for the pixel-frequency rung (mirrors the folder scanner's
 # ASSET_EXTS, minus the non-image formats it also sweeps up).
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
-
-OWNED_KEYS = ("primary_colors", "secondary_colors", "accent_colors", "fonts",
-              "tone_of_voice", "brand_kit_source", "enrichment")
 
 # Content-type map for the font/logo files this module uploads to GCS.
 _UPLOAD_MIME_BY_EXT = {
@@ -57,13 +55,33 @@ def _build_sources(folder: BrandFolder) -> KitSources:
     )
 
 
+def _source_ladder(profile: BrandKitProfile, kit_pdf_present: bool) -> dict:
+    """Which rungs CONTRIBUTED to the merged profile — not merely which had
+    material present. Uses Unit A's context conventions: a ColorHit whose
+    context starts "svg:" came from the SVG rung, "pixel-share=" from the
+    pixel rung, and any other context can only be a kit-PDF text line
+    (guarded on the PDF actually being present); a FontHit whose raw_name is
+    a .ttf/.otf file name came from the font-file rung (PDF-embedded fonts
+    carry basefont names like "ABCDEF+Family-Style" instead). A rung whose
+    every hit was deduped out by a higher-priority rung reads False."""
+    contexts = [c.context for c in profile.colors]
+    return {
+        "kit_pdf": kit_pdf_present and any(
+            not c.startswith("svg:") and not c.startswith("pixel-share=")
+            for c in contexts),
+        "svg": any(c.startswith("svg:") for c in contexts),
+        "font_files": any(f.raw_name.lower().endswith((".ttf", ".otf"))
+                          for f in profile.fonts),
+        "pixel": any(c.startswith("pixel-share=") for c in contexts),
+    }
+
+
 def profile_to_patch(profile: BrandKitProfile, folder: BrandFolder, now_iso: str) -> dict:
     """The exact brand_metadata patch (R2c patch hygiene): build every owned
     key, then drop top-level keys whose value is None or [] — except
     `brand_kit_source` (only ever added when folder.kit_pdf is set, so it is
     never empty when present) and `enrichment` (always written, even when its
     `palette` sub-value is {})."""
-    sources = _build_sources(folder)
     patch: dict = {
         "primary_colors": profile.primary_colors,
         "secondary_colors": profile.secondary_colors,
@@ -75,12 +93,7 @@ def profile_to_patch(profile: BrandKitProfile, folder: BrandFolder, now_iso: str
             "extracted_at": now_iso,
             "palette": profile.palette,
             "pages_scanned": profile.provenance.get("pages_scanned", 0),
-            "source_ladder": {
-                "kit_pdf": sources.kit_pdf is not None,
-                "svg": bool(sources.svg_files),
-                "font_files": bool(sources.font_files),
-                "pixel": bool(sources.image_files),
-            },
+            "source_ladder": _source_ladder(profile, folder.kit_pdf is not None),
         },
     }
     if folder.kit_pdf is not None:
@@ -93,19 +106,36 @@ def profile_to_patch(profile: BrandKitProfile, folder: BrandFolder, now_iso: str
 
 
 def _upload_file(local: Path, dest: str) -> str | None:
-    """Upload `local` to GCS at object path `dest` (e.g.
-    "brands/<id>/fonts/<file>"), delegating to storage's core `_upload`
-    primitive — the same one every public storage.upload_* helper wraps; none
-    of the existing public helpers match this feature's destination layout
-    (brands/<brand_id>/fonts|logos/<file>), so this seam calls the shared
-    primitive directly rather than duplicating its GCS/signing logic.
-    Returns the `gs://` URI, or None when no bucket is configured — callers
-    log that as a report note rather than raising."""
+    """Upload `local` to GCS at object path `dest`
+    ("brands/<brand_id>/<kind>/<file>"), delegating to the public
+    `storage.upload_brand_asset` helper with a content type derived from the
+    file extension. Returns the `gs://` URI, or None when no bucket is
+    configured — callers log that as a report note rather than raising.
+    Upload errors propagate; `_upload_batch` contains them per-file."""
     if not storage.is_configured():
         return None
+    _, brand_id, kind, filename = dest.split("/", 3)
     content_type = _UPLOAD_MIME_BY_EXT.get(local.suffix.lower(), "application/octet-stream")
-    gs_uri, _ = storage._upload(dest, local.read_bytes(), content_type)
-    return gs_uri
+    return storage.upload_brand_asset(brand_id, kind, filename, local.read_bytes(),
+                                      content_type)
+
+
+def _upload_batch(files: list[Path], brand_id: str, kind: str, notes: list[str]) -> list[str]:
+    """Upload a brand's font/logo files, containing failures per-file: one
+    flaky upload appends a note and moves on — it never aborts the rest of
+    the batch (or the brand's Firestore write)."""
+    uris: list[str] = []
+    for f in files:
+        try:
+            uri = _upload_file(f, f"brands/{brand_id}/{kind}/{f.name}")
+        except Exception as exc:  # noqa: BLE001 - per-file containment by design
+            notes.append(f"upload failed: {f.name}: {exc}")
+            continue
+        if uri:
+            uris.append(uri)
+        else:
+            notes.append(f"no GCS bucket configured — skipped upload of {f.name}")
+    return uris
 
 
 def enrich_root(root: Path, *, dry_run: bool = True,
@@ -118,8 +148,10 @@ def enrich_root(root: Path, *, dry_run: bool = True,
 
 
 def _enrich_one(folder: BrandFolder, *, dry_run: bool, llm, now_iso: str) -> dict:
+    # matched_existing starts as None = "not checked": dry-run performs ZERO
+    # Firestore calls, including the name lookup, so it can never know.
     base = {"brand_name": folder.brand_name, "brand_id": None,
-            "matched_existing": False, "wrote": False, "skipped_reason": None,
+            "matched_existing": None, "wrote": False, "skipped_reason": None,
             "patch": None, "confidence": None,
             "font_fallback": not folder.font_files, "notes": []}
 
@@ -135,10 +167,11 @@ def _enrich_one(folder: BrandFolder, *, dry_run: bool, llm, now_iso: str) -> dic
     patch = profile_to_patch(profile, folder, now_iso)
     base |= {"patch": patch, "confidence": profile.confidence}
 
-    existing = firestore_repo.find_brand_by_name(folder.brand_name)
-    base["matched_existing"] = existing is not None
     if dry_run:
         return base
+
+    existing = firestore_repo.find_brand_by_name(folder.brand_name)
+    base["matched_existing"] = existing is not None
 
     # R2d live-write order: allocate the doc first (find-or-create), THEN
     # upload fonts/logos (R3), THEN a single update_brand_metadata carrying
@@ -149,22 +182,8 @@ def _enrich_one(folder: BrandFolder, *, dry_run: bool, llm, now_iso: str) -> dic
         created = firestore_repo.upsert_brand(folder.brand_name, {})
         brand_id = created["id"]
 
-    font_uris: list[str] = []
-    for f in folder.font_files:
-        uri = _upload_file(f, f"brands/{brand_id}/fonts/{f.name}")
-        if uri:
-            font_uris.append(uri)
-        else:
-            base["notes"].append(f"no GCS bucket configured — skipped upload of {f.name}")
-
-    logo_uris: list[str] = []
-    for f in folder.logo_candidates:
-        uri = _upload_file(f, f"brands/{brand_id}/logos/{f.name}")
-        if uri:
-            logo_uris.append(uri)
-        else:
-            base["notes"].append(f"no GCS bucket configured — skipped upload of {f.name}")
-
+    font_uris = _upload_batch(folder.font_files, brand_id, "fonts", base["notes"])
+    logo_uris = _upload_batch(folder.logo_candidates, brand_id, "logos", base["notes"])
     if font_uris:
         patch["enrichment"]["font_files"] = font_uris
     if logo_uris:

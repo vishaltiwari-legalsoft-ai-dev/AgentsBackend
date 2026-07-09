@@ -130,6 +130,31 @@ def upload_generated(
     )
 
 
+def upload_brand_asset(
+    brand_id: str,
+    kind: str,
+    filename: str,
+    data: bytes,
+    content_type: str | None = None,
+) -> str:
+    """Store a brand-kit asset at `brands/<brand_id>/<kind>/<filename>` (kind
+    is "fonts" or "logos") and return its `gs://` URI.
+
+    Unlike `_upload`, no signed view URL is generated — brand enrichment
+    persists durable `gs://` URIs in Firestore, not time-limited links.
+    """
+    bucket_name = settings.require("gcs_bucket_name")
+    object_path = f"brands/{brand_id}/{kind}/{_safe_name(filename)}"
+    try:
+        blob = _storage().bucket(bucket_name).blob(object_path)
+        blob.upload_from_string(
+            data, content_type=content_type or "application/octet-stream"
+        )
+        return f"gs://{bucket_name}/{object_path}"
+    except Exception as exc:  # noqa: BLE001 - surface storage errors with context
+        raise RuntimeError(f'GCS upload failed for "{object_path}": {exc}') from exc
+
+
 # Cloud Storage namespace for the Brand Reference Library (Drive-synced
 # precedent + its index). Kept separate from brand kits, references and
 # generated output so it is never confused with — or pruned alongside — them.
