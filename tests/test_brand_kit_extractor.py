@@ -81,3 +81,34 @@ def test_derive_palette_requires_three_colors():
     import pytest
     with pytest.raises(ValueError):
         derive_palette(["#FFFFFF", "#000000"])
+
+
+import json
+
+from app.services.brand_kit_extractor import KitSources, build_profile
+
+
+def test_build_profile_offline_labels_by_context(kit_pdf):
+    profile = build_profile("Acme Health", KitSources(kit_pdf=kit_pdf), llm=None)
+    assert "#1A2B3C" in profile.primary_colors      # line said "Primary"
+    assert "#24B9CE" in profile.secondary_colors    # line said "Secondary"
+    assert "#19B1E3" in profile.accent_colors       # line said "Accent"
+    assert profile.confidence == "high"             # explicit role words found
+    assert profile.palette["light"]                 # derive_palette ran
+    assert profile.provenance["kit_pdf"].endswith("kit.pdf")
+
+
+def test_llm_cannot_invent_colors(kit_pdf):
+    def lying_llm(prompt: str) -> str:
+        return json.dumps({"primary": ["#DEADBF"], "secondary": ["#24B9CE"],
+                           "accent": [], "tone_of_voice": "confident, warm"})
+    profile = build_profile("Acme Health", KitSources(kit_pdf=kit_pdf), llm=lying_llm)
+    assert "#DEADBF" not in (profile.primary_colors + profile.secondary_colors
+                             + profile.accent_colors)   # invented hex discarded
+    assert "#24B9CE" in profile.secondary_colors        # real hex accepted
+    assert profile.tone_of_voice == "confident, warm"
+
+
+def test_build_profile_survives_broken_llm(kit_pdf):
+    profile = build_profile("Acme", KitSources(kit_pdf=kit_pdf), llm=lambda p: "not json at all")
+    assert profile.primary_colors                       # heuristic fallback used
