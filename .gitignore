@@ -16,3 +16,6 @@ agents/**/runs/
 agents/**/creative_runs/
 # npm scratch installs used to vendor static assets (not project deps)
 node_modules/
+
+# dynamically materialized brand fonts (downloaded from GCS at runtime; static brand fonts stay committed)
+agents/Graphics designer agent/graphics_designer_agent/brands/ai-answering/
