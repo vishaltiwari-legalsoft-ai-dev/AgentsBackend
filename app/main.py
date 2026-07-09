@@ -28,6 +28,8 @@ from app.routers import (
     reference_library,
     references,
 )
+from app.services.gd_brand_source import firestore_spec_source
+from graphics_designer_agent import registry as gd_registry
 
 logging.basicConfig(level=logging.INFO)
 
@@ -81,6 +83,12 @@ for router in (
     marketing_research,
 ):
     app.include_router(router.router, prefix="/api")
+
+# Firestore-backed brands become available to the Graphics Designer registry
+# once GD_DYNAMIC_BRANDS=1 (see graphics_designer_agent.registry._registry).
+# Unconditional and harmless when the flag is unset: firestore_spec_source is
+# simply never invoked.
+gd_registry.register_dynamic_source(firestore_spec_source)
 
 
 @app.get("/")

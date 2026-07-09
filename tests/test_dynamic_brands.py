@@ -54,3 +54,69 @@ def test_broken_spec_skipped_not_fatal(monkeypatch):
     monkeypatch.setenv("GD_DYNAMIC_BRANDS", "1")
     registry.register_dynamic_source(lambda: [{"id": "broken"}])  # missing keys
     assert registry.list_packs()  # registry still works
+
+
+# --------------------------------------------------------------------------- #
+# Task 11 — firestore_spec_source + font materialization
+# --------------------------------------------------------------------------- #
+
+def test_firestore_spec_source_yields_specs_with_local_fonts(monkeypatch, tmp_path, valid_dyn_spec):
+    from app.services import gd_brand_source
+
+    # valid_dyn_spec's font_variants are the full Be Vietnam set (14 faces,
+    # since its BrandFolder carries no font_files) — cover every one of them
+    # with a matching enrichment URI so this is a true happy path (no fallback).
+    font_files = [
+        f"gs://bucket/brands/b1/fonts/{v['file']}" for v in valid_dyn_spec["font_variants"]
+    ]
+    docs = [
+        {"id": "b1", "brand_metadata": {
+            "gd_spec": valid_dyn_spec,
+            "enrichment": {"font_files": font_files},
+        }},
+        {"id": "b2", "brand_metadata": {}},  # no gd_spec -> skipped
+    ]
+    monkeypatch.setattr(gd_brand_source, "_list_brands", lambda: docs)
+    monkeypatch.setattr(gd_brand_source, "_fonts_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        gd_brand_source, "_download", lambda uri, dest: dest.write_bytes(b"font")
+    )
+
+    specs = gd_brand_source.firestore_spec_source()
+    assert len(specs) == 1
+    first_file = valid_dyn_spec["font_variants"][0]["file"]
+    assert (tmp_path / valid_dyn_spec["id"] / "fonts" / first_file).exists()
+    assert specs[0]["font_variants"] == valid_dyn_spec["font_variants"]  # untouched, not fallback
+
+
+def test_firestore_spec_source_falls_back_to_bevietnam_on_download_failure(
+    monkeypatch, tmp_path, valid_dyn_spec
+):
+    from app.services import gd_brand_source
+    from graphics_designer_agent.templated_brands import _BEVIETNAM_FULL
+
+    # Give the spec a distinctive, non-Be-Vietnam font so a successful
+    # substitution is actually observable (not coincidentally equal).
+    valid_dyn_spec["font_variants"] = [{"name": "Custom Bold", "file": "Custom-Bold.ttf"}]
+    valid_dyn_spec["font_family"] = "Custom"
+    valid_dyn_spec["default_font"] = "Custom Bold"
+
+    docs = [
+        {"id": "b1", "brand_metadata": {
+            "gd_spec": valid_dyn_spec,
+            "enrichment": {"font_files": ["gs://bucket/brands/b1/fonts/Custom-Bold.ttf"]},
+        }},
+    ]
+    monkeypatch.setattr(gd_brand_source, "_list_brands", lambda: docs)
+    monkeypatch.setattr(gd_brand_source, "_fonts_root", lambda: tmp_path)
+
+    def boom(uri, dest):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(gd_brand_source, "_download", boom)
+
+    specs = gd_brand_source.firestore_spec_source()
+    assert len(specs) == 1  # the spec is still yielded, not dropped
+    assert specs[0]["font_variants"] == _BEVIETNAM_FULL
+    assert specs[0]["font_family"] == "Be Vietnam"
+    assert specs[0]["default_font"] == "Be Vietnam Bold"
