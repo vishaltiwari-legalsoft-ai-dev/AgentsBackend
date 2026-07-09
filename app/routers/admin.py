@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from app.config import settings
 from app.security import get_current_user, require_admin, require_creator
 from app.services import agent_config, firestore_repo, runtime_config
+from graphics_designer_agent import registry
 
 router = APIRouter()
 logger = logging.getLogger("agentos.admin")
@@ -570,3 +571,16 @@ def analytics(_admin: dict = Depends(require_admin)) -> dict:
         "by_brand": dict(by_brand.most_common()),
         "by_category": dict(by_category.most_common()),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Graphics Designer: brand-pack refresh (Super Admin). Drops the GD registry's
+# pack cache so a brand kit enriched in Firestore by the ingestion CLI (or any
+# other registry change) is picked up by the running app without a redeploy.
+# --------------------------------------------------------------------------- #
+
+@router.post("/admin/brands/refresh-packs")
+def refresh_brand_packs(_admin: dict = Depends(require_admin)) -> dict:
+    """Super Admin: rebuild the GD brand-pack cache and return the live list."""
+    registry.refresh()
+    return {"packs": registry.list_packs()}
