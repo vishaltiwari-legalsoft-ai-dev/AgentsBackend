@@ -60,3 +60,13 @@ def test_report_stamps_sources(monkeypatch, tmp_path):
                       "metrics": 1, "leads": 1}]
     r = reports.build("daily_summary", ds, user_id="u1")
     assert r["sources"] == ds["sources"]
+
+
+def test_daily_movement_has_a_real_prompt():
+    """Without a prompt file the LLM free-styles a 3000-word report; the daily
+    brief must ship with explicit brevity instructions."""
+    from marketing_research_agent import analysis
+
+    prompt = analysis.load_prompt("daily_movement")
+    assert prompt != "{data}"
+    assert "Recommend:" in prompt and "{data}" in prompt
