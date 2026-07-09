@@ -8,12 +8,13 @@ runs, owned by the authenticated user.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import tempfile
 from datetime import date, datetime, timezone
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 
 from app.security import get_current_user
 
@@ -148,45 +149,78 @@ def ingest_sheet(
     body = body or {}
     year = int(body.get("year") or mr_config.SHEETS_YEAR)
 
-    # Clear prior sheet datasets for this user so a re-pull is a clean refresh
-    # (prevents stale/duplicate datasets — incl. ones from older platform keys).
-    for run in runs.list_runs(user["id"]):
-        if run.get("kind") == "dataset" and str(run.get("platform", "")).startswith("sheets:"):
-            runs.delete_run(run["id"])
-
-    def _persist(label: str, metrics, gaps) -> dict:
-        run = {
-            "id": runs.new_run_id(),
-            "kind": "dataset",
-            "user_id": user["id"],
-            "agent_id": MR_AGENT_ID,
-            "platform": f"sheets:{label}",
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "metrics": [m.__dict__ for m in metrics],
-            "leads": [],
-            "gaps": [g.__dict__ for g in gaps],
-        }
-        runs.save_run(run)
-        return {"tab": label, "dataset_id": run["id"], "metrics": len(metrics), "gaps": run["gaps"]}
-
-    results = []
     if body.get("gid"):
         src = SheetsSource(
             mr_config.SHEETS_SPREADSHEET_ID, str(body["gid"]), year=year, brand=body.get("brand")
         )
         try:
             metrics, gaps = src.fetch_campaign_metrics(_FULL_RANGE)
-            results.append(_persist(str(body["gid"]), metrics, gaps))
+            results = [_persist_sheet_dataset(user["id"], str(body["gid"]), metrics, gaps)]
         except Exception as exc:  # auth/network/format — report, don't 500
-            results.append({"tab": str(body["gid"]), "error": str(exc)})
+            results = [{"tab": str(body["gid"]), "error": str(exc)}]
     else:
-        try:
-            for found in fetch_all_trackers(mr_config.SHEETS_SPREADSHEET_ID, year):
-                results.append(_persist(found["tab"], found["metrics"], found["gaps"]))
-        except Exception as exc:
-            results.append({"tab": "*", "error": str(exc)})
+        results = _ingest_sheet_all(user["id"], year)
 
     return {"spreadsheet_id": mr_config.SHEETS_SPREADSHEET_ID, "year": year, "tabs": results}
+
+
+def _persist_sheet_dataset(user_id: str, label: str, metrics, gaps) -> dict:
+    run = {
+        "id": runs.new_run_id(),
+        "kind": "dataset",
+        "user_id": user_id,
+        "agent_id": MR_AGENT_ID,
+        "platform": f"sheets:{label}",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "metrics": [m.__dict__ for m in metrics],
+        "leads": [],
+        "gaps": [g.__dict__ for g in gaps],
+    }
+    runs.save_run(run)
+    return {"tab": label, "dataset_id": run["id"], "metrics": len(metrics), "gaps": run["gaps"]}
+
+
+def _ingest_sheet_all(user_id: str, year: int) -> list[dict]:
+    """Auto-discovery pull of every tracker tab for one user (UI and cron path).
+
+    Clears prior sheet datasets first so a re-pull is a clean refresh."""
+    for run in runs.list_runs(user_id):
+        if run.get("kind") == "dataset" and str(run.get("platform", "")).startswith("sheets:"):
+            runs.delete_run(run["id"])
+    results = []
+    try:
+        for found in fetch_all_trackers(mr_config.SHEETS_SPREADSHEET_ID, year):
+            results.append(_persist_sheet_dataset(user_id, found["tab"], found["metrics"], found["gaps"]))
+    except Exception as exc:
+        results.append({"tab": "*", "error": str(exc)})
+    return results
+
+
+@router.post("/mr/cron/refresh")
+def cron_refresh(request: Request):
+    """Scheduled full refresh: sheet pull + daily snapshot capture + GCS export.
+
+    Authenticated by the MR_CRON_KEY shared secret (Cloud Scheduler can't hold a
+    Firebase user session). The pull runs for MR_CRON_USER_ID's workspace; the
+    snapshot capture and exports are user-independent."""
+    key = os.environ.get("MR_CRON_KEY", "")
+    if not key:
+        raise HTTPException(503, "MR_CRON_KEY not configured on this deployment")
+    if not hmac.compare_digest(request.headers.get("x-cron-key", ""), key):
+        raise HTTPException(403, "bad cron key")
+
+    today = date.today()
+    out: dict = {"date": today.isoformat()}
+    uid = os.environ.get("MR_CRON_USER_ID")
+    out["pull"] = _ingest_sheet_all(uid, mr_config.SHEETS_YEAR) if uid else "skipped (MR_CRON_USER_ID unset)"
+    try:
+        grids = _workbook_grids()
+    except Exception as exc:
+        out["capture_error"] = str(exc)
+        return out
+    out["capture"] = mr_snapshots.capture_workbook(grids, year=mr_config.SHEETS_YEAR, today=today)
+    out["exported"] = mr_snapshots.export_all_to_gcs(today)
+    return out
 
 
 @router.get("/mr/datasets")
