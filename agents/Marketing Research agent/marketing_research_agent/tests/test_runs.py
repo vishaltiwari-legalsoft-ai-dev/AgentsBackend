@@ -18,6 +18,30 @@ def test_list_runs_filters_by_user(tmp_path, monkeypatch):
     assert len(runs.list_runs("u1")) == 1
 
 
+def test_cloud_save_payload_is_json_safe(tmp_path, monkeypatch):
+    """Dataset runs embed datetime.date objects; the Firestore client rejects
+    those, so the cloud copy must be serialized like the disk copy."""
+    from datetime import date
+
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    captured = {}
+
+    class _Doc:
+        def set(self, payload):
+            captured.update(payload)
+
+    class _Coll:
+        def document(self, _id):
+            return _Doc()
+
+    monkeypatch.setattr(runs, "_use_cloud", lambda: True)
+    monkeypatch.setattr(runs, "_collection", lambda: _Coll())
+    runs.save_run({"id": "r1", "kind": "dataset", "user_id": "u1",
+                   "metrics": [{"channel": "Google", "date": date(2026, 7, 9)}]})
+    assert captured["metrics"][0]["date"] == "2026-07-09"  # str, not date
+
+
 def test_list_runs_merges_cloud_disk_wins(tmp_path, monkeypatch):
     """Cloud Run disk is ephemeral - list_runs must also surface Firestore docs."""
     monkeypatch.setenv("MR_OFFLINE", "1")

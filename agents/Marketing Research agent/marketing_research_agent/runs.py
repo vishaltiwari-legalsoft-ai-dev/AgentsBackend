@@ -56,10 +56,13 @@ def _path(run_id: str) -> Path:
 
 
 def save_run(run: dict) -> None:
-    _path(run["id"]).write_text(json.dumps(run, default=str, indent=2), encoding="utf-8")
+    payload = json.dumps(run, default=str, indent=2)
+    _path(run["id"]).write_text(payload, encoding="utf-8")
     if _use_cloud():
         try:
-            _collection().document(run["id"]).set(run)
+            # Same serialization as disk: dataset runs embed datetime.date
+            # objects, which the Firestore client rejects.
+            _collection().document(run["id"]).set(json.loads(payload))
         except Exception:  # cloud write is best-effort; disk is source of truth
             logger.warning("MR cloud save failed for run %s", run.get("id"))
 
