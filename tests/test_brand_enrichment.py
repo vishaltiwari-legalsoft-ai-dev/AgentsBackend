@@ -1,4 +1,5 @@
 # backend/tests/test_brand_enrichment.py
+import json
 from pathlib import Path
 
 from app.services import firestore_repo
@@ -274,3 +275,200 @@ def test_enrich_root_dry_run_never_writes(monkeypatch, tmp_path):
     reports = brand_enrichment.enrich_root(_brand_tree(tmp_path), dry_run=True,
                                             now_iso="2026-07-09T00:00:00Z")
     assert reports[0]["wrote"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Task 8 — CLI + font/logo GCS upload + static backfill
+# --------------------------------------------------------------------------- #
+
+def test_enrich_live_uploads_fonts_and_records_uris(monkeypatch, tmp_path):
+    from app.services import brand_enrichment
+    root = _brand_tree(tmp_path)
+    fonts_dir = root / "Acme Health" / "Fonts"
+    fonts_dir.mkdir()
+    (fonts_dir / "Inter-Bold.ttf").write_bytes(b"font")
+
+    db = _FakeDb()
+    monkeypatch.setattr(firestore_repo, "_db", lambda: db)
+    monkeypatch.setattr(firestore_repo, "find_brand_by_name", lambda n: None)
+    monkeypatch.setattr(firestore_repo, "upsert_brand",
+                         lambda n, m: {"id": "new1", "brand_name": n})
+    uploaded = []
+    monkeypatch.setattr(brand_enrichment, "_upload_file",
+                         lambda local, dest: uploaded.append(dest) or f"gs://bucket/{dest}")
+
+    reports = brand_enrichment.enrich_root(root, dry_run=False,
+                                            now_iso="2026-07-09T00:00:00Z")
+    assert "brands/new1/fonts/Inter-Bold.ttf" in uploaded
+    assert reports[0]["patch"]["enrichment"]["font_files"] == \
+        ["gs://bucket/brands/new1/fonts/Inter-Bold.ttf"]
+
+
+def test_enrich_live_uploads_logos_and_records_uris(monkeypatch, tmp_path):
+    from app.services import brand_enrichment
+    root = _brand_tree(tmp_path)
+    logos_dir = root / "Acme Health" / "Logos"
+    logos_dir.mkdir()
+    (logos_dir / "acme-logo.png").write_bytes(b"logo")
+
+    db = _FakeDb()
+    monkeypatch.setattr(firestore_repo, "_db", lambda: db)
+    monkeypatch.setattr(firestore_repo, "find_brand_by_name", lambda n: None)
+    monkeypatch.setattr(firestore_repo, "upsert_brand",
+                         lambda n, m: {"id": "new1", "brand_name": n})
+    uploaded = []
+    monkeypatch.setattr(brand_enrichment, "_upload_file",
+                         lambda local, dest: uploaded.append(dest) or f"gs://bucket/{dest}")
+
+    reports = brand_enrichment.enrich_root(root, dry_run=False,
+                                            now_iso="2026-07-09T00:00:00Z")
+    assert "brands/new1/logos/acme-logo.png" in uploaded
+    assert reports[0]["patch"]["enrichment"]["logo_files"] == \
+        ["gs://bucket/brands/new1/logos/acme-logo.png"]
+
+
+def test_enrich_root_dry_run_never_uploads(monkeypatch, tmp_path):
+    from app.services import brand_enrichment
+    root = _brand_tree(tmp_path)
+    fonts_dir = root / "Acme Health" / "Fonts"
+    fonts_dir.mkdir()
+    (fonts_dir / "Inter-Bold.ttf").write_bytes(b"font")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("must not upload during dry-run")
+    monkeypatch.setattr(brand_enrichment, "_upload_file", boom)
+
+    reports = brand_enrichment.enrich_root(root, dry_run=True,
+                                            now_iso="2026-07-09T00:00:00Z")
+    assert reports[0]["wrote"] is False
+
+
+def test_upload_file_returns_none_when_bucket_not_configured(monkeypatch, tmp_path):
+    from app.services import brand_enrichment, storage
+    monkeypatch.setattr(storage, "is_configured", lambda: False)
+    local = tmp_path / "a.ttf"
+    local.write_bytes(b"x")
+    assert brand_enrichment._upload_file(local, "brands/x/fonts/a.ttf") is None
+
+
+def test_backfill_static_medvirtual_mapping(monkeypatch):
+    from app.services import brand_enrichment
+    from graphics_designer_agent.templated_brands import _MEDVIRTUAL
+
+    captured = {}
+
+    def fake_update(brand_id, patch):
+        captured.update({"brand_id": brand_id, "patch": patch})
+        return {}
+    monkeypatch.setattr(firestore_repo, "update_brand_metadata", fake_update)
+
+    report = brand_enrichment.backfill_static("medvirtual", dry_run=False,
+                                               now_iso="2026-07-09T00:00:00Z")
+
+    palette = _MEDVIRTUAL["palette"]
+    assert captured["brand_id"] == _MEDVIRTUAL["firestore_brand_id"]
+    patch = captured["patch"]
+    assert patch["primary_colors"] == [palette["mid"], palette["deep"]]
+    assert patch["secondary_colors"] == [palette["light"]]
+    assert patch["accent_colors"] == [palette["accent"]]
+    assert patch["fonts"] == [v["name"] for v in _MEDVIRTUAL["font_variants"]]
+    assert patch["brand_kit_source"] == "static-spec:templated_brands/medvirtual"
+    assert patch["enrichment"] == {
+        "confidence": "high", "extracted_at": "2026-07-09T00:00:00Z",
+        "palette": dict(palette), "source": "static_spec",
+    }
+    assert report["wrote"] is True
+    assert report["brand_name"] == "MedVirtual"
+
+
+def test_backfill_static_dry_run_never_writes(monkeypatch):
+    from app.services import brand_enrichment
+
+    def boom(*args, **kwargs):
+        raise AssertionError("must not be called during dry-run")
+    monkeypatch.setattr(firestore_repo, "update_brand_metadata", boom)
+
+    report = brand_enrichment.backfill_static("medvirtual", dry_run=True,
+                                                now_iso="2026-07-09T00:00:00Z")
+    assert report["wrote"] is False
+    assert report["patch"]["primary_colors"]
+
+
+def test_backfill_static_unknown_pack_id_raises():
+    from app.services import brand_enrichment
+    import pytest
+    with pytest.raises(ValueError):
+        brand_enrichment.backfill_static("nonexistent-pack", dry_run=True,
+                                          now_iso="2026-07-09T00:00:00Z")
+
+
+# --------------------------------------------------------------------------- #
+# CLI (app/enrich_brands.py) — pure helper + argparse wiring, offline
+# --------------------------------------------------------------------------- #
+
+def test_cli_sources_label_lists_active_ladder_rungs():
+    from app.enrich_brands import _sources_label
+    report = {"patch": {"enrichment": {"source_ladder": {
+        "kit_pdf": False, "svg": True, "font_files": True, "pixel": True,
+    }}}}
+    assert _sources_label(report) == "svg+fonts+pixel"
+
+
+def test_cli_sources_label_handles_skipped_brand_without_patch():
+    from app.enrich_brands import _sources_label
+    assert _sources_label({"patch": None}) == "-"
+
+
+def test_cli_sources_label_handles_static_backfill():
+    from app.enrich_brands import _sources_label
+    report = {"patch": {"enrichment": {"source": "static_spec"}}}
+    assert _sources_label(report) == "static_spec"
+
+
+def test_cli_main_dry_run_writes_report_and_touches_no_firestore_write(
+        monkeypatch, tmp_path, capsys):
+    from app import enrich_brands
+    from app.services import brand_enrichment
+
+    db = _FakeDb()
+    monkeypatch.setattr(firestore_repo, "_db", lambda: db)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("must not write during a dry-run CLI invocation")
+    monkeypatch.setattr(firestore_repo, "update_brand_metadata", boom)
+    monkeypatch.setattr(firestore_repo, "upsert_brand", boom)
+    monkeypatch.setattr(brand_enrichment, "_upload_file", boom)
+
+    root = _brand_tree(tmp_path)
+    report_path = tmp_path / "out.json"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["enrich_brands", "--root", str(root), "--report", str(report_path)],
+    )
+    enrich_brands.main()
+
+    assert report_path.exists()
+    data = json.loads(report_path.read_text(encoding="utf-8"))
+    assert data[0]["wrote"] is False
+    out = capsys.readouterr().out
+    assert "DRY-RUN" in out
+    assert "sources=" in out
+
+
+def test_cli_main_backfill_static_dry_run(monkeypatch, tmp_path, capsys):
+    from app import enrich_brands
+
+    def boom(*args, **kwargs):
+        raise AssertionError("must not write during a dry-run CLI invocation")
+    monkeypatch.setattr(firestore_repo, "update_brand_metadata", boom)
+
+    report_path = tmp_path / "backfill.json"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["enrich_brands", "--backfill-static", "medvirtual", "--report", str(report_path)],
+    )
+    enrich_brands.main()
+
+    data = json.loads(report_path.read_text(encoding="utf-8"))
+    assert data[0]["wrote"] is False
+    assert data[0]["brand_name"] == "MedVirtual"

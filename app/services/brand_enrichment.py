@@ -1,16 +1,21 @@
 # backend/app/services/brand_enrichment.py
-"""Orchestrates: scan folder -> extract profile -> merge-write Firestore.
+"""Orchestrates: scan folder -> extract profile -> merge-write Firestore
+(+ upload fonts/logos to GCS).
 
-The ONLY module in this feature allowed to touch Firestore. Extraction and
-scanning stay pure so they test offline; this module wraps their calls with
-a fake Firestore in tests, never the real thing.
+The ONLY module in this feature allowed to touch Firestore/GCS. Extraction
+and scanning stay pure so they test offline; this module wraps its calls
+with a fake Firestore / fake `_upload_file` in tests, never the real thing.
+
+Also implements the Amendment-A rung-5 static backfill (`backfill_static`)
+for brands whose exact palette/fonts are already hardcoded in
+`graphics_designer_agent.templated_brands` rather than re-extracted.
 """
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Callable
 
-from app.services import firestore_repo
+from app.services import firestore_repo, storage
 from app.services.brand_folder_scanner import BrandFolder, scan_root
 from app.services.brand_kit_extractor import BrandKitProfile, KitSources, build_profile
 
@@ -20,6 +25,23 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
 OWNED_KEYS = ("primary_colors", "secondary_colors", "accent_colors", "fonts",
               "tone_of_voice", "brand_kit_source", "enrichment")
+
+# Content-type map for the font/logo files this module uploads to GCS.
+_UPLOAD_MIME_BY_EXT = {
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".svg": "image/svg+xml",
+    ".pdf": "application/pdf",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
 
 
 def _build_sources(folder: BrandFolder) -> KitSources:
@@ -70,6 +92,22 @@ def profile_to_patch(profile: BrandKitProfile, folder: BrandFolder, now_iso: str
     }
 
 
+def _upload_file(local: Path, dest: str) -> str | None:
+    """Upload `local` to GCS at object path `dest` (e.g.
+    "brands/<id>/fonts/<file>"), delegating to storage's core `_upload`
+    primitive — the same one every public storage.upload_* helper wraps; none
+    of the existing public helpers match this feature's destination layout
+    (brands/<brand_id>/fonts|logos/<file>), so this seam calls the shared
+    primitive directly rather than duplicating its GCS/signing logic.
+    Returns the `gs://` URI, or None when no bucket is configured — callers
+    log that as a report note rather than raising."""
+    if not storage.is_configured():
+        return None
+    content_type = _UPLOAD_MIME_BY_EXT.get(local.suffix.lower(), "application/octet-stream")
+    gs_uri, _ = storage._upload(dest, local.read_bytes(), content_type)
+    return gs_uri
+
+
 def enrich_root(root: Path, *, dry_run: bool = True,
                  llm: Callable[[str], str] | None = None,
                  now_iso: str) -> list[dict]:
@@ -83,7 +121,7 @@ def _enrich_one(folder: BrandFolder, *, dry_run: bool, llm, now_iso: str) -> dic
     base = {"brand_name": folder.brand_name, "brand_id": None,
             "matched_existing": False, "wrote": False, "skipped_reason": None,
             "patch": None, "confidence": None,
-            "font_fallback": not folder.font_files}
+            "font_fallback": not folder.font_files, "notes": []}
 
     sources = _build_sources(folder)
     profile = build_profile(folder.brand_name, sources, llm=llm)
@@ -102,14 +140,75 @@ def _enrich_one(folder: BrandFolder, *, dry_run: bool, llm, now_iso: str) -> dic
     if dry_run:
         return base
 
-    # R2d live-write order: allocate the doc first (find-or-create), THEN a
-    # single update_brand_metadata carrying everything.
+    # R2d live-write order: allocate the doc first (find-or-create), THEN
+    # upload fonts/logos (R3), THEN a single update_brand_metadata carrying
+    # everything — including the freshly-uploaded URIs.
     if existing:
         brand_id = existing["id"]
     else:
         created = firestore_repo.upsert_brand(folder.brand_name, {})
         brand_id = created["id"]
 
+    font_uris: list[str] = []
+    for f in folder.font_files:
+        uri = _upload_file(f, f"brands/{brand_id}/fonts/{f.name}")
+        if uri:
+            font_uris.append(uri)
+        else:
+            base["notes"].append(f"no GCS bucket configured — skipped upload of {f.name}")
+
+    logo_uris: list[str] = []
+    for f in folder.logo_candidates:
+        uri = _upload_file(f, f"brands/{brand_id}/logos/{f.name}")
+        if uri:
+            logo_uris.append(uri)
+        else:
+            base["notes"].append(f"no GCS bucket configured — skipped upload of {f.name}")
+
+    if font_uris:
+        patch["enrichment"]["font_files"] = font_uris
+    if logo_uris:
+        patch["enrichment"]["logo_files"] = logo_uris
+
     firestore_repo.update_brand_metadata(brand_id, patch)
     base |= {"brand_id": brand_id, "wrote": True}
+    return base
+
+
+def backfill_static(pack_id: str, *, dry_run: bool, now_iso: str) -> dict:
+    """Amendment-A rung 5: build a patch straight from a
+    `graphics_designer_agent.templated_brands` static spec's exact
+    palette/fonts (no re-extraction — that spec already wins). Same
+    report-entry shape as `_enrich_one` so the CLI can print/serialize both
+    uniformly."""
+    from graphics_designer_agent.templated_brands import SPECS
+
+    spec = next((s for s in SPECS if s["id"] == pack_id), None)
+    if spec is None:
+        known = ", ".join(s["id"] for s in SPECS)
+        raise ValueError(f"Unknown static brand pack id {pack_id!r} (known: {known})")
+
+    firestore_brand_id = spec.get("firestore_brand_id")
+    if not firestore_brand_id:
+        raise ValueError(
+            f"Static pack {pack_id!r} has no firestore_brand_id — cannot backfill.")
+
+    palette = spec["palette"]
+    patch = {
+        "primary_colors": [palette["mid"], palette["deep"]],
+        "secondary_colors": [palette["light"]],
+        "accent_colors": [palette["accent"]],
+        "fonts": [v["name"] for v in spec["font_variants"]],
+        "brand_kit_source": f"static-spec:templated_brands/{spec['id']}",
+        "enrichment": {"confidence": "high", "extracted_at": now_iso,
+                       "palette": dict(palette), "source": "static_spec"},
+    }
+    base = {"brand_name": spec["name"], "brand_id": firestore_brand_id,
+            "matched_existing": True, "wrote": False, "skipped_reason": None,
+            "patch": patch, "confidence": "high", "font_fallback": False, "notes": []}
+    if dry_run:
+        return base
+
+    firestore_repo.update_brand_metadata(firestore_brand_id, patch)
+    base["wrote"] = True
     return base
