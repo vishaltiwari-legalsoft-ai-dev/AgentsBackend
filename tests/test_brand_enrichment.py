@@ -619,6 +619,68 @@ def test_cli_main_writes_report_even_when_run_raises(monkeypatch, tmp_path):
     assert json.loads(report_path.read_text(encoding="utf-8")) == []
 
 
+# --------------------------------------------------------------------------- #
+# Task 9 — GD spec builder integration (patch["gd_spec"])
+# --------------------------------------------------------------------------- #
+
+def _thin_brand_tree(tmp_path: Path) -> Path:
+    """Build <root>/Thin Co/Brand Kit/kit.pdf with a single hex color — fewer
+    than 3, so build_gd_spec must return None (not generatable)."""
+    from reportlab.pdfgen import canvas
+
+    kit_dir = tmp_path / "root" / "Thin Co" / "Brand Kit"
+    kit_dir.mkdir(parents=True)
+    pdf = kit_dir / "Thin Brand Guide.pdf"
+    c = canvas.Canvas(str(pdf))
+    c.drawString(72, 700, "Primary #112233")
+    c.save()
+    return tmp_path / "root"
+
+
+def test_enrich_root_dry_run_patch_contains_gd_spec_with_null_firestore_id(
+        monkeypatch, tmp_path):
+    from app.services import brand_enrichment
+    db = _FakeDb()
+    monkeypatch.setattr(firestore_repo, "_db", lambda: db)
+
+    reports = brand_enrichment.enrich_root(_brand_tree(tmp_path), dry_run=True,
+                                            now_iso="2026-07-09T00:00:00Z")
+    spec = reports[0]["patch"]["gd_spec"]
+    assert spec is not None
+    assert spec["id"] == "acme-health"
+    assert spec["firestore_brand_id"] is None       # brand_id unknown during dry-run
+    assert db.brands == {}                          # still zero Firestore calls
+
+
+def test_enrich_root_live_writes_gd_spec_with_allocated_brand_id(monkeypatch, tmp_path):
+    from app.services import brand_enrichment
+    db = _FakeDb()
+    monkeypatch.setattr(firestore_repo, "_db", lambda: db)
+    monkeypatch.setattr(firestore_repo, "find_brand_by_name", lambda name: None)
+    monkeypatch.setattr(firestore_repo, "upsert_brand",
+                         lambda n, m: {"id": "new1", "brand_name": n})
+    updated = {}
+    monkeypatch.setattr(
+        firestore_repo, "update_brand_metadata",
+        lambda i, p: updated.update({"brand_id": i, "patch": p}) or {})
+
+    reports = brand_enrichment.enrich_root(_brand_tree(tmp_path), dry_run=False,
+                                            now_iso="2026-07-09T00:00:00Z")
+    assert reports[0]["wrote"] is True
+    # the write that actually reached Firestore carries the allocated id
+    assert updated["patch"]["gd_spec"]["firestore_brand_id"] == "new1"
+    # and the returned report reflects the same patched spec (same dict)
+    assert reports[0]["patch"]["gd_spec"]["firestore_brand_id"] == "new1"
+
+
+def test_enrich_root_patch_omits_gd_spec_when_fewer_than_three_colors(monkeypatch, tmp_path):
+    from app.services import brand_enrichment
+
+    reports = brand_enrichment.enrich_root(_thin_brand_tree(tmp_path), dry_run=True,
+                                            now_iso="2026-07-09T00:00:00Z")
+    assert "gd_spec" not in reports[0]["patch"]
+
+
 def test_cli_brand_flag_rejected_in_backfill_mode(monkeypatch, tmp_path, capsys):
     """--brand only filters --root scans; combining it with --backfill-static
     is a usage error, not silently ignored."""

@@ -19,6 +19,7 @@ from typing import Callable
 from app.services import firestore_repo, storage
 from app.services.brand_folder_scanner import BrandFolder, scan_root
 from app.services.brand_kit_extractor import BrandKitProfile, KitSources, build_profile
+from app.services.gd_spec_builder import build_gd_spec
 
 # Images considered for the pixel-frequency rung (mirrors the folder scanner's
 # ASSET_EXTS, minus the non-image formats it also sweeps up).
@@ -167,6 +168,15 @@ def _enrich_one(folder: BrandFolder, *, dry_run: bool, llm, now_iso: str) -> dic
     patch = profile_to_patch(profile, folder, now_iso)
     base |= {"patch": patch, "confidence": profile.confidence}
 
+    # Pure — no Firestore/GCS calls — so this is safe to run before the
+    # dry-run return below. brand_id is unknown at this point (dry-run never
+    # allocates one, and a live run hasn't allocated one yet either); the
+    # live path patches spec["firestore_brand_id"] in below once the doc id
+    # is known, right before the Firestore write.
+    gd_spec = build_gd_spec(profile, folder, brand_id=None)
+    if gd_spec is not None:
+        patch["gd_spec"] = gd_spec
+
     if dry_run:
         return base
 
@@ -188,6 +198,8 @@ def _enrich_one(folder: BrandFolder, *, dry_run: bool, llm, now_iso: str) -> dic
         patch["enrichment"]["font_files"] = font_uris
     if logo_uris:
         patch["enrichment"]["logo_files"] = logo_uris
+    if patch.get("gd_spec") is not None:
+        patch["gd_spec"]["firestore_brand_id"] = brand_id
 
     firestore_repo.update_brand_metadata(brand_id, patch)
     base |= {"brand_id": brand_id, "wrote": True}
