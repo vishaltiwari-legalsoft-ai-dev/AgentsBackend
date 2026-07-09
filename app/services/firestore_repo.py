@@ -96,6 +96,15 @@ def upsert_brand(brand_name: str, brand_metadata: dict[str, Any]) -> dict[str, A
     return payload | {"id": brand_id}
 
 
+def update_brand_metadata(brand_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+    """Merge ``patch`` into brand_metadata; never clobbers other metadata keys
+    (Firestore merge=True does a per-key nested merge)."""
+    _invalidate_brands_cache()
+    _db().collection("brands").document(brand_id).set(
+        {"brand_metadata": patch}, merge=True)
+    return get_brand(brand_id) or {}
+
+
 # --------------------------------------------------------------------------- #
 # Creatives
 # --------------------------------------------------------------------------- #
