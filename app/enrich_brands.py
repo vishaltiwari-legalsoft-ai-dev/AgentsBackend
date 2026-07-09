@@ -21,7 +21,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.services.brand_enrichment import backfill_static, enrich_root
+from app.services.brand_enrichment import backfill_static, enrich_iter
+from app.services.brand_folder_scanner import scan_root
 
 # Human labels for the enrichment.source_ladder flags, in display order.
 _LADDER_LABELS = (("kit_pdf", "pdf"), ("svg", "svg"),
@@ -78,9 +79,19 @@ def main() -> None:
             except ValueError as exc:
                 raise SystemExit(f"[enrich_brands] {exc}")
         else:
-            for r in enrich_root(args.root, dry_run=not args.write, now_iso=now_iso):
-                if not args.brand or r["brand_name"].lower() == args.brand.lower():
-                    reports.append(r)
+            if args.brand:
+                available = [f.brand_name for f in scan_root(args.root)]
+                if not any(name.lower() == args.brand.lower() for name in available):
+                    print(f"[enrich_brands] no brand folder named {args.brand!r} "
+                          f"found under {args.root}")
+                    print("available brand folders: "
+                          + (", ".join(available) if available else "(none found)"))
+                    raise SystemExit(2)
+            # only_brand scopes the RUN itself (filters before any enrichment
+            # runs) — never a post-hoc report filter (Finding 1).
+            for r in enrich_iter(args.root, dry_run=not args.write, now_iso=now_iso,
+                                  only_brand=args.brand):
+                reports.append(r)
     finally:
         # Always leave an inspectable artifact — even when a run aborts
         # mid-way, whatever was gathered is written before the error surfaces.

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import warnings
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -180,6 +181,19 @@ def derive_palette(hexes: list[str]) -> dict:
     }
 
 
+def _flattened_pixels(img):
+    """Pillow-version seam: ``get_flattened_data()`` is the current (>=10.x)
+    API; older-yet-``pillow>=10.0``-satisfying installs may only have the
+    deprecated ``getdata()``. Prefer the new name when present; otherwise
+    fall back, suppressing just its own DeprecationWarning locally so test
+    output (and any future strict-warnings CI gate) stays pristine."""
+    if hasattr(img, "get_flattened_data"):
+        return img.get_flattened_data()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return img.getdata()
+
+
 def extract_pixel_colors(image_paths: list[Path], min_share: float = 0.02) -> list[ColorHit]:
     """Flat-pixel frequency analysis across ALL given images: exact observed
     RGB values (no quantization) that cover >= min_share of the combined
@@ -196,8 +210,12 @@ def extract_pixel_colors(image_paths: list[Path], min_share: float = 0.02) -> li
             with Image.open(path) as img:
                 rgb = img.convert("RGB")
                 rgb.thumbnail((256, 256))
-                counts.update(rgb.get_flattened_data())
-        except Exception:
+                counts.update(_flattened_pixels(rgb))
+        except (OSError, Image.DecompressionBombError, ValueError):
+            # Only genuine per-image data problems are skipped — a corrupt
+            # file, a decompression-bomb guard trip, or a bad value from a
+            # malformed image. Programming errors (TypeError, AttributeError,
+            # ...) must raise, not vanish silently into a dead pixel rung.
             continue
     total = sum(counts.values())
     if not total:

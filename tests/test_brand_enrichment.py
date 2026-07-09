@@ -606,7 +606,7 @@ def test_cli_main_writes_report_even_when_run_raises(monkeypatch, tmp_path):
 
     def boom_root(*args, **kwargs):
         raise RuntimeError("scan exploded")
-    monkeypatch.setattr(enrich_brands, "enrich_root", boom_root)
+    monkeypatch.setattr(enrich_brands, "enrich_iter", boom_root)
 
     report_path = tmp_path / "out.json"
     monkeypatch.setattr(
@@ -693,3 +693,141 @@ def test_cli_brand_flag_rejected_in_backfill_mode(monkeypatch, tmp_path, capsys)
     with pytest.raises(SystemExit):
         enrich_brands.main()
     assert "--brand only applies to --root mode" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# Final-review Finding 1 — --brand must scope the RUN, not just the report:
+# only_brand filters scan_root's folders BEFORE any enrichment runs, so an
+# unrequested brand is never profiled, matched, or written — live or dry.
+# --------------------------------------------------------------------------- #
+
+def _two_brand_tree(tmp_path: Path) -> Path:
+    """<root>/Acme Health/... (Task 7 fixture) plus a second, unrelated
+    <root>/Beta Co/... brand folder — both independently extractable."""
+    root = _brand_tree(tmp_path)
+    beta_dir = root / "Beta Co" / "Brand Kit"
+    beta_dir.mkdir(parents=True)
+    _make_kit_pdf(beta_dir / "Beta Brand Guidelines.pdf")
+    return root
+
+
+def test_enrich_root_only_brand_runs_exactly_matching_folder(monkeypatch, tmp_path):
+    """(a) only_brand scopes the run to exactly the matching folder —
+    case-insensitively — never the others."""
+    from app.services import brand_enrichment
+
+    root = _two_brand_tree(tmp_path)
+    reports = brand_enrichment.enrich_root(root, dry_run=True, only_brand="acme health",
+                                            now_iso="2026-07-09T00:00:00Z")
+    assert [r["brand_name"] for r in reports] == ["Acme Health"]
+
+
+def test_enrich_root_only_brand_live_never_writes_other_brands(monkeypatch, tmp_path):
+    """(b) Booby-trap: in live (--write) mode, only_brand must scope the RUN
+    itself — Firestore calls must never fire for the non-matching brand,
+    not merely be excluded from the printed report."""
+    from app.services import brand_enrichment
+
+    root = _two_brand_tree(tmp_path)
+    monkeypatch.setattr(firestore_repo, "find_brand_by_name", lambda n: None)
+
+    def guarded_upsert(name, meta):
+        if name != "Acme Health":
+            raise AssertionError(f"must not enrich unrequested brand {name!r}")
+        return {"id": "new1", "brand_name": name}
+    monkeypatch.setattr(firestore_repo, "upsert_brand", guarded_upsert)
+
+    updated = {}
+
+    def guarded_update(brand_id, patch):
+        if brand_id != "new1":
+            raise AssertionError(f"must not write unrequested brand id {brand_id!r}")
+        updated.update({"brand_id": brand_id, "patch": patch})
+        return {}
+    monkeypatch.setattr(firestore_repo, "update_brand_metadata", guarded_update)
+
+    reports = brand_enrichment.enrich_root(root, dry_run=False, only_brand="Acme Health",
+                                            now_iso="2026-07-09T00:00:00Z")
+    assert [r["brand_name"] for r in reports] == ["Acme Health"]
+    assert reports[0]["wrote"] is True
+    assert updated["brand_id"] == "new1"
+
+
+def test_cli_brand_no_match_exits_2_with_no_enrichment(monkeypatch, tmp_path, capsys):
+    """(c) A --brand with no matching folder must exit 2, list the available
+    folder names, and never call into enrichment at all — not even a dry run
+    of the other brands (no report of other brands, no writes)."""
+    from app import enrich_brands
+    from app.services import brand_enrichment
+
+    root = _two_brand_tree(tmp_path)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("must not enrich when --brand has no matching folder")
+    monkeypatch.setattr(brand_enrichment, "_enrich_one", boom)
+
+    report_path = tmp_path / "out.json"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["enrich_brands", "--root", str(root), "--brand", "Nonexistent Co",
+         "--report", str(report_path)],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        enrich_brands.main()
+    assert exc_info.value.code == 2
+
+    out = capsys.readouterr().out
+    assert "Acme Health" in out and "Beta Co" in out       # available folders listed
+    assert json.loads(report_path.read_text(encoding="utf-8")) == []  # no report entries
+
+
+# --------------------------------------------------------------------------- #
+# Final-review Finding 5 — a mid-batch crash must not empty the report: the
+# CLI now iterates the streaming `enrich_iter` generator, accumulating into
+# the list it writes in `finally`, so brands already yielded before a crash
+# stay on disk.
+# --------------------------------------------------------------------------- #
+
+def test_cli_main_partial_crash_preserves_earlier_brand_entries(monkeypatch, tmp_path):
+    from app import enrich_brands
+    from app.services import brand_enrichment
+
+    root = _two_brand_tree(tmp_path)  # scan_root sorts: "Acme Health" then "Beta Co"
+    real_enrich_one = brand_enrichment._enrich_one
+
+    def flaky(folder, **kwargs):
+        if folder.brand_name == "Beta Co":
+            raise RuntimeError("beta exploded")
+        return real_enrich_one(folder, **kwargs)
+    monkeypatch.setattr(brand_enrichment, "_enrich_one", flaky)
+
+    report_path = tmp_path / "out.json"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["enrich_brands", "--root", str(root), "--report", str(report_path)],
+    )
+    with pytest.raises(RuntimeError, match="beta exploded"):
+        enrich_brands.main()
+
+    data = json.loads(report_path.read_text(encoding="utf-8"))
+    assert [r["brand_name"] for r in data] == ["Acme Health"]  # first brand preserved
+
+
+def test_enrich_iter_reraises_after_yielding_prior_entries(monkeypatch, tmp_path):
+    """Same guarantee one level down: `enrich_iter` itself yields the first
+    brand's entry before the second brand's crash propagates — `enrich_root`
+    (a thin `list(enrich_iter(...))` wrapper) therefore cannot silently
+    return `[]` on a mid-batch crash either."""
+    from app.services import brand_enrichment
+
+    root = _two_brand_tree(tmp_path)
+    it = brand_enrichment.enrich_iter(root, dry_run=True, now_iso="2026-07-09T00:00:00Z")
+    first = next(it)
+    assert first["brand_name"] == "Acme Health"
+
+    def flaky(folder, **kwargs):
+        raise RuntimeError("beta exploded")
+    monkeypatch.setattr(brand_enrichment, "_enrich_one", flaky)
+
+    with pytest.raises(RuntimeError, match="beta exploded"):
+        next(it)

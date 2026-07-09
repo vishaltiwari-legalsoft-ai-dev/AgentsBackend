@@ -165,3 +165,55 @@ def test_firestore_spec_source_returns_empty_on_firestore_error(monkeypatch):
 
     monkeypatch.setattr(gd_brand_source, "_list_brands", boom)
     assert gd_brand_source.firestore_spec_source() == []
+
+
+# --------------------------------------------------------------------------- #
+# Task 12 — _list_brands() bypasses firestore_repo's 60s brands cache
+# (Finding 3): the enrichment CLI writes from a separate process, so the
+# admin refresh-packs endpoint must always rebuild from fresh Firestore data,
+# never a cache window it can't invalidate.
+# --------------------------------------------------------------------------- #
+
+def test_list_brands_bypasses_stale_firestore_cache(monkeypatch):
+    import time
+
+    from app.services import firestore_repo, gd_brand_source
+
+    class _FakeSnap:
+        def __init__(self, doc_id, data):
+            self.id = doc_id
+            self._data = data
+
+        def to_dict(self):
+            return dict(self._data)
+
+    class _FakeCol:
+        def __init__(self, docs):
+            self._docs = docs
+
+        def order_by(self, field):
+            return self
+
+        def stream(self):
+            return [_FakeSnap(d["id"], {"brand_name": d["brand_name"]}) for d in self._docs]
+
+    class _FakeDb:
+        def __init__(self, docs):
+            self._docs = docs
+
+        def collection(self, name):
+            assert name == "brands"
+            return _FakeCol(self._docs)
+
+    monkeypatch.setattr(
+        firestore_repo, "_db",
+        lambda: _FakeDb([{"id": "fresh1", "brand_name": "Fresh Brand"}]))
+    # Seed a stale-but-still-within-TTL cache entry directly — if
+    # `_list_brands()` honored the default `use_cache=True`, it would return
+    # this stale value instead of hitting the fake db above.
+    monkeypatch.setattr(
+        firestore_repo, "_brands_cache",
+        (time.monotonic(), [{"id": "stale1", "brand_name": "Stale Brand"}]))
+
+    result = gd_brand_source._list_brands()
+    assert [b["id"] for b in result] == ["fresh1"]

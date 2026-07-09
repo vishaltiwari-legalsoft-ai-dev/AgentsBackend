@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -211,6 +212,10 @@ def _build_legalsoft() -> BrandPack:
 
 # Registry of available brands. New brands register their pack here.
 _PACKS: dict[str, BrandPack] = {}
+# Guards the build-then-rebind below so a concurrent reader can never observe
+# a partially-built registry — _PACKS is only ever reassigned wholesale, atop
+# a LOCALLY-built dict, never mutated in place while other threads can see it.
+_PACKS_LOCK = threading.Lock()
 
 # App-level injection point (Stage 4): a callable returning templated-brand
 # spec dicts (the templated_brands.SPECS contract), set by the app at startup.
@@ -229,20 +234,35 @@ def register_dynamic_source(fn: Callable[[], list[dict]] | None) -> None:
 
 
 def refresh() -> None:
-    """Drop the pack cache; next access rebuilds (call after enrichment runs)."""
+    """Drop the pack cache; next access rebuilds (call after enrichment runs).
+    Lock-guarded so it can't interleave mid-build with `_registry()` and clobber
+    (or be clobbered by) a build that's already in flight."""
     global _PACKS
-    _PACKS = {}
+    with _PACKS_LOCK:
+        _PACKS = {}
 
 
 def _registry() -> dict[str, BrandPack]:
-    if not _PACKS:
-        _PACKS[DEFAULT_BRAND_ID] = _build_legalsoft()
+    """Fast path: an already-built, non-empty `_PACKS` is read lock-free.
+    Slow path (build or rebuild needed): acquire the lock, double-check under
+    it (another thread may have just finished building), then assemble the
+    WHOLE registry into a local dict — never touching the module-level
+    `_PACKS` until it's complete — and rebind it in one atomic assignment.
+    A concurrent reader therefore only ever sees either the old registry or
+    the fully-built new one, never a partially-populated dict."""
+    global _PACKS
+    if _PACKS:
+        return _PACKS
+    with _PACKS_LOCK:
+        if _PACKS:
+            return _PACKS
+        local: dict[str, BrandPack] = {DEFAULT_BRAND_ID: _build_legalsoft()}
         # Templated brands (Phase C). Lazy import avoids a cycle — templated_brands
         # imports BrandPack from this module.
         from . import templated_brands
 
         for pack in templated_brands.build_all():
-            _PACKS[pack.id] = pack
+            local[pack.id] = pack
 
         # Dynamic brands (Stage 4, Firestore-backed). Flag-gated so the registry
         # is byte-identical to today when unset, and fault-isolated: one bad
@@ -255,8 +275,10 @@ def _registry() -> dict[str, BrandPack]:
                 except Exception as exc:  # one bad brand must not kill the registry
                     logger.warning("dynamic brand %r skipped: %s", spec.get("id"), exc)
                     continue
-                _PACKS.setdefault(pack.id, pack)  # static packs win on collision
-    return _PACKS
+                local.setdefault(pack.id, pack)  # static packs win on collision
+
+        _PACKS = local
+        return _PACKS
 
 
 def get_pack(brand_id: str | None = None) -> BrandPack:

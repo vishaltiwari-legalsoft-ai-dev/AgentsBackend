@@ -39,8 +39,11 @@ _BEVIETNAM_SRC_DIR = _BRANDS_DIR / "medvirtual" / "fonts"
 
 def _list_brands() -> list[dict]:
     """Seam: all brand docs. Delegates to the existing Firestore helper
-    (``app/routers/brands.py`` uses the same one to list brands for the UI)."""
-    return firestore_repo.list_brands()
+    (``app/routers/brands.py`` uses the same one to list brands for the UI),
+    bypassing its 60s in-process cache: the enrichment CLI writes from a
+    separate process, so an admin-triggered refresh must always see the
+    freshest Firestore state rather than a cache window it can't invalidate."""
+    return firestore_repo.list_brands(use_cache=False)
 
 
 def _fonts_root() -> Path:

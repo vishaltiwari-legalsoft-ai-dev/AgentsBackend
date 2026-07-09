@@ -139,13 +139,26 @@ def _upload_batch(files: list[Path], brand_id: str, kind: str, notes: list[str])
     return uris
 
 
+def enrich_iter(root: Path, *, dry_run: bool = True,
+                 llm: Callable[[str], str] | None = None,
+                 now_iso: str, only_brand: str | None = None):
+    """Per-brand streaming generator — the CLI accumulates its own list so a
+    mid-batch crash still leaves the already-yielded entries on disk (Finding
+    5). ``only_brand`` filters ``scan_root``'s folders by case-insensitive
+    ``brand_name`` equality BEFORE any enrichment runs, so a scoped run never
+    touches (or even builds a profile for) an unrequested brand (Finding 1)."""
+    folders = scan_root(root)
+    if only_brand is not None:
+        folders = [f for f in folders if f.brand_name.lower() == only_brand.lower()]
+    for folder in folders:
+        yield _enrich_one(folder, dry_run=dry_run, llm=llm, now_iso=now_iso)
+
+
 def enrich_root(root: Path, *, dry_run: bool = True,
                  llm: Callable[[str], str] | None = None,
-                 now_iso: str) -> list[dict]:
-    reports = []
-    for folder in scan_root(root):
-        reports.append(_enrich_one(folder, dry_run=dry_run, llm=llm, now_iso=now_iso))
-    return reports
+                 now_iso: str, only_brand: str | None = None) -> list[dict]:
+    return list(enrich_iter(root, dry_run=dry_run, llm=llm, now_iso=now_iso,
+                            only_brand=only_brand))
 
 
 def _enrich_one(folder: BrandFolder, *, dry_run: bool, llm, now_iso: str) -> dict:

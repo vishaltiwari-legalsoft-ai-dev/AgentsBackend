@@ -175,6 +175,43 @@ def test_extract_pixel_colors_skips_corrupt_images(tmp_path):
     assert [h.hex for h in hits] == ["#0892D0"]
 
 
+def test_extract_pixel_colors_falls_back_to_getdata_when_flattened_missing(
+        tmp_path, monkeypatch):
+    """Finding 4: on a Pillow install old enough to satisfy `pillow>=10.0`
+    but lacking `get_flattened_data()`, extraction must still work via the
+    deprecated `getdata()` — and must not leak that method's
+    DeprecationWarning into test/CI output."""
+    import warnings
+
+    from PIL import Image as PILImage
+
+    monkeypatch.delattr(PILImage.Image, "get_flattened_data", raising=False)
+
+    blue_path = tmp_path / "blue.png"
+    Image.new("RGB", (100, 100), (0x08, 0x92, 0xD0)).save(blue_path)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        hits = extract_pixel_colors([blue_path])
+
+    assert [h.hex for h in hits] == ["#0892D0"]  # fallback still yields exact colors
+    assert not any(issubclass(w.category, DeprecationWarning) for w in caught)
+
+
+def test_extract_pixel_colors_propagates_programming_errors(tmp_path, monkeypatch):
+    """The narrowed except must not swallow a programming error (e.g. a
+    TypeError from a code bug) — only genuine per-image data problems
+    (OSError / DecompressionBombError / ValueError) are contained."""
+    from app.services import brand_kit_extractor
+
+    def boom_open(path):
+        raise TypeError("not an image/os error — must propagate")
+    monkeypatch.setattr(brand_kit_extractor.Image, "open", boom_open)
+
+    with pytest.raises(TypeError):
+        brand_kit_extractor.extract_pixel_colors([tmp_path / "whatever.png"])
+
+
 def test_build_profile_source_ladder_merges_and_prioritizes(tmp_path, kit_pdf):
     svg_path = tmp_path / "brand.svg"
     svg_path.write_text(
