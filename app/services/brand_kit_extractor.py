@@ -49,3 +49,40 @@ def _add(hits: list[ColorHit], seen: set[str], raw: str, page_no: int, line: str
     if hx not in seen:
         seen.add(hx)
         hits.append(ColorHit(hex=hx, page=page_no, context=line.strip()))
+
+
+_SUBSET_RE = re.compile(r"^[A-Z]{6}\+")
+
+
+@dataclass
+class FontHit:
+    family: str            # "BeVietnamPro"
+    style: str             # "Bold" | "Regular" | ...
+    raw_name: str          # "ABCDEF+BeVietnamPro-Bold"
+    embedded: bool
+    pages: list[int] = field(default_factory=list)
+
+
+def _clean_basefont(basefont: str) -> tuple[str, str]:
+    clean = _SUBSET_RE.sub("", basefont)
+    family, _, style = clean.partition("-")
+    return family, (style or "Regular")
+
+
+def extract_fonts(pdf_path: Path) -> list[FontHit]:
+    found: dict[tuple[str, str], FontHit] = {}
+    with fitz.open(pdf_path) as doc:
+        for page_no, page in enumerate(doc, start=1):
+            # page.get_fonts() tuples: (xref, ext, type, basefont, name, encoding)
+            for f in page.get_fonts(full=False):
+                basefont = f[3]
+                if not basefont:
+                    continue
+                family, style = _clean_basefont(basefont)
+                key = (family, style)
+                hit = found.setdefault(key, FontHit(
+                    family=family, style=style, raw_name=basefont,
+                    embedded=bool(f[1] and f[1] != "n/a")))
+                if page_no not in hit.pages:
+                    hit.pages.append(page_no)
+    return list(found.values())

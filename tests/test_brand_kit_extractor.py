@@ -41,3 +41,19 @@ def test_bare_hex_needs_hex_keyword_on_line(kit_pdf):
     # may contribute bare 6-char hexes.
     hexes = {h.hex for h in extract_colors(kit_pdf)}
     assert "#000760" not in hexes
+
+
+from app.services.brand_kit_extractor import extract_fonts
+
+
+def test_extract_fonts_enumerates_families_and_styles(kit_pdf):
+    fonts = extract_fonts(kit_pdf)
+    got = {(f.family, f.style) for f in fonts}
+    assert ("Helvetica", "Regular") in got
+    assert ("Helvetica", "Bold") in got
+
+
+def test_extract_fonts_strips_subset_prefix():
+    from app.services.brand_kit_extractor import _clean_basefont
+    assert _clean_basefont("ABCDEF+BeVietnamPro-Bold") == ("BeVietnamPro", "Bold")
+    assert _clean_basefont("Helvetica") == ("Helvetica", "Regular")
