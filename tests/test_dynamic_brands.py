@@ -120,3 +120,48 @@ def test_firestore_spec_source_falls_back_to_bevietnam_on_download_failure(
     assert specs[0]["font_variants"] == _BEVIETNAM_FULL
     assert specs[0]["font_family"] == "Be Vietnam"
     assert specs[0]["default_font"] == "Be Vietnam Bold"
+
+    # The fallback must also materialize the actual Be Vietnam BYTES (copied
+    # from the bundled in-repo medvirtual fonts dir — offline, no network) so
+    # Stage-3 text rendering works for the fallback brand, not just its
+    # metadata. Every face of the substituted set must be locally present.
+    fonts_dir = tmp_path / valid_dyn_spec["id"] / "fonts"
+    for variant in _BEVIETNAM_FULL:
+        assert (fonts_dir / variant["file"]).exists(), variant["file"]
+        assert (fonts_dir / variant["file"]).stat().st_size > 0
+
+
+def test_firestore_spec_source_isolates_malformed_doc(monkeypatch, tmp_path, valid_dyn_spec):
+    """One malformed brand doc must not drop the other, valid dynamic brands."""
+    from app.services import gd_brand_source
+
+    font_files = [
+        f"gs://bucket/brands/good/fonts/{v['file']}" for v in valid_dyn_spec["font_variants"]
+    ]
+    docs = [
+        {"id": "bad", "brand_metadata": "not-a-dict"},  # malformed -> skipped + logged
+        {"id": "good", "brand_metadata": {
+            "gd_spec": valid_dyn_spec,
+            "enrichment": {"font_files": font_files},
+        }},
+    ]
+    monkeypatch.setattr(gd_brand_source, "_list_brands", lambda: docs)
+    monkeypatch.setattr(gd_brand_source, "_fonts_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        gd_brand_source, "_download", lambda uri, dest: dest.write_bytes(b"font")
+    )
+
+    specs = gd_brand_source.firestore_spec_source()
+    assert len(specs) == 1
+    assert specs[0]["id"] == valid_dyn_spec["id"]
+
+
+def test_firestore_spec_source_returns_empty_on_firestore_error(monkeypatch):
+    """A Firestore failure yields [] with a warning — never an exception."""
+    from app.services import gd_brand_source
+
+    def boom():
+        raise RuntimeError("firestore down")
+
+    monkeypatch.setattr(gd_brand_source, "_list_brands", boom)
+    assert gd_brand_source.firestore_spec_source() == []
