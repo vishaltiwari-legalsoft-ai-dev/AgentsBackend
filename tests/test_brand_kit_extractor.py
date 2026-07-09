@@ -57,3 +57,27 @@ def test_extract_fonts_strips_subset_prefix():
     from app.services.brand_kit_extractor import _clean_basefont
     assert _clean_basefont("ABCDEF+BeVietnamPro-Bold") == ("BeVietnamPro", "Bold")
     assert _clean_basefont("Helvetica") == ("Helvetica", "Regular")
+
+
+from app.services.brand_kit_extractor import derive_palette
+
+
+def test_derive_palette_maps_medvirtual_like_hexes():
+    # real MedVirtual brand hexes — known-good shape
+    palette = derive_palette(["#A1D7E2", "#24B9CE", "#137A9A", "#19B1E3"])
+    assert set(palette) == {"light", "mid", "deep", "accent", "ink",
+                            "hl_from", "hl_to", "cta_from", "cta_to"}
+    assert palette["light"] == "#A1D7E2"   # lightest by luminance
+    assert palette["deep"] == "#137A9A"    # darkest
+    assert palette["accent"] in {"#24B9CE", "#19B1E3"}  # most saturated middle
+
+
+def test_derive_palette_uses_darkest_as_ink_when_truly_dark():
+    palette = derive_palette(["#A1D7E2", "#24B9CE", "#161511"])
+    assert palette["ink"] == "#161511"
+
+
+def test_derive_palette_requires_three_colors():
+    import pytest
+    with pytest.raises(ValueError):
+        derive_palette(["#FFFFFF", "#000000"])

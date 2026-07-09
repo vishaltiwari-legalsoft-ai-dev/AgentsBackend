@@ -86,3 +86,35 @@ def extract_fonts(pdf_path: Path) -> list[FontHit]:
                 if page_no not in hit.pages:
                     hit.pages.append(page_no)
     return list(found.values())
+
+
+def _rgb(hx: str) -> tuple[float, float, float]:
+    return tuple(int(hx[i:i + 2], 16) / 255 for i in (1, 3, 5))
+
+
+def _lum(hx: str) -> float:
+    r, g, b = _rgb(hx)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _sat(hx: str) -> float:
+    r, g, b = _rgb(hx)
+    mx, mn = max(r, g, b), min(r, g, b)
+    return 0.0 if mx == 0 else (mx - mn) / mx
+
+
+def derive_palette(hexes: list[str]) -> dict:
+    """Map exact brand hexes onto the palette contract that
+    templated_brands.build_templated_pack expects. Deterministic."""
+    if len(hexes) < 3:
+        raise ValueError("need at least 3 brand colors to derive a palette")
+    ordered = sorted(hexes, key=_lum, reverse=True)
+    light, deep = ordered[0], ordered[-1]
+    ink = deep if _lum(deep) < 0.2 else "#161511"
+    middles = [h for h in ordered[1:-1]] or [ordered[0]]
+    accent = max(middles, key=_sat)
+    mid = next((h for h in middles if h != accent), accent)
+    return {
+        "light": light, "mid": mid, "deep": deep, "accent": accent, "ink": ink,
+        "hl_from": accent, "hl_to": deep, "cta_from": mid, "cta_to": deep,
+    }
