@@ -578,6 +578,7 @@ def portfolio(date_iso: str | None = None) -> dict | None:
         "qual_demos_booked": qdb,
         "cost_per_qual_demo_booked": div(spend, qdb),
         "demos_completed": completed,
+        "cost_per_demo_completed": div(spend, completed),
         "show_rate_pct": div(completed * 100, qdb),
         "services_sold": sold,
         "pacing": {"day": day, "days_in_month": days_in_month,

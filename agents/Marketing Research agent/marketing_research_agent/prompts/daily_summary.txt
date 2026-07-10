@@ -9,6 +9,10 @@ Rules:
 - Lead with the verdict: are we efficient or overspending, and on which channel.
 - Name the channel and the one number that matters; do not list every metric.
 - Compare channels against their goals (cost per demo, CAC, cost per qualified lead).
+- If "period" is present, anchor the read to that window (e.g. "Jul 1–8").
+- If "red_flag_vendors" is non-empty, name EVERY vendor in it and the reason it
+  is flagged, in one compact sentence (e.g. "Red flags: X (CPQL $812), Y ($3.2k
+  spend, no demo)."). If it is empty, say nothing about red flags.
 
 Data:
 {data}

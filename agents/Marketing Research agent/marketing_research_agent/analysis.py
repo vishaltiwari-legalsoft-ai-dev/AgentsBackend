@@ -59,6 +59,12 @@ def _offline_summary(kind: str, data: dict) -> str:
     elif ranked:
         parts.append(f"{ranked[0][0]} is running at {_fmt_money(ranked[0][1])} per demo booked.")
 
+    red_vendors = data.get("red_flag_vendors") or []
+    if red_vendors:
+        named = "; ".join(
+            f"{v.get('vendor')} — {(v.get('reasons') or ['flagged'])[0]}" for v in red_vendors[:4])
+        parts.append(f"Vendors on a red flag: {named}.")
+
     if issues:
         top = issues[0]
         parts.append(f"Top issue: {top.get('text', '')}.")
