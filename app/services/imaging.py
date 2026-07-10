@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import logging
 import re
+import sys
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -24,6 +25,19 @@ try:  # pragma: no cover - depends on host libs
     import cairosvg as _cairosvg
 except Exception:  # noqa: BLE001
     _cairosvg = None
+
+# When the native cairo DLL is missing, ``import cairocffi`` raises OSError —
+# not ImportError — which breaks reportlab's renderPM backend (rlPyCairo does
+# ``import cairocffi`` guarded only by ``except ImportError`` before trying the
+# self-contained pycairo wheel). Poison the module so downstream imports get a
+# plain ImportError and rlPyCairo falls back to pycairo, keeping the svglib
+# fallback below functional on hosts without native cairo.
+try:  # pragma: no cover - depends on host libs
+    import cairocffi as _cairocffi  # noqa: F401
+except ImportError:
+    pass
+except Exception:  # noqa: BLE001 - OSError from a failed dlopen
+    sys.modules["cairocffi"] = None  # type: ignore[assignment]
 
 _NAMED_COLORS = {
     "white": (255, 255, 255),
