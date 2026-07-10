@@ -88,3 +88,16 @@ def test_suggestions_are_brand_scoped(bid):
     assert suggestions.suggest_element({}, pack=pack)["element"]["subject"]
     assert suggestions.generate_hooks("A", pack=pack)["headlines"]
     assert suggestions.recommend_font("A", pack=pack)["family"] == pack.font_family
+
+
+@pytest.mark.parametrize("bid", TEMPLATED)
+def test_templated_packs_ship_a_stage4_logo_library(bid):
+    """Stage 4's pick-a-logo library (Issue: brands other than Legal Soft had no
+    ``logo_dir``, so the studio showed an empty library and the composite 400'd
+    offline). Every bundled brand must carry real PNG variants + a default."""
+    pack = registry.get_pack(bid)
+    assert pack.logo_dir is not None and pack.logo_dir.is_dir()
+    variants = sorted(pack.logo_dir.glob("*.png"))
+    assert variants, f"{bid} ships no logo variants"
+    assert pack.logo_path is not None and pack.logo_path.exists()
+    assert pack.logo_path in variants  # the offline default is one of the library

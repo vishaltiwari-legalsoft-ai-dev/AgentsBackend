@@ -21,6 +21,21 @@ from .registry import BrandPack
 
 _BRANDS_DIR = Path(__file__).resolve().parent / "brands"
 
+# Bundled on-brand logo variants (same layout as Legal Soft's):
+# assets/brand-logos/<brand-id>/*.png. Stage 4 offers these as the pick-a-logo
+# library and uses the first one as the offline fallback logo.
+_LOGO_ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets" / "brand-logos"
+
+
+def _bundled_logos(brand_id: str) -> tuple[Path | None, Path | None]:
+    """(logo_dir, logo_path) for a brand's bundled logo variants, or (None, None)
+    when no ``assets/brand-logos/<id>/`` directory ships with the repo."""
+    d = _LOGO_ASSETS_DIR / brand_id
+    if not d.is_dir():
+        return None, None
+    pngs = sorted(d.glob("*.png"))
+    return d, (pngs[0] if pngs else None)
+
 # Brand-neutral compositing prompts, reused by every templated brand.
 STAGE2_BLEND_FILE = "stage2_element_blend.txt"
 STAGE4_COMPOSITE_FILE = "stage4_logo_composite.txt"
@@ -209,6 +224,7 @@ def build_templated_pack(spec: dict) -> BrandPack:
         palette["hl_from"], palette["hl_to"])}
 
     elements = spec["stage2_variants"]
+    logo_dir, logo_path = _bundled_logos(spec["id"])
     return BrandPack(
         id=spec["id"],
         name=spec["name"],
@@ -216,6 +232,8 @@ def build_templated_pack(spec: dict) -> BrandPack:
         fonts_dir=_BRANDS_DIR / spec["id"] / "fonts",
         canonical_sha256=canonical,
         firestore_brand_id=spec.get("firestore_brand_id"),
+        logo_dir=logo_dir,
+        logo_path=logo_path,
         inline_prompts=inline_prompts,
         locked_colors=_locked_colors(palette),
         brand_kit_block=_brand_kit_block(spec["name"], palette),
