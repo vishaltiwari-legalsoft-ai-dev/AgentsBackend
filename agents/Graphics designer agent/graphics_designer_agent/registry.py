@@ -259,7 +259,7 @@ def _registry() -> dict[str, BrandPack]:
         local: dict[str, BrandPack] = {DEFAULT_BRAND_ID: _build_legalsoft()}
         # Templated brands (Phase C). Lazy import avoids a cycle — templated_brands
         # imports BrandPack from this module.
-        from . import templated_brands
+        from . import library_variants, templated_brands
 
         for pack in templated_brands.build_all():
             local[pack.id] = pack
@@ -276,6 +276,15 @@ def _registry() -> dict[str, BrandPack]:
                     logger.warning("dynamic brand %r skipped: %s", spec.get("id"), exc)
                     continue
                 local.setdefault(pack.id, pack)  # static packs win on collision
+
+        # Design-library variants (distilled from each brand's real, human-made
+        # creatives) are appended AFTER every pack is built — append-only and
+        # fault-isolated, so a bad library entry can never lose a brand.
+        for bid, pack in local.items():
+            try:
+                local[bid] = library_variants.extend_pack(pack)
+            except Exception as exc:  # noqa: BLE001 - library extras are optional
+                logger.warning("library variants skipped for %r: %s", bid, exc)
 
         _PACKS = local
         return _PACKS

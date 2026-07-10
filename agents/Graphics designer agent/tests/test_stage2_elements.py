@@ -1,6 +1,6 @@
 """Expanded Stage-2 element library + the agent element explorer (§7.1.1b)."""
 
-from graphics_designer_agent import suggestions
+from graphics_designer_agent import registry, suggestions
 from graphics_designer_agent.prompts import CANONICAL_SHA256, load_prompt
 from graphics_designer_agent.stage2_element import (
     STAGE2_BLEND_PROMPT,
@@ -9,7 +9,9 @@ from graphics_designer_agent.stage2_element import (
     substitute_stage2,
 )
 
-_IDS = {v["id"] for v in STAGE2_VARIANTS}
+# The live catalog = canonical STAGE2_VARIANTS + appended design-library
+# variants (library_variants.extend_pack), so derive ids from the pack.
+_IDS = {v["id"] for v in registry.get_pack("legalsoft").stage2_variants}
 
 
 def test_catalog_is_well_formed():
