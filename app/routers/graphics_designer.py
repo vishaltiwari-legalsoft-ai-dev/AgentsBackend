@@ -31,6 +31,7 @@ from graphics_designer_agent.runs import (
 from graphics_designer_agent.stage3_text import elements as elements_mod
 from graphics_designer_agent.stage3_text import icons as icons_mod
 from graphics_designer_agent.stage3_text import layout as gd_layout
+from graphics_designer_agent.stage3_text import placement_brain
 from graphics_designer_agent.stage3_text import shapes as shapes_mod
 from graphics_designer_agent.stage3_text import style_options as text_opts
 from graphics_designer_agent.stage4_logo import options as logo_opts
@@ -811,12 +812,31 @@ def text_preview_endpoint(run_id: str, body: TextPreviewBody,
 def suggest_placement_endpoint(run_id: str, user: dict = Depends(get_current_user)) -> dict:
     """Propose a polished, premium arrangement for the Stage-3 elements present.
 
-    A one-click refinement: returns ``{layout, shapes?}`` but does NOT persist it.
-    The client previews the proposal and chooses to apply (via the config patch)
-    or discard, so the AI arranger never overrides the user's flow by default.
+    Vision-first: a micro-subagent (``stage3_text.placement_brain``) looks at the
+    ACTUAL approved Stage-2 image and judges the clean zone / text colour / image
+    density; the deterministic arranger turns that into exact coordinates. If
+    vision is unavailable or fails, the arranger runs on Stage-2 metadata alone —
+    exactly the previous behaviour (``source: "deterministic"``).
+
+    A one-click refinement: returns ``{layout, element_styles?, ...}`` but does
+    NOT persist it. The client previews the proposal and chooses to apply (via
+    the config patch) or discard, so the AI arranger never overrides the user's
+    flow by default.
     """
     run = _owned_run(run_id, user)
-    return suggestions.suggest_placement(run, _pack_for_run(run))
+    judgment = None
+    base = pipeline.approved_base_png(run)
+    if base:
+        cfg = run.get("config", {})
+        tokens = cfg.get("tokens", {})
+        judgment = placement_brain.decide(
+            base,
+            headline=tokens.get("headline", ""),
+            subheading_count=len(cfg.get("subheadings") or []),
+            cta=tokens.get("cta", ""),
+            element_placement=cfg.get("element_placement"),
+        )
+    return suggestions.suggest_placement(run, _pack_for_run(run), judgment=judgment)
 
 
 @router.post("/gd/runs/{run_id}/generate")

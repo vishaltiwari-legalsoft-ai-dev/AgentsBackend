@@ -1374,44 +1374,73 @@ def qa_critique(stage: int, *, pack=None) -> dict:
     return {"type": "qa", "state": "proposed", "source": "agent", "stage": stage, "note": qa.get(stage, "")}
 
 
-def suggest_placement(run: dict, pack=None) -> dict:
+def suggest_placement(run: dict, pack=None, judgment: dict | None = None) -> dict:
     """§ "AI Suggest Placement" — propose a polished, premium arrangement for the
     Stage-3 elements present (does NOT auto-apply; the caller decides).
 
     Composition rules (deterministic, but content-aware):
-    * Text is placed in the NEGATIVE SPACE opposite the Stage-2 subject — subject
-      on the left -> copy column on the right (and vice-versa); subject up top ->
-      copy drops to the lower band. The subject side comes from the Stage-2
-      ``element_placement`` (9-cell); ``auto``/unknown falls back to a wide
-      left-aligned band in the upper area with the CTA pinned low, leaving the
-      centre open for the subject.
+    * With a vision ``judgment`` (from ``stage3_text.placement_brain``, which
+      actually LOOKED at the approved Stage-2 image), the copy column goes in the
+      zone the model chose, the text colour follows its legibility call, and a
+      "busy" image steps the headline down and narrows the column. Coordinates
+      are still computed here — the model judges, the arranger positions.
+    * Without a judgment (vision unavailable/failed), text is placed in the
+      NEGATIVE SPACE opposite the Stage-2 subject — subject on the left -> copy
+      column on the right (and vice-versa); subject up top -> copy drops to the
+      lower band. The subject side comes from the Stage-2 ``element_placement``
+      (9-cell); ``auto``/unknown falls back to a wide left-aligned band in the
+      upper area with the CTA pinned low, leaving the centre open for the subject.
     * Every text element gets a column ``w`` (max width fraction) so the renderer
       wraps inside the safe column — nothing runs off the canvas edge (the old
       arranger let copy overflow).
     * Headline on top, sub-headings stacked with even gaps, CTA anchored low,
       venue/website as a bottom-corner footer.
 
-    Returns ``{"layout": {element_id: {x, y, w, anchor}}}``.
+    Returns ``{"layout": {element_id: {x, y, w, anchor}}, "source": ...}`` plus,
+    when vision judged, ``element_styles`` / ``text_color`` / ``reason``.
     """
     from .stage3_text import layout as _layout
 
     ids = {l["id"] for l in _layout.resolve_layers(run)}
-    subj = (run.get("config", {}).get("element_placement") or "auto").lower()
-    on_left = "left" in subj
-    on_right = "right" in subj
-    on_top = subj.startswith("top")
-
     margin = 0.07
-    # Copy column on the side OPPOSITE the subject; wide band if unknown.
-    if on_left:                      # subject left -> copy on the right
-        col_x, col_w = 0.50, round(1 - margin - 0.50, 3)
-    elif on_right:                   # subject right -> copy on the left
-        col_x, col_w = margin, round(0.50 - margin, 3)
-    else:                            # center / auto -> wide left-aligned band
-        col_x, col_w = margin, round(1 - 2 * margin, 3)
+    busy = bool(judgment) and judgment.get("density") == "busy"
 
-    # Drop the copy to the lower band when the subject is up top.
-    y = 0.40 if on_top else margin
+    if judgment:
+        # Vision path: the model saw the image; its zone is where the TEXT goes.
+        zone = judgment.get("zone")
+        y = margin
+        if zone == "left":
+            col_x, col_w = margin, round(0.50 - margin, 3)
+        elif zone == "right":
+            col_x, col_w = 0.50, round(1 - margin - 0.50, 3)
+        elif zone == "center":
+            # A centred column must sit in the vertical middle too — starting at
+            # the top margin would render "center" as top-center.
+            col_x, col_w = 0.20, 0.60
+            y = 0.30
+        elif zone == "bottom":
+            col_x, col_w = margin, round(1 - 2 * margin, 3)
+            y = 0.40
+        else:  # top
+            col_x, col_w = margin, round(1 - 2 * margin, 3)
+        if busy:  # tighter column keeps copy clear of a crowded frame
+            col_w = round(col_w * 0.85, 3)
+    else:
+        subj = (run.get("config", {}).get("element_placement") or "auto").lower()
+        on_left = "left" in subj
+        on_right = "right" in subj
+        on_top = subj.startswith("top")
+
+        # Copy column on the side OPPOSITE the subject; wide band if unknown.
+        if on_left:                      # subject left -> copy on the right
+            col_x, col_w = 0.50, round(1 - margin - 0.50, 3)
+        elif on_right:                   # subject right -> copy on the left
+            col_x, col_w = margin, round(0.50 - margin, 3)
+        else:                            # center / auto -> wide left-aligned band
+            col_x, col_w = margin, round(1 - 2 * margin, 3)
+
+        # Drop the copy to the lower band when the subject is up top.
+        y = 0.40 if on_top else margin
     out: dict[str, dict] = {}
 
     if "headline" in ids:
@@ -1428,4 +1457,15 @@ def suggest_placement(run: dict, pack=None) -> dict:
         out["venue"] = {"x": margin, "y": 0.965, "w": 0.5, "anchor": "bl"}
     if "website" in ids:
         out["website"] = {"x": round(1 - margin, 3), "y": 0.965, "w": 0.5, "anchor": "br"}
-    return {"layout": out}
+
+    result: dict = {"layout": out, "source": "vision" if judgment else "deterministic"}
+    if judgment:
+        color = judgment.get("text_color", "dark")
+        headline_style: dict = {"color": color}
+        if busy:  # step the headline down one notch on a crowded frame
+            headline_style["size_pct"] = 6.5
+        result["element_styles"] = {"headline": headline_style}
+        result["text_color"] = color
+        if judgment.get("reason"):
+            result["reason"] = judgment["reason"]
+    return result
