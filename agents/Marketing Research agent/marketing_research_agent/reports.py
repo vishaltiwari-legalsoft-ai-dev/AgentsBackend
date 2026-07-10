@@ -8,8 +8,9 @@ offline).
 
 from __future__ import annotations
 
+import json
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from . import analysis, goals, runs
 from .modules import campaign_reporting as cr
@@ -19,6 +20,8 @@ from .modules import opportunity_research as orr
 KINDS = [
     "daily_summary",
     "weekly_summary",
+    "monthly_summary",
+    "quarterly_summary",
     "threshold_alert",
     "competitor_digest",
     "opportunity_report",
@@ -26,6 +29,13 @@ KINDS = [
     "icp_signal",
     "daily_movement",
 ]
+
+# Campaign-performance kinds share the aggregation pipeline and the
+# period-window logic (the tracker holds monthly cumulative figures).
+CAMPAIGN_KINDS = (
+    "daily_summary", "weekly_summary", "monthly_summary",
+    "quarterly_summary", "threshold_alert",
+)
 
 
 def _md_to_html(md: str) -> str:
@@ -65,15 +75,18 @@ def _enrich(channel: str, agg: dict) -> dict:
 
 
 # Plain-language summary per flagged metric (so the report shows "14 campaigns
-# over the $600 ceiling", not 14 near-identical lines).
-_FLAG_LABELS = {
-    "cost_per_qualified_lead": "over the $600 cost-per-qualified-lead ceiling",
-    "cac": "over the $3,000 CAC ceiling",
-    "spend_no_demo": "spending $3,000+ with no demo booked",
-    "cost_per_booking": "over the $150 cost-per-booking target",
-    "conversion_drop": "with a 30%+ drop in conversion",
-    "channel_goal": "over the channel cost-per-demo-booked goal",
-}
+# over the $600 ceiling", not 14 near-identical lines). Built per call because
+# every threshold figure is user-editable.
+def _flag_labels() -> dict[str, str]:
+    t = goals.thresholds()
+    return {
+        "cost_per_qualified_lead": f"over the ${t['cost_per_qualified_lead_red']:,.0f} cost-per-qualified-lead ceiling",
+        "cac": f"over the ${t['cac_red']:,.0f} CAC ceiling",
+        "spend_no_demo": f"spending ${t['spend_no_demo_limit']:,.0f}+ with no demo booked",
+        "cost_per_booking": f"over the ${t['cost_per_booking_flag']:,.0f} cost-per-booking target",
+        "conversion_drop": f"with a {t['conversion_drop_pct'] * 100:.0f}%+ drop in conversion",
+        "channel_goal": "over the channel cost-per-demo-booked goal",
+    }
 
 
 def _money_in(text: str) -> float:
@@ -89,9 +102,10 @@ def _flag_summary(flags: list[dict]) -> list[dict]:
         g = groups.setdefault(key, {"metric": f.get("metric"), "level": f["level"], "count": 0, "worst": 0.0})
         g["count"] += 1
         g["worst"] = max(g["worst"], _money_in(f["message"]))
+    labels = _flag_labels()
     out = []
     for (metric, level), g in groups.items():
-        label = _FLAG_LABELS.get(metric, (metric or "issue").replace("_", " "))
+        label = labels.get(metric, (metric or "issue").replace("_", " "))
         worst = f" (worst ${g['worst']:,.0f})" if g["worst"] else ""
         out.append({
             "metric": metric,
@@ -101,6 +115,151 @@ def _flag_summary(flags: list[dict]) -> list[dict]:
         })
     out.sort(key=lambda x: (x["level"] != "red", -x["count"]))
     return out
+
+
+# --- reporting period ---------------------------------------------------------
+
+def _period_window(kind: str, today: date) -> tuple[date, date]:
+    """The window a campaign report covers. Reports always run through
+    YESTERDAY (a July 9 daily report covers July 1–8): today's sheet state is
+    still moving while the day is in progress."""
+    end = today - timedelta(days=1)
+    if kind == "weekly_summary":
+        return end - timedelta(days=6), end
+    if kind == "quarterly_summary":
+        return date(end.year, ((end.month - 1) // 3) * 3 + 1, 1), end
+    # daily / monthly / threshold_alert: month-to-date
+    return end.replace(day=1), end
+
+
+def _period_label(start: date, end: date) -> str:
+    if (start.year, start.month) == (end.year, end.month):
+        return f"{start.strftime('%b')} {start.day}–{end.day}, {end.year}"
+    return f"{start.strftime('%b')} {start.day} – {end.strftime('%b')} {end.day}, {end.year}"
+
+
+def _clip_to_period(metrics: list, start: date, end: date) -> list:
+    """Keep the months the window touches (the tracker is a monthly grid).
+    Falls back to the latest month on/before the window's end so a report never
+    silently aggregates pre-filled future retainer months or goes empty."""
+    lo, hi = (start.year, start.month), (end.year, end.month)
+    kept = [m for m in metrics if lo <= (m.date.year, m.date.month) <= hi]
+    if not kept and metrics:
+        past = {(m.date.year, m.date.month) for m in metrics
+                if (m.date.year, m.date.month) <= hi}
+        if past:
+            ym = max(past)
+            kept = [m for m in metrics if (m.date.year, m.date.month) == ym]
+    return kept
+
+
+# --- per-vendor rollups, red flags, insights -----------------------------------
+
+def _vendor_rollup(vendor_metrics: dict[str, list]) -> list[dict]:
+    div = lambda n, d: round(n / d, 2) if d else None
+    out = []
+    for vendor, ms in (vendor_metrics or {}).items():
+        spend = round(sum(m.spend for m in ms), 2)
+        leads = sum(m.leads for m in ms)
+        ql = sum(m.qualified_leads for m in ms)
+        booked = sum(m.demos_booked for m in ms)
+        completed = sum(m.demos_completed for m in ms)
+        out.append({
+            "vendor": vendor,
+            "spend": spend,
+            "leads": leads,
+            "qualified_leads": ql,
+            "demos_booked": booked,
+            "demos_completed": completed,
+            "cost_per_qualified_lead": div(spend, ql),
+            "cost_per_demo_booked": div(spend, booked),
+            "cost_per_demo_completed": div(spend, completed),
+        })
+    out.sort(key=lambda v: v["spend"], reverse=True)
+    return out
+
+
+def _vendor_red_flags(vendors: list[dict]) -> list[dict]:
+    """Which vendors are on a red flag and exactly why (editable thresholds)."""
+    t = goals.thresholds()
+    out = []
+    for v in vendors:
+        reasons = []
+        if v["spend"] >= t["spend_no_demo_limit"] and v["demos_booked"] == 0:
+            reasons.append(f"${v['spend']:,.0f} spent with no demo booked")
+        if v["spend"] > 0 and v["leads"] == 0:
+            reasons.append(f"${v['spend']:,.0f} spent with zero leads")
+        cpql = v["cost_per_qualified_lead"]
+        if cpql is not None and cpql >= t["cost_per_qualified_lead_red"]:
+            reasons.append(
+                f"cost per qualified lead ${cpql:,.0f} at/above the "
+                f"${t['cost_per_qualified_lead_red']:,.0f} red line")
+        cac = v["cost_per_demo_completed"]
+        if cac is not None and cac >= t["cac_red"]:
+            reasons.append(f"CAC ${cac:,.0f} at/above the ${t['cac_red']:,.0f} red line")
+        if reasons:
+            out.append({"vendor": v["vendor"], "reasons": reasons})
+    return out
+
+
+def _fallback_vendor_insights(vendors: list[dict], red_map: dict[str, list[str]]) -> list[dict]:
+    """Deterministic 3-insights / 3-actions per vendor (offline or LLM failure)."""
+    t = goals.thresholds()
+    lo, hi = t["cost_per_qualified_lead_target_low"], t["cost_per_qualified_lead_target_high"]
+    out = []
+    for v in vendors:
+        cpql = v["cost_per_qualified_lead"]
+        show = round(v["demos_completed"] / v["demos_booked"] * 100) if v["demos_booked"] else None
+        insights = [
+            f"${v['spend']:,.0f} spend produced {v['qualified_leads']} qualified leads "
+            f"from {v['leads']} total leads.",
+            (f"Cost per qualified lead is ${cpql:,.0f} vs the ${lo:,.0f}–${hi:,.0f} target."
+             if cpql is not None else "No qualified leads yet, so cost per qualified lead can't be measured."),
+            (f"{v['demos_booked']} demos booked and {v['demos_completed']} completed"
+             + (f" ({show}% show rate)." if show is not None else ".")),
+        ]
+        actions = []
+        if red_map.get(v["vendor"]):
+            actions.append(f"Address the red flag: {red_map[v['vendor']][0]}.")
+        if cpql is not None and cpql > hi:
+            actions.append(f"Rework the worst ad sets to pull CPQL back under ${hi:,.0f}.")
+        elif cpql is None and v["spend"] > 0:
+            actions.append("Audit targeting and lead capture — spend is running without qualified leads.")
+        else:
+            actions.append("Keep the current mix; efficiency is inside target.")
+        if v["demos_booked"] == 0:
+            actions.append("Investigate the lead-to-demo handoff; nothing is being booked.")
+        elif show is not None and show < 60:
+            actions.append("Tighten demo reminders/follow-ups to lift the show rate.")
+        else:
+            actions.append("Hold demo follow-up cadence; booking flow is working.")
+        actions.append("Review spend pacing against the monthly budget before the next pull.")
+        out.append({"vendor": v["vendor"], "insights": insights[:3], "actions": actions[:3]})
+    return out
+
+
+def _vendor_insights(vendors: list[dict], red_flags: list[dict]) -> list[dict]:
+    """3 concise insights + 3 action points per vendor: LLM online, deterministic
+    fallback offline — output shape is identical either way."""
+    if not vendors:
+        return []
+    red_map = {r["vendor"]: r["reasons"] for r in red_flags}
+    prompt = analysis.load_prompt("vendor_insights").replace(
+        "{data}", json.dumps({"vendors": vendors, "red_flags": red_flags}, default=str))
+    raw = analysis.llm_json(prompt)
+    if isinstance(raw, list):
+        known = {v["vendor"] for v in vendors}
+        rows = []
+        for r in raw:
+            if not isinstance(r, dict) or r.get("vendor") not in known:
+                continue
+            ins = [str(s) for s in (r.get("insights") or []) if str(s).strip()][:3]
+            act = [str(s) for s in (r.get("actions") or []) if str(s).strip()][:3]
+            if len(ins) == 3 and len(act) == 3:
+                rows.append({"vendor": r["vendor"], "insights": ins, "actions": act})
+        if len(rows) == len(vendors):
+            return sorted(rows, key=lambda r: [v["vendor"] for v in vendors].index(r["vendor"]))
+    return _fallback_vendor_insights(vendors, red_map)
 
 
 def _campaign_structured(ds: dict) -> dict:
@@ -121,6 +280,15 @@ def _campaign_structured(ds: dict) -> dict:
         "flags": flags,
         "flag_summary": _flag_summary(flags),
     }
+    # Per-vendor layer (present when the dataset keeps vendor identity).
+    vendor_metrics = ds.get("vendor_metrics")
+    if vendor_metrics:
+        vendors = _vendor_rollup(vendor_metrics)
+        red = _vendor_red_flags(vendors)
+        structured["vendors"] = vendors
+        structured["red_flag_vendors"] = red
+        if ds.get("with_vendor_insights"):
+            structured["vendor_insights"] = _vendor_insights(vendors, red)
     if previous is not None:
         structured["week_over_week"] = cr.week_over_week(
             current_agg, cr.aggregate_by_channel(previous)
@@ -129,7 +297,7 @@ def _campaign_structured(ds: dict) -> dict:
 
 
 def _structured(kind: str, ds: dict) -> dict:
-    if kind in ("daily_summary", "weekly_summary", "threshold_alert"):
+    if kind in CAMPAIGN_KINDS:
         return _campaign_structured(ds)
     if kind == "utm_attribution":
         leads = ds.get("leads", [])
@@ -163,14 +331,16 @@ def _structured(kind: str, ds: dict) -> dict:
 def _narration_input(kind: str, s: dict) -> dict:
     """Compact, relevant slice of the structured data for the LLM — keeps the
     read focused and cheap (no giant raw-flag list)."""
-    if kind in ("daily_summary", "weekly_summary", "threshold_alert"):
+    if kind in CAMPAIGN_KINDS:
         keep = ("spend", "demos_booked", "demos_completed",
                 "cost_per_demo_booked", "cost_per_demo_completed",
                 "cost_per_qualified_lead", "cac", "goal")
         return {
+            "period": s.get("period"),
             "totals": {k: (s.get("totals") or {}).get(k) for k in ("spend", "demos_completed", "cost_per_demo_completed", "qualified_leads")},
             "channels": {ch: {k: a.get(k) for k in keep} for ch, a in (s.get("channels") or {}).items()},
             "issues": s.get("flag_summary", []),
+            "red_flag_vendors": s.get("red_flag_vendors", []),
         }
     if kind == "daily_movement":
         return {
@@ -199,7 +369,26 @@ def build(kind: str, dataset: dict, user_id: str) -> dict:
     """Build, persist, and return one report deliverable."""
     if kind not in KINDS:
         raise ValueError(f"unknown report kind: {kind}")
-    structured = _structured(kind, dataset)
+    if kind in CAMPAIGN_KINDS:
+        today = dataset.get("today") or date.today()
+        start, end = _period_window(kind, today)
+        dataset = {
+            **dataset,
+            "metrics": _clip_to_period(dataset.get("metrics", []), start, end),
+            "vendor_metrics": {
+                v: _clip_to_period(ms, start, end)
+                for v, ms in (dataset.get("vendor_metrics") or {}).items()
+            } or None,
+            "with_vendor_insights": True,
+        }
+        structured = _structured(kind, dataset)
+        structured["period"] = {
+            "start": start.isoformat(), "end": end.isoformat(),
+            "label": _period_label(start, end),
+            "basis": "Tracker figures are month-to-date cumulatives; the report reads the months this window touches.",
+        }
+    else:
+        structured = _structured(kind, dataset)
     markdown = _markdown(kind, structured)
     report = {
         "id": runs.new_run_id(),
@@ -233,7 +422,7 @@ def overview(ds: dict) -> dict:
     current = {ym for ym in months if ym <= (today.year, today.month)}
     latest = max(current) if current else min(months)
     month_metrics = [m for m in metrics if (m.date.year, m.date.month) == latest]
-    s = _campaign_structured({**ds, "metrics": month_metrics})
+    s = _campaign_structured({**ds, "metrics": month_metrics, "vendor_metrics": None})
     return {
         "has_data": True,
         "month": f"{latest[0]:04d}-{latest[1]:02d}",

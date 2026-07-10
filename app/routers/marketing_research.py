@@ -78,20 +78,35 @@ def _latest_datasets(user_id: str) -> dict[str, dict]:
     return latest
 
 
+def _vendor_label(platform: str) -> str:
+    """Human vendor name from a dataset's platform key ("sheets:<tab>" → tab)."""
+    plat = str(platform or "")
+    for prefix in ("sheets:", "pdf:"):
+        if plat.startswith(prefix):
+            return plat[len(prefix):]
+    return plat
+
+
 def _load_dataset(user_id: str) -> dict:
-    """Reassemble the user's ingested data into one dataset."""
+    """Reassemble the user's ingested data into one dataset. Keeps a per-vendor
+    view (one entry per source tab/upload) so reports can name vendors."""
     latest = _latest_datasets(user_id)
     metrics: list[CampaignMetric] = []
     leads: list[Lead] = []
-    for run in latest.values():
-        metrics.extend(_rehydrate_metrics(run.get("metrics", [])))
+    vendor_metrics: dict[str, list[CampaignMetric]] = {}
+    for plat, run in sorted(latest.items()):
+        ms = _rehydrate_metrics(run.get("metrics", []))
+        metrics.extend(ms)
         leads.extend(_rehydrate_leads(run.get("leads", [])))
+        if ms:
+            vendor_metrics.setdefault(_vendor_label(plat), []).extend(ms)
     sources = [
         {"platform": plat, "generated_at": run.get("generated_at"),
          "metrics": len(run.get("metrics", [])), "leads": len(run.get("leads", []))}
         for plat, run in sorted(latest.items())
     ]
-    return {"metrics": metrics, "leads": leads, "today": date.today(), "sources": sources}
+    return {"metrics": metrics, "leads": leads, "vendor_metrics": vendor_metrics,
+            "today": date.today(), "sources": sources}
 
 
 @router.post("/mr/ingest")
@@ -239,6 +254,110 @@ def datasets(user=Depends(get_current_user)):
     ]
 
 
+@router.delete("/mr/datasets/{dataset_id}")
+def delete_dataset(dataset_id: str, user=Depends(get_current_user)):
+    """Remove one ingested file/pull from the workspace (its numbers leave the
+    Overview and future reports immediately)."""
+    run = runs.get_run(dataset_id)
+    if not run or run.get("user_id") != user["id"] or run.get("kind") != "dataset":
+        raise HTTPException(404, "dataset not found")
+    runs.delete_run(dataset_id)
+    return {"deleted": dataset_id}
+
+
+_PDF_EXTRACT_PROMPT = """You are a marketing data extractor. Below is text from a
+marketing performance PDF. Find campaign/channel performance figures and reply
+with ONLY a JSON array (no prose). One object per channel or campaign row:
+{"channel": "Google|META|Email|Websites|Organic|...", "campaign": "<name>",
+ "date": "YYYY-MM-DD", "spend": <number>, "leads": <int>,
+ "qualified_leads": <int>, "demos_booked": <int>, "demos_completed": <int>}
+Use 0 for counts the document doesn't state; use the document's period start for
+"date" (default {today} if none is stated). If the document has no usable
+marketing metrics, reply [].
+
+Text:
+{text}
+"""
+
+
+def _metrics_from_pdf(text: str, today: date) -> list[CampaignMetric]:
+    from marketing_research_agent import analysis as mr_analysis
+
+    prompt = _PDF_EXTRACT_PROMPT.replace("{today}", today.isoformat()).replace("{text}", text[:12000])
+    raw = mr_analysis.llm_json(prompt)
+    out: list[CampaignMetric] = []
+    if not isinstance(raw, list):
+        return out
+    for r in raw:
+        if not isinstance(r, dict):
+            continue
+        try:
+            when = date.fromisoformat(str(r.get("date", ""))[:10])
+        except ValueError:
+            when = today.replace(day=1)
+        try:
+            channel = str(r.get("channel") or "Other").strip() or "Other"
+            out.append(CampaignMetric(
+                channel=channel,
+                campaign=str(r.get("campaign") or channel),
+                utm_source=channel.lower(),
+                utm_medium="pdf",
+                utm_campaign=str(r.get("campaign") or channel),
+                spend=float(r.get("spend") or 0),
+                leads=int(r.get("leads") or 0),
+                qualified_leads=int(r.get("qualified_leads") or 0),
+                demos_booked=int(r.get("demos_booked") or 0),
+                demos_completed=int(r.get("demos_completed") or 0),
+                date=when,
+            ))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+@router.post("/mr/ingest-pdf")
+async def ingest_pdf(file: UploadFile = File(...), user=Depends(get_current_user)):
+    """Upload a PDF report: text is extracted locally, metrics are parsed by the
+    LLM into the canonical schema and saved as a dataset."""
+    import io as _io
+
+    content = await file.read()
+    name = file.filename or "report.pdf"
+    if not name.lower().endswith(".pdf"):
+        raise HTTPException(400, "expected a .pdf file")
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(_io.BytesIO(content))
+        text = "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+    except Exception as exc:
+        raise HTTPException(400, f"could not read the PDF: {exc}")
+
+    gaps: list[dict] = []
+    metrics: list[CampaignMetric] = []
+    if not text:
+        gaps.append({"source": "pdf", "message": "no extractable text in the PDF (scanned image?)"})
+    else:
+        metrics = _metrics_from_pdf(text, date.today())
+        if not metrics:
+            gaps.append({"source": "pdf",
+                         "message": "no campaign metrics could be parsed from this PDF"})
+
+    run = {
+        "id": runs.new_run_id(),
+        "kind": "dataset",
+        "user_id": user["id"],
+        "agent_id": MR_AGENT_ID,
+        "platform": f"pdf:{name}",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "metrics": [m.__dict__ for m in metrics],
+        "leads": [],
+        "gaps": gaps,
+    }
+    runs.save_run(run)
+    return {"dataset_id": run["id"], "platform": run["platform"],
+            "metrics": len(metrics), "leads": 0, "gaps": gaps}
+
+
 @router.get("/mr/overview")
 def overview(user=Depends(get_current_user)):
     """Live dashboard state — latest-month KPIs vs 2026 goals. Persists nothing."""
@@ -374,6 +493,29 @@ def connectors(user=Depends(get_current_user)):
     ]
 
 
+@router.get("/mr/targets")
+def get_targets(user=Depends(get_current_user)):
+    """Effective performance targets/thresholds (defaults merged with edits)."""
+    from marketing_research_agent import goals as mr_goals
+
+    return mr_goals.get_targets()
+
+
+@router.post("/mr/targets")
+def save_targets(body: dict | None = None, user=Depends(get_current_user)):
+    """Edit targets/figures. Body: {"thresholds": {...}, "channel_goals": {"Google": {...}}}.
+    Send {"reset": true} to return to the 2026 defaults."""
+    from marketing_research_agent import goals as mr_goals
+
+    body = body or {}
+    if body.get("reset"):
+        return mr_goals.reset_targets()
+    try:
+        return mr_goals.set_targets(body)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
 @router.get("/mr/config")
 def get_config(user=Depends(get_current_user)):
     """Agent configuration: data source, report schedule, and thresholds."""
@@ -387,6 +529,8 @@ def get_config(user=Depends(get_current_user)):
         "schedule": [
             {"report": "Daily Performance Summary", "cadence": "Daily · 3:00 PM PST"},
             {"report": "Weekly Performance Summary", "cadence": "Mondays · 12:00 PM PST"},
+            {"report": "Monthly Performance Summary", "cadence": "1st of the month"},
+            {"report": "Quarterly Performance Summary", "cadence": "Quarter start"},
             {"report": "Campaign Threshold Alert", "cadence": "Triggered"},
             {"report": "Competitor Change Digest", "cadence": "Weekly"},
             {"report": "Media Opportunity Report", "cadence": "Bi-weekly"},
@@ -394,11 +538,11 @@ def get_config(user=Depends(get_current_user)):
             {"report": "ICP Audience Signal", "cadence": "Monthly"},
         ],
         "thresholds": {
-            "cost_per_booking_flag": mr_goals.COST_PER_BOOKING_FLAG,
-            "cac_red": mr_goals.CAC_RED,
-            "cost_per_qualified_lead_red": mr_goals.CPQL_RED,
-            "spend_no_demo_limit": mr_goals.SPEND_NO_DEMO_LIMIT,
-            "conversion_drop_pct": int(mr_goals.CONVERSION_DROP_PCT * 100),
+            "cost_per_booking_flag": mr_goals.thresholds()["cost_per_booking_flag"],
+            "cac_red": mr_goals.thresholds()["cac_red"],
+            "cost_per_qualified_lead_red": mr_goals.thresholds()["cost_per_qualified_lead_red"],
+            "spend_no_demo_limit": mr_goals.thresholds()["spend_no_demo_limit"],
+            "conversion_drop_pct": int(mr_goals.thresholds()["conversion_drop_pct"] * 100),
         },
     }
 

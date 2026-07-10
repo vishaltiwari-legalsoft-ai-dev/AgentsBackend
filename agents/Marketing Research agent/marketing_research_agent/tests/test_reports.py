@@ -62,6 +62,69 @@ def test_report_stamps_sources(monkeypatch, tmp_path):
     assert r["sources"] == ds["sources"]
 
 
+def test_daily_report_covers_month_to_date_through_yesterday(monkeypatch, tmp_path):
+    """On July 9 the daily report must read July 1–8: July data only, no other
+    months, and the period stamped on the report."""
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+
+    def m(month, day, spend):
+        return CampaignMetric(
+            channel="Google", campaign="c", utm_source="g", utm_medium="cpc",
+            utm_campaign="c", spend=spend, leads=10, qualified_leads=5,
+            demos_booked=2, demos_completed=1, date=date(2026, month, day),
+        )
+
+    ds = {"metrics": [m(6, 15, 999.0), m(7, 1, 500.0), m(9, 1, 2200.0)],
+          "leads": [], "today": date(2026, 7, 9)}
+    r = reports.build("daily_summary", ds, user_id="u1")
+    p = r["structured"]["period"]
+    assert p["start"] == "2026-07-01" and p["end"] == "2026-07-08"
+    assert r["structured"]["totals"]["spend"] == 500.0  # June + future September excluded
+
+
+def test_quarterly_report_spans_the_quarter(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+
+    def m(month, spend):
+        return CampaignMetric(
+            channel="Google", campaign="c", utm_source="g", utm_medium="cpc",
+            utm_campaign="c", spend=spend, leads=10, qualified_leads=5,
+            demos_booked=2, demos_completed=1, date=date(2026, month, 1),
+        )
+
+    ds = {"metrics": [m(6, 100.0), m(7, 200.0)], "leads": [], "today": date(2026, 7, 9)}
+    r = reports.build("quarterly_summary", ds, user_id="u1")
+    assert r["structured"]["period"]["start"] == "2026-07-01"
+    assert r["structured"]["totals"]["spend"] == 200.0  # Q3 only; June is Q2
+
+
+def test_report_names_red_flag_vendors_and_insights(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+
+    def m(spend, ql):
+        return CampaignMetric(
+            channel="Google", campaign="c", utm_source="g", utm_medium="cpc",
+            utm_campaign="c", spend=spend, leads=10, qualified_leads=ql,
+            demos_booked=2, demos_completed=1, date=date(2026, 7, 1),
+        )
+
+    good, bad = m(600.0, 3), m(4000.0, 5)  # bad: CPQL $800 >= $600 red line
+    ds = {"metrics": [good, bad], "leads": [], "today": date(2026, 7, 9),
+          "vendor_metrics": {"Good Vendor": [good], "Bad Vendor": [bad]}}
+    r = reports.build("daily_summary", ds, user_id="u1")
+    s = r["structured"]
+    assert [v["vendor"] for v in s["red_flag_vendors"]] == ["Bad Vendor"]
+    assert "qualified lead" in s["red_flag_vendors"][0]["reasons"][0]
+    assert len(s["vendors"]) == 2
+    rows = {i["vendor"]: i for i in s["vendor_insights"]}
+    assert set(rows) == {"Good Vendor", "Bad Vendor"}
+    assert all(len(i["insights"]) == 3 and len(i["actions"]) == 3 for i in rows.values())
+    assert "Bad Vendor" in r["markdown"]  # exec summary names the flagged vendor
+
+
 def test_daily_movement_has_a_real_prompt():
     """Without a prompt file the LLM free-styles a 3000-word report; the daily
     brief must ship with explicit brevity instructions."""
