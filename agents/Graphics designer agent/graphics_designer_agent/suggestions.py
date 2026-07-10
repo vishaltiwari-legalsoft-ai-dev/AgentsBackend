@@ -876,73 +876,158 @@ def suggest_gradient(
 ) -> dict:
     """Propose ONE fresh, on-brand Stage-1 gradient for this creative only.
 
-    Curated + deterministic so it works fully offline; when an OpenRouter key is
-    configured the gradient is written by the model (best-effort — any failure or
-    invalid/off-brand result silently falls back to the curated pick)."""
+    When an OpenRouter key is configured the gradient is written by the model,
+    with the user's ``steer`` as the #1 hard requirement (same contract as the
+    Stage-2 element). If the LLM path fails, the curated fallback is returned
+    honestly flagged (``ai: False`` + ``fallback_reason``) so the UI can say so
+    instead of presenting a canned pick as an AI result."""
     pack = _resolve_pack(pack)
     answers = answers or {}
     steer = (steer or "").strip()
     excl = set(exclude or [])
     curated = _curated_gradient(answers, steer, excl, pack)
-    enriched = _enrich_gradient_with_llm(answers, steer, curated, excl, pack)
-    return enriched or curated
+    enriched, fail_reason = _enrich_gradient_with_llm(answers, steer, curated, excl, pack)
+    if enriched:
+        return enriched
+    if fail_reason:
+        curated["fallback_reason"] = fail_reason
+    return curated
 
 
-def _enrich_gradient_with_llm(
-    answers: dict, steer: str, curated: dict, exclude: set[str] | None = None, pack=None
-) -> dict | None:
-    """Best-effort: let the model study the canonical gradients and invent a new
-    on-brand one. Returns None on any problem (caller keeps the curated pick)."""
-    pack = _resolve_pack(pack)
-    try:
-        from app.services.openrouter import get_llm  # lazy — package works without the app
-    except Exception:
-        logger.debug("OpenRouter not importable; using curated suggestion fallback")
-        return None
+def _get_llm(**kwargs):
+    """Lazy OpenRouter accessor — a module-level seam tests monkeypatch. Raises
+    when the app layer (and its key) is unavailable; callers treat any raise as
+    "LLM path unavailable"."""
+    from app.services.openrouter import get_llm  # lazy — package works without the app
 
+    return get_llm(**kwargs)
+
+
+def _gradient_llm_prompt(steer: str, pack, exclude: set[str] | None = None) -> str:
+    """Art-direction prompt for the AI gradient.
+
+    A non-empty ``steer`` is the user's request and is the single most important
+    requirement — it drives composition AND texture (only the brand palette, the
+    AR anchor and "no text" stay locked). Only when there is NO steer does the
+    rotating composition archetype apply, so steer-less regenerates still vary
+    instead of defaulting to a radial bloom."""
     inspiration = "\n".join(
         f"- {v['id']} — {v['title']}: {pack.load_prompt(v['prompt_file']).strip()}"
         for v in pack.stage1_variants
     )
     palette = ", ".join(sorted(pack.brand_gradient_hexes))
-    _, comp_directive = _target_composition(steer, exclude or set())
-    steer_line = f"\nUser steer (honour its mood, e.g. warmer/minimal): {steer}" if steer else ""
-    prompt = (
-        "You are an art director for premium legal-tech ad backgrounds. Study the "
-        "existing brand gradient prompts below and invent ONE NEW gradient that is "
+    if steer:
+        request_line = (
+            f'THE USER ASKED FOR: "{steer}"\n'
+            "The gradient MUST visibly deliver this request — its composition, texture "
+            "and mood come FROM the request, not from the examples below. This is the "
+            "single most important requirement; do not substitute a generic design.\n\n"
+        )
+        comp_rule = (
+            "3. COMPOSITION & TEXTURE — follow the user's request literally. Any "
+            "composition it implies is allowed (linear, diagonal, horizontal, radial, "
+            "layered waves, aurora bands, mesh-like multi-point blends, subtle film "
+            "grain…) as long as it remains an abstract background.\n"
+        )
+        honesty_rule = (
+            "6. HONESTY — if part of the request cannot be honoured (e.g. it names "
+            "colours outside the brand palette), deliver the closest on-brand "
+            'interpretation and say so plainly in "desc" (e.g. "kept to brand blues — '
+            'emerald is not in the palette"). The title must describe what the '
+            "gradient actually looks like, never just echo the request.\n"
+        )
+        ending = 'and MUST end with "no text."'
+    else:
+        _, comp_directive = _target_composition(steer, exclude or set())
+        request_line = ""
+        comp_rule = (
+            f"3. COMPOSITION — the gradient MUST be {comp_directive}. Do NOT use any "
+            "other composition (do NOT default to a radial bloom unless told to here). "
+            "Make the named composition unmistakable in the wording.\n"
+        )
+        honesty_rule = ""
+        ending = 'and MUST end with "no noise, no text."'
+    return (
+        f"You are an art director for premium {pack.name} ad backgrounds. Study the "
+        "existing brand gradient prompts below and design ONE NEW gradient that is "
         "visibly different from all of them, while staying strictly on-brand.\n\n"
+        f"{request_line}"
         "HARD RULES:\n"
         f'1. The "prompt" MUST begin with "Create a {STAGE1_AR_ANCHOR} immersive '
-        'abstract background gradient" and MUST end with "no noise, no text.".\n'
+        f"abstract background gradient\" {ending}\n"
         f"2. Use ONLY these brand hex colours, by code: {palette}. No other colours.\n"
-        f"3. COMPOSITION — the gradient MUST be {comp_directive}. Do NOT use any "
-        "other composition (do NOT default to a radial bloom unless told to here). "
-        "Make the named composition unmistakable in the wording.\n"
-        "4. Within that fixed composition, get novelty from colour ordering, light "
-        "position, feathering and vignette — NEVER from new colours.\n"
-        "5. No people, objects, logos, or text in the image.\n\n"
+        f"{comp_rule}"
+        "4. Get novelty from colour ordering, light position, feathering and "
+        "vignette — NEVER from new colours.\n"
+        "5. No people, objects, logos, or text in the image.\n"
+        f"{honesty_rule}\n"
         f"Brand kit (reference):\n{pack.brand_kit_block}\n{pack.source_note_stage1}\n\n"
-        f"Existing gradient prompts:\n{inspiration}{steer_line}\n\n"
+        f"Existing gradient prompts:\n{inspiration}\n\n"
         'Return ONLY minified JSON: {"title":"2-4 words","desc":"one sentence",'
         '"prompt":"the full gradient prompt","css_gradient":"a CSS gradient that '
-        "matches the composition above (linear-gradient(...) for linear, "
-        'radial-gradient(...) for radial) using only the brand hexes"}'
+        "previews the design (linear-gradient(...) or radial-gradient(...)) using "
+        'only the brand hexes"}'
     )
+
+
+def _css_on_brand(css: str, pack) -> bool:
+    """A preview css_gradient is acceptable when it is a plain linear/radial
+    gradient built from brand hexes only."""
+    return css.startswith(("linear-gradient(", "radial-gradient(")) and not (
+        {h.upper() for h in _HEX_RE.findall(css)} - pack.brand_gradient_hexes
+    )
+
+
+def _enrich_gradient_with_llm(
+    answers: dict, steer: str, curated: dict, exclude: set[str] | None = None, pack=None
+) -> tuple[dict | None, str | None]:
+    """Best-effort: let the model design a new on-brand gradient from the user's
+    steer. A validation-rejected answer is retried ONCE with the errors echoed
+    back (mirrors the element path) instead of silently dropping to curated.
+
+    Returns ``(result, None)`` on success, ``(None, reason)`` on failure — the
+    reason is surfaced to the UI as ``fallback_reason`` so a curated pick is
+    never presented as an AI result."""
+    pack = _resolve_pack(pack)
+    base = _gradient_llm_prompt(steer, pack, exclude)
     try:
-        msg = get_llm(temperature=0.8, fast=True).invoke(prompt)
-        content = msg.content if isinstance(msg.content, str) else str(msg.content)
-        match = re.search(r"\{.*\}", content, re.S)
-        if not match:
-            return None
-        data = json.loads(match.group(0))
+        llm = _get_llm(temperature=0.8, fast=True)
+        data: dict | None = None
+        errors: list[str] = []
+        for attempt in range(2):
+            ask = base if attempt == 0 else (
+                base
+                + "\n\nYOUR PREVIOUS ANSWER WAS REJECTED: "
+                + " ".join(errors)
+                + " Fix every issue and return ONLY the corrected minified JSON."
+            )
+            msg = llm.invoke(ask)
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            match = re.search(r"\{.*\}", content, re.S)
+            if not match:
+                errors = ["The reply was not the requested minified JSON object."]
+                continue
+            try:
+                candidate = json.loads(match.group(0))
+            except Exception:  # noqa: BLE001
+                errors = ["The reply was not valid JSON."]
+                continue
+            text = str(candidate.get("prompt") or "").strip()
+            errors = _validate_gradient_prompt(text, pack=pack)
+            css = str(candidate.get("css_gradient") or "").strip()
+            if css and not _css_on_brand(css, pack):
+                errors.append(
+                    'The "css_gradient" must be a linear-gradient(...) or '
+                    "radial-gradient(...) using only the brand hexes."
+                )
+            if not errors:
+                data = candidate
+                break
+        if data is None:
+            logger.warning("AI gradient rejected by validation after retry: %s", "; ".join(errors))
+            return None, "The AI's design failed brand validation twice — showing a curated brand preset instead."
         text = str(data.get("prompt") or "").strip()
-        if _validate_gradient_prompt(text, pack=pack):  # non-empty error list → reject
-            return None
         css = str(data.get("css_gradient") or "").strip()
-        css_ok = (
-            css.startswith(("linear-gradient(", "radial-gradient("))
-            and not ({h.upper() for h in _HEX_RE.findall(css)} - pack.brand_gradient_hexes)
-        )
         title = str(data.get("title") or "AI Gradient").strip()[:48]
         desc = str(data.get("desc") or curated["gradient"]["desc"]).strip()[:160]
         return {
@@ -955,12 +1040,12 @@ def _enrich_gradient_with_llm(
                 "title": title,
                 "desc": desc,
                 "prompt": text,
-                "css_gradient": css if css_ok else curated["gradient"]["css_gradient"],
+                "css_gradient": css if _css_on_brand(css, pack) else curated["gradient"]["css_gradient"],
             },
-        }
+        }, None
     except Exception:
         logger.warning("LLM gradient enrichment failed; using curated fallback", exc_info=True)
-        return None
+        return None, "The AI gradient service is unavailable — showing a curated brand preset instead."
 
 
 # ── §7.1.1d — AI element ("let the agent invent a fresh element / subject") ────
