@@ -4,11 +4,12 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app.config import settings
 from app.security import get_current_user, require_admin, require_creator
-from app.services import agent_config, firestore_repo, runtime_config
+from app.services import agent_config, firestore_repo, runtime_config, storage
 from graphics_designer_agent import registry
 
 router = APIRouter()
@@ -571,6 +572,72 @@ def analytics(_admin: dict = Depends(require_admin)) -> dict:
         "by_brand": dict(by_brand.most_common()),
         "by_category": dict(by_category.most_common()),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Image Library (Super Admin): the gallery of every COMPLETED Graphics Designer
+# run's final creative. Entries are written at Stage-4 approval (see
+# ``_archive_final_image`` in the GD router); images live in GCS under
+# ``generated/gallery/`` and are served here as fresh signed URLs, with a
+# byte-proxy fallback for local-fs artifacts (dev) or when signing fails.
+# --------------------------------------------------------------------------- #
+
+def _gallery_view_url(item: dict) -> str:
+    """Browser-facing URL for one gallery entry: a fresh signed GCS URL when
+    possible, else this router's authenticated byte-proxy."""
+    gs_uri = item.get("image_gs_uri")
+    if gs_uri and storage.is_configured():
+        try:
+            return storage.signed_url_for_gs_uri(gs_uri)
+        except Exception:  # noqa: BLE001 - fall back to the proxy
+            logger.exception("Image library: failed to sign %s", gs_uri)
+    return f"/api/admin/image-library/{item.get('run_id')}/image"
+
+
+@router.get("/admin/image-library")
+def image_library(limit: int = 200, _admin: dict = Depends(require_admin)) -> dict:
+    """Super Admin: every completed GD run's final image, newest first."""
+    limit = max(1, min(limit, 500))
+    items = []
+    for item in firestore_repo.list_gallery_images(limit=limit):
+        items.append({
+            "run_id": item.get("run_id") or item.get("id"),
+            "user_id": item.get("user_id", ""),
+            "user_email": item.get("user_email", ""),
+            "brand": item.get("brand"),
+            "brand_id": item.get("brand_id"),
+            "summary": item.get("summary", ""),
+            "headline": item.get("headline", ""),
+            "aspect_ratio": item.get("aspect_ratio"),
+            "completed_at": item.get("completed_at", ""),
+            "view_url": _gallery_view_url(item),
+        })
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/admin/image-library/{run_id}/image")
+def image_library_image(run_id: str, _admin: dict = Depends(require_admin)):
+    """Super Admin: the final image bytes for one gallery entry.
+
+    Fallback path when a signed URL isn't available — reads the archived GCS
+    copy, or the run's own artifact store (local fs in dev).
+    """
+    item = firestore_repo.get_gallery_image(run_id)
+    if not item:
+        raise HTTPException(404, "Gallery entry not found")
+    gs_uri = item.get("image_gs_uri")
+    try:
+        if gs_uri:
+            data = storage.download_bytes(gs_uri)
+        else:
+            from graphics_designer_agent.runs import read_artifact
+
+            data = read_artifact(run_id, item.get("artifact") or "")
+    except Exception as exc:  # noqa: BLE001 - surface a clean 404, log the cause
+        logger.warning("Image library: could not read image for run %s: %s", run_id, exc)
+        raise HTTPException(404, "Image not found") from exc
+    return Response(content=data, media_type="image/png",
+                    headers={"Cache-Control": "private, max-age=3600"})
 
 
 # --------------------------------------------------------------------------- #

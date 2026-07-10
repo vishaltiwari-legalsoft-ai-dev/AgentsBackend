@@ -581,6 +581,51 @@ def update_run(
         pass
 
 
+# --------------------------------------------------------------------------- #
+# Image library (admin-only gallery of completed Graphics Designer runs)
+# --------------------------------------------------------------------------- #
+# One document per COMPLETED run (doc id = run id, so a re-approved Stage 4
+# simply refreshes the same entry). The final creative's bytes live in GCS
+# (``generated/gallery/…``); this collection stores only the pointer + context
+# the admin gallery renders. Writes are best-effort — archiving must never
+# break the user's approval request.
+
+def upsert_gallery_image(item: dict[str, Any]) -> None:
+    """Create/refresh the image-library entry for a completed run."""
+    run_id = str(item.get("run_id") or "")
+    if not run_id:
+        return
+    try:
+        _db().collection("image_library").document(run_id).set(
+            {**item, "updated_at": _now()}, merge=True
+        )
+    except Exception:  # archiving is best-effort — never fail the approval
+        pass
+
+
+def list_gallery_images(limit: int = 200) -> list[dict[str, Any]]:
+    """Image-library entries, newest completion first."""
+    try:
+        docs = (
+            _db()
+            .collection("image_library")
+            .order_by("completed_at", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+            .stream()
+        )
+        return [doc.to_dict() | {"id": doc.id} for doc in docs]
+    except Exception:
+        return []
+
+
+def get_gallery_image(run_id: str) -> Optional[dict[str, Any]]:
+    try:
+        doc = _db().collection("image_library").document(run_id).get()
+        return (doc.to_dict() | {"id": doc.id}) if doc.exists else None
+    except Exception:
+        return None
+
+
 def purge_telemetry() -> dict[str, int]:
     """Delete the superseded telemetry collections (Tables 1/2 replace them).
     Operational collections are never touched. Returns {collection: deleted}
@@ -638,6 +683,8 @@ VIEWABLE_COLLECTIONS: list[dict[str, str]] = [
      "description": "Graphics Designer run manifests / live state (cloud storage mode)."},
     {"name": "reference_creatives", "label": "Reference uploads",
      "description": "User-uploaded reference material."},
+    {"name": "image_library", "label": "Image library",
+     "description": "Final creatives of completed Graphics Designer runs (admin gallery)."},
     {"name": "app_config", "label": "App config",
      "description": "Runtime settings (single global document; secrets masked)."},
 ]

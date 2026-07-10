@@ -24,6 +24,7 @@ from graphics_designer_agent.runs import (
     get_run,
     is_own_artifact_ref,
     log_manifest,
+    read_artifact,
     save_artifact,
     save_run,
 )
@@ -129,6 +130,51 @@ def _advance_run(
         summary=_creative_summary(run),
         run_status=run_status,
     )
+
+def _archive_final_image(user: dict, run: dict) -> None:
+    """Archive a COMPLETED run's final creative into the admin Image Library.
+
+    Called when Stage 4 is approved (run state = DONE). Copies the approved
+    Stage-4 image to a durable GCS home (``generated/gallery/…``) and records a
+    pointer + run context in the ``image_library`` Firestore collection, which
+    the admin-only "Image Library" tab renders. Best-effort by design: any
+    failure is logged and swallowed so the user's approval never breaks.
+    """
+    rid = str(run.get("id"))
+    try:
+        approved = (run.get("stages") or {}).get("4", {}).get("approved") or {}
+        ref = approved.get("artifact")
+        if not ref:
+            return
+        item = {
+            "run_id": rid,
+            "user_id": str(user["id"]),
+            "user_email": str(user.get("email", "")),
+            "brand_id": run.get("brand_id"),
+            "brand": _brand_name(run),
+            "summary": _creative_summary(run),
+            "headline": ((run.get("config") or {}).get("tokens") or {}).get("headline", ""),
+            "aspect_ratio": (run.get("config") or {}).get("aspect_ratio"),
+            "artifact": ref,
+            "image_gs_uri": ref if ref.startswith("gs://") else None,
+            "completed_at": firestore_repo._now(),
+        }
+        # Give the final image a durable, run-independent home in GCS so the
+        # gallery survives any future pruning of per-run artifacts. Skipped
+        # when GCS isn't configured (local dev) — the fs artifact still backs
+        # the gallery through the admin image proxy.
+        if storage.is_configured():
+            gs_uri, _signed = storage.upload_generated(
+                partition="gallery",
+                file_name=f"{rid}-final.png",
+                data=read_artifact(rid, ref),
+                content_type="image/png",
+            )
+            item["image_gs_uri"] = gs_uri
+        firestore_repo.upsert_gallery_image(item)
+    except Exception:  # noqa: BLE001 - archiving must never fail the approval
+        logger.exception("GD: failed to archive final image for run %s", rid)
+
 
 # Headline/highlight/CTA text tokens. Sub-heading text lives in the dynamic
 # ``subheadings`` list, each with its own approval, gated separately.
@@ -1017,6 +1063,9 @@ def approve_endpoint(run_id: str, body: ApproveBody, user: dict = Depends(get_cu
         stage_status="approved",
         run_status="completed" if body.stage == 4 else None,
     )
+    # A completed run's final creative is archived into the admin Image Library.
+    if body.stage == 4:
+        _archive_final_image(user, run)
     return _to_client(run)
 
 
