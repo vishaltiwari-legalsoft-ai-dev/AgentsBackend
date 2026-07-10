@@ -14,12 +14,20 @@ These packs are intentionally a strong starting point you can refine later.
 from __future__ import annotations
 
 import hashlib
+import logging
+import re
 from pathlib import Path
 
 from .prompts import PROMPT_DIR
 from .registry import BrandPack
 
+logger = logging.getLogger("graphics_designer.templated_brands")
+
 _BRANDS_DIR = Path(__file__).resolve().parent / "brands"
+
+# Matches literal 6-digit hex colours embedded in a css_gradient string
+# (e.g. "linear-gradient(90deg, #ABCDEF 0%, #123456 100%)").
+_HEX_RE = re.compile(r"#[0-9A-Fa-f]{6}")
 
 # Brand-neutral compositing prompts, reused by every templated brand.
 STAGE2_BLEND_FILE = "stage2_element_blend.txt"
@@ -140,13 +148,41 @@ _GENERIC_DISCOVERY = [
 ]
 
 
-def _gradient_artifacts(palette: dict):
-    """Return (stage1_variants, inline_prompt_map, curated_gradients) for a palette."""
+def _gradient_artifacts(palette: dict, extra_gradients: list[dict] | None = None):
+    """Return (stage1_variants, inline_prompt_map, curated_gradients) for a palette.
+
+    ``extra_gradients`` (optional) — per-brand gradient presets riding the same
+    artifact shape as the 5 shared templates, but with LITERAL values (content
+    units bake exact hexes; nothing here is palette-templated). Each dict is
+    ``{"id","title","desc","css_gradient","prompt"}``. Appended, in order,
+    after the shared templates. An id colliding with a shared template id (or
+    a prior extra gradient in this same list) is skipped and logged — never
+    fatal, matching the fault-isolation convention used elsewhere in this
+    package (e.g. ``gd_brand_source``'s per-doc isolation)."""
     L, M, D = palette["light"], palette["mid"], palette["deep"]
     variants, inline, curated = [], {}, []
+    seen_ids: set[str] = set()
     for vid, title, desc, css, prompt in _GRADIENT_TEMPLATES:
         text = prompt.format(L=L, M=M, D=D)
         css_filled = css.format(L=L, M=M, D=D)
+        fname = f"stage1_gradient_{vid}.txt"
+        variants.append({"id": vid, "prompt_file": fname, "title": title,
+                         "desc": desc, "css_gradient": css_filled})
+        inline[fname] = text
+        curated.append({"cid": f"grad-{vid.lower()}", "title": title, "desc": desc,
+                        "css_gradient": css_filled, "prompt": text})
+        seen_ids.add(vid)
+
+    for eg in extra_gradients or []:
+        vid = eg["id"]
+        if vid in seen_ids:
+            logger.warning(
+                "templated_brands: extra_gradients id %r collides with an existing "
+                "gradient id — skipped (fault-isolated, not fatal)", vid,
+            )
+            continue
+        seen_ids.add(vid)
+        title, desc, css_filled, text = eg["title"], eg["desc"], eg["css_gradient"], eg["prompt"]
         fname = f"stage1_gradient_{vid}.txt"
         variants.append({"id": vid, "prompt_file": fname, "title": title,
                          "desc": desc, "css_gradient": css_filled})
@@ -196,7 +232,8 @@ def _brand_kit_block(name: str, palette: dict) -> str:
 
 def build_templated_pack(spec: dict) -> BrandPack:
     palette = spec["palette"]
-    stage1_variants, grad_inline, curated_gradients = _gradient_artifacts(palette)
+    stage1_variants, grad_inline, curated_gradients = _gradient_artifacts(
+        palette, spec.get("extra_gradients"))
     inline_prompts = {
         **grad_inline,
         STAGE2_BLEND_FILE: _SHARED_BLEND,
@@ -207,6 +244,10 @@ def build_templated_pack(spec: dict) -> BrandPack:
     hexes = {h.upper() for h in (
         "#FFFFFF", palette["light"], palette["mid"], palette["deep"], palette["accent"],
         palette["hl_from"], palette["hl_to"])}
+    # Extra (per-brand preset) gradients are literal, not palette-templated —
+    # union whatever hexes their css_gradient strings actually carry.
+    for cg in curated_gradients[len(_GRADIENT_TEMPLATES):]:
+        hexes.update(m.upper() for m in _HEX_RE.findall(cg["css_gradient"]))
 
     elements = spec["stage2_variants"]
     return BrandPack(

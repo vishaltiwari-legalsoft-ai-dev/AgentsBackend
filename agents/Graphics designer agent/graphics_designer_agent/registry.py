@@ -124,10 +124,16 @@ class BrandPack:
     def verify_integrity(self) -> list[str]:
         problems: list[str] = []
         for name, expected in self.canonical_sha256.items():
-            path = self.prompts_dir / name
-            if not path.exists():
-                problems.append(f"missing prompt file: {name}")
-                continue
+            # Inline-served prompts (templated brands: base + per-brand preset
+            # gradients) have no on-disk file by design — the disk-existence
+            # check only applies to filesystem-backed prompts. Their content
+            # is still verified below via prompt_hash(), which reads the same
+            # inline_prompts dict the running pack actually serves from.
+            if not (self.inline_prompts and name in self.inline_prompts):
+                path = self.prompts_dir / name
+                if not path.exists():
+                    problems.append(f"missing prompt file: {name}")
+                    continue
             actual = self.prompt_hash(name)
             if actual != expected:
                 problems.append(f"prompt modified: {name} ({actual[:12]}… != {expected[:12]}…)")
