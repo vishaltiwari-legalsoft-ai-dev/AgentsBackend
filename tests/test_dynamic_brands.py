@@ -168,6 +168,135 @@ def test_firestore_spec_source_returns_empty_on_firestore_error(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Unit P1 — brand_metadata.gd_presets merge (preset libraries ride the spec)
+# --------------------------------------------------------------------------- #
+
+_GD_PRESETS = {
+    "extra_gradients": [
+        {"id": "G1", "title": "T", "desc": "D",
+         "css_gradient": "linear-gradient(90deg, #111111 0%, #222222 100%)",
+         "prompt": "16:9 aspect ratio p, no noise, no text."},
+    ],
+    "curated_elements": [
+        {"cid": "el-1", "title": "T", "desc": "D", "category": "people", "subject": "S"},
+    ],
+}
+
+
+def test_firestore_spec_source_merges_gd_presets_into_spec(monkeypatch, tmp_path, valid_dyn_spec):
+    from app.services import gd_brand_source
+
+    font_files = [
+        f"gs://bucket/brands/b1/fonts/{v['file']}" for v in valid_dyn_spec["font_variants"]
+    ]
+    docs = [
+        {"id": "b1", "brand_metadata": {
+            "gd_spec": valid_dyn_spec,
+            "enrichment": {"font_files": font_files},
+            "gd_presets": _GD_PRESETS,
+        }},
+    ]
+    monkeypatch.setattr(gd_brand_source, "_list_brands", lambda: docs)
+    monkeypatch.setattr(gd_brand_source, "_fonts_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        gd_brand_source, "_download", lambda uri, dest: dest.write_bytes(b"font")
+    )
+
+    specs = gd_brand_source.firestore_spec_source()
+    assert len(specs) == 1
+    assert specs[0]["extra_gradients"] == _GD_PRESETS["extra_gradients"]
+    assert specs[0]["curated_elements"] == _GD_PRESETS["curated_elements"]
+
+
+def test_firestore_spec_source_gd_presets_win_over_stale_gd_spec_keys(
+    monkeypatch, tmp_path, valid_dyn_spec
+):
+    """`gd_spec` never actually carries these keys (build_gd_spec never emits
+    them), but the merge must win over them defensively per the contract:
+    'presets win over any same-name keys in gd_spec'."""
+    from app.services import gd_brand_source
+
+    valid_dyn_spec["extra_gradients"] = [{"id": "STALE"}]
+    valid_dyn_spec["curated_elements"] = [{"cid": "stale"}]
+    font_files = [
+        f"gs://bucket/brands/b1/fonts/{v['file']}" for v in valid_dyn_spec["font_variants"]
+    ]
+    docs = [
+        {"id": "b1", "brand_metadata": {
+            "gd_spec": valid_dyn_spec,
+            "enrichment": {"font_files": font_files},
+            "gd_presets": _GD_PRESETS,
+        }},
+    ]
+    monkeypatch.setattr(gd_brand_source, "_list_brands", lambda: docs)
+    monkeypatch.setattr(gd_brand_source, "_fonts_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        gd_brand_source, "_download", lambda uri, dest: dest.write_bytes(b"font")
+    )
+
+    specs = gd_brand_source.firestore_spec_source()
+    assert specs[0]["extra_gradients"] == _GD_PRESETS["extra_gradients"]
+    assert specs[0]["curated_elements"] == _GD_PRESETS["curated_elements"]
+
+
+def test_firestore_spec_source_no_gd_presets_key_leaves_spec_without_them(
+    monkeypatch, tmp_path, valid_dyn_spec
+):
+    """Absent brand_metadata.gd_presets -> no merge at all (byte-identical:
+    the spec doesn't gain empty extra_gradients/curated_elements keys)."""
+    from app.services import gd_brand_source
+
+    font_files = [
+        f"gs://bucket/brands/b1/fonts/{v['file']}" for v in valid_dyn_spec["font_variants"]
+    ]
+    docs = [
+        {"id": "b1", "brand_metadata": {
+            "gd_spec": valid_dyn_spec,
+            "enrichment": {"font_files": font_files},
+        }},
+    ]
+    monkeypatch.setattr(gd_brand_source, "_list_brands", lambda: docs)
+    monkeypatch.setattr(gd_brand_source, "_fonts_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        gd_brand_source, "_download", lambda uri, dest: dest.write_bytes(b"font")
+    )
+
+    specs = gd_brand_source.firestore_spec_source()
+    assert "extra_gradients" not in specs[0]
+    assert "curated_elements" not in specs[0]
+
+
+def test_firestore_spec_source_isolates_malformed_gd_presets(monkeypatch, tmp_path, valid_dyn_spec):
+    """A malformed gd_presets on one doc (e.g. wrong type) is caught by the
+    existing per-doc fault isolation — that doc is skipped + logged, other
+    valid dynamic brands are still yielded."""
+    from app.services import gd_brand_source
+
+    good_spec = valid_dyn_spec
+    font_files = [f"gs://bucket/brands/good/fonts/{v['file']}" for v in good_spec["font_variants"]]
+    docs = [
+        {"id": "bad", "brand_metadata": {
+            "gd_spec": {**good_spec, "id": "bad-brand"},
+            "enrichment": {"font_files": font_files},
+            "gd_presets": "not-a-dict",  # malformed -> skipped + logged
+        }},
+        {"id": "good", "brand_metadata": {
+            "gd_spec": good_spec,
+            "enrichment": {"font_files": font_files},
+        }},
+    ]
+    monkeypatch.setattr(gd_brand_source, "_list_brands", lambda: docs)
+    monkeypatch.setattr(gd_brand_source, "_fonts_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        gd_brand_source, "_download", lambda uri, dest: dest.write_bytes(b"font")
+    )
+
+    specs = gd_brand_source.firestore_spec_source()
+    assert len(specs) == 1
+    assert specs[0]["id"] == good_spec["id"]
+
+
+# --------------------------------------------------------------------------- #
 # Task 12 — _list_brands() bypasses firestore_repo's 60s brands cache
 # (Finding 3): the enrichment CLI writes from a separate process, so the
 # admin refresh-packs endpoint must always rebuild from fresh Firestore data,

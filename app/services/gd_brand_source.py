@@ -140,7 +140,18 @@ def firestore_spec_source() -> list[dict]:
                 if not gd_spec:
                     continue
                 font_file_uris = (meta.get("enrichment") or {}).get("font_files") or []
-                specs.append(_materialize_fonts(dict(gd_spec), font_file_uris))
+                spec = _materialize_fonts(dict(gd_spec), font_file_uris)
+                # Per-brand preset libraries (Unit P1): gd_spec itself never
+                # carries these keys (gd_spec_builder.build_gd_spec never
+                # emits them, so a later re-enrich can't clobber curated
+                # content) — they live in their own metadata key, admin-
+                # refreshable independent of enrichment, and win over any
+                # same-name keys already on the spec.
+                gd_presets = meta.get("gd_presets")
+                if gd_presets:
+                    spec["extra_gradients"] = gd_presets.get("extra_gradients", [])
+                    spec["curated_elements"] = gd_presets.get("curated_elements", [])
+                specs.append(spec)
             except Exception as exc:  # noqa: BLE001 - isolate the bad doc, keep the rest
                 doc_id = doc.get("id") if isinstance(doc, dict) else None
                 logger.warning(

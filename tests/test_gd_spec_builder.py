@@ -31,6 +31,17 @@ def test_spec_satisfies_build_templated_pack_contract(kit_pdf, tmp_path):
     assert pack.font_names()                                # non-empty
 
 
+def test_build_gd_spec_never_emits_extra_gradients_or_curated_elements(kit_pdf, tmp_path):
+    """Unit P1: build_gd_spec's output feeds enrichment's patch["gd_spec"] — it
+    must never carry extra_gradients/curated_elements, so a later re-enrich
+    can't clobber library content stored separately under
+    brand_metadata.gd_presets (merged in by gd_brand_source instead)."""
+    folder = BrandFolder(brand_name="Acme Health", root=tmp_path, kit_pdf=kit_pdf)
+    spec = build_gd_spec(_profile(kit_pdf), folder, brand_id="b1")
+    assert "extra_gradients" not in spec
+    assert "curated_elements" not in spec
+
+
 def test_spec_none_when_too_few_colors(tmp_path):
     # a PDF with <3 colors -> not generatable
     from reportlab.pdfgen import canvas
