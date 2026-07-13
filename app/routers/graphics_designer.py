@@ -490,6 +490,75 @@ def gd_brands(_user: dict = Depends(get_current_user)) -> dict:
     return {"brands": registry.list_packs(), "default": registry.DEFAULT_BRAND_ID}
 
 
+def _ingested_logo_url(brand_id: str) -> str | None:
+    """Signed view URL for a brand's ingested logo (None if absent/unsignable)."""
+    rec = firestore_repo.find_brand_logo(brand_id)
+    if not rec:
+        return None
+    return storage.signed_url_for_gs_uri(rec["file_url"])
+
+
+def _reference_count(brand_name: str) -> int | None:
+    """Indexed reference-creative count for a brand. None = index unavailable
+    (the strip renders an em-dash instead of a wrong zero)."""
+    from graphics_designer_agent import reference_library as rl
+
+    records = rl.load_index(rl.default_base_dir())
+    if not records:
+        return None
+    needle = (brand_name or "").strip().casefold()
+    return sum(1 for r in records if str(r.get("brand_name", "")).strip().casefold() == needle)
+
+
+def ingested_brand_entries(brands: list[dict], *, logo_url_for, reference_count) -> list[dict]:
+    """Strip entries for every brand whose kit data has been ingested (has
+    ``brand_metadata.enrichment`` or a baked ``gd_spec``). Pure over its inputs;
+    the injected helpers are each best-effort — any raise degrades that field."""
+    out: list[dict] = []
+    for b in brands:
+        meta = b.get("brand_metadata") or {}
+        enrichment = meta.get("enrichment") or {}
+        if "enrichment" not in meta and "gd_spec" not in meta:
+            continue
+        try:
+            logo_url = logo_url_for(b.get("id"))
+        except Exception:  # noqa: BLE001 - decorative; the strip shows an initial instead
+            logo_url = None
+        counts = {
+            "fonts": len(enrichment.get("font_files") or []),
+            "logos": len(enrichment.get("logo_files") or []),
+        }
+        try:
+            refs = reference_count(b.get("brand_name") or "")
+        except Exception:  # noqa: BLE001 - index unavailable → omit, never guess
+            refs = None
+        if refs is not None:
+            counts["reference_assets"] = refs
+        out.append({
+            "id": b.get("id"),
+            "name": b.get("brand_name"),
+            "logo_url": logo_url,
+            "primary_colors": list(meta.get("primary_colors") or [])[:6],
+            "counts": counts,
+            "source": enrichment.get("source"),
+        })
+    return out
+
+
+@router.get("/gd/ingested-brands")
+def gd_ingested_brands(_user: dict = Depends(get_current_user)) -> dict:
+    """Brands whose kit data has been ingested — powers the setup-screen strip.
+    Read-only and best-effort: any listing failure returns an empty strip."""
+    try:
+        brands = firestore_repo.list_brands()
+    except Exception:  # noqa: BLE001 - the strip is decorative; empty beats a 500
+        logger.exception("GD: ingested-brands listing failed")
+        return {"brands": []}
+    return {"brands": ingested_brand_entries(
+        brands, logo_url_for=_ingested_logo_url, reference_count=_reference_count,
+    )}
+
+
 # ── static config for the studio UI (per selected brand) ───────────────────────
 @router.get("/gd/config")
 def gd_config(brand: str | None = None, _user: dict = Depends(get_current_user)) -> dict:
