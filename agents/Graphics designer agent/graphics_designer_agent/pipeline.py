@@ -5,7 +5,9 @@ image chaining (§2.5) and the deterministic Stage-4 composite (§5.4).
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import uuid
 from dataclasses import asdict
 from io import BytesIO
 
@@ -23,7 +25,7 @@ from .runs import (
 from .stage1_gradient import substitute_stage1
 from .stage2_element import place_subject, substitute_stage2
 from .stage3_text import layout as gd_layout
-from .stage3_text import render, text_overlay
+from .stage3_text import render, text_optimizer, text_overlay
 from .stage3_text.style_options import DEFAULT_TEXT_SIZE_PCT
 from .stage4_logo.compositor import composite_logo, logo_placement
 from .tokens import (
@@ -74,6 +76,24 @@ GD_AGENT_ID = "a1"
 # The studio editor produces vertical social posts, so its reference precedent is
 # drawn from the social-story bucket of the Brand Reference Library.
 STUDIO_CREATIVE_TYPE = "social_story"
+
+
+def _optimizer_enabled() -> bool:
+    """Stage-3 Text Optimizer master switch (spec 2026-07-14). Default ON;
+    ``GD_TEXT_OPTIMIZER=0`` restores the deterministic-only Stage 3 exactly."""
+    return (os.environ.get("GD_TEXT_OPTIMIZER") or "1").strip() != "0"
+
+
+def stage3_config_hash(run: dict) -> str:
+    """Fingerprint of everything that shapes the Stage-3 composite. Stamped on
+    styled attempts so approve can reject a stale render instead of silently
+    approving a polish of an arrangement the user has since changed."""
+    cfg = run.get("config") or {}
+    subset = {k: cfg.get(k) for k in (
+        "tokens", "element_styles", "subheadings", "layout",
+        "shapes", "elements", "font", "polish_notes", "aspect_ratio",
+    )}
+    return _sha(json.dumps(subset, sort_keys=True, ensure_ascii=False, default=str))
 
 
 def _reference_grounding(run: dict) -> str:
@@ -324,39 +344,110 @@ def _hires_canvas(base_png: bytes, canvas_w: int, canvas_h: int) -> tuple[int, i
     return round(canvas_w * scale), round(canvas_h * scale), scale
 
 
-def _generate_stage3(run: dict) -> dict:
-    """Render the Stage-3 text overlay deterministically onto the approved Stage-2
-    image (no model call) — exact sizes, positions, colours; base pixels intact."""
+def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
+    """Stage 3 = the Text Optimizer agent (spec 2026-07-14).
+
+    Always starts from the deterministic Pillow composite (auto fonts resolved
+    from the brand pool first). With the optimizer enabled AND a real image
+    provider, the composite is fanned out to the three style recipes
+    (polish + QA gate + honest fallback) and all three attempts are stored,
+    sharing a ``set_id``; the returned attempt is ``brand_strict`` (auto-pilot's
+    pick). Flag off / mock provider → today's single deterministic attempt."""
     base = _approved_png(run, 2)
     if base is None:
         raise PipelineError("Stage 3 requires the approved Stage 2 image.")
-    layers = gd_layout.resolve_layers(run)
+    pack = registry.get_pack(run.get("brand_id"))
+
+    use_optimizer = _optimizer_enabled()
+    if use_optimizer:
+        provider = provider or get_provider(agent_id=GD_AGENT_ID)
+        if provider.name == "mock":
+            use_optimizer = False
+
+    # Auto fonts: the vision density judgment is fetched only when it can matter
+    # (optimizer on + something actually set to auto). Never mutates the config.
+    judgment = None
+    if use_optimizer and text_optimizer.resolve_fonts(run, pack):
+        from .stage3_text import placement_brain
+
+        cfg = run.get("config") or {}
+        judgment = placement_brain.decide(
+            base,
+            headline=(cfg.get("tokens") or {}).get("headline", ""),
+            subheading_count=len(cfg.get("subheadings") or []),
+            cta=(cfg.get("tokens") or {}).get("cta", ""),
+            element_placement=cfg.get("element_placement"),
+        )
+    view, chosen_fonts = text_optimizer.resolved_fonts_view(run, pack, judgment)
+
+    layers = gd_layout.resolve_layers(view)
     canvas_w, canvas_h = _stage_dims(run, 3)
     w, h, px_scale = _hires_canvas(base, canvas_w, canvas_h)
     png = render.render_layers(
-        base, layers, w, h, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id")),
+        base, layers, w, h, px_scale=px_scale, pack=pack,
         image_loader=lambda ref: read_artifact(run["id"], ref),
     )
-    summary = text_overlay.overlay_spec_summary(_resolve_overlay_spec(run))
-    attempt_no = len(run["stages"]["3"]["attempts"]) + 1
-    rel = save_artifact(run["id"], 3, "T", attempt_no, png)
-    attempt = {
-        "attempt": attempt_no,
-        "variant": "T",
-        "artifact": rel,
-        "prompt": summary,
-        "prompt_hash": _sha(summary),
-        "diffs": [],
-        "warnings": [],
-        "provider": "deterministic",
-        "created_at": now_iso(),
-    }
+    summary = text_overlay.overlay_spec_summary(_resolve_overlay_spec(view))
     st = run["stages"]["3"]
-    st["attempts"].append(attempt)
+    cfg_hash = stage3_config_hash(run)
+
+    if not use_optimizer:
+        attempt_no = len(st["attempts"]) + 1
+        rel = save_artifact(run["id"], 3, "T", attempt_no, png)
+        attempt = {
+            "attempt": attempt_no,
+            "variant": "T",
+            "artifact": rel,
+            "prompt": summary,
+            "prompt_hash": _sha(summary),
+            "diffs": [],
+            "warnings": [],
+            "provider": "deterministic",
+            "created_at": now_iso(),
+            **({"fonts": chosen_fonts} if chosen_fonts else {}),
+        }
+        st["attempts"].append(attempt)
+        st["variant"] = "T"
+        run["state"] = STATE_FOR_STAGE_REVIEW[3]
+        save_run(run)
+        return attempt
+
+    results = text_optimizer.optimize(
+        composite_png=png, layers=layers, provider=provider,
+        notes=(run["config"].get("polish_notes") or ""),
+        width=w, height=h, aspect_ratio=_stage_ar(run),
+        image_size=STAGE_IMAGE_SIZE[3],
+    )
+    set_id = uuid.uuid4().hex[:8]
+    stored: list[dict] = []
+    for res in results:
+        attempt_no = len(st["attempts"]) + 1
+        rel = save_artifact(run["id"], 3, "T", attempt_no, res["png"])
+        attempt = {
+            "attempt": attempt_no,
+            "variant": "T",
+            "artifact": rel,
+            "prompt": res["prompt"],
+            "prompt_hash": _sha(res["prompt"]),
+            "diffs": [],
+            "warnings": [],
+            "provider": provider.name if res["ai"] else "deterministic",
+            "created_at": now_iso(),
+            "style": res["style"],
+            "style_label": res["label"],
+            "ai": res["ai"],
+            "fallback_reason": res["fallback_reason"],
+            "qa": res["qa"],
+            "set_id": set_id,
+            "config_hash": cfg_hash,
+            "fonts": chosen_fonts,
+        }
+        st["attempts"].append(attempt)
+        stored.append(attempt)
     st["variant"] = "T"
     run["state"] = STATE_FOR_STAGE_REVIEW[3]
     save_run(run)
-    return attempt
+    return stored[0]  # brand_strict — the auto-pilot pick
 
 
 # Width (px) of the live Stage-3 preview. Small enough to render in well under
@@ -396,6 +487,10 @@ def render_stage3_preview(run: dict, *, tokens: dict | None = None,
                 subs[i] = {**subs[i], "text": txt}
         cfg["subheadings"] = subs
     view = {**run, "config": cfg}
+    # Auto fonts render as their concrete brand weights in the live preview too
+    # (deterministic role defaults — no vision call in the hot preview path).
+    view, _fonts = text_optimizer.resolved_fonts_view(
+        view, registry.get_pack(run.get("brand_id")))
 
     layers = gd_layout.resolve_layers(view)
     canvas_w, canvas_h = _stage_dims(view, 3)
@@ -422,8 +517,9 @@ def generate(run: dict, stage: int, variant: str | None = None,
     if stage == 4:
         raise PipelineError("Use generate_stage4 for the logo stage.")
     if stage == 3:
-        # Deterministic text overlay — no image model, no upstream prompt.
-        return _generate_stage3(run)
+        # The Text Optimizer stage — deterministic composite, then (flag + real
+        # provider permitting) the 3-style polish fan-out.
+        return _generate_stage3(run, provider=provider)
     if stage == 2 and (variant or "").strip().upper() == "UPLOAD":
         # Composite mode: the user's uploaded subject is pasted onto the
         # approved Stage-1 image deterministically — no image model. Only
@@ -640,6 +736,11 @@ def approve(run: dict, stage: int, attempt_no: int | None = None) -> dict:
     chosen = next((a for a in st["attempts"] if a["attempt"] == attempt_no), None)
     if not chosen:
         raise PipelineError(f"Attempt {attempt_no} not found.")
+    if stage == 3 and chosen.get("style") and chosen.get("config_hash") \
+            and chosen["config_hash"] != stage3_config_hash(run):
+        raise PipelineError(
+            "The arrangement changed after this style was rendered — Generate again, "
+            "then approve the fresh result.")
     st["approved"] = {
         "attempt": chosen["attempt"],
         "variant": chosen["variant"],
