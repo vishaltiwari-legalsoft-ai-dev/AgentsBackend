@@ -18,7 +18,7 @@ def cover_fit(image_bytes: bytes, canvas_w: int, canvas_h: int, *, max_width: in
     native width (never below the canvas preset, bounded by ``max_width``) so
     a high-res photo keeps its resolution through Stages 2-4."""
     img = Image.open(BytesIO(image_bytes)).convert("RGB")
-    scale = min(max(1.0, img.width / canvas_w), max_width / canvas_w)
+    scale = max(1.0, min(img.width / canvas_w, max_width / canvas_w))
     tw, th = round(canvas_w * scale), round(canvas_h * scale)
     s = max(tw / img.width, th / img.height)
     rw, rh = max(1, round(img.width * s)), max(1, round(img.height * s))

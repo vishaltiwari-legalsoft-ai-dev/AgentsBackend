@@ -74,3 +74,9 @@ def test_background_ref_presence_changes_nothing_for_preset_variants():
     attempt = pipeline.generate(run, 1, "A")
     assert attempt["provider"] == "mock"
     assert attempt["prompt"] == pipeline.build_prompt(run, 1, "A")["text"]
+
+
+def test_cover_fit_canvas_floor_beats_max_width():
+    # max_width below the canvas preset must NOT shrink the output below it.
+    out = cover_fit(_png(2000, 2000), 1000, 1000, max_width=500)
+    assert _size(out) == (1000, 1000)
