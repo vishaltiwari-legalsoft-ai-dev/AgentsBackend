@@ -233,7 +233,7 @@ def _shrink_reference(refs: list[tuple[bytes, str]] | None,
     return out
 
 
-def build_prompt(run: dict, stage: int, variant: str) -> dict:
+def build_prompt(run: dict, stage: int, variant: str, *, remix: bool = False) -> dict:
     """Return the exact final prompt + audit diff for a stage (no generation)."""
     cfg = run["config"]
     pack = registry.get_pack(run.get("brand_id"))
@@ -241,6 +241,7 @@ def build_prompt(run: dict, stage: int, variant: str) -> dict:
     diffs: list = []
     warnings: list[str] = []
     negative: str | None = None
+    remix_meta: dict | None = None
 
     if stage == 1:
         if variant.upper() == "AI":
@@ -253,6 +254,11 @@ def build_prompt(run: dict, stage: int, variant: str) -> dict:
                 raise PipelineError("Generate an AI gradient first.")
         else:
             template = pack.load_prompt(pack.stage1_variant(variant)["prompt_file"])
+            if remix:
+                from .remix import remix_prompt
+
+                rr = remix_prompt(run, 1, template, pack=pack)
+                template, remix_meta = rr.text, rr.meta
         sub = substitute_stage1(template, ar)
         text, diffs, warnings = sub.text, sub.diffs, list(sub.warnings)
     elif stage == 2:
@@ -265,6 +271,11 @@ def build_prompt(run: dict, stage: int, variant: str) -> dict:
                 raise PipelineError("Generate an AI element first.")
         else:
             subject = pack.stage2_variant(variant)["subject"]
+            if remix:
+                from .remix import remix_prompt
+
+                rr = remix_prompt(run, 2, subject, pack=pack)
+                subject, remix_meta = rr.text, rr.meta
         # Prompt-steered placement: when the user picks one of the 9 cells we
         # append an explicit override clause; "auto"/absent is a strict no-op.
         subject = place_subject(subject, cfg.get("element_placement"))
@@ -291,6 +302,7 @@ def build_prompt(run: dict, stage: int, variant: str) -> dict:
         "diffs": [asdict(d) for d in diffs],
         "warnings": warnings,
         "negative_prompt": negative,
+        "remix": remix_meta,
     }
 
 
@@ -439,7 +451,12 @@ def generate(run: dict, stage: int, variant: str | None = None,
         # Chained upstream first (it sets composition), then on-brand precedent.
         refs = (refs or []) + (_shrink_reference(extra_references) or [])
 
-    built = build_prompt(run, stage, variant)
+    remix_on = (
+        bool((run.get("config") or {}).get("remix_enabled"))
+        and stage in (1, 2)
+        and variant not in ("AI", "UPLOAD")
+    )
+    built = build_prompt(run, stage, variant, remix=remix_on)
     if built["negative_prompt"] and not provider.supports_negative:
         built["warnings"].append(
             "Provider has no negative-prompt support — Prompt B negative was skipped."
@@ -468,6 +485,7 @@ def generate(run: dict, stage: int, variant: str | None = None,
         "warnings": built["warnings"],
         "provider": provider.name,
         "created_at": now_iso(),
+        **({"remix": built["remix"]} if built.get("remix") else {}),
     }
     st = run["stages"][key]
     st["attempts"].append(attempt)

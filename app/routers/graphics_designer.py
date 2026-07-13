@@ -653,6 +653,7 @@ class CreateRunBody(BaseModel):
     aspect_ratio: str | None = None
     creative_type: str | None = None
     creative_brief: dict[str, str] | None = None
+    remix_enabled: bool | None = None
 
 
 @router.post("/gd/runs")
@@ -680,6 +681,9 @@ def create_run_endpoint(body: CreateRunBody = Body(default=CreateRunBody()),
             if text:
                 brief[k] = text
         run["config"]["creative_brief"] = brief
+        changed = True
+    if body.remix_enabled is not None:
+        run["config"]["remix_enabled"] = bool(body.remix_enabled)
         changed = True
     if changed:
         save_run(run)
@@ -727,6 +731,7 @@ class ConfigBody(BaseModel):
     # suggestion. Keys with empty values are dropped (lets the UI clear an answer).
     creative_brief: dict | None = None
     use_ai_compositor: bool | None = None
+    remix_enabled: bool | None = None
     tokens: dict[str, str] | None = None
     # token -> {approved: bool, source: "user"|"agent", original_suggestion?: str}
     token_approvals: dict[str, dict] | None = None
@@ -840,6 +845,8 @@ def update_config(run_id: str, body: ConfigBody, user: dict = Depends(get_curren
         cfg["creative_brief"] = brief
     if body.use_ai_compositor is not None:
         cfg["use_ai_compositor"] = bool(body.use_ai_compositor)
+    if body.remix_enabled is not None:
+        cfg["remix_enabled"] = bool(body.remix_enabled)
     if body.tokens:
         for k, v in body.tokens.items():
             # Known token or an optional detail field (venue/website may be absent
