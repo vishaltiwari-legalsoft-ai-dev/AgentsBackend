@@ -288,7 +288,9 @@ def _apply_element_styles(cfg: dict, incoming: dict, pack) -> None:
             raise HTTPException(400, f"Unknown Stage-3 element '{key}'")
         cur = dict(styles.get(key) or {})
         if "font" in patch:
-            if patch["font"] not in fonts:
+            # "auto" = Text Optimizer picks the weight from the brand pool at
+            # generate time (family still locked by construction).
+            if patch["font"] not in fonts and patch["font"] != "auto":
                 raise HTTPException(
                     400, f"Font is locked to the {pack.font_family} family; "
                     f"'{patch['font']}' is not an allowed variant.")
@@ -343,7 +345,7 @@ def _apply_subheadings(cfg: dict, incoming: list, pack) -> None:
         if len(text) > 120:
             raise HTTPException(400, "Sub-heading must be ≤ 120 characters.")
         font = item.get("font") or pack.default_font
-        if font not in fonts:
+        if font not in fonts and font != "auto":
             raise HTTPException(
                 400, f"Font is locked to the {pack.font_family} family; "
                 f"'{font}' is not allowed.")
@@ -732,6 +734,9 @@ class ConfigBody(BaseModel):
     creative_brief: dict | None = None
     use_ai_compositor: bool | None = None
     remix_enabled: bool | None = None
+    # Stage-3 Text Optimizer: optional free-text placement/style notes woven into
+    # the polish prompts (≤500 chars kept).
+    polish_notes: str | None = None
     tokens: dict[str, str] | None = None
     # token -> {approved: bool, source: "user"|"agent", original_suggestion?: str}
     token_approvals: dict[str, dict] | None = None
@@ -936,7 +941,17 @@ def generate_endpoint(run_id: str, body: GenerateBody, user: dict = Depends(get_
     attempt = _guard(lambda: pipeline.generate(run, body.stage, variant=body.variant))
     _log_usage(user, "generate", brand=run.get("brand_id"))  # one creative produced
     _advance_run(run, stage=body.stage, stage_status="generated", attempt=attempt)
-    return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
+    payload = {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])},
+               "run": _to_client(run)}
+    if body.stage == 3 and attempt.get("set_id"):
+        # Text Optimizer set: return all styled siblings so the client can show
+        # the 3-up gallery without re-deriving them from the run.
+        siblings = [a for a in run["stages"]["3"]["attempts"]
+                    if a.get("set_id") == attempt["set_id"]]
+        payload["attempts"] = [
+            {**a, "url": _artifact_url(run_id, a["artifact"])} for a in siblings
+        ]
+    return payload
 
 
 def _local_logo_png(pack) -> bytes | None:
