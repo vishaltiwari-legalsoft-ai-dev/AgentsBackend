@@ -25,7 +25,7 @@ _VISION_MAX_DIM = 768
 _VISION_TIMEOUT_S = 45
 _MAX_ATTEMPTS = 2  # one retry on malformed JSON, then give up
 
-_CHECKS = ("text_ok", "elements_ok", "gradient_ok", "photo_ok")
+_CHECKS = ("text_ok", "elements_ok", "gradient_ok", "photo_ok", "placement_ok")
 
 
 def check(composite_png: bytes, polished_png: bytes, layout_desc: str) -> dict | None:
@@ -77,18 +77,24 @@ def _build_prompt(layout_desc: str) -> str:
     return (
         "You are a meticulous brand QA reviewer. Image 1 is the ORIGINAL composite "
         "(ground truth). Image 2 is a polished version that was ONLY allowed to refine "
-        "lighting, sharpness and integration — additions of subtle emphasis are "
-        "allowed, but nothing that already existed may change.\n\n"
+        "lighting, sharpness and integration, plus ONE permitted adjustment: a text "
+        "block or the CTA button that overlapped the photo/subject may have been "
+        "MOVED (unchanged, as one unit) into clean negative space. Nothing else that "
+        "already existed may change.\n\n"
         "The overlay should contain exactly this content:\n" + layout_desc + "\n\n"
         "Check image 2 against image 1:\n"
-        "1. text_ok — every word identical, same font shapes and weights, fully legible\n"
-        "2. elements_ok — every pre-existing shape/icon/button unchanged (nothing "
-        "moved, removed or recolored; NEW additions are acceptable)\n"
+        "1. text_ok — every word identical, same font shapes and weights, fully "
+        "legible (a repositioned block is fine; reworded/restyled/reflowed text is not)\n"
+        "2. elements_ok — every pre-existing shape/icon/button still present and "
+        "identical in look (repositioning to fix an overlap is fine; NEW additions "
+        "are acceptable)\n"
         "3. gradient_ok — background gradient colours and direction unchanged\n"
-        "4. photo_ok — the photo/subject content unchanged\n\n"
+        "4. photo_ok — the photo/subject content unchanged\n"
+        "5. placement_ok — no text and no button overlaps the subject's face/body "
+        "or any other element; everything is fully readable\n\n"
         'Reply with ONLY minified JSON: {"text_ok":true,"elements_ok":true,'
-        '"gradient_ok":true,"photo_ok":true,"violations":["one short reason per '
-        'failed check"]}. No prose.'
+        '"gradient_ok":true,"photo_ok":true,"placement_ok":true,"violations":'
+        '["one short reason per failed check"]}. No prose.'
     )
 
 
@@ -106,7 +112,7 @@ def _parse(raw: str) -> dict | None:
     raw_violations = data.get("violations") or []
     if not isinstance(raw_violations, list):
         raw_violations = [str(raw_violations)]
-    violations = [str(v)[:160] for v in raw_violations[:4]]
+    violations = [str(v)[:160] for v in raw_violations[:len(_CHECKS)]]
     if not passed and not violations:
         violations = [f"{k} check failed" for k in _CHECKS if not data[k]]
     return {"passed": passed, "violations": [] if passed else violations}

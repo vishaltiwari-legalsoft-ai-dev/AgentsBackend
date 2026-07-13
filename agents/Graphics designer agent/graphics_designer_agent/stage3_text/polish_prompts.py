@@ -12,14 +12,19 @@ PRESERVATION_BLOCK = (
     "NON-NEGOTIABLE PRESERVATION RULES — violating any one ruins the output:\n"
     "1. Keep ALL text character-for-character identical and fully legible. Never\n"
     "   add, remove, reword or re-case a word.\n"
-    "2. Never change a letterform: same font family, same weights, same spacing,\n"
-    "   same sizes, same colours on every text element.\n"
-    "3. Never alter, move, recolor, redraw or remove ANY element already present\n"
+    "2. Never change a letterform: same font family, same weights, same spacing\n"
+    "   within each block, same sizes, same colours on every text element.\n"
+    "3. Never alter, recolor, redraw or remove ANY element already present\n"
     "   (shapes, icons, stickers, buttons, dividers).\n"
     "4. Never modify the background gradient — colours, direction and stops stay\n"
     "   exactly as they are.\n"
     "5. Never modify the photo/subject — same person or object, same pose, same crop.\n"
-    "Your job is finishing and integration ONLY."
+    "THE ONE ALLOWED ADJUSTMENT — collision fix: if any text block or the CTA\n"
+    "button overlaps the photo/subject or another element, MOVE that whole block\n"
+    "(unchanged, as one unit) to the nearest clean negative space so NOTHING\n"
+    "overlaps the subject and every word stays fully readable. Reposition only —\n"
+    "never resize, restyle or reflow it.\n"
+    "Your job is finishing, integration and collision-free placement ONLY."
 )
 
 STYLE_RECIPES = [
@@ -102,7 +107,8 @@ def build_polish_prompt(style_key: str, layout_desc: str, notes: str = "") -> st
         "social-media creative. The attached image is the FINISHED composite: brand "
         "background, subject and overlaid text are already in their final arrangement.",
         f"STYLE DIRECTION — {recipe['label']}:\n{recipe['intent']}",
-        "CURRENT LAYOUT (already final — keep every element exactly here):\n" + layout_desc,
+        "CURRENT LAYOUT (keep each element here UNLESS it collides with the "
+        "subject — then apply the collision fix below):\n" + layout_desc,
     ]
     if (notes or "").strip():
         parts.append("DESIGNER NOTES (from the user):\n" + notes.strip()[:500])

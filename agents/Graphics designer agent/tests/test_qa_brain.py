@@ -16,7 +16,7 @@ def test_pass_verdict(monkeypatch):
     monkeypatch.setattr(
         qa_brain, "_call_model",
         lambda *_: '{"text_ok":true,"elements_ok":true,"gradient_ok":true,'
-                   '"photo_ok":true,"violations":[]}')
+                   '"photo_ok":true,"placement_ok":true,"violations":[]}')
     assert qa_brain.check(PNG, PNG, "desc") == {"passed": True, "violations": []}
 
 
@@ -25,9 +25,22 @@ def test_fail_verdict_carries_violations(monkeypatch):
     monkeypatch.setattr(
         qa_brain, "_call_model",
         lambda *_: '{"text_ok":false,"elements_ok":true,"gradient_ok":true,'
-                   '"photo_ok":true,"violations":["headline was reworded"]}')
+                   '"photo_ok":true,"placement_ok":true,'
+                   '"violations":["headline was reworded"]}')
     out = qa_brain.check(PNG, PNG, "desc")
     assert out["passed"] is False and out["violations"] == ["headline was reworded"]
+
+
+def test_text_overlapping_subject_fails_placement(monkeypatch):
+    monkeypatch.setattr(qa_brain, "_vision_available", lambda: True)
+    monkeypatch.setattr(
+        qa_brain, "_call_model",
+        lambda *_: '{"text_ok":true,"elements_ok":true,"gradient_ok":true,'
+                   '"photo_ok":true,"placement_ok":false,'
+                   '"violations":["subheading still covers the laptop screen"]}')
+    out = qa_brain.check(PNG, PNG, "desc")
+    assert out["passed"] is False
+    assert out["violations"] == ["subheading still covers the laptop screen"]
 
 
 def test_fail_without_reasons_names_the_failed_checks(monkeypatch):
@@ -35,7 +48,7 @@ def test_fail_without_reasons_names_the_failed_checks(monkeypatch):
     monkeypatch.setattr(
         qa_brain, "_call_model",
         lambda *_: '{"text_ok":true,"elements_ok":true,"gradient_ok":false,'
-                   '"photo_ok":true,"violations":[]}')
+                   '"photo_ok":true,"placement_ok":true,"violations":[]}')
     out = qa_brain.check(PNG, PNG, "desc")
     assert out["passed"] is False and out["violations"] == ["gradient_ok check failed"]
 
