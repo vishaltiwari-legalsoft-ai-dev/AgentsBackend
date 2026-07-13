@@ -76,3 +76,25 @@ def test_ask_contains_brief_and_inventory():
     assert "Diwali offer 20% off" in ask and "#1 hard rule" in ask
     assert pack.stage1_variants[0]["id"] in ask
     assert "combined-solid" in ask
+
+
+def test_non_dict_section_is_retried_not_crashed(monkeypatch):
+    bad = '{"concept": "x", "gradient": "A", "element": {"cid": "A", "reason": "r"}, "text": {"headline": "h", "cta": "c"}, "logo": {"logo_id": null, "reason": "r"}}'
+    asks: list[str] = []
+    replies = iter([bad, _good_plan()])
+    llm = SimpleNamespace()
+    def invoke(q):
+        asks.append(q)
+        return SimpleNamespace(content=next(replies))
+    llm.invoke = invoke
+    monkeypatch.setattr(planner, "_get_planner_llm", lambda: llm)
+    plan = planner.build_plan(create_run("plan-user-6"), registry.get_pack(None), "brief text", LOGOS)
+    assert plan["gradient"]["cid"] == "A"
+    assert "must be a JSON object" in asks[1]
+
+
+def test_persistent_non_dict_sections_raise_plan_error(monkeypatch):
+    bad = '{"concept": "x", "gradient": "A", "element": "B", "text": "words", "logo": "L"}'
+    monkeypatch.setattr(planner, "_get_planner_llm", lambda: _fake_llm([bad] * 3))
+    with pytest.raises(planner.PlanError):
+        planner.build_plan(create_run("plan-user-7"), registry.get_pack(None), "brief text", LOGOS)

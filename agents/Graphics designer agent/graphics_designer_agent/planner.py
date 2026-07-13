@@ -63,6 +63,13 @@ def _validate(cand: dict, pack, logo_ids: list[str]) -> list[str]:
     errors: list[str] = []
     if not isinstance(cand, dict):
         return ["The reply must be a JSON object."]
+    for key in ("gradient", "element", "text"):
+        if not isinstance(cand.get(key), dict):
+            errors.append(f'"{key}" must be a JSON object.')
+    if cand.get("logo") is not None and not isinstance(cand.get("logo"), dict):
+        errors.append('"logo" must be a JSON object or omitted.')
+    if errors:
+        return errors
     s1 = {v["id"] for v in pack.stage1_variants}
     s2 = {v["id"] for v in pack.stage2_variants}
     g = str((cand.get("gradient") or {}).get("cid") or "").upper()
