@@ -418,6 +418,11 @@ def generate(run: dict, stage: int, variant: str | None = None,
         # reachable via variant "UPLOAD"; every other variant keeps the
         # byte-identical AI-generation path.
         return _generate_stage2_composite(run)
+    if stage == 1 and (variant or "").strip().upper() == "UPLOAD":
+        # The user's uploaded photo IS the background — deterministic cover-fit,
+        # no image model. Only reachable via variant "UPLOAD"; every other
+        # variant keeps the byte-identical AI-generation path.
+        return _generate_stage1_background(run)
     provider = provider or get_provider(agent_id=GD_AGENT_ID)
     key = str(stage)
 
@@ -515,6 +520,46 @@ def _generate_stage2_composite(run: dict) -> dict:
     st["attempts"].append(attempt)
     st["variant"] = "UPLOAD"
     run["state"] = STATE_FOR_STAGE_REVIEW[2]
+    save_run(run)
+    return attempt
+
+
+def _generate_stage1_background(run: dict) -> dict:
+    """Stage-1 attempt from the user's uploaded photo (variant ``UPLOAD``).
+
+    Deterministic: ``config.background_asset_ref`` is cover-fitted to the run's
+    aspect ratio with Pillow — instant and free, no image model."""
+    from .stage1_gradient.background import cover_fit
+
+    ref = (run.get("config") or {}).get("background_asset_ref")
+    if not ref:
+        raise PipelineError(
+            "Variant UPLOAD needs an uploaded photo — POST /subject/upload?role=background first."
+        )
+    try:
+        src = read_artifact(run["id"], ref)
+    except ValueError as exc:
+        raise PipelineError(str(exc)) from exc
+    w, h = _stage_dims(run, 1)
+    png = cover_fit(src, w, h, max_width=MAX_RENDER_WIDTH)
+    attempt_no = len(run["stages"]["1"]["attempts"]) + 1
+    rel = save_artifact(run["id"], 1, "UPLOAD", attempt_no, png)
+    attempt = {
+        "attempt": attempt_no,
+        "variant": "UPLOAD",
+        "artifact": rel,
+        "prompt": "(deterministic cover-fit of the uploaded photo — no image model)",
+        "prompt_hash": _sha(f"upload-background:{ref}"),
+        "diffs": [],
+        "warnings": [],
+        "provider": "upload-background",
+        "method": "deterministic",
+        "created_at": now_iso(),
+    }
+    st = run["stages"]["1"]
+    st["attempts"].append(attempt)
+    st["variant"] = "UPLOAD"
+    run["state"] = STATE_FOR_STAGE_REVIEW[1]
     save_run(run)
     return attempt
 

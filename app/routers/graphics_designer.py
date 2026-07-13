@@ -719,6 +719,9 @@ class ConfigBody(BaseModel):
     # Uploaded Stage-2 subject (composite mode, variant "UPLOAD"). Must be an
     # artifact ref owned by this run (from /subject/upload). Explicit null clears.
     subject_asset_ref: str | None = None
+    # Uploaded Stage-1 background (cover-fit mode, Stage-1 variant "UPLOAD").
+    # Must be an artifact ref owned by this run. Explicit null clears.
+    background_asset_ref: str | None = None
     # Pre-generation discovery brief (feeling/audience/tone/style/event/theme).
     # Shallow-merged onto the run so the conversation is durable + reaches every
     # suggestion. Keys with empty values are dropped (lets the UI clear an answer).
@@ -816,6 +819,16 @@ def update_config(run_id: str, body: ConfigBody, user: dict = Depends(get_curren
                     400, f"Invalid subject ref (not owned by this run): {body.subject_asset_ref!r}"
                 )
             cfg["subject_asset_ref"] = body.subject_asset_ref
+    if "background_asset_ref" in body.model_fields_set:
+        if body.background_asset_ref is None:
+            cfg["background_asset_ref"] = None
+        else:
+            # Same C1 ownership rule as subject/image refs.
+            if not is_own_artifact_ref(run_id, body.background_asset_ref):
+                raise HTTPException(
+                    400, f"Invalid background ref (not owned by this run): {body.background_asset_ref!r}"
+                )
+            cfg["background_asset_ref"] = body.background_asset_ref
     if body.creative_brief is not None:
         brief = dict(cfg.get("creative_brief") or {})
         for k, v in body.creative_brief.items():
@@ -1105,13 +1118,15 @@ async def gd_element_upload(run_id: str, file: UploadFile = File(...),
 
 @router.post("/gd/runs/{run_id}/subject/upload")
 async def gd_subject_upload(run_id: str, file: UploadFile = File(...),
+                            role: str = "subject",
                             user: dict = Depends(get_current_user)) -> dict:
-    """Upload an image to use as the Stage-2 subject (composite mode).
-
-    Unlike ``/elements/upload`` (Stage-3 overlay stickers, PNG/WebP only) this
-    accepts JPEG too and normalizes everything to PNG. The returned ``ref`` is
-    stored via config ``subject_asset_ref`` and consumed by Stage-2 variant
-    ``UPLOAD``."""
+    """Upload an image for this run — the Stage-2 subject (``role=subject``,
+    default) or the Stage-1 background (``role=background``). Accepts
+    PNG/WebP/JPEG and normalizes to PNG. The ref is stored via config
+    ``subject_asset_ref`` / ``background_asset_ref`` and consumed by that
+    stage's ``UPLOAD`` variant."""
+    if role not in ("subject", "background"):
+        raise HTTPException(400, "role must be 'subject' or 'background'")
     run = _owned_run(run_id, user)
     if (file.content_type or "") not in ("image/png", "image/webp", "image/jpeg"):
         raise HTTPException(400, "Only PNG, WebP or JPEG uploads are supported.")
@@ -1131,8 +1146,9 @@ async def gd_subject_upload(run_id: str, file: UploadFile = File(...),
     except UnidentifiedImageError as exc:
         raise HTTPException(400, "That file doesn't look like a valid image.") from exc
     token = hashlib.sha256(data).hexdigest()[:16]
-    rel = save_artifact(run["id"], 2, "subject", token, data)
-    return {"ref": rel}
+    stage, variant = (1, "background") if role == "background" else (2, "subject")
+    rel = save_artifact(run["id"], stage, variant, token, data)
+    return {"ref": rel, "role": role}
 
 
 class ApproveBody(BaseModel):
