@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     openrouter_image_model_hero: str = "black-forest-labs/flux.2-max"
     # Vision-capable model used for OCR / reading uploaded images.
     openrouter_vision_model: str = "openai/gpt-4o-mini"
+    # Auto-mode planner (Graphics Designer): plans gradient/element/text/logo
+    # from the user's brief. Routed through OpenRouter like every model here.
+    gd_planner_model: str = "openai/gpt-5.6-sol"
     # Sent as HTTP-Referer/X-Title to OpenRouter for attribution (optional).
     app_public_url: str = "http://localhost:3000"
     app_title: str = "AgentOS"

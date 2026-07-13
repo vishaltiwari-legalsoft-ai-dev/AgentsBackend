@@ -1254,6 +1254,36 @@ def suggest_endpoint(run_id: str, body: SuggestBody, user: dict = Depends(get_cu
     raise HTTPException(400, f"Unknown suggestion kind '{body.kind}'")
 
 
+class PlanBody(BaseModel):
+    brief: str
+
+
+@router.post("/gd/runs/{run_id}/plan")
+def plan_endpoint(run_id: str, body: PlanBody, user: dict = Depends(get_current_user)) -> dict:
+    """Auto mode: plan gradient / element / words / logo from the brief.
+
+    Every pick is validated against the run's real pack inventory (retried with
+    the errors echoed back); failure is an honest 502, never a fabricated plan.
+    The plan is persisted on the run and the brief grounds downstream
+    suggestions exactly like a setup-screen brief."""
+    from graphics_designer_agent import planner
+
+    run = _owned_run(run_id, user)
+    pack = _pack_for_run(run)
+    logo_ids = [l["id"] for l in _list_brand_logos(pack)]
+    try:
+        plan = planner.build_plan(run, pack, body.brief, logo_ids)
+    except planner.PlanError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    run["plan"] = plan
+    cfg_brief = dict(run["config"].get("creative_brief") or {})
+    cfg_brief["goal"] = plan["brief"]
+    run["config"]["creative_brief"] = cfg_brief
+    save_run(run)
+    _log_usage(user, "plan", brand=run.get("brand_id"))
+    return {"plan": plan, "run": _to_client(run)}
+
+
 # ── artifact streaming ────────────────────────────────────────────────────────
 @router.get("/gd/runs/{run_id}/artifact/{rel:path}")
 def get_artifact(run_id: str, rel: str, user: dict = Depends(get_current_user)):

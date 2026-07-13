@@ -22,20 +22,19 @@ def _default_headers() -> dict[str, str]:
     return {"HTTP-Referer": settings.app_public_url, "X-Title": settings.app_title}
 
 
-def get_llm(temperature: float = 0.4, *, fast: bool = False) -> ChatOpenAI:
-    """LangChain chat model backed by OpenRouter (used inside the LangGraph agent).
+def get_llm(temperature: float = 0.4, *, fast: bool = False, model: str | None = None) -> ChatOpenAI:
+    """LangChain chat model backed by OpenRouter.
 
-    `fast=True` selects the cheap parsing model; the default is the high-end
-    reasoning model that pieces the creative together (persona, art direction,
-    master prompt).
-    """
-    model = (
+    ``model`` pins an explicit model id (e.g. the GD planner); otherwise
+    ``fast=True`` selects the cheap parsing model and the default is the
+    high-end reasoning model."""
+    resolved = model or (
         runtime_config.get("openrouter_fast_model")
         if fast
         else runtime_config.get("openrouter_model")
     )
     return ChatOpenAI(
-        model=model,
+        model=resolved,
         api_key=runtime_config.require("openrouter_api_key"),
         base_url=settings.openrouter_base_url,
         default_headers=_default_headers(),
