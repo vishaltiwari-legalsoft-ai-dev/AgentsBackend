@@ -196,3 +196,39 @@ def get_provider(name: str | None = None, *, agent_id: str | None = None) -> Ima
         return OpenRouterProvider(model=model)
     # Auto: use the real model when a key is configured, otherwise the mock.
     return OpenRouterProvider(model=model) if _openrouter_key_configured() else MockImageProvider()
+
+
+# The Stage-3 polish pass runs a PREMIUM image-edit model by default: collision
+# fixes and text fidelity are exactly what Gemini 3 Pro Image (Nano Banana Pro)
+# is strongest at, and the polish pass is where placement quality is decided.
+# Stages 1–2 keep the cheaper default model — cost rises only where it pays.
+_DEFAULT_POLISH_MODEL = "google/gemini-3-pro-image"
+
+
+def _polish_model(agent_id: str | None) -> str:
+    """Model for the Text Optimizer polish fan-out:
+    env ``GD_POLISH_IMAGE_MODEL`` → runtime config ``gd_polish_image_model``
+    (admin-settable) → the premium default."""
+    env = (os.environ.get("GD_POLISH_IMAGE_MODEL") or "").strip()
+    if env:
+        return env
+    try:
+        from app.services import runtime_config
+
+        override = runtime_config.get("gd_polish_image_model")
+        if override:
+            return str(override)
+    except Exception:
+        pass
+    return _DEFAULT_POLISH_MODEL
+
+
+def get_polish_provider(*, agent_id: str | None = None) -> ImageProvider:
+    """Provider for the Stage-3 polish fan-out — same mock/auto semantics as
+    ``get_provider``, but with the dedicated polish-model resolution above."""
+    name = (os.environ.get("GD_IMAGE_PROVIDER") or "").strip().lower()
+    if name == "mock":
+        return MockImageProvider()
+    if name == "openrouter" or _openrouter_key_configured():
+        return OpenRouterProvider(model=_polish_model(agent_id))
+    return MockImageProvider()

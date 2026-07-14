@@ -360,7 +360,11 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
 
     use_optimizer = _optimizer_enabled()
     if use_optimizer:
-        provider = provider or get_provider(agent_id=GD_AGENT_ID)
+        # The polish pass gets its own (premium) model seam; an explicitly
+        # passed provider still wins so tests and callers stay in control.
+        from .providers import get_polish_provider
+
+        provider = provider or get_polish_provider(agent_id=GD_AGENT_ID)
         if provider.name == "mock":
             use_optimizer = False
 
