@@ -147,3 +147,18 @@ def test_highlight_guard_skips_without_gradient_or_highlight():
     no_hl = {**_headline_layer(), "highlight": ""}
     assert to.ensure_highlight_contrast([solid], _base_png((235, 240, 250)), pack) is None
     assert to.ensure_highlight_contrast([no_hl], _base_png((235, 240, 250)), pack) is None
+
+
+def test_highlight_guard_last_resort_picks_dark_on_light_sky():
+    # Live-run regression: a mid-teal brand whose BOTH gradient stops fail on a
+    # light-blue sky must fall back to DARK text, never white-on-light. The old
+    # threshold (rel-lum 0.5) mislabeled light-blue backgrounds as "dark".
+    from types import SimpleNamespace
+
+    pack = SimpleNamespace(locked_colors={
+        "headline_highlight": {"from": "#9FD4E8", "to": "#5FA8C4"},
+    })
+    layers = [_headline_layer()]
+    info = to.ensure_highlight_contrast(layers, _base_png((100, 170, 215)), pack)
+    assert info is not None
+    assert layers[0]["highlight_color"] == "dark"
