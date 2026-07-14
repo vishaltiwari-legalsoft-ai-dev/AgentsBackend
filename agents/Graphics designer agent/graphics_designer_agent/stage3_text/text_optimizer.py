@@ -99,7 +99,10 @@ def ensure_highlight_contrast(layers: list[dict], base_png: bytes, pack) -> dict
         new_color = pack.locked_colors["headline_highlight"]["to"]
         reason = "brand gradient's light stop is illegible on this background — using its dark stop"
     else:
-        new_color = "dark" if bg_lum > 0.5 else "white"
+        # Relative luminance is nonlinear: mid perceptual gray sits near 0.18,
+        # not 0.5 — a light-blue sky is ~0.35-0.45 and must get DARK text.
+        # (0.5 mislabeled such backgrounds as dark and painted white on them.)
+        new_color = "dark" if bg_lum > 0.18 else "white"
         reason = "neither gradient stop is legible on this background"
     head["highlight_color"] = new_color
     logger.info("highlight contrast guard: %s", reason)

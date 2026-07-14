@@ -52,3 +52,29 @@ def test_konva_failure_falls_back_to_pillow(monkeypatch):
     png = _png(64, 80)
     assert render.render_layers(png, _layers(), 64, 80) == \
         text_overlay.render_layers(png, _layers(), 64, 80)
+
+
+# ── landscape text normalization (live-run fix 2026-07-14) ────────────────────
+def test_landscape_text_sizes_scale_down():
+    layers = [{"type": "text", "id": "h", "size_pct": 8.0},
+              {"type": "cta", "id": "c", "size_pct": 3.4},
+              {"type": "shape", "id": "s", "w": 0.3}]
+    out = render._normalize_text_sizes(layers, 1920, 1080)
+    assert out[0]["size_pct"] == 5.4   # 8.0 * 1.2 * 1080/1920
+    assert out[1]["size_pct"] == 2.295
+    assert "size_pct" not in out[2]    # shapes stay fraction-of-canvas
+    assert layers[0]["size_pct"] == 8.0  # input never mutated
+
+
+def test_portrait_and_square_are_identity():
+    layers = [{"type": "text", "id": "h", "size_pct": 8.0}]
+    assert render._normalize_text_sizes(layers, 1080, 1350) is layers
+    assert render._normalize_text_sizes(layers, 1080, 1080) is layers
+
+
+def test_landscape_render_uses_smaller_text(monkeypatch):
+    monkeypatch.delenv("GD_RENDERER", raising=False)
+    png = _png(192, 108)  # 16:9
+    naive = text_overlay.render_layers(png, _layers(), 192, 108)
+    normalized = render.render_layers(png, _layers(), 192, 108)
+    assert normalized != naive  # dispatch applied the aspect normalization

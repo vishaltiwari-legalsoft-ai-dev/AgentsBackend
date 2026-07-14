@@ -23,8 +23,30 @@ def _service_render(req: dict, url: str) -> bytes:
         return resp.read()
 
 
+# Text sizes are calibrated as % of canvas WIDTH on portrait/square social
+# canvases. On a LANDSCAPE canvas the width far exceeds the height, so
+# %-of-width text blows up vertically (a 16:9 headline at 8% of width is ~14%
+# of the height PER LINE) — stacks overflow the canvas and collide with the
+# CTA. The dispatch normalizes text/CTA sizes by the aspect factor so the same
+# config reads the same on any AR; min(1, …) keeps every portrait/square
+# render byte-identical, and both engines (Pillow + Konva) inherit it.
+_LANDSCAPE_TEXT_NORM = 1.2
+
+
+def _normalize_text_sizes(layers: list, base_w: int, base_h: int) -> list:
+    factor = min(1.0, _LANDSCAPE_TEXT_NORM * base_h / max(1, base_w))
+    if factor >= 1.0:
+        return layers
+    return [
+        {**layer, "size_pct": round(float(layer["size_pct"]) * factor, 3)}
+        if layer.get("type") in ("text", "cta") and "size_pct" in layer else layer
+        for layer in layers
+    ]
+
+
 def render_layers(base_png: bytes, layers: list, base_w: int, base_h: int,
                   *, px_scale: float = 1.0, pack=None, image_loader=None) -> bytes:
+    layers = _normalize_text_sizes(layers, base_w, base_h)
     engine = os.environ.get("GD_RENDERER", "pillow").strip().lower()
     url = os.environ.get("GD_RENDERER_URL", "").strip()
     if engine == "konva" and url:
