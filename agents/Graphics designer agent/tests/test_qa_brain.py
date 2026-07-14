@@ -67,3 +67,8 @@ def test_model_error_returns_none(monkeypatch):
 
     monkeypatch.setattr(qa_brain, "_call_model", boom)
     assert qa_brain.check(PNG, PNG, "desc") is None
+
+
+def test_qa_prompt_counts_added_text_as_violation():
+    prompt = qa_brain._build_prompt("HEADLINE — top left")
+    assert "no new text of any kind was added" in prompt
