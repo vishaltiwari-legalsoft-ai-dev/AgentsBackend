@@ -98,3 +98,42 @@ def test_persistent_non_dict_sections_raise_plan_error(monkeypatch):
     monkeypatch.setattr(planner, "_get_planner_llm", lambda: _fake_llm([bad] * 3))
     with pytest.raises(planner.PlanError):
         planner.build_plan(create_run("plan-user-7"), registry.get_pack(None), "brief text", LOGOS)
+
+
+# ── binding wireframe layout (spec 2026-07-14) ────────────────────────────────
+def test_sanitize_layout_passthrough_valid():
+    layout = {"subject_cell": "bottom-left", "headline_zone": "right",
+              "sub_zone": "right", "cta_zone": "center", "logo_corner": "bottom-right"}
+    assert planner._sanitize_layout(layout) == layout
+
+
+def test_sanitize_layout_invalid_fields_fall_back():
+    out = planner._sanitize_layout({"subject_cell": "everywhere", "headline_zone": "left"})
+    assert out["subject_cell"] == planner.DEFAULT_LAYOUT["subject_cell"]
+    assert out["headline_zone"] == "left"
+    assert out["logo_corner"] == planner.DEFAULT_LAYOUT["logo_corner"]
+
+
+def test_sanitize_layout_non_dict_falls_back():
+    assert planner._sanitize_layout(None) == planner.DEFAULT_LAYOUT
+    assert planner._sanitize_layout("left") == planner.DEFAULT_LAYOUT
+
+
+def test_plan_without_layout_gets_default(monkeypatch):
+    monkeypatch.setattr(planner, "_get_planner_llm", lambda: _fake_llm([_good_plan()]))
+    plan = planner.build_plan(create_run("plan-user-8"), registry.get_pack(None), "brief", LOGOS)
+    assert plan["layout"] == planner.DEFAULT_LAYOUT
+
+
+def test_plan_with_layout_is_kept(monkeypatch):
+    cand = json.loads(_good_plan())
+    cand["layout"] = {"subject_cell": "middle-left", "headline_zone": "right",
+                      "sub_zone": "right", "cta_zone": "bottom", "logo_corner": "top-left"}
+    monkeypatch.setattr(planner, "_get_planner_llm", lambda: _fake_llm([json.dumps(cand)]))
+    plan = planner.build_plan(create_run("plan-user-9"), registry.get_pack(None), "brief", LOGOS)
+    assert plan["layout"] == cand["layout"]
+
+
+def test_ask_describes_the_layout_contract():
+    ask = planner._plan_ask(registry.get_pack(None), "brief", LOGOS)
+    assert '"layout"' in ask and "subject_cell" in ask and "logo_corner" in ask

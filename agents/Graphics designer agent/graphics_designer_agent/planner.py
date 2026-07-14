@@ -17,6 +17,29 @@ logger = logging.getLogger("graphics_designer.planner")
 PLAN_VERSION = 1
 _MAX_ATTEMPTS = 3  # 1 try + 2 retries-with-errors
 
+# Binding wireframe vocabularies (spec 2026-07-14). Subject cells mirror
+# STAGE2_PLACEMENTS keys; logo corners are the 4 corner LOGO_POSITIONS.
+SUBJECT_CELLS = ("top-left", "top-center", "top-right", "middle-left", "middle-center",
+                 "middle-right", "bottom-left", "bottom-center", "bottom-right")
+TEXT_ZONES = ("left", "right", "top", "bottom", "center")
+LOGO_CORNERS = ("top-left", "top-right", "bottom-left", "bottom-right")
+DEFAULT_LAYOUT = {"subject_cell": "middle-right", "headline_zone": "left",
+                  "sub_zone": "left", "cta_zone": "bottom", "logo_corner": "top-right"}
+
+
+def _sanitize_layout(cand) -> dict:
+    """The planned wireframe, validated field-by-field. Layout must NEVER block
+    a plan, so anything invalid silently falls back to the default zone."""
+    if not isinstance(cand, dict):
+        return dict(DEFAULT_LAYOUT)
+    vocab = {"subject_cell": SUBJECT_CELLS, "headline_zone": TEXT_ZONES,
+             "sub_zone": TEXT_ZONES, "cta_zone": TEXT_ZONES, "logo_corner": LOGO_CORNERS}
+    out: dict = {}
+    for key, allowed in vocab.items():
+        value = str(cand.get(key) or "").strip().lower()
+        out[key] = value if value in allowed else DEFAULT_LAYOUT[key]
+    return out
+
 
 class PlanError(Exception):
     """Planning failed for a user-visible reason (router maps it to HTTP 502)."""
@@ -51,11 +74,18 @@ def _plan_ask(pack, brief: str, logo_ids: list[str]) -> str:
         "Write the words too: headline ≤ 8 words, one highlight word taken from "
         "the headline, subline ≤ 14 words, cta ≤ 4 words. Every reason is ONE "
         "short sentence tied to the brief.\n\n"
+        "Also plan the LAYOUT as a wireframe: put the subject in one of the 9 grid "
+        "cells and every text zone in the clean space AWAY from the subject.\n\n"
         'Return ONLY minified JSON: {"concept":"one sentence",'
         '"gradient":{"cid":"...","reason":"..."},'
         '"element":{"cid":"...","reason":"..."},'
         '"text":{"headline":"...","highlight":"...","subline":"...","cta":"...","reason":"..."},'
-        '"logo":{"logo_id":"..." or null,"reason":"..."}}'
+        '"logo":{"logo_id":"..." or null,"reason":"..."},'
+        '"layout":{"subject_cell":"top-left|top-center|top-right|middle-left|middle-center|'
+        'middle-right|bottom-left|bottom-center|bottom-right",'
+        '"headline_zone":"left|right|top|bottom|center","sub_zone":"left|right|top|bottom|center",'
+        '"cta_zone":"left|right|top|bottom|center",'
+        '"logo_corner":"top-left|top-right|bottom-left|bottom-right"}}'
     )
 
 
@@ -147,6 +177,7 @@ def build_plan(run: dict, pack, brief: str, logo_ids: list[str]) -> dict:
                 },
                 "logo": {"logo_id": (cand.get("logo") or {}).get("logo_id"),
                          "reason": str((cand.get("logo") or {}).get("reason") or "").strip()[:200]},
+                "layout": _sanitize_layout(cand.get("layout")),
             }
         logger.warning("plan attempt %d rejected: %s", attempt + 1, "; ".join(errors))
     raise PlanError("The planner's output kept failing validation: " + " ".join(errors))
