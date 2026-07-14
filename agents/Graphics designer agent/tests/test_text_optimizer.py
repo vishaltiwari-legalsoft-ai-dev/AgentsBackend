@@ -107,3 +107,43 @@ def test_optimize_provider_error_falls_back_honestly():
                           provider=_FakeProvider(fail=True), width=480, height=600)
     assert all(not r["ai"] and r["png"] == b"BASE" and r["qa"] == "not_run" for r in results)
     assert all(r["fallback_reason"] == "image model call failed" for r in results)
+
+
+# ── highlight contrast guard (live-run fix 2026-07-14) ────────────────────────
+from io import BytesIO
+
+from PIL import Image
+
+
+def _base_png(color):
+    buf = BytesIO()
+    Image.new("RGB", (100, 125), color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _headline_layer():
+    return {"type": "text", "id": "headline", "text": "Hi there", "highlight": "there",
+            "highlight_color": "gradient", "x": 0.5, "y": 0.5, "w": 0.9, "anchor": "mc"}
+
+
+def test_highlight_guard_darkens_on_light_background():
+    pack = registry.get_pack(None)
+    layers = [_headline_layer()]
+    info = to.ensure_highlight_contrast(layers, _base_png((235, 240, 250)), pack)
+    assert info is not None and info["to"] == pack.locked_colors["headline_highlight"]["to"]
+    assert layers[0]["highlight_color"] == pack.locked_colors["headline_highlight"]["to"]
+
+
+def test_highlight_guard_keeps_gradient_on_dark_background():
+    pack = registry.get_pack(None)
+    layers = [_headline_layer()]
+    assert to.ensure_highlight_contrast(layers, _base_png((10, 20, 40)), pack) is None
+    assert layers[0]["highlight_color"] == "gradient"
+
+
+def test_highlight_guard_skips_without_gradient_or_highlight():
+    pack = registry.get_pack(None)
+    solid = {**_headline_layer(), "highlight_color": "#111111"}
+    no_hl = {**_headline_layer(), "highlight": ""}
+    assert to.ensure_highlight_contrast([solid], _base_png((235, 240, 250)), pack) is None
+    assert to.ensure_highlight_contrast([no_hl], _base_png((235, 240, 250)), pack) is None

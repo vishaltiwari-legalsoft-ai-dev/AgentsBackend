@@ -32,6 +32,79 @@ _BUSY_HEADLINE_WEIGHT = 700
 
 _MAX_POLISH_ATTEMPTS = 2  # first try + one retry with violations fed back
 
+# Minimum WCAG-style contrast between the highlight's LIGHT gradient stop and
+# the background it sits on; below this the guard swaps to the dark stop.
+_MIN_HL_CONTRAST = 2.5
+
+
+def _rel_lum(rgb: tuple[int, int, int]) -> float:
+    def lin(c: float) -> float:
+        c = c / 255.0
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    r, g, b = rgb
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+
+
+def _contrast(rgb: tuple[int, int, int], bg_lum: float) -> float:
+    la = _rel_lum(rgb)
+    hi, lo = max(la, bg_lum), min(la, bg_lum)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _hex_rgb(value: str) -> tuple[int, int, int]:
+    h = value.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
+def ensure_highlight_contrast(layers: list[dict], base_png: bytes, pack) -> dict | None:
+    """Deterministic legibility guard for the headline highlight (optimizer path
+    only — the flag-off render stays byte-identical). Samples the base image
+    behind the headline layer; when the brand gradient's LIGHT stop lacks
+    contrast there, the highlight renders as the gradient's dark stop instead
+    (or plain dark/white as a last resort). Mutates the layer in place and
+    returns an honest ``{"from","to","reason"}`` record, or ``None`` when the
+    gradient is already legible. Never raises."""
+    head = next((l for l in layers
+                 if l.get("id") == "headline" and l.get("type") == "text"), None)
+    if not head or head.get("highlight_color") != "gradient":
+        return None
+    if not str(head.get("highlight") or "").strip():
+        return None
+    try:
+        hl = pack.locked_colors["headline_highlight"]
+        light_stop, dark_stop = _hex_rgb(hl["from"]), _hex_rgb(hl["to"])
+    except Exception:  # noqa: BLE001 - pack without a gradient → nothing to guard
+        return None
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+
+        img = Image.open(BytesIO(base_png)).convert("RGB")
+        cw, ch = img.size
+        x, y, w = float(head.get("x", 0.5)), float(head.get("y", 0.5)), float(head.get("w", 0.5))
+        box = (max(0, int((x - w / 2) * cw)), max(0, int((y - 0.2) * ch)),
+               min(cw, int((x + w / 2) * cw) or cw), min(ch, int((y + 0.2) * ch) or ch))
+        region = img.crop(box) if box[0] < box[2] and box[1] < box[3] else img
+        region.thumbnail((32, 32))
+        px = list(region.getdata())
+        mean = tuple(sum(c[i] for c in px) // len(px) for i in range(3))
+        bg_lum = _rel_lum(mean)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001 - unreadable base → never block generation
+        return None
+    if _contrast(light_stop, bg_lum) >= _MIN_HL_CONTRAST:
+        return None
+    if _contrast(dark_stop, bg_lum) >= _MIN_HL_CONTRAST:
+        new_color = pack.locked_colors["headline_highlight"]["to"]
+        reason = "brand gradient's light stop is illegible on this background — using its dark stop"
+    else:
+        new_color = "dark" if bg_lum > 0.5 else "white"
+        reason = "neither gradient stop is legible on this background"
+    head["highlight_color"] = new_color
+    logger.info("highlight contrast guard: %s", reason)
+    return {"from": "gradient", "to": new_color, "reason": reason}
+
 
 def pick_variant(font_variants: list[dict], weight: int) -> str:
     """Name of the upright variant closest to ``weight`` (obliques excluded)."""

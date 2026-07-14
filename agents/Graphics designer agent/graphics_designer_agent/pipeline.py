@@ -385,6 +385,12 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
     view, chosen_fonts = text_optimizer.resolved_fonts_view(run, pack, judgment)
 
     layers = gd_layout.resolve_layers(view)
+    # Legibility guard (optimizer path only, so flag-off stays byte-identical):
+    # a brand-gradient highlight whose light stop vanishes on a light background
+    # is rendered with the gradient's dark stop instead — recorded honestly.
+    highlight_guard = (
+        text_optimizer.ensure_highlight_contrast(layers, base, pack) if use_optimizer else None
+    )
     canvas_w, canvas_h = _stage_dims(run, 3)
     w, h, px_scale = _hires_canvas(base, canvas_w, canvas_h)
     png = render.render_layers(
@@ -436,6 +442,7 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
             "diffs": [],
             "warnings": [],
             "provider": provider.name if res["ai"] else "deterministic",
+            **({"highlight_guard": highlight_guard} if highlight_guard else {}),
             "created_at": now_iso(),
             "style": res["style"],
             "style_label": res["label"],

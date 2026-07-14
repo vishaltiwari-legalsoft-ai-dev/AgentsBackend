@@ -37,3 +37,10 @@ def test_prompt_contains_all_blocks():
 def test_prompt_omits_notes_block_when_empty():
     p = pp.build_polish_prompt("brand_strict", "X")
     assert "DESIGNER NOTES" not in p
+
+
+def test_preservation_forbids_added_text():
+    # Live-run regression: the polish model hallucinated a vertical "NO GLYPH"
+    # tag inside the CTA — adding NEW text must be explicitly forbidden.
+    assert "Never ADD new text" in pp.PRESERVATION_BLOCK
+    assert "watermark" in pp.PRESERVATION_BLOCK
