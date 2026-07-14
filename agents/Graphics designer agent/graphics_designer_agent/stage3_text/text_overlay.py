@@ -216,12 +216,34 @@ def _render_text_elements(canvas, elements, base_w, base_h, theme: _Theme, px_sc
             y += lay["height"] + gap
 
 
+def _glyph_available(font: ImageFont.FreeTypeFont, ch: str) -> bool:
+    """True when ``font`` has a real glyph for ``ch`` — not the .notdef tofu.
+
+    Brand fonts routinely lack the arrow (U+2192): Be Vietnam renders it as the
+    tofu box, which the Stage-3 polish model then repaints as vertical gibberish
+    inside the CTA on every run. Detection: the mask for ``ch`` matching the
+    mask of a certainly-unmapped plane-15 codepoint means both fell back to
+    .notdef. Permissive on any error (worst case = legacy behavior)."""
+    try:
+        probe = "\U000F0000"  # private-use plane 15 — never mapped in brand fonts
+        m1, m2 = font.getmask(ch), font.getmask(probe)
+        if m1.size != m2.size:
+            return True
+        return bytes(m1) != bytes(m2)
+    except Exception:  # noqa: BLE001 - never let detection break a render
+        return True
+
+
 def _draw_cta(canvas, cta: dict, base_w, base_h, theme: _Theme, px_scale=1.0, coords=None):
-    label = cta["text"].rstrip() + "  →"
     font = _font(cta["font"], cta["size_pct"] / 100 * base_w, theme)
+    has_arrow_glyph = _glyph_available(font, "→")
+    label = cta["text"].rstrip() + ("  →" if has_arrow_glyph else "  ")
     asc, desc = font.getmetrics()
     th = asc + desc
-    tw = int(round(font.getlength(label)))
+    # Fonts without the arrow glyph get a DRAWN vector arrow after the label —
+    # reserve its width so the pill geometry stays balanced.
+    arrow_w = 0 if has_arrow_glyph else int(th * 0.62)
+    tw = int(round(font.getlength(label))) + arrow_w
     pad_x, pad_y = int(th * 0.9), int(th * 0.55)
     pw, ph = tw + 2 * pad_x, th + 2 * pad_y
     radius = ph // 2
@@ -271,6 +293,17 @@ def _draw_cta(canvas, cta: dict, base_w, base_h, theme: _Theme, px_scale=1.0, co
     canvas.paste(body, (x, y), mask)
 
     _draw_run(canvas, x + pad_x, y + pad_y, label, font, ("solid", theme.white))
+    if not has_arrow_glyph:
+        # Vector arrow: shaft + triangular head, sized to the text height.
+        ax0 = x + pad_x + tw - arrow_w
+        cy = y + ph // 2
+        head = max(3, round(th * 0.22))
+        shaft = max(2, round(th * 0.09))
+        d = ImageDraw.Draw(canvas)
+        d.line([(ax0, cy), (ax0 + arrow_w - head, cy)], fill=theme.white, width=shaft)
+        d.polygon([(ax0 + arrow_w, cy),
+                   (ax0 + arrow_w - head, cy - round(head * 0.8)),
+                   (ax0 + arrow_w - head, cy + round(head * 0.8))], fill=theme.white)
 
 
 def _theme_dict(theme: _Theme) -> dict:
