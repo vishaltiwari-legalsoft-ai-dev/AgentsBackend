@@ -72,3 +72,34 @@ def test_model_error_returns_none(monkeypatch):
 def test_qa_prompt_counts_added_text_as_violation():
     prompt = qa_brain._build_prompt("HEADLINE — top left")
     assert "no new text of any kind was added" in prompt
+
+
+# ── tweak verdicts (Step 5, spec 2026-07-15) ──────────────────────────────────
+def test_check_tweak_pass(monkeypatch):
+    monkeypatch.setattr(qa_brain, "_vision_available", lambda: True)
+    monkeypatch.setattr(
+        qa_brain, "_call_model",
+        lambda *_: '{"text_ok":true,"logo_ok":true,"gradient_ok":true,"violations":[]}')
+    assert qa_brain.check_tweak(PNG, PNG, "soften the shadow") == {
+        "passed": True, "violations": []}
+
+
+def test_check_tweak_logo_violation(monkeypatch):
+    monkeypatch.setattr(qa_brain, "_vision_available", lambda: True)
+    monkeypatch.setattr(
+        qa_brain, "_call_model",
+        lambda *_: '{"text_ok":true,"logo_ok":false,"gradient_ok":true,'
+                   '"violations":["logo was recolored"]}')
+    out = qa_brain.check_tweak(PNG, PNG, "make it warmer")
+    assert out["passed"] is False and out["violations"] == ["logo was recolored"]
+
+
+def test_check_tweak_unavailable_returns_none(monkeypatch):
+    monkeypatch.setattr(qa_brain, "_vision_available", lambda: False)
+    assert qa_brain.check_tweak(PNG, PNG, "x") is None
+
+
+def test_tweak_prompt_carries_instruction_and_guardrails():
+    p = qa_brain._build_tweak_prompt("make the plant smaller")
+    assert "make the plant smaller" in p
+    assert "logo_ok" in p and "gradient_ok" in p and "text_ok" in p

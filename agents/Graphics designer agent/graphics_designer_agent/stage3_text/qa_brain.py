@@ -100,7 +100,7 @@ def _build_prompt(layout_desc: str) -> str:
     )
 
 
-def _parse(raw: str) -> dict | None:
+def _parse(raw: str, checks: tuple[str, ...] = _CHECKS) -> dict | None:
     match = re.search(r"\{.*\}", raw or "", re.S)
     if not match:
         return None
@@ -108,16 +108,60 @@ def _parse(raw: str) -> dict | None:
         data = json.loads(match.group(0))
     except Exception:
         return None
-    if not isinstance(data, dict) or not all(k in data for k in _CHECKS):
+    if not isinstance(data, dict) or not all(k in data for k in checks):
         return None
-    passed = all(bool(data[k]) for k in _CHECKS)
+    passed = all(bool(data[k]) for k in checks)
     raw_violations = data.get("violations") or []
     if not isinstance(raw_violations, list):
         raw_violations = [str(raw_violations)]
-    violations = [str(v)[:160] for v in raw_violations[:len(_CHECKS)]]
+    violations = [str(v)[:160] for v in raw_violations[:len(checks)]]
     if not passed and not violations:
-        violations = [f"{k} check failed" for k in _CHECKS if not data[k]]
+        violations = [f"{k} check failed" for k in checks if not data[k]]
     return {"passed": passed, "violations": [] if passed else violations}
+
+
+# ── Step-5 tweak verdict (spec 2026-07-15) ────────────────────────────────────
+_TWEAK_CHECKS = ("text_ok", "logo_ok", "gradient_ok")
+
+
+def check_tweak(before_png: bytes, after_png: bytes, instruction: str) -> dict | None:
+    """Step-5 verdict: did the retouch change anything the guardrails forbid?
+    ``{"passed": bool, "violations": [str]}`` or ``None`` when unavailable."""
+    if not _vision_available():
+        return None
+    images = [_downscale_png(before_png, _VISION_MAX_DIM),
+              _downscale_png(after_png, _VISION_MAX_DIM)]
+    prompt = _build_tweak_prompt(instruction)
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            out = _call_model(prompt, images)
+        except Exception:
+            logger.warning("tweak QA call failed; treating as unavailable", exc_info=True)
+            return None
+        verdict = _parse(out, checks=_TWEAK_CHECKS)
+        if verdict is not None:
+            return verdict
+        logger.info("tweak QA returned malformed JSON (attempt %d)", attempt + 1)
+    return None
+
+
+def _build_tweak_prompt(instruction: str) -> str:
+    return (
+        "You are a meticulous brand QA reviewer. Image 1 is the APPROVED FINAL "
+        "creative (ground truth). Image 2 is a retouch whose ONLY intended "
+        "difference is this requested change:\n" + instruction.strip()[:500] + "\n\n"
+        "The retouch was FORBIDDEN from touching three things regardless of the "
+        "request. Check image 2 against image 1:\n"
+        "1. text_ok — every word identical, same font family and letterforms, and "
+        "no new text/labels/tags/watermarks anywhere\n"
+        "2. logo_ok — the logo is pixel-faithful: same position, size, colours and "
+        "shape, not redrawn or restyled in any way\n"
+        "3. gradient_ok — the background colour gradient is unchanged: same "
+        "colours, direction and stops\n\n"
+        'Reply with ONLY minified JSON: {"text_ok":true,"logo_ok":true,'
+        '"gradient_ok":true,"violations":["one short reason per failed check"]}. '
+        "No prose."
+    )
 
 
 def _downscale_png(image_bytes: bytes, max_dim: int) -> bytes:

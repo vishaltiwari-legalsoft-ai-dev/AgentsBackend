@@ -1173,6 +1173,28 @@ async def gd_subject_upload(run_id: str, file: UploadFile = File(...),
     return {"ref": rel, "role": role}
 
 
+class TweakBody(BaseModel):
+    instruction: str
+
+
+@router.post("/gd/runs/{run_id}/tweak")
+def tweak_endpoint(run_id: str, body: TweakBody, user: dict = Depends(get_current_user)) -> dict:
+    """Step 5: guardrailed retouch of the approved final (spec 2026-07-15).
+
+    Optional and user-initiated. A rejected tweak stores nothing and surfaces
+    the guardrail violations; approving the returned attempt makes it the new
+    final via the existing stage-4 approve (which re-archives it)."""
+    instruction = (body.instruction or "").strip()
+    if not 3 <= len(instruction) <= 500:
+        raise HTTPException(400, "Describe the change in 3–500 characters.")
+    run = _owned_run(run_id, user)
+    attempt = _guard(lambda: pipeline.generate_tweak(run, instruction))
+    _log_usage(user, "generate", brand=run.get("brand_id"))
+    _advance_run(run, stage=4, stage_status="generated", attempt=attempt)
+    return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])},
+            "run": _to_client(run)}
+
+
 class ApproveBody(BaseModel):
     stage: int = Field(ge=1, le=4)
     attempt: int | None = None

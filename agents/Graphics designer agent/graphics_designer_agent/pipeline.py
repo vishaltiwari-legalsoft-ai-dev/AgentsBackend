@@ -738,6 +738,62 @@ def generate_stage4(run: dict, logo_png: bytes, *, use_ai: bool | None = None,
     return attempt
 
 
+def generate_tweak(run: dict, instruction: str,
+                   provider: ImageProvider | None = None) -> dict:
+    """Step 5 (spec 2026-07-15): guardrailed retouch of the APPROVED final.
+
+    Only valid on a DONE run. The base is the currently approved Stage-4
+    artifact, so accepted tweaks compound. A passing tweak is appended as a
+    Stage-4 attempt (``variant: "tweak"``) and the state STAYS ``DONE`` — the
+    user approves it ("Keep it") to make it the final; a rejected tweak stores
+    nothing and raises with the guardrail violations."""
+    from . import final_tweak
+    from .providers import get_polish_provider
+
+    instruction = (instruction or "").strip()
+    if not instruction:
+        raise PipelineError("Describe the change you want first.")
+    if run.get("state") != "DONE" or not run["stages"]["4"]["approved"]:
+        raise PipelineError("Finish and approve the creative before tweaking it.")
+    base = _approved_png(run, 4)
+    if base is None:
+        raise PipelineError("The approved final image could not be read.")
+    provider = provider or get_polish_provider(agent_id=GD_AGENT_ID)
+    if provider.name == "mock":
+        raise PipelineError(
+            "The image model is offline — a tweak can't be produced honestly right now.")
+
+    w, h = _stage_dims(run, 4)
+    result = final_tweak.apply_tweak(
+        final_png=base, instruction=instruction, provider=provider,
+        width=w, height=h, aspect_ratio=_stage_ar(run),
+        image_size=STAGE_IMAGE_SIZE[4],
+    )
+    if not result["ok"]:
+        raise PipelineError(
+            "The tweak violated a guardrail and was rejected: "
+            + "; ".join(result["violations"]))
+
+    st = run["stages"]["4"]
+    attempt_no = len(st["attempts"]) + 1
+    rel = save_artifact(run["id"], 4, "tweak", attempt_no, result["png"])
+    attempt = {
+        "attempt": attempt_no,
+        "variant": "tweak",
+        "artifact": rel,
+        "method": "ai",
+        "tweak_instruction": instruction,
+        "qa": result["qa"],
+        "prompt": result["prompt"],
+        "prompt_hash": _sha(result["prompt"]),
+        "provider": provider.name,
+        "created_at": now_iso(),
+    }
+    st["attempts"].append(attempt)
+    save_run(run)
+    return attempt
+
+
 def approve(run: dict, stage: int, attempt_no: int | None = None) -> dict:
     st = run["stages"][str(stage)]
     if not st["attempts"]:
