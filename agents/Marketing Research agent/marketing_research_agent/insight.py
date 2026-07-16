@@ -202,12 +202,23 @@ _ANSWER_PROMPT = """You are Legal Soft's marketing analyst answering a busy mark
 brief, decisive, and useful. Use ONLY the data provided (already filtered to the
 requested timeframe where possible).
 
+Shape your answer EXACTLY like this — it is rendered as discrete blocks, so a
+single dense paragraph is unreadable:
+
+  <one sentence: the direct answer — a number or a clear verdict>
+  - <finding, with its figure>
+  - <finding, with its figure>
+  - <finding, with its figure>
+  Recommend: <the single action worth taking>
+
 Rules:
-- Plain language. NO markdown, NO asterisks, NO headings.
-- Lead with the direct answer in the first sentence — a number or a clear verdict.
-- Keep it to 4-6 short sentences total. Summarize: give the totals and name only
-  the top one or two and the worst one or two (e.g. who is over budget / burning
-  money). Do NOT list every row.
+- The first line stands alone: the answer itself, no preamble. Max ~25 words.
+- Then 2-5 bullet lines, each starting "- ". ONE point per bullet, each carrying
+  the number or name that proves it. Never stack three findings into one bullet.
+- Plain language. No headings, no bold, no asterisks — bullets and the lines
+  above are the only structure.
+- Summarize: give the totals and name only the top one or two and the worst one
+  or two (e.g. who is over budget / burning money). Do NOT list every row.
 - Be concrete: back every point with a specific number or name from the data —
   no vague generalities. When asked "how many", give the count.
 - Never invent numbers.
@@ -229,7 +240,9 @@ Data by tab:
 def _offline_answer(question: str, timeframe: str | None, selected: list[str],
                     grids: dict[str, list[list[str]]], profiles_by_title: dict[str, TabProfile],
                     year: int) -> str:
-    parts: list[str] = []
+    # Same shape the LLM is asked for (lead line / "- " bullets / Recommend), so
+    # the answer card renders offline reads as structured blocks too.
+    bullets: list[str] = []
     for title in selected:
         prof = profiles_by_title.get(title)
         rows = grids.get(title, [])
@@ -240,15 +253,22 @@ def _offline_answer(question: str, timeframe: str | None, selected: list[str],
             for m in metrics:
                 agg[m.channel][0] += m.spend
                 agg[m.channel][1] += m.demos_completed
-            line = "; ".join(f"{ch} spent ${v[0]:,.0f} for {v[1]} completed demos" for ch, v in agg.items())
-            parts.append(f"From {title}: {line}." if line else f"{title}: {prof.summary}.")
+            if agg:
+                bullets.extend(
+                    f"- {ch}: ${v[0]:,.0f} spent for {v[1]} completed demos ({title})"
+                    for ch, v in agg.items())
+            else:
+                bullets.append(f"- {title}: {prof.summary}")
         elif prof:
             cols = ", ".join(c for c in (rows[0] if rows else [])[:6] if c)
-            parts.append(f"{title} ({prof.summary}) has {len(rows)} rows; columns include {cols}.")
+            bullets.append(f"- {title} ({prof.summary}): {len(rows)} rows; columns include {cols}")
         else:
-            parts.append(f"{title}: {len(rows)} rows.")
-    parts.append("Recommend: connect the live LLM for a deeper read; the figures above are exact.")
-    return " ".join(parts)
+            bullets.append(f"- {title}: {len(rows)} rows")
+    scope = f" for {timeframe}" if timeframe and timeframe != "unspecified" else ""
+    lead = (f"Read straight from {len(selected)} tab{'s' if len(selected) != 1 else ''}{scope} "
+            f"— exact figures below.") if selected else "No usable tab matched that question."
+    return "\n".join([lead, *bullets,
+                      "Recommend: connect the live LLM for a deeper read; the figures above are exact."])
 
 
 def answer(question: str, profiles: list[TabProfile], grids: dict[str, list[list[str]]],

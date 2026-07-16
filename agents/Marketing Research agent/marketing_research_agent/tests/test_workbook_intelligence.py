@@ -77,6 +77,31 @@ def test_answer_returns_grounded_text():
     assert isinstance(out["answer"], str) and len(out["answer"]) > 10
 
 
+def test_answer_is_structured_not_a_wall_of_prose():
+    """The desk called the Ask card unreadable: every figure was packed into one
+    dense paragraph. Answers must come back as a lead line + bullet findings so
+    the card can render them as discrete blocks."""
+    profiles = [_heuristic_profile(g, YEAR) for g in ALL]
+    grids = {g.title: g.rows for g in ALL}
+    out = insight.answer("How much did we spend this month?", profiles, grids, year=YEAR)
+    lines = [ln for ln in out["answer"].splitlines() if ln.strip()]
+
+    assert len(lines) > 1, "answer collapsed into a single blob"
+    assert any(ln.lstrip().startswith("- ") for ln in lines), "no bullet findings"
+    assert lines[-1].lower().startswith("recommend:"), "Recommend must stay its own trailing line"
+
+
+def test_answer_prompt_asks_for_the_shape_the_card_renders():
+    """The card parses '- ' bullets into a list. The prompt used to ban markdown
+    outright and cap the answer at 4-6 sentences, which is what produced the wall
+    - so guard the two instructions against drifting back apart."""
+    p = insight._ANSWER_PROMPT.lower()
+    assert "- " in insight._ANSWER_PROMPT
+    assert "bullet" in p
+    assert "no markdown" not in p, "a blanket markdown ban contradicts the bullet list"
+    assert "recommend:" in p
+
+
 def test_slice_filters_long_tab_by_month():
     rows = [
         ["Vendor", "Month", "Budget", "Spend"],
