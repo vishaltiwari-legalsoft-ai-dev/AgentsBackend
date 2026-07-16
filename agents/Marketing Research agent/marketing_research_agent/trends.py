@@ -128,14 +128,7 @@ def _insights(monthly_list: list[dict], vendors: list[dict], today: date) -> lis
                         "text": (f"{worst['vendor']} pays ${worst['cpql']:,.0f} per qualified lead — "
                                  f"{worst['cpql'] / best['cpql']:.1f}x the best desk rate")})
 
-    # 3 — spend with zero leads this month
-    zeros = [v for v in vendors if v["spend_mtd"] > 0 and v["leads"] == 0]
-    if zeros:
-        names = ", ".join(f"{v['vendor']} (${v['spend_mtd']:,.0f})" for v in zeros[:3])
-        more = f" +{len(zeros) - 3} more" if len(zeros) > 3 else ""
-        out.append({"level": "warn", "text": f"Spend with zero leads this month: {names}{more}"})
-
-    # 4 — MoM movers in the last complete month
+    # 3 — MoM movers in the last complete month
     if prev:
         ppy, ppm = (py, pm - 1) if pm > 1 else (py - 1, 12)
         pp = by_month.get(_mkey(ppy, ppm))

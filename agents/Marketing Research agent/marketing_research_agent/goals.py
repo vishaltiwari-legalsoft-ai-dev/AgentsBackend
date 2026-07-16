@@ -1,21 +1,28 @@
 """2026 performance goals + red-flag thresholds, encoded verbatim as data.
 
 Source: the requirements doc "2026 Goals" section. The verbatim values are the
-DEFAULTS; the team can edit any figure from the UI, which persists a JSON
-overrides file (``MR_TARGETS_FILE``, default ``<agent>/targets.json``). All
-threshold logic lives in ``evaluate`` and reads the effective (merged) targets.
+DEFAULTS; the team can edit any figure from the UI. Edits persist to Firestore
+(``mr_config/targets``) with a JSON file (``MR_TARGETS_FILE``) as the local /
+offline copy — Cloud Run's disk is ephemeral, so a file-only store silently
+reset the desk's edits on every redeploy. All threshold logic lives in
+``evaluate`` and reads the effective (merged) targets.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from .schemas import CampaignMetric, Flag
 
+logger = logging.getLogger(__name__)
+
 _TARGETS_FILE_DEFAULT = Path(__file__).resolve().parents[1] / "targets.json"
+_MR_CONFIG_COLLECTION = "mr_config"
+_TARGETS_DOC_ID = "targets"
 
 # --- Report rules (requirements §3.1) -------------------------------------
 COST_PER_BOOKING_FLAG = 150.0   # flag campaigns where cost-per-booking > $150
@@ -77,7 +84,27 @@ def _targets_path() -> Path:
     return Path(os.environ.get("MR_TARGETS_FILE") or _TARGETS_FILE_DEFAULT)
 
 
-def _load_overrides() -> dict:
+def _use_cloud() -> bool:
+    if os.environ.get("MR_OFFLINE") == "1":
+        return False
+    try:
+        # Same source of truth firestore_repo connects with (GCP_PROJECT_ID env);
+        # Cloud Run does NOT set GOOGLE_CLOUD_PROJECT/GCP_PROJECT.
+        from app.config import settings
+        from app.services import firestore_repo  # noqa: F401
+
+        return bool(settings.gcp_project_id)
+    except Exception:
+        return False
+
+
+def _doc():
+    from app.services import firestore_repo
+
+    return firestore_repo._db().collection(_MR_CONFIG_COLLECTION).document(_TARGETS_DOC_ID)
+
+
+def _load_disk() -> dict:
     p = _targets_path()
     if not p.exists():
         return {}
@@ -86,6 +113,22 @@ def _load_overrides() -> dict:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _load_overrides() -> dict:
+    """Firestore is the source of truth when configured; the file is the local
+    copy (and the only store offline). A cloud read failure falls back to disk
+    rather than silently serving defaults over the desk's real edits."""
+    if _use_cloud():
+        try:
+            snap = _doc().get()
+            if snap.exists:
+                data = snap.to_dict()
+                return data if isinstance(data, dict) else {}
+            return {}
+        except Exception:
+            logger.warning("MR targets cloud read failed; falling back to disk")
+    return _load_disk()
 
 
 _GOAL_FIELDS = ("cpd_booked_low", "cpd_booked_high",
@@ -137,6 +180,11 @@ def set_targets(update: dict) -> dict:
             ov.setdefault("channel_goals", {}).setdefault(name, {}).update(
                 {k: float(v) for k, v in fields.items()})
     _targets_path().write_text(json.dumps(ov, indent=1), encoding="utf-8")
+    # Deliberately NOT best-effort: on Cloud Run the file above is ephemeral, so
+    # a swallowed cloud failure would report "saved" for an edit that is already
+    # gone. Let it raise and tell the desk the truth.
+    if _use_cloud():
+        _doc().set(ov)
     return get_targets()
 
 
@@ -144,6 +192,8 @@ def reset_targets() -> dict:
     p = _targets_path()
     if p.exists():
         p.unlink()
+    if _use_cloud():
+        _doc().delete()
     return get_targets()
 
 

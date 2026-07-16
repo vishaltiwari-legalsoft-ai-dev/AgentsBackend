@@ -41,6 +41,7 @@ def test_conversion_drop_flag():
 
 
 def test_targets_are_editable_and_change_flags(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
     monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "targets.json"))
     assert goals.get_targets()["edited"] is False
 
@@ -58,6 +59,7 @@ def test_targets_are_editable_and_change_flags(monkeypatch, tmp_path):
 
 
 def test_channel_goals_are_editable(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
     monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "targets.json"))
     goals.set_targets({"channel_goals": {"Google": {"cpd_booked_high": 900}}})
     g = goals.channel_goal("google")
@@ -67,8 +69,78 @@ def test_channel_goals_are_editable(monkeypatch, tmp_path):
 def test_set_targets_rejects_unknown_keys(monkeypatch, tmp_path):
     import pytest
 
+    monkeypatch.setenv("MR_OFFLINE", "1")
     monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "targets.json"))
     with pytest.raises(ValueError):
         goals.set_targets({"thresholds": {"nope": 1}})
     with pytest.raises(ValueError):
         goals.set_targets({"thresholds": {"cac_red": "high"}})
+
+
+# --- durability: Cloud Run's disk is ephemeral, so edits must reach Firestore --
+
+class _FakeDoc:
+    """Minimal stand-in for a Firestore document reference."""
+
+    def __init__(self, store, fail=False):
+        self._store = store
+        self._fail = fail
+
+    def set(self, payload):
+        if self._fail:
+            raise RuntimeError("firestore unavailable")
+        self._store["doc"] = payload
+
+    def get(self):
+        doc = self
+
+        class _Snap:
+            exists = "doc" in doc._store
+
+            @staticmethod
+            def to_dict():
+                return doc._store.get("doc")
+
+        return _Snap()
+
+    def delete(self):
+        self._store.pop("doc", None)
+
+
+def test_saved_targets_survive_an_empty_disk(monkeypatch, tmp_path):
+    """The prod bug: targets.json lives on Cloud Run's ephemeral disk, so every
+    redeploy silently reset the desk's edits. Reads must consult Firestore."""
+    monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "targets.json"))
+    cloud: dict = {}
+    monkeypatch.setattr(goals, "_use_cloud", lambda: True)
+    monkeypatch.setattr(goals, "_doc", lambda: _FakeDoc(cloud))
+
+    goals.set_targets({"thresholds": {"cost_per_qualified_lead_red": 300}})
+
+    # Redeploy: the container comes up with a blank disk.
+    (tmp_path / "targets.json").unlink()
+    assert goals.get_targets()["thresholds"]["cost_per_qualified_lead_red"] == 300
+
+
+def test_failed_cloud_write_is_not_reported_as_saved(monkeypatch, tmp_path):
+    """Saving to ephemeral disk only is not saving - say so rather than toast success."""
+    import pytest
+
+    monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "targets.json"))
+    monkeypatch.setattr(goals, "_use_cloud", lambda: True)
+    monkeypatch.setattr(goals, "_doc", lambda: _FakeDoc({}, fail=True))
+
+    with pytest.raises(RuntimeError):
+        goals.set_targets({"thresholds": {"cost_per_qualified_lead_red": 300}})
+
+
+def test_reset_clears_the_cloud_copy(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "targets.json"))
+    cloud: dict = {}
+    monkeypatch.setattr(goals, "_use_cloud", lambda: True)
+    monkeypatch.setattr(goals, "_doc", lambda: _FakeDoc(cloud))
+
+    goals.set_targets({"thresholds": {"cac_red": 4000}})
+    goals.reset_targets()
+    assert cloud == {}
+    assert goals.get_targets()["edited"] is False

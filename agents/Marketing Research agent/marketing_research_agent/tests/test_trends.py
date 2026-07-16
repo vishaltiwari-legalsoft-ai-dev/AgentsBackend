@@ -60,11 +60,12 @@ def test_insight_best_and_worst_cpql():
     assert any("Pricey Co" in t for t in texts)
 
 
-def test_insight_zero_lead_spender():
+def test_no_zero_lead_spender_banner():
+    """The desk asked for this banner off the Overview (7/9 review). Vendors that
+    spend with no leads are still named as a red flag inside the reports."""
     vd = [{"vendor": "Ghost", "metrics": [_m(7, spend=4600.0, leads=0, q=0)]}]
     out = trends.build(vd, today=TODAY)
-    z = next(i for i in out["insights"] if "zero leads" in i["text"].lower())
-    assert z["level"] == "warn" and "Ghost" in z["text"]
+    assert not any("zero leads" in i["text"].lower() for i in out["insights"])
 
 
 def test_insight_mom_mover():
