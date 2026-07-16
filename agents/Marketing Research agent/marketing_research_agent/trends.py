@@ -115,16 +115,16 @@ def _insights(monthly_list: list[dict], vendors: list[dict], today: date) -> lis
             qpct = (qproj - prev["qualified_leads"]) / prev["qualified_leads"] * 100
             text += f"; qualified leads tracking {qproj:.0f} vs {prev['qualified_leads']} ({qpct:+.0f}%)"
         level = "warn" if pct <= PACE_WARN_PCT or (qpct is not None and qpct <= PACE_WARN_PCT) else "info"
-        out.append({"level": level, "text": text})
+        out.append({"kind": "pace", "level": level, "text": text})
 
     # 2 — vendor efficiency (current month)
     ranked = sorted((v for v in vendors if v["cpql"]), key=lambda v: v["cpql"])
     if len(ranked) >= 2:
         best, worst = ranked[0], ranked[-1]
-        out.append({"level": "good",
+        out.append({"kind": "efficiency", "level": "good",
                     "text": f"Best cost per qualified lead: {best['vendor']} at ${best['cpql']:,.0f} MTD"})
         if worst["cpql"] >= CPQL_OUTLIER_X * best["cpql"]:
-            out.append({"level": "warn",
+            out.append({"kind": "efficiency", "level": "warn",
                         "text": (f"{worst['vendor']} pays ${worst['cpql']:,.0f} per qualified lead — "
                                  f"{worst['cpql'] / best['cpql']:.1f}x the best desk rate")})
 
@@ -139,6 +139,7 @@ def _insights(monthly_list: list[dict], vendors: list[dict], today: date) -> lis
                     pct = (b - a) / a * 100
                     fmt = (lambda n: f"${n:,.0f}") if money else (lambda n: f"{n:,.0f}")
                     out.append({
+                        "kind": "mover",
                         "level": "warn" if pct < 0 else "info",
                         "text": f"{label} moved {pct:+.0f}% in {_mname(prev['month'])} ({fmt(a)} → {fmt(b)})",
                     })

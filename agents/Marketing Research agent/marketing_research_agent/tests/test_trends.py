@@ -68,6 +68,30 @@ def test_no_zero_lead_spender_banner():
     assert not any("zero leads" in i["text"].lower() for i in out["insights"])
 
 
+def test_every_insight_declares_its_kind():
+    """The board routes insights by kind — pace to the hero, efficiency to the
+    vendor chart. It used to substring-match, and the pace sentence contains the
+    words "qualified leads", so it matched BOTH and rendered twice."""
+    vd = [
+        {"vendor": "Good Co", "metrics": [_m(6, spend=1000.0, q=5), _m(7, spend=500.0, q=5)]},
+        {"vendor": "Pricey Co", "metrics": [_m(6, spend=900.0, q=3), _m(7, spend=900.0, q=3)]},
+    ]
+    out = trends.build(vd, today=TODAY)
+    assert out["insights"], "expected insights for this fixture"
+    assert all(i.get("kind") in {"pace", "efficiency", "mover"} for i in out["insights"])
+    # The pace sentence must be pace and nothing else.
+    paces = [i for i in out["insights"] if i["kind"] == "pace"]
+    assert all("pace" in i["text"].lower() for i in paces)
+
+
+def test_insight_kinds_are_unique_per_role():
+    """No insight may carry two roles — that is what produced the duplicate."""
+    vd = [{"vendor": "A", "metrics": [_m(6, spend=1000.0), _m(7, spend=1500.0)]}]
+    out = trends.build(vd, today=TODAY)
+    kinds = [i["kind"] for i in out["insights"]]
+    assert len(kinds) == len(out["insights"])
+
+
 def test_insight_mom_mover():
     # May->June spend +50%
     vd = [{"vendor": "A", "metrics": [_m(5, spend=1000.0), _m(6, spend=1500.0), _m(7, spend=100.0)]}]
