@@ -32,14 +32,18 @@ def _fmt_money(v) -> str:
 
 def _offline_summary(kind: str, data: dict) -> str:
     """Deterministic plain-language read used when the LLM is unavailable.
-    Mirrors the prompt's house style: a couple of sentences + a recommendation."""
+
+    Mirrors the prompts' house style — and the shape the report doc's <Prose>
+    renders: a standalone verdict line, "- " bullet findings, then Recommend."""
     channels = data.get("channels") or {}
     issues = data.get("issues") or []
     totals = data.get("totals") or {}
-    parts: list[str] = []
+    lead = ""
+    bullets: list[str] = []
+    recommend = ""
 
     if totals.get("spend") is not None:
-        parts.append(
+        lead = (
             f"Total spend {_fmt_money(totals.get('spend'))} produced "
             f"{totals.get('demos_completed', 'n/a')} completed demos at "
             f"{_fmt_money(totals.get('cost_per_demo_completed'))} each."
@@ -52,40 +56,42 @@ def _offline_summary(kind: str, data: dict) -> str:
     )
     if len(ranked) >= 2:
         best, worst = ranked[0], ranked[-1]
-        parts.append(
-            f"{best[0]} is the most efficient channel at {_fmt_money(best[1])} per demo booked, "
-            f"while {worst[0]} is the most expensive at {_fmt_money(worst[1])}."
-        )
+        bullets.append(f"- {best[0]} is the most efficient channel at {_fmt_money(best[1])} per demo booked.")
+        bullets.append(f"- {worst[0]} is the most expensive at {_fmt_money(worst[1])} per demo booked.")
     elif ranked:
-        parts.append(f"{ranked[0][0]} is running at {_fmt_money(ranked[0][1])} per demo booked.")
+        bullets.append(f"- {ranked[0][0]} is running at {_fmt_money(ranked[0][1])} per demo booked.")
 
-    red_vendors = data.get("red_flag_vendors") or []
-    if red_vendors:
-        named = "; ".join(
-            f"{v.get('vendor')} — {(v.get('reasons') or ['flagged'])[0]}" for v in red_vendors[:4])
-        parts.append(f"Vendors on a red flag: {named}.")
+    # One bullet per flagged vendor — the desk reads these individually.
+    for v in (data.get("red_flag_vendors") or [])[:4]:
+        bullets.append(f"- Red flag: {v.get('vendor')} — {(v.get('reasons') or ['flagged'])[0]}.")
 
     if issues:
         top = issues[0]
-        parts.append(f"Top issue: {top.get('text', '')}.")
-        parts.append(f"Recommend: address {top.get('count', '')} flagged campaigns, starting with the worst offenders.")
+        bullets.append(f"- Top issue: {top.get('text', '')}.")
+        recommend = (f"Recommend: address {top.get('count', '')} flagged campaigns, "
+                     f"starting with the worst offenders.")
     else:
         # Non-campaign kinds.
         attribution = data.get("attribution")
         if attribution:
-            parts.append(f"{attribution.get('pct')}% of leads are attributed to a source.")
+            bullets.append(f"- {attribution.get('pct')}% of leads are attributed to a source.")
         comps = data.get("competitors")
         if comps:
             changed = [c.get("competitor") for c in comps if c.get("changed")]
-            parts.append(
-                f"{len(changed)} competitor(s) changed this period: {', '.join(changed)}." if changed
-                else "No material competitor changes detected."
+            bullets.append(
+                f"- {len(changed)} competitor(s) changed this period: {', '.join(changed)}." if changed
+                else "- No material competitor changes detected."
             )
         ranked_opps = data.get("ranked")
         if ranked_opps:
-            parts.append(f"{len(ranked_opps)} qualified media opportunities surfaced.")
+            bullets.append(f"- {len(ranked_opps)} qualified media opportunities surfaced.")
 
-    return " ".join(p for p in parts if p) or json.dumps(data, default=str)[:300]
+    if not lead:
+        # No totals line — promote the first finding so the read still opens with
+        # a standalone verdict rather than a bullet.
+        lead = bullets.pop(0).lstrip("- ") if bullets else ""
+    lines = [ln for ln in [lead, *bullets, recommend] if ln]
+    return "\n".join(lines) or json.dumps(data, default=str)[:300]
 
 
 def llm_json(prompt: str):

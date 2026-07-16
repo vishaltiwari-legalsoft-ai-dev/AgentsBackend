@@ -2,17 +2,26 @@ You are Legal Soft's marketing analyst writing the quarterly read for the
 leadership team. Using the JSON (blended totals, per-channel metrics, summarized
 issues), write a SHORT plain-language summary of the quarter to date.
 
+Shape your summary EXACTLY like this — it is rendered as discrete blocks, so one
+dense paragraph is unreadable:
+
+  <one sentence: the verdict for the quarter — pacing and efficiency>
+  - <point, with the number that matters>
+  - <point, with the number that matters>
+  Recommend: <the single most important action for the rest of the quarter>
+
 Rules:
-- Plain sentences only. NO markdown, NO asterisks, NO bullet points, NO headings.
-- 4-5 short sentences, then a final line that starts with "Recommend:" giving the
-  single most important action for the rest of the quarter.
-- Lead with the verdict for the quarter: pacing, efficiency, and the standout
-  channel in each direction.
+- The first line stands alone: the verdict only, no preamble. Max ~25 words.
+- Then 4-6 bullet lines, each starting "- ". ONE point per bullet, each carrying
+  the figure that proves it. Cover the standout channel in each direction.
 - Compare channels to their 2026 goals (cost per demo booked/completed, CAC,
   cost per qualified lead). Name the channel and the number that matters.
+- Plain language. No headings, no bold, no asterisks — the lead line and bullets
+  are the only structure.
 - If "period" is present, anchor the read to that window.
-- If "red_flag_vendors" is non-empty, name EVERY vendor in it and the reason it
-  is flagged, in one compact sentence. If it is empty, say nothing about red flags.
+- If "red_flag_vendors" is non-empty, give each flagged vendor its OWN bullet
+  naming the vendor and the reason. If it is empty, say nothing about red flags.
+- End with one final line starting with "Recommend:".
 
 Data:
 {data}

@@ -1,5 +1,7 @@
 from datetime import date
 
+import pytest
+
 from marketing_research_agent import reports
 from marketing_research_agent.schemas import CampaignMetric, Lead, MediaOpportunity
 
@@ -133,3 +135,27 @@ def test_daily_movement_has_a_real_prompt():
     prompt = analysis.load_prompt("daily_movement")
     assert prompt != "{data}"
     assert "Recommend:" in prompt and "{data}" in prompt
+
+
+# Every kind whose narrative is rendered by the report doc's <Prose>, which turns
+# a lead line + "- " bullets into readable blocks. The desk called these reports
+# unreadable while the prompts were ordering "NO bullet points" — guard the
+# instruction against drifting away from the renderer again.
+NARRATIVE_KINDS = [
+    "daily_summary", "weekly_summary", "monthly_summary",
+    "quarterly_summary", "threshold_alert", "daily_movement",
+]
+
+
+@pytest.mark.parametrize("kind", NARRATIVE_KINDS)
+def test_narrative_prompt_asks_for_the_shape_the_doc_renders(kind):
+    from marketing_research_agent import analysis
+
+    prompt = analysis.load_prompt(kind)
+    low = prompt.lower()
+    assert "{data}" in prompt, f"{kind}: prompt lost its data slot"
+    assert "recommend:" in low, f"{kind}: no Recommend line"
+    assert "bullet" in low, f"{kind}: does not ask for bullets"
+    assert "\n- " in prompt, f"{kind}: does not show the '- ' marker"
+    assert "no markdown" not in low, f"{kind}: blanket markdown ban contradicts bullets"
+    assert "no bullet" not in low, f"{kind}: still forbids the bullets the doc renders"
