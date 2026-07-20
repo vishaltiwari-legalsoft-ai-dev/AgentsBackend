@@ -1,15 +1,12 @@
-"""SEO Analyst agent (marketing department) — Legal Soft.
+"""SEO + GEO agent (marketing department) — Legal Soft.
 
-Scaffold only. Importable package root: ``seo_agent`` (the parent folders
-contain spaces, so the outer folder goes on ``sys.path`` and this
-underscore-named package is imported from it — same pattern as
-``graphics_designer_agent``).
+Frontend card ``a2`` ("SEO Analyst"). Two capabilities:
+- P1 content optimizer: analyze a keyword's live SERP into a Benchmark, then
+  score drafts against it live (pure function, no I/O in the hot path).
+- P2 GEO skeleton: weekly AI-answer visibility runs → GEO score /10 per brand.
 
-Capabilities, pipeline, and module layout are still being designed — see the
-frontend card (id ``a2``, "SEO Analyst": audits pages, finds keyword gaps,
-writes optimization briefs). Nothing here is wired into the app yet.
+Importable package root: ``seo_agent`` (outer folder has spaces and goes on
+``sys.path`` — same pattern as ``marketing_research_agent``).
 """
 
 from __future__ import annotations
-
-__all__: list[str] = []
