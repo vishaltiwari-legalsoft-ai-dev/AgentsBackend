@@ -76,3 +76,52 @@ def test_score_is_weighted_blend_0_100():
     # report.score is rounded to 0.1 and subscores to 4dp — allow that slack
     assert abs(report.score - expected) < 0.06
     assert 0 <= report.score <= 100
+
+
+def test_term_report_covers_all_targets_with_statuses():
+    text = "intake intake intake " + "salary " * 10 + "filler " * 30
+    # intake=3 → ok in [2,4]; salary=10 → past 2*2.0 ceiling → overused
+    report = score_draft(text, None, _benchmark(), CFG)
+    rows = {r.term: r for r in report.term_report}
+    assert set(rows) == {"intake", "salary"}
+    assert rows["intake"].status == "ok" and rows["intake"].used == 3
+    assert rows["salary"].status == "overused" and rows["salary"].used == 10
+    assert [r.term for r in report.term_report] == ["intake", "salary"]  # weight desc
+
+
+def test_term_report_missing_and_low_statuses():
+    report = score_draft("intake " + "filler " * 30, None, _benchmark(), CFG)
+    rows = {r.term: r for r in report.term_report}
+    assert rows["intake"].status == "low"       # 1 < min_count 2
+    assert rows["salary"].status == "missing"   # 0 uses
+
+
+def test_topic_coverage_lists_present_missing_and_questions():
+    report = score_draft("filler " * 30, None, _benchmark(), CFG)
+    tc = report.topic_coverage[0]
+    assert tc.name == "Role"
+    assert tc.terms_present == [] and tc.terms_missing == ["intake"]
+    assert tc.questions_unanswered == ["What does an intake specialist do?"]
+    covered = score_draft(
+        "intake specialist answers calls. What does an intake specialist do? " + "filler " * 30,
+        None, _benchmark(), CFG)
+    tc2 = covered.topic_coverage[0]
+    assert tc2.terms_present == ["intake"] and tc2.terms_missing == []
+    assert tc2.questions_unanswered == []
+
+
+def test_structure_block_always_present():
+    report = score_draft(_draft(40, 3), None, _benchmark(), CFG)
+    s = report.structure
+    assert s is not None
+    assert s.word_count_range == [20, 60] and s.heading_count_range == [2, 4]
+    assert s.heading_count == 3
+    assert s.faq_needed is False
+
+
+def test_structure_faq_flags():
+    b = _benchmark(paa_questions=["How much does it cost?"])
+    no_faq = score_draft(_draft(40, 3), None, b, CFG)
+    assert no_faq.structure.faq_needed is True and no_faq.structure.faq_present is False
+    with_faq = score_draft("# FAQ\n" + _draft(40, 2), None, b, CFG)
+    assert with_faq.structure.faq_needed is True and with_faq.structure.faq_present is True

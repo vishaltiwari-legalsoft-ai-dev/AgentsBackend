@@ -64,6 +64,31 @@ class Benchmark(BaseModel):
     topics_fallback_reason: str | None = None
 
 
+class TermReportRow(BaseModel):
+    term: str
+    weight: float = 1.0
+    min_count: int = 1
+    max_count: int = 3
+    used: int = 0
+    status: str = "missing"  # "missing" | "low" | "ok" | "overused"
+
+
+class TopicCoverage(BaseModel):
+    name: str
+    terms_present: list[str] = Field(default_factory=list)
+    terms_missing: list[str] = Field(default_factory=list)
+    questions_unanswered: list[str] = Field(default_factory=list)
+
+
+class StructureStatus(BaseModel):
+    word_count: int = 0
+    word_count_range: list[int] = Field(default_factory=lambda: [0, 0])
+    heading_count: int = 0
+    heading_count_range: list[int] = Field(default_factory=lambda: [0, 0])
+    faq_needed: bool = False
+    faq_present: bool = False
+
+
 class ScoreReport(BaseModel):
     score: float                      # 0-100
     term_coverage: float              # each subscore 0-1
@@ -73,6 +98,9 @@ class ScoreReport(BaseModel):
     missing_terms: list[dict] = Field(default_factory=list)  # {term, used, min_count, max_count}
     questions_unanswered: list[str] = Field(default_factory=list)
     structure_notes: list[str] = Field(default_factory=list)
+    term_report: list[TermReportRow] = Field(default_factory=list)   # every target, weight desc
+    topic_coverage: list[TopicCoverage] = Field(default_factory=list)
+    structure: StructureStatus | None = None
 
 
 class GeoAnswer(BaseModel):

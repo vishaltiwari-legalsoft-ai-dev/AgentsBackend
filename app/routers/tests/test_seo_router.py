@@ -170,3 +170,13 @@ def test_config_roundtrip_as_admin():
         client.put("/api/seo/config", json={"w_term_coverage": 0.5,
                                             "brands": {"x": {"name": "X", "domain": "x.com"}}})
         assert client.get("/api/seo/config").json()["w_term_coverage"] == 0.5
+
+
+def test_score_response_includes_surfer_fields():
+    bid = _seed_benchmark()
+    body = {"benchmark_id": bid, "draft_text": "intake " + "w " * 30}
+    r = client.post("/api/seo/score", json=body).json()
+    assert {row["term"] for row in r["term_report"]} == {"intake"}
+    assert r["term_report"][0]["status"] in ("missing", "low", "ok", "overused")
+    assert r["structure"]["word_count_range"] == [20, 60]
+    assert isinstance(r["topic_coverage"], list)

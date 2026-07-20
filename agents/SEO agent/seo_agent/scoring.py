@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 
-from seo_agent.schemas import Benchmark, ScoreReport
+from seo_agent.schemas import Benchmark, ScoreReport, StructureStatus, TermReportRow, TopicCoverage
 from seo_agent.terms import tokenize
 
 _HEADING_RE = re.compile(r"^#{1,6}\s+(.+)$", flags=re.MULTILINE)
@@ -27,6 +27,16 @@ def _term_credit(used: int, lo: int, hi: int, zero_multiple: float) -> float:
     if used >= ceiling:
         return 0.0
     return 1.0 - (used - hi) / (ceiling - hi)
+
+
+def _term_status(used: int, lo: int, hi: int) -> str:
+    if used <= 0:
+        return "missing"
+    if used < lo:
+        return "low"
+    if used <= hi:
+        return "ok"
+    return "overused"
 
 
 def _range_credit(value: int, lo: int, hi: int) -> float:
@@ -74,17 +84,24 @@ def score_draft(
 
     # --- term coverage (weighted by term importance) ---
     missing_terms: list[dict] = []
+    term_report: list[TermReportRow] = []
     total_weight = sum(t.weight for t in benchmark.term_targets) or 1.0
     earned = 0.0
     for target in benchmark.term_targets:
         used = _term_count(target.term, counts, joined)
         credit = _term_credit(used, target.min_count, target.max_count, zero_multiple)
         earned += target.weight * credit
+        term_report.append(TermReportRow(
+            term=target.term, weight=target.weight,
+            min_count=target.min_count, max_count=target.max_count,
+            used=used, status=_term_status(used, target.min_count, target.max_count),
+        ))
         if credit < 1.0 and used < target.min_count:
             missing_terms.append({
                 "term": target.term, "used": used,
                 "min_count": target.min_count, "max_count": target.max_count,
             })
+    term_report.sort(key=lambda r: r.weight, reverse=True)
     term_coverage = earned / total_weight
 
     # --- topical completeness (topic hit = ≥half its terms present) ---
@@ -93,13 +110,21 @@ def score_draft(
         if not _question_answered(q, text_lower, headings_lower)
     ]
     topic_scores: list[float] = []
+    topic_coverage: list[TopicCoverage] = []
     for topic in benchmark.topics:
         t_terms = [t for t in topic.terms if t]
-        term_hit = (
-            sum(1 for t in t_terms if _term_count(t, counts, joined) > 0) / len(t_terms)
-            if t_terms else 0.0
-        )
+        present = [t for t in t_terms if _term_count(t, counts, joined) > 0]
+        term_hit = len(present) / len(t_terms) if t_terms else 0.0
         topic_scores.append(term_hit)
+        topic_coverage.append(TopicCoverage(
+            name=topic.name,
+            terms_present=present,
+            terms_missing=[t for t in t_terms if t not in present],
+            questions_unanswered=[
+                q for q in topic.questions
+                if not _question_answered(q, text_lower, headings_lower)
+            ],
+        ))
     q_total = len(benchmark.questions)
     q_score = (q_total - len(questions_unanswered)) / q_total if q_total else 1.0
     parts = topic_scores + [q_score]
@@ -120,14 +145,18 @@ def score_draft(
         structure_notes.append(f"Trim toward {wc_lo}-{wc_hi} words (have {word_count})")
     if len(headings) < h_lo:
         structure_notes.append(f"Add headings (have {len(headings)}, target {h_lo}-{h_hi})")
-    if benchmark.paa_questions and not any(
-        "faq" in h or "question" in h for h in headings_lower
-    ):
+    faq_present = any("faq" in h or "question" in h for h in headings_lower)
+    if benchmark.paa_questions and not faq_present:
         structure_parts.append(0.0)
         structure_notes.append("Add an FAQ section — Google shows People-Also-Ask for this keyword")
     else:
         structure_parts.append(1.0)
     structure_fit = sum(structure_parts) / len(structure_parts)
+    structure = StructureStatus(
+        word_count=word_count, word_count_range=[wc_lo, wc_hi],
+        heading_count=len(headings), heading_count_range=[h_lo, h_hi],
+        faq_needed=bool(benchmark.paa_questions), faq_present=faq_present,
+    )
 
     # --- semantic depth (local proxies only) ---
     unique_ratio = len(set(tokens)) / len(tokens) if tokens else 0.0
@@ -157,4 +186,7 @@ def score_draft(
         missing_terms=missing_terms,
         questions_unanswered=questions_unanswered,
         structure_notes=structure_notes,
+        term_report=term_report,
+        topic_coverage=topic_coverage,
+        structure=structure,
     )
