@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-from app.security import get_current_user
+from app.security import get_current_user, require_admin
 
 from seo_agent import store
 from seo_agent.analyze import AnalysisError, run_analysis
@@ -144,11 +144,14 @@ def geo_run_detail(rid: str, user=Depends(get_current_user)):
 
 
 @router.get("/seo/config")
-def config_get(user=Depends(get_current_user)):
+def config_get(user=Depends(require_admin)):
+    """Creator/admin only: scoring weights, GEO engines, and per-brand config."""
     return effective_config(store.load_config())
 
 
 @router.put("/seo/config")
-def config_put(overrides: dict, user=Depends(get_current_user)):
+def config_put(overrides: dict, user=Depends(require_admin)):
+    """Creator/admin only. ``require_admin`` also passes creators — see
+    ``app.security.is_admin`` (creators are a superset of Super Admins)."""
     store.save_config(overrides)
     return effective_config(store.load_config())

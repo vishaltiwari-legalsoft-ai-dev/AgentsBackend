@@ -1,5 +1,6 @@
 """Integration tests for the SEO router (/api/seo). Fully offline."""
 
+import contextlib
 import os
 
 os.environ["SEO_OFFLINE"] = "1"
@@ -14,9 +15,35 @@ app.dependency_overrides[get_current_user] = lambda: {"id": "u1", "email": "t@le
 client = TestClient(app)
 
 
+@contextlib.contextmanager
+def _as_user(user: dict):
+    """Temporarily override get_current_user for one test, restoring whatever
+    override (if any) was previously in place — ``app.dependency_overrides``
+    is a single shared dict on the app singleton, mutated at module level by
+    several test files, so a test must never clobber it with a hardcoded
+    value on exit (that would silently break other files' tests depending on
+    collection/run order)."""
+    previous = app.dependency_overrides.get(get_current_user)
+    app.dependency_overrides[get_current_user] = lambda: user
+    try:
+        yield
+    finally:
+        if previous is not None:
+            app.dependency_overrides[get_current_user] = previous
+        else:
+            app.dependency_overrides.pop(get_current_user, None)
+
+
 @pytest.fixture(autouse=True)
 def _runs_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("SEO_RUNS_DIR", str(tmp_path))
+    # load_config()'s TTL cache (I5) is module-global; each test gets a fresh
+    # SEO_RUNS_DIR, so a cached value from another test must not leak in.
+    from seo_agent import store
+
+    store._config_cache = None
+    yield
+    store._config_cache = None
 
 
 def _seed_benchmark() -> str:
@@ -130,9 +157,16 @@ def test_geo_capture_nothing_returns_401(monkeypatch):
     assert response.status_code == 401
 
 
-def test_config_roundtrip():
-    got = client.get("/api/seo/config").json()
-    assert got["w_term_coverage"] == 0.40          # defaults visible
-    client.put("/api/seo/config", json={"w_term_coverage": 0.5,
-                                        "brands": {"x": {"name": "X", "domain": "x.com"}}})
-    assert client.get("/api/seo/config").json()["w_term_coverage"] == 0.5
+def test_config_get_and_put_reject_non_admin():
+    with _as_user({"id": "u1", "email": "t@legalsoft.com"}):
+        assert client.get("/api/seo/config").status_code == 403
+        assert client.put("/api/seo/config", json={"w_term_coverage": 0.5}).status_code == 403
+
+
+def test_config_roundtrip_as_admin():
+    with _as_user({"id": "a1", "email": "admin@legalsoft.com", "is_admin": True}):
+        got = client.get("/api/seo/config").json()
+        assert got["w_term_coverage"] == 0.40          # defaults visible
+        client.put("/api/seo/config", json={"w_term_coverage": 0.5,
+                                            "brands": {"x": {"name": "X", "domain": "x.com"}}})
+        assert client.get("/api/seo/config").json()["w_term_coverage"] == 0.5
