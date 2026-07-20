@@ -12,7 +12,6 @@ _BACKEND_ROOT = Path(__file__).resolve().parents[1]
 _AGENT_ROOTS = [
     _BACKEND_ROOT / "agents" / "Graphics designer agent",
     _BACKEND_ROOT / "agents" / "Marketing Research agent",
-    _BACKEND_ROOT / "agents" / "SEO agent",
 ]
 for _root in _AGENT_ROOTS:
     if _root.is_dir() and str(_root) not in sys.path:

@@ -24,11 +24,6 @@ _MODEL_FIELDS = (
     "openrouter_vision_model",
 )
 
-# Additional standalone secrets manageable from the same panel (masked, no
-# model catalog / dropdown — just a value + set/unset state).
-_SECRET_FIELDS = ("serpapi_key",)
-
-
 def _mask(secret: str) -> str:
     """Show only enough of a secret to recognise it — never the full value."""
     if not secret:
@@ -46,11 +41,6 @@ def _settings_payload() -> dict:
         "override" if overrides.get("openrouter_api_key")
         else "env" if settings.openrouter_api_key else "unset"
     )
-    serpapi_key = runtime_config.get("serpapi_key")
-    serpapi_source = (
-        "override" if overrides.get("serpapi_key")
-        else "env" if settings.serpapi_key else "unset"
-    )
     return {
         "openrouter": {
             "api_key_set": bool(key),
@@ -60,13 +50,6 @@ def _settings_payload() -> dict:
             "fast_model": runtime_config.get("openrouter_fast_model"),
             "image_model": runtime_config.get("openrouter_image_model"),
             "vision_model": runtime_config.get("openrouter_vision_model"),
-        },
-        # SerpAPI (SEO + GEO agent): a single standalone key, masked like the
-        # OpenRouter key. No model catalog — it's just a search API key.
-        "serpapi": {
-            "api_key_set": bool(serpapi_key),
-            "api_key_hint": _mask(serpapi_key),
-            "api_key_source": serpapi_source,
         },
         # Per-field provenance so the UI can show "from env" vs "set here".
         "sources": {
@@ -84,7 +67,6 @@ class AdminSettingsBody(BaseModel):
     openrouter_fast_model: str | None = None
     openrouter_image_model: str | None = None
     openrouter_vision_model: str | None = None
-    serpapi_key: str | None = None
 
 
 @router.get("/admin/settings")
@@ -97,14 +79,13 @@ def get_admin_settings(_creator: dict = Depends(require_creator)) -> dict:
 def update_admin_settings(
     body: AdminSettingsBody, _creator: dict = Depends(require_creator)
 ) -> dict:
-    """Super Admin: save the OpenRouter key, model ids, and other standalone
-    secrets (e.g. serpapi_key, used by the SEO + GEO agent) to Firestore.
+    """Super Admin: save the OpenRouter key and model ids to Firestore.
 
     Only provided fields are written. An empty string clears that override so the
     value reverts to the environment default. The raw key is never logged.
     """
     patch: dict[str, str] = {}
-    for field in ("openrouter_api_key", *_MODEL_FIELDS, *_SECRET_FIELDS):
+    for field in ("openrouter_api_key", *_MODEL_FIELDS):
         value = getattr(body, field)
         if value is None:
             continue
@@ -424,7 +405,7 @@ def list_users(_admin: dict = Depends(require_admin)) -> dict:
 
 # Field names whose values must never be shown in full, wherever they appear
 # (top-level or nested). Secrets are masked to a recognisable hint instead.
-_SENSITIVE_FIELDS = {"openrouter_api_key", "serpapi_key", "api_key", "google_sub", "jwt_secret"}
+_SENSITIVE_FIELDS = {"openrouter_api_key", "api_key", "google_sub", "jwt_secret"}
 
 # Long text/blobs are truncated per cell so a single huge field (e.g. a base64
 # string) can't bloat the table; the truncation is signalled in the value.

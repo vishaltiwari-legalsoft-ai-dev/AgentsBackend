@@ -25,7 +25,6 @@ OVERRIDE_FIELDS: tuple[str, ...] = (
     "openrouter_image_model",
     "openrouter_vision_model",
     "gd_planner_model",
-    "serpapi_key",
 )
 
 # Model fields that may additionally be overridden *per agent* in the creator's
