@@ -129,7 +129,7 @@ MODEL_CATALOG: dict[str, list[dict[str, str | bool]]] = {
 # rest store config for when they go live. Keep ids in sync with the frontend.
 AGENTS: list[dict[str, str | bool]] = [
     {"id": "a1", "name": "Graphic Designer", "role": "Brand & visual assets", "category": "design", "live": True},
-    {"id": "a2", "name": "SEO Analyst", "role": "Search & rankings", "category": "seo", "live": False},
+    {"id": "a2", "name": "SEO Analyst", "role": "Search & rankings", "category": "seo", "live": True},
     {"id": "a3", "name": "Copywriter", "role": "Words that convert", "category": "copy", "live": False},
     {"id": "a4", "name": "Social Scheduler", "role": "Posts & calendars", "category": "social", "live": False},
     {"id": "a5", "name": "Ads Optimizer", "role": "Paid performance", "category": "ads", "live": False},

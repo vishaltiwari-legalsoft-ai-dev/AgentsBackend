@@ -49,6 +49,8 @@ class Settings(BaseSettings):
 
     # OpenRouter (agent LLM + image generation)
     openrouter_api_key: str = ""
+    # SerpAPI (SEO agent live SERP capture)
+    serpapi_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     # Reasoning model — the agent's "brain" for piecing everything together:
     # brand persona compilation, creative-type decision, and master-prompt
