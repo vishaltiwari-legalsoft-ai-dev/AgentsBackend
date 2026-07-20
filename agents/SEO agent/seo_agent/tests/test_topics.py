@@ -50,3 +50,37 @@ def test_llm_failure_falls_back_honestly():
     assert len(topics) == 1 and topics[0].name == "Key terms (statistical)"
     assert topics[0].terms == ["intake", "salary", "qualification"]
     assert questions == PAA          # PAA questions still usable without the LLM
+
+
+class CaptureLLM:
+    def __init__(self):
+        self.prompt = None
+
+    def invoke(self, prompt):
+        self.prompt = prompt
+
+        class R:
+            content = ('{"topics": [{"name": "A", "terms": ["intake"], "questions": []}],'
+                       ' "questions": []}')
+        return R()
+
+
+def test_brand_context_reaches_prompt():
+    from seo_agent.topics import build_brand_context
+
+    ctx = build_brand_context({
+        "name": "LegalSoft", "domain": "legalsoft.com",
+        "category": "legal intake outsourcing",
+        "competitors": ["Alert Communications"],
+    })
+    llm = CaptureLLM()
+    group_topics(TARGETS, PAA, "kw", llm=llm, brand_context=ctx)
+    assert "LegalSoft" in llm.prompt
+    assert "legal intake outsourcing" in llm.prompt
+    assert "Alert Communications" in llm.prompt
+
+
+def test_no_brand_context_keeps_prompt_generic():
+    llm = CaptureLLM()
+    group_topics(TARGETS, PAA, "kw", llm=llm)
+    assert "written FOR this business" not in llm.prompt

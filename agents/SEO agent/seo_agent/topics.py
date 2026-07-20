@@ -25,6 +25,23 @@ Return ONLY JSON:
   "questions": [str]}}
 "questions" is the deduplicated union of all questions an article should answer."""
 
+_BRAND_BLOCK = """
+
+The article is being written FOR this business — make every topic name and
+question relevant to it, not generic SEO advice:
+- Brand: {name} ({domain})
+- What they do: {category}
+- Competitors to be aware of: {competitors}"""
+
+
+def build_brand_context(brand_cfg: dict) -> str:
+    return _BRAND_BLOCK.format(
+        name=brand_cfg.get("name", ""),
+        domain=brand_cfg.get("domain", ""),
+        category=brand_cfg.get("category", "this industry"),
+        competitors=", ".join(brand_cfg.get("competitors", [])) or "(none listed)",
+    )
+
 
 def _default_llm():
     from app.services import openrouter, runtime_config
@@ -54,14 +71,16 @@ def group_topics(
     paa_questions: list[str],
     keyword: str,
     llm=None,
+    brand_context: str | None = None,
 ) -> tuple[list[Topic], list[str], bool, str | None]:
     try:
         model = llm or _default_llm()
-        reply = model.invoke(_PROMPT.format(
+        prompt = _PROMPT.format(
             keyword=keyword,
             terms=", ".join(t.term for t in term_targets),
             paa="; ".join(paa_questions) or "(none)",
-        ))
+        ) + (brand_context or "")
+        reply = model.invoke(prompt)
         data = _extract_json(str(reply.content))
         topics = [Topic(**t) for t in data.get("topics", [])]
         questions = [q for q in data.get("questions", []) if isinstance(q, str)]

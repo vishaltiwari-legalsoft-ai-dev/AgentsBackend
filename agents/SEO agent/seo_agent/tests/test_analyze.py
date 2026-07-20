@@ -48,3 +48,27 @@ def test_too_few_pages_fails_with_reason():
 
     with pytest.raises(AnalysisError, match=r"only 0 of .* pages"):
         run_analysis("kw", "US", "b", provider=FixtureProvider(FIXTURE), fetcher=broken_fetcher)
+
+
+def test_analysis_passes_brand_context_when_brand_configured(monkeypatch):
+    from seo_agent.config import DEFAULTS
+    from seo_agent.schemas import Topic
+
+    captured = {}
+
+    def fake_group(tt, paa, kw, llm=None, brand_context=None):
+        captured["ctx"] = brand_context
+        return ([Topic(name="T", terms=[], questions=[])], [], True, None)
+
+    monkeypatch.setattr("seo_agent.analyze.group_topics", fake_group)
+    monkeypatch.setattr("seo_agent.analyze._cfg", lambda: {
+        **DEFAULTS, "min_pages": 3,
+        "brands": {"legalsoft": {"name": "LegalSoft", "category": "legal intake outsourcing"}},
+    })
+    run_analysis("kw", "US", "legalsoft", provider=FixtureProvider(FIXTURE), fetcher=_fetcher)
+    assert "LegalSoft" in (captured["ctx"] or "")
+
+    captured.clear()
+    monkeypatch.setattr("seo_agent.analyze._cfg", lambda: {**DEFAULTS, "min_pages": 3})
+    run_analysis("kw", "US", "unknown-brand", provider=FixtureProvider(FIXTURE), fetcher=_fetcher)
+    assert captured["ctx"] is None

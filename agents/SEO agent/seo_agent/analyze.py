@@ -13,7 +13,7 @@ from seo_agent.filters import filter_entries
 from seo_agent.schemas import Benchmark
 from seo_agent.serp import get_provider
 from seo_agent.terms import build_term_targets, structure_ranges
-from seo_agent.topics import group_topics
+from seo_agent.topics import build_brand_context, group_topics
 
 
 class AnalysisError(RuntimeError):
@@ -62,8 +62,11 @@ def run_analysis(
     ranges = structure_ranges(pages)
 
     emit("Grouping topics (AI pass)…")
+    brand_cfg = (cfg.get("brands") or {}).get(brand)
+    brand_context = build_brand_context(brand_cfg) if brand_cfg else None
     topics, questions, ai, fallback_reason = group_topics(
-        term_targets, serp_result.paa_questions, keyword, llm=llm
+        term_targets, serp_result.paa_questions, keyword,
+        llm=llm, brand_context=brand_context,
     )
 
     benchmark = Benchmark(
