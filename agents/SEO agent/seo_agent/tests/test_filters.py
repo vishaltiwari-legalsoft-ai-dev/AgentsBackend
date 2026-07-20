@@ -41,3 +41,19 @@ def test_top_n_cap_applies_after_filtering():
     assert kept[0].position == 1
     overflow = [d for d in excluded if d["reason"] == "beyond-top-n"]
     assert len(overflow) == 4
+
+
+def test_lookalike_domains_are_not_blocked():
+    entries = [
+        _entry(1, "https://amazon.computer.com/products"),
+        _entry(2, "https://reddit.company.com/page"),
+        _entry(3, "https://findlaw.com/lawyersearchtool"),
+        _entry(4, "https://findlaw.com/lawyers/smith"),
+    ]
+    kept, excluded = filter_entries(entries, top_n=10)
+    assert [e.url for e in kept] == [
+        "https://amazon.computer.com/products",
+        "https://reddit.company.com/page",
+        "https://findlaw.com/lawyersearchtool",
+    ]
+    assert excluded == [{"url": "https://findlaw.com/lawyers/smith", "reason": "blocklist:findlaw.com/lawyers"}]

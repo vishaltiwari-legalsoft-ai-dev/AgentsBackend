@@ -28,7 +28,10 @@ def _block_reason(entry: SerpEntry) -> str | None:
     domain = _domain(entry.url)
     full = f"{domain}{urlparse(entry.url).path.lower()}"
     for blocked in BLOCKLIST_DOMAINS:
-        if domain == blocked or domain.endswith("." + blocked) or full.startswith(blocked):
+        if "/" in blocked:
+            if full == blocked or full.startswith(blocked + "/"):
+                return f"blocklist:{blocked}"
+        elif domain == blocked or domain.endswith("." + blocked):
             return f"blocklist:{blocked}"
     return None
 
