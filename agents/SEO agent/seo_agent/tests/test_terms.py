@@ -63,3 +63,14 @@ def test_structure_ranges_are_iqr_not_minmax():
     assert hi < 9000                  # outlier does not define the ceiling
     h_lo, h_hi = ranges["heading_count_range"]
     assert h_lo >= 8 and h_hi < 40
+
+
+def test_two_page_term_range_spans_min_to_max():
+    pages = [
+        _page(1, "widget " * 2 + "filler stuff here " * 10),
+        _page(2, "widget " * 6 + "filler stuff here " * 10),
+    ]
+    targets = build_term_targets(pages, "kw", CFG)
+    widget = next(t for t in targets if t.term == "widget")
+    assert widget.min_count == 2
+    assert widget.max_count == 6

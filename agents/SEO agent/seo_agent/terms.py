@@ -39,12 +39,16 @@ def _page_weight(rank: int, cfg: dict) -> float:
 
 
 def _quartile_range(values: list[int]) -> list[int]:
-    """[Q1, Q3] of the values — robust to a single outlier page."""
+    """[Q1, Q3] of the values — robust to a single outlier page. Fewer than
+    4 samples have no meaningful quartiles: use [min, max] so the range
+    stays honest instead of collapsing to a single value."""
     vs = sorted(values)
     if not vs:
         return [0, 0]
-    q1 = vs[max(0, (len(vs) - 1) // 4)]
-    q3 = vs[min(len(vs) - 1, (3 * (len(vs) - 1)) // 4)]
+    if len(vs) < 4:
+        return [vs[0], vs[-1]]
+    q1 = vs[(len(vs) - 1) // 4]
+    q3 = vs[(3 * (len(vs) - 1)) // 4]
     return [q1, max(q3, q1)]
 
 
