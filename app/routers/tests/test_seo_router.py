@@ -94,6 +94,42 @@ def test_geo_overview_and_run_detail():
     assert run["no_data_engines"] == ["gemini"]
 
 
+def test_geo_capture_valid_cron_key_no_session_returns_200(monkeypatch):
+    monkeypatch.setenv("SEO_CRON_KEY", "shhh")
+    monkeypatch.setattr("app.routers.seo.run_geo_capture", lambda: [])
+    response = client.post("/api/seo/geo/capture", headers={"X-Cron-Key": "shhh"})
+    assert response.status_code == 200
+    assert response.json() == {"runs": []}
+
+
+def test_geo_capture_wrong_cron_key_no_session_returns_401(monkeypatch):
+    monkeypatch.setenv("SEO_CRON_KEY", "shhh")
+    monkeypatch.setattr("app.routers.seo.run_geo_capture", lambda: [])
+    response = client.post("/api/seo/geo/capture", headers={"X-Cron-Key": "wrong"})
+    assert response.status_code == 401
+
+
+def test_geo_capture_no_cron_key_valid_session_returns_200(monkeypatch):
+    monkeypatch.delenv("SEO_CRON_KEY", raising=False)
+    monkeypatch.setattr("app.routers.seo.run_geo_capture", lambda: [])
+    monkeypatch.setattr(
+        "app.routers.seo.get_current_user",
+        lambda credentials: {"id": "u1", "email": "t@legalsoft.com"},
+    )
+    response = client.post(
+        "/api/seo/geo/capture", headers={"Authorization": "Bearer faketoken"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"runs": []}
+
+
+def test_geo_capture_nothing_returns_401(monkeypatch):
+    monkeypatch.delenv("SEO_CRON_KEY", raising=False)
+    monkeypatch.setattr("app.routers.seo.run_geo_capture", lambda: [])
+    response = client.post("/api/seo/geo/capture")
+    assert response.status_code == 401
+
+
 def test_config_roundtrip():
     got = client.get("/api/seo/config").json()
     assert got["w_term_coverage"] == 0.40          # defaults visible

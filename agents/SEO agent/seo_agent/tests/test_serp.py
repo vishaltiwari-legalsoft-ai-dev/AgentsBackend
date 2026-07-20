@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import httpx
 import pytest
 
 from seo_agent import serp
@@ -49,3 +50,23 @@ def test_serpapi_provider_builds_request(monkeypatch):
     assert captured["params"]["location"] == "United States"
     assert captured["params"]["api_key"] == "test-key"
     assert len(result.entries) == 5
+
+
+def test_serpapi_provider_sanitizes_http_status_error(monkeypatch):
+    """A failing SerpAPI call must never leak the request URL/api_key to callers."""
+
+    class FakeClient:
+        def get(self, url, params=None, timeout=None):
+            request = httpx.Request(
+                "GET", "https://serpapi.com/search?q=x&api_key=SECRET123"
+            )
+            return httpx.Response(401, request=request)
+
+    monkeypatch.setattr(serp, "_serpapi_key", lambda: "SECRET123")
+    provider = serp.SerpApiProvider(client=FakeClient())
+    with pytest.raises(RuntimeError) as excinfo:
+        provider.fetch("legal intake specialist", "United States")
+    message = str(excinfo.value)
+    assert "SECRET123" not in message
+    assert "api_key" not in message
+    assert "401" in message

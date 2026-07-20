@@ -75,8 +75,17 @@ class SerpApiProvider:
             "engine": "google", "q": keyword, "location": location,
             "num": 20, "api_key": _serpapi_key(),
         }
-        response = self._client.get(_SERPAPI_URL, params=params, timeout=30)
-        response.raise_for_status()
+        try:
+            response = self._client.get(_SERPAPI_URL, params=params, timeout=30)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # Never let the request URL (it embeds api_key as a query param) reach
+            # callers/clients — sanitize before re-raising.
+            raise RuntimeError(
+                f"SerpAPI returned HTTP {exc.response.status_code} for keyword {keyword!r}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"SerpAPI request failed: {type(exc).__name__}") from exc
         return _parse_serpapi(response.json(), keyword, location)
 
 
