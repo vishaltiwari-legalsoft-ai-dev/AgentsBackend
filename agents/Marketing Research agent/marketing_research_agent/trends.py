@@ -9,6 +9,8 @@ import calendar
 from collections import defaultdict
 from datetime import date, datetime
 
+from . import config
+
 PACE_WARN_PCT = -15.0
 MOVER_PCT = 30.0
 CPQL_OUTLIER_X = 2.0
@@ -27,8 +29,9 @@ def _blk() -> dict:
     return {"spend": 0.0, "leads": 0, "qualified_leads": 0, "demos_booked": 0, "demos_completed": 0}
 
 
-def _add(b: dict, m) -> None:
-    b["spend"] += m.spend or 0
+def _add(b: dict, m, *, media: bool = True) -> None:
+    if media:
+        b["spend"] += m.spend or 0
     b["leads"] += int(m.leads or 0)
     b["qualified_leads"] += int(m.qualified_leads or 0)
     b["demos_booked"] += int(m.demos_booked or 0)
@@ -53,7 +56,9 @@ def build(vendor_datasets: list[dict], today: date | None = None) -> dict:
                 continue  # pre-filled future retainer months
             any_metrics = True
             k = _mkey(m.date.year, m.date.month)
-            _add(monthly[k], m)
+            # Blended monthly spend is media-only (sheet convention); the
+            # channel's own series and the vendor card keep their spend.
+            _add(monthly[k], m, media=m.channel not in config.NON_MEDIA_CHANNELS)
             _add(channels[m.channel][k], m)
             _add(vseries[k], m)
             if k == cur_key:

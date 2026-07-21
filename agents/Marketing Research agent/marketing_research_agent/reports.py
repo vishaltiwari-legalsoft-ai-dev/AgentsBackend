@@ -12,7 +12,7 @@ import json
 import re
 from datetime import date, datetime, timedelta, timezone
 
-from . import analysis, goals, runs
+from . import analysis, config, goals, runs
 from .modules import campaign_reporting as cr
 from .modules import funnel_analysis as fa
 from .modules import opportunity_research as orr
@@ -50,8 +50,12 @@ def _md_to_html(md: str) -> str:
 
 
 def _totals(agg: dict[str, dict]) -> dict:
-    """Blended KPIs across all channels for the report's hero strip."""
-    spend = sum(a["spend"] for a in agg.values())
+    """Blended KPIs across all channels for the report's hero strip.
+
+    Spend (and the costs derived from it) is media channels only, matching the
+    tracker sheet's own total; funnel counts still include every channel."""
+    media = {ch: a for ch, a in agg.items() if ch not in config.NON_MEDIA_CHANNELS}
+    spend = sum(a["spend"] for a in media.values())
     leads = sum(a["leads"] for a in agg.values())
     qualified = sum(a["qualified_leads"] for a in agg.values())
     booked = sum(a["demos_booked"] for a in agg.values())

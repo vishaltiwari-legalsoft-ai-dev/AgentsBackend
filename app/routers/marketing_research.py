@@ -30,7 +30,11 @@ from marketing_research_agent import workbook as mr_workbook
 from marketing_research_agent.config import COLUMN_MAPS
 from marketing_research_agent.schemas import CampaignMetric, DateRange, Lead
 from marketing_research_agent.sources.csv_source import CsvSource
-from marketing_research_agent.sources.sheets_source import SheetsSource, fetch_all_trackers
+from marketing_research_agent.sources.sheets_source import (
+    SheetsSource,
+    fetch_all_trackers,
+    is_rollup_platform,
+)
 
 router = APIRouter()
 logger = logging.getLogger("agentos.mr")
@@ -72,6 +76,10 @@ def _latest_datasets(user_id: str) -> dict[str, dict]:
         if run.get("kind") != "dataset":
             continue
         plat = run.get("platform", run["id"])
+        # Stale-data guard: a rollup tab ingested before the fetch-time skip
+        # existed would double-count every vendor dollar forever.
+        if is_rollup_platform(plat):
+            continue
         prev = latest.get(plat)
         if prev is None or run.get("generated_at", "") > prev.get("generated_at", ""):
             latest[plat] = run

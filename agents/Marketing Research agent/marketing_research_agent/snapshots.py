@@ -14,6 +14,7 @@ import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from . import config
 from .sources.sheets_source import _find_blocks, _month_columns, _num
 
 logger = logging.getLogger("agentos.mr.snapshots")
@@ -353,6 +354,9 @@ def list_snapshots(slug: str | None = None, month: str | None = None,
             continue
     out = []
     for snap in by_id.values():
+        # Rollup-tab snapshots duplicate the vendor tabs — never list them.
+        if "overall" in (snap.get("vendor_slug") or ""):
+            continue
         if slug and snap.get("vendor_slug") != slug:
             continue
         if month and snap.get("month") != month:
@@ -482,8 +486,10 @@ def compute_delta(curr: dict, prev: dict | None) -> dict:
 
 
 def deltas_for(date_iso: str | None = None) -> list[dict]:
-    """Per-vendor movement for `date_iso` (default: latest captured date)."""
-    all_snaps = list_snapshots()
+    """Per-vendor movement for `date_iso` (default: latest captured date).
+
+    Rollup-tab snapshots are excluded — their numbers duplicate the vendors."""
+    all_snaps = [s for s in list_snapshots() if "overall" not in s["vendor_slug"]]
     if not all_snaps:
         return []
     if date_iso is None:
@@ -552,8 +558,11 @@ def portfolio(date_iso: str | None = None) -> dict | None:
     newest = max(s["date"] for s in latest.values())
     for s in latest.values():
         t = s["canonical"].get("team_overall", {})
-        budget += val(t, "budget", pair=True)
-        spend += val(t, "spend", pair=True)
+        # Non-media vendors (Website) stay out of blended spend/budget — the
+        # sheet's own total works that way; their funnel counts still add up.
+        if s["vendor_slug"] not in config.NON_MEDIA_VENDOR_SLUGS:
+            budget += val(t, "budget", pair=True)
+            spend += val(t, "spend", pair=True)
         leads += int(val(t, "leads", "total"))
         qualified += int(val(t, "leads", "qualified"))
         b = val(t, "demos", "qualified_booked_all")

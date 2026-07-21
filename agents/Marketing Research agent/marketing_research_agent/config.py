@@ -59,6 +59,12 @@ COLUMN_MAPS: dict[str, dict[str, str]] = {
 
 CHANNEL_BY_PLATFORM = {"google_ads": "Google", "meta": "META", "hubspot": "Organic"}
 
+# Channels whose "spend" is not media spend. The tracker sheet's own total
+# keeps these out of blended spend, and the platform must reconcile with the
+# sheet; their leads/demos still count (organic conversions are real).
+NON_MEDIA_CHANNELS = frozenset({"Websites"})
+NON_MEDIA_VENDOR_SLUGS = frozenset({"website"})
+
 # The six named competitors (requirements §3.2).
 COMPETITORS = [
     {"name": "BackOffice Betties", "url": "https://www.backofficebetties.com/"},

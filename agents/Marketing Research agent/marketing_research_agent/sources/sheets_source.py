@@ -295,6 +295,15 @@ def is_rollup_tab(title: str, rows: list[list[str]]) -> bool:
     return a1 in ("all", "overall")
 
 
+def is_rollup_platform(platform: str) -> bool:
+    """True when a dataset-run platform key ("sheets:<tab>") points at the
+    roll-up tab. Read-path guard: runs ingested before the fetch-time skip
+    existed stay in storage forever and would double-count every dollar."""
+    plat = str(platform or "")
+    title = plat.split(":", 1)[1] if ":" in plat else plat
+    return is_rollup_tab(title, [])
+
+
 def fetch_all_trackers(
     spreadsheet_id: str,
     year: int,
