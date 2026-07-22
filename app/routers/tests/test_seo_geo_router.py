@@ -70,6 +70,39 @@ def test_todo_status_update_validates():
     assert r.json() == {"id": "abc123", "status": "assigned"}
 
 
+def test_keyword_lab_offline_runs_heuristic():
+    r = client.post("/api/seo-geo/keywords/legalsoft/run")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["clusters"] and body["degraded"]
+    assert client.get("/api/seo-geo/keywords/legalsoft").json()["lab"]["brand_id"] == "legalsoft"
+
+
+def test_competitors_flow():
+    assert client.get("/api/seo-geo/competitors/legalsoft").json()["tracked"] == []
+    assert client.put("/api/seo-geo/competitors/legalsoft", json={"domains": ["comp.com"]}).status_code == 403
+    as_creator()
+    r = client.put("/api/seo-geo/competitors/legalsoft", json={"domains": [" Comp.com "]})
+    assert r.json()["tracked"] == ["comp.com"]
+    t = client.post("/api/seo-geo/competitors/legalsoft/track")
+    assert t.status_code == 200 and t.json()["degraded"]  # offline: no Serper, no fetches
+
+
+def test_live_analysis_endpoints_offline_503():
+    assert client.post("/api/seo-geo/serp/legalsoft", json={"query": "x"}).status_code == 503
+    assert client.post("/api/seo-geo/briefs/legalsoft", json={"keyword": "x"}).status_code == 503
+    assert client.post("/api/seo-geo/audit/legalsoft/run").status_code == 503
+    assert client.get("/api/seo-geo/briefs/legalsoft").json()["briefs"] == []
+    assert client.get("/api/seo-geo/audit/legalsoft").json()["report"] is None
+
+
+def test_draft_score_endpoint():
+    r = client.post("/api/seo-geo/draft-score/legalsoft",
+                    json={"text": "Buy now.", "keyword": "legal virtual assistant"})
+    assert r.status_code == 200
+    assert r.json()["verdict"] == "rework"
+
+
 def test_cron_inert_without_key_then_gated(monkeypatch):
     assert client.post("/api/seo-geo/cron/run").status_code == 503
     monkeypatch.setenv("SEO_CRON_KEY", "s3cret")
