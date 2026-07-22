@@ -246,6 +246,11 @@ SITE["https://x.com/pricing"].text = "Plans start small and scale with your firm
 
 REVIEW_JSON = {
     "positioning": "Virtual assistants for US law firms.",
+    "scorecard": {
+        "intent": {"grade": 7, "note": "clamped"},          # out of range -> 5
+        "content_depth": {"grade": 2, "note": "thin"},
+        "trust": {"grade": "bad", "note": "ignored"},        # unparsable -> dropped
+    },
     "strengths": ["Clear services"],
     "issues": [
         {"insight": "No testimonials anywhere", "evidence": "https://x.com/",
@@ -286,6 +291,9 @@ def test_expert_review_todos_and_seeds(monkeypatch):
     corpus = {"brand_id": "b", "page_count": 2, "pages": [], "degraded": []}
     review = site_brain.expert_review(BRAND, corpus)
     assert review["positioning"].startswith("Virtual assistants")
+    assert review["scorecard"]["intent"]["grade"] == 5      # clamped into 1-5
+    assert review["scorecard"]["content_depth"]["grade"] == 2
+    assert "trust" not in review["scorecard"]               # unparsable grade dropped
 
     todos = site_brain.site_todos("b")
     assert todos[0]["kind"] == "site" and todos[0]["action"].startswith("Add 3 client")

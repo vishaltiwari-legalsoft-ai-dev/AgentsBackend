@@ -59,7 +59,7 @@ def _context(brand: dict) -> str:
         "existing_briefs": [b["keyword"] for b in briefs.list_briefs(brand["id"])],
         "site_review": {
             k: (site_brain.latest_review(brand["id"]) or {}).get(k)
-            for k in ("at", "positioning", "strengths", "issues", "covered_topics", "missing_topics")
+            for k in ("at", "positioning", "scorecard", "strengths", "issues", "covered_topics", "missing_topics")
         },
     }
     return json.dumps(ctx, ensure_ascii=False)[:9000]
