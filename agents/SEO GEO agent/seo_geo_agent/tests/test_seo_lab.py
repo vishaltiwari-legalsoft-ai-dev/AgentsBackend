@@ -131,6 +131,14 @@ def serp_with(pos_ours):
     return {"organic": organic[:10], "related": [], "paa": ["How much does it cost?"], "aio_present": False}
 
 
+def test_tracked_keywords_fall_back_to_site_review_seeds(monkeypatch):
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: REVIEW_JSON)
+    site_brain.expert_review(BRAND, {"brand_id": "b", "page_count": 1, "pages": [], "degraded": []})
+    seedless = {**BRAND, "seeds": []}
+    tracked = competitors.tracked_keywords(seedless)
+    assert "legal virtual assistant" in tracked  # from the site review's suggested_seeds
+
+
 def test_rank_snapshot_and_shifts():
     competitors.rank_snapshot(BRAND, search=lambda q: serp_with(5))
     competitors.rank_snapshot(BRAND, search=lambda q: serp_with(3))

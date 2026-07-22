@@ -25,7 +25,9 @@ def _domain(url: str) -> str:
 
 
 def tracked_keywords(brand: dict) -> list[str]:
-    seeds = [s.strip() for s in brand.get("seeds", []) if s.strip()]
+    from . import site_brain  # site-review seeds fill in when the brand has none
+
+    seeds = [s.strip() for s in site_brain.effective_seeds(brand).get("seeds", []) if s.strip()]
     lab = kw_lab.latest(brand["id"])
     heads = [c["name"] for c in (lab or {}).get("clusters", [])]
     out: list[str] = []
