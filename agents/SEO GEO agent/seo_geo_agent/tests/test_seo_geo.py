@@ -91,6 +91,43 @@ def test_todo_status_survives_rerun(monkeypatch):
     assert next(t for t in latest["todos"] if t["id"] == tid)["status"] == "done"
 
 
+# --------------------------- rank-tracking mode ---------------------------
+
+def test_build_rank_todos_orders_drops_first():
+    doc = {"snapshots": [
+        {"at": "2026-07-15", "ranks": {
+            "kw a": {"position": 3, "top": []},
+            "kw b": {"position": 6, "top": []},
+            "kw c": {"position": None, "top": ["comp.com"]},
+        }},
+        {"at": "2026-07-22", "ranks": {
+            "kw a": {"position": 8, "top": []},
+            "kw b": {"position": 6, "top": []},
+            "kw c": {"position": None, "top": ["comp.com"]},
+        }},
+    ]}
+    todos = insights.build_rank_todos("b", doc)
+    assert todos[0]["kind"] == "rank_drop"  # kw a fell 3 -> 8, urgency first
+    kinds = [t["kind"] for t in todos]
+    assert "striking" in kinds and "unranked" in kinds
+    assert todos[0]["est_monthly_clicks"] is None  # honest: no impression data
+    unranked = next(t for t in todos if t["kind"] == "unranked")
+    assert "comp.com" in unranked["why"]
+
+
+def test_run_brand_rank_mode_without_gsc(monkeypatch):
+    brand = insights.list_brands()[0]
+    fake_doc = {"snapshots": [{"at": "2026-07-22", "ranks": {
+        "legal virtual assistant": {"position": 5, "top": ["comp.com"]},
+    }}], "suggested_competitors": ["comp.com"]}
+    monkeypatch.setattr(insights.competitors, "rank_snapshot", lambda b: fake_doc)
+    run = insights.run_brand(brand, trigger="test", today=date(2026, 7, 22))
+    assert run["summary"]["mode"] == "rank-tracking"
+    assert run["summary"]["tracked"] == 1 and run["summary"]["top10"] == 1
+    assert run["todos"][0]["kind"] == "striking"
+    assert run["insights"]
+
+
 # --------------------------------- topic lab ---------------------------------
 
 WEAK_SERP = {

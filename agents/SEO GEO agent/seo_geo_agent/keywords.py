@@ -136,13 +136,15 @@ def cluster_keywords(brand: dict, keywords: list[str]) -> tuple[list[dict], list
     return _heuristic_clusters(keywords)[:MAX_CLUSTERS], notes
 
 
-def score_clusters(clusters: list[dict], rows: list[QueryStat]) -> None:
+def score_clusters(clusters: list[dict], rows: list[QueryStat], ranks: dict[str, float] | None = None) -> None:
     """Volume proxy + our coverage -> opportunity. Mutates clusters in place.
 
-    Coverage is honest about its basis: our own Search Console positions, not a
-    third-party authority score. gap = nothing of ours ranks top-20 for the
-    cluster; weak = we rank but below the fold.
+    Coverage is honest about its basis: our own Search Console positions when we
+    have them, live rank-snapshot positions otherwise — never a made-up
+    authority score. gap = nothing of ours ranks top-20 for the cluster;
+    weak = we rank but below the fold.
     """
+    ranks = {k.lower(): v for k, v in (ranks or {}).items() if v}
     for c in clusters:
         volume = sum(_match_impressions(kw, rows) for kw in c["keywords"][:15])
         matched_positions = [
@@ -152,6 +154,10 @@ def score_clusters(clusters: list[dict], rows: list[QueryStat]) -> None:
             if (_tokens(kw) <= _tokens(r.query) or (_tokens(r.query) and _tokens(r.query) <= _tokens(kw)))
             and r.position > 0
         ]
+        if not matched_positions and ranks:
+            matched_positions = [
+                ranks[kw.lower()] for kw in [c["name"], *c["keywords"][:15]] if kw.lower() in ranks
+            ]
         best = round(min(matched_positions), 1) if matched_positions else None
         if best is None or best > 20:
             coverage, factor = "gap", 1.0
@@ -175,7 +181,12 @@ def run_keyword_lab(
     notes = list(extra_notes or []) + notes
     clusters, cluster_notes = cluster_keywords(brand, keywords)
     notes.extend(cluster_notes)
-    score_clusters(clusters, rows)
+    ranks: dict[str, float] = {}
+    if not rows:  # no Search Console — fall back to the latest rank snapshot
+        snaps = (state.load(f"ranks-{brand['id']}") or {}).get("snapshots", [])
+        if snaps:
+            ranks = {k: e.get("position") for k, e in snaps[-1]["ranks"].items()}
+    score_clusters(clusters, rows, ranks)
     doc = {
         "brand_id": brand["id"],
         "at": date.today().isoformat(),

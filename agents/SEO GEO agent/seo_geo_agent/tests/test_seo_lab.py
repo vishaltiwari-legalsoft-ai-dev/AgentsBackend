@@ -62,6 +62,14 @@ def test_cluster_scoring_gap_vs_ranking():
     assert clusters[0]["name"] == "legal virtual assistant"  # 1000*0.25 > 10*1.0
 
 
+def test_cluster_scoring_uses_rank_snapshot_when_no_gsc():
+    clusters = [{"name": "legal virtual assistant", "intent": "commercial",
+                 "keywords": ["legal virtual assistant"]}]
+    keywords.score_clusters(clusters, [], ranks={"legal virtual assistant": 12.0})
+    assert clusters[0]["coverage"] == "weak"
+    assert clusters[0]["best_position"] == 12
+
+
 def test_run_keyword_lab_persists_and_lists_gaps():
     doc = keywords.run_keyword_lab(BRAND, [], trigger="test")
     assert doc["degraded"]
