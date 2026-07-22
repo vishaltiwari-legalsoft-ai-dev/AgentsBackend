@@ -27,6 +27,7 @@ from app.routers import (
     marketing_research,
     reference_library,
     references,
+    seo_geo,
 )
 from app.services.gd_brand_source import firestore_spec_source
 from graphics_designer_agent import registry as gd_registry
@@ -81,6 +82,7 @@ for router in (
     graphics_designer,
     creative_agent,
     marketing_research,
+    seo_geo,
 ):
     app.include_router(router.router, prefix="/api")
 
