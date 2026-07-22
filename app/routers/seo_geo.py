@@ -112,7 +112,7 @@ def save_brand(payload: BrandIn, user=Depends(require_creator)):
     slug = re.sub(r"[^a-z0-9]+", "-", (payload.id or payload.name).lower()).strip("-")
     if not slug:
         raise HTTPException(status_code=422, detail="Brand needs a name")
-    domain = re.sub(r"^https?://", "", payload.domain.lower()).strip("/ ")
+    domain = re.sub(r"^https?://", "", payload.domain.lower()).strip("/ ").removeprefix("www.")
     if "." not in domain:
         raise HTTPException(status_code=422, detail="Enter the site domain, e.g. brand.com")
     brand = {

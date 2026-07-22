@@ -51,6 +51,15 @@ def test_brand_domain_validation():
     assert r.status_code == 422
 
 
+def test_brand_domain_strips_www_and_protocol():
+    as_creator()
+    body = client.post("/api/seo-geo/brands",
+                       json={"name": "Berry", "domain": "https://www.BerryVirtual.com/"}).json()
+    berry = next(b for b in body["brands"] if b["id"] == "berry")
+    assert berry["domain"] == "berryvirtual.com"
+    assert berry["gsc_property"] == "sc-domain:berryvirtual.com"
+
+
 def test_run_and_detail_roundtrip():
     r = client.post("/api/seo-geo/run/legalsoft")
     assert r.status_code == 200, r.text
