@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 from datetime import date, timedelta
 
-from . import competitors, gsc_oauth, state, topics
+from . import competitors, gsc_oauth, site_brain, state, topics
 from .sources import CredentialMissing, QueryStat, gsc_fetch
 
 # Aggregate organic CTR by position (rounded from public CTR studies). Position
@@ -309,7 +309,10 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
             todos, bullets = [], []
             summary = _summary([], [], [])
 
-    topic_list, topic_notes = topics.build_topics(brand, rows, prev_rows)
+    # Site-review findings ride along in the fix list (stable ids keep status).
+    todos = (todos + site_brain.site_todos(brand["id"]))[:MAX_TODOS]
+
+    topic_list, topic_notes = topics.build_topics(site_brain.effective_seeds(brand), rows, prev_rows)
     degraded.extend(topic_notes)
 
     run = {

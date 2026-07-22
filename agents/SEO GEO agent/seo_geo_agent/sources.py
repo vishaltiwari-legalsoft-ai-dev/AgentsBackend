@@ -168,6 +168,7 @@ class PageFacts:
     internal_links: list[str] = field(default_factory=list)
     images_no_alt: int = 0
     word_count: int = 0
+    text: str = ""  # body text, capped — feeds the site-brain content analysis
 
     @property
     def questions(self) -> list[str]:
@@ -185,6 +186,8 @@ class _PageParser(HTMLParser):
         self.links: list[str] = []
         self.images_no_alt = 0
         self.words = 0
+        self.text_parts: list[str] = []
+        self._text_len = 0
         self._stack: list[str] = []
         self._in_schema = False
 
@@ -225,6 +228,9 @@ class _PageParser(HTMLParser):
                 self.schema_raw[-1] += data
         else:
             self.words += len(text.split())
+            if self._text_len < 6000:
+                self.text_parts.append(text)
+                self._text_len += len(text) + 1
 
 
 def fetch_page(url: str, client: httpx.Client | None = None) -> PageFacts:
@@ -251,6 +257,7 @@ def fetch_page(url: str, client: httpx.Client | None = None) -> PageFacts:
         facts.internal_links = parser.links[:400]
         facts.images_no_alt = parser.images_no_alt
         facts.word_count = parser.words
+        facts.text = " ".join(parser.text_parts)[:6000]
         for raw in parser.schema_raw:
             try:
                 node = json.loads(raw)

@@ -120,6 +120,13 @@ def test_oauth_start_callback_and_disconnect(monkeypatch):
     assert detail["gsc"] == {"connected": False, "property": None}
 
 
+def test_site_review_endpoints_offline():
+    assert client.get("/api/seo-geo/site-review/legalsoft").json()["review"] is None
+    assert client.post("/api/seo-geo/site-review/legalsoft").status_code == 503  # offline crawl
+    detail = client.get("/api/seo-geo/brands/legalsoft").json()
+    assert detail["plan"] == [] and detail["site_review"] is None
+
+
 def test_ask_expert_offline_503():
     r = client.post("/api/seo-geo/ask/legalsoft", json={"question": "kya karna chahiye?"})
     assert r.status_code == 503

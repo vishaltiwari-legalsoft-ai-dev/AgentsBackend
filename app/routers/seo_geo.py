@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from app.security import get_current_user, require_creator
 from seo_geo_agent import advisor as seo_advisor
 from seo_geo_agent import gsc_oauth as seo_oauth
+from seo_geo_agent import site_brain as seo_site
 from seo_geo_agent import audit as seo_audit
 from seo_geo_agent import briefs as seo_briefs
 from seo_geo_agent import competitors as seo_competitors
@@ -88,14 +89,28 @@ def _brand_or_404(brand_id: str) -> dict:
     return brand
 
 
+def _headline(run: dict | None, review: dict | None) -> str | None:
+    """The one line a busy owner should read first on the brand card."""
+    if run:
+        todo = next((t for t in run.get("todos", []) if t.get("status") != "done"), None)
+        if todo:
+            gain = f" → est. +{todo['est_monthly_clicks']}/mo" if todo.get("est_monthly_clicks") else ""
+            return f"Top action: {todo['action']}{gain}"
+    if review and review.get("positioning"):
+        return review["positioning"]
+    return None
+
+
 @router.get("/seo-geo/overview")
 def overview(user=Depends(get_current_user)):
     cards = []
     for brand in insights.list_brands():
         run = insights.latest_run(brand["id"])
+        review = seo_site.latest_review(brand["id"])
         cards.append({
             "brand": brand,
             "gsc_connected": bool(seo_oauth.connection(brand["id"])),
+            "headline": _headline(run, review),
             "last_run": run and {
                 "at": run["at"],
                 "summary": run["summary"],
@@ -143,15 +158,56 @@ def run_brand(brand_id: str, user=Depends(get_current_user)):
             "todo_count": len(run["todos"]), "topic_count": len(run["topics"])}
 
 
+def _plan_of_action(brand_id: str, run: dict | None) -> list[dict]:
+    """Top 3 next moves across every surface — the 'what do I do' strip."""
+    plan: list[dict] = []
+    todo = next((t for t in (run or {}).get("todos", []) if t.get("status") != "done"), None)
+    if todo:
+        plan.append({"source": "fix list", "action": todo["action"], "detail": todo["why"]})
+    lab = seo_keywords.latest(brand_id) or {}
+    cluster = next((c for c in lab.get("clusters", []) if c.get("tier") == "high"), None)
+    if cluster:
+        plan.append({"source": "keywords", "action": f"Go after “{cluster['name']}”",
+                     "detail": cluster.get("recommendation", "")})
+    report = seo_audit.latest_audit(brand_id) or {}
+    issue = next((i for i in report.get("issues", []) if i["severity"] == "high"), None)
+    if issue:
+        plan.append({"source": "audit", "action": f"Fix: {issue['issue']}", "detail": issue["fix"]})
+    else:
+        failed = next((c for c in report.get("site_checks", []) if not c["ok"]), None)
+        if failed:
+            plan.append({"source": "audit", "action": f"Fix: {failed['name']}", "detail": failed["fix"]})
+    return plan[:3]
+
+
 @router.get("/seo-geo/brands/{brand_id}")
 def brand_detail(brand_id: str, user=Depends(get_current_user)):
     brand = _brand_or_404(brand_id)
     conn = seo_oauth.connection(brand_id)
+    run = insights.latest_run(brand_id)
     return {
         "brand": brand,
-        "run": insights.latest_run(brand_id),
+        "run": run,
         "gsc": {"connected": bool(conn), "property": (conn or {}).get("property")},
+        "plan": _plan_of_action(brand_id, run),
+        "site_review": seo_site.latest_review(brand_id),
     }
+
+
+@router.post("/seo-geo/site-review/{brand_id}")
+def run_site_review(brand_id: str, user=Depends(get_current_user)):
+    """Crawl the brand's site, build the corpus, and run the expert review."""
+    brand = _brand_or_404(brand_id)
+    try:
+        return seo_site.analyze(brand)
+    except CredentialMissing as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.get("/seo-geo/site-review/{brand_id}")
+def get_site_review(brand_id: str, user=Depends(get_current_user)):
+    _brand_or_404(brand_id)
+    return {"review": seo_site.latest_review(brand_id)}
 
 
 @router.post("/seo-geo/todos/{brand_id}/{todo_id}")
@@ -167,7 +223,7 @@ def set_todo_status(brand_id: str, todo_id: str, payload: TodoStatusIn, user=Dep
 
 @router.post("/seo-geo/keywords/{brand_id}/run")
 def run_keyword_lab(brand_id: str, user=Depends(get_current_user)):
-    brand = _brand_or_404(brand_id)
+    brand = seo_site.effective_seeds(_brand_or_404(brand_id))
     rows, notes = _rows_28d(brand)
     return seo_keywords.run_keyword_lab(
         brand, rows, trigger=f"manual:{user['email']}", extra_notes=notes

@@ -1,7 +1,8 @@
 """Tests for the researcher layer: keyword lab, competitors, briefs, audit, advisor."""
 import pytest
 
-from seo_geo_agent import advisor, audit, briefs, competitors, gsc_oauth, insights, keywords, topics
+from seo_geo_agent import (advisor, audit, briefs, competitors, gsc_oauth, insights, keywords,
+                           site_brain, topics)
 from seo_geo_agent.sources import CredentialMissing, PageFacts, QueryStat
 
 
@@ -232,6 +233,76 @@ def test_site_checks_flag_missing_foundations():
     assert checks["Sitemap.xml"]["ok"] is False and checks["Sitemap.xml"]["fix"]
     assert checks["Robots.txt"]["ok"] is False
     assert checks["HTTP → HTTPS redirect"]["ok"] is False
+
+
+# -------------------------------- site brain --------------------------------
+
+SITE = {
+    "https://x.com/": facts("https://x.com/", title="Acme Legal — Home", h2=["What we do"]),
+    "https://x.com/pricing": facts("https://x.com/pricing", title="Pricing", h2=["Plans"]),
+}
+SITE["https://x.com/"].text = "Acme Legal offers virtual assistants for law firms."
+SITE["https://x.com/pricing"].text = "Plans start small and scale with your firm."
+
+REVIEW_JSON = {
+    "positioning": "Virtual assistants for US law firms.",
+    "strengths": ["Clear services"],
+    "issues": [
+        {"insight": "No testimonials anywhere", "evidence": "https://x.com/",
+         "action": "Add 3 client testimonials to the homepage", "priority": "high", "category": "trust"},
+        {"insight": "Pricing page is thin", "evidence": "https://x.com/pricing",
+         "action": "Expand the pricing page with plan comparisons", "priority": "medium", "category": "content"},
+    ],
+    "suggested_seeds": ["legal virtual assistant", "law firm answering service"],
+    "covered_topics": ["virtual assistants"],
+    "missing_topics": ["pricing comparisons"],
+}
+
+
+def test_corpus_falls_back_without_llm():
+    corpus = site_brain.build_corpus(BRAND, fetch=lambda u, c=None: SITE[u],
+                                     sitemap=lambda d: list(SITE.keys()))
+    assert corpus["page_count"] == 2
+    assert any("Acme Legal" in p["summary"] for p in corpus["pages"])
+    assert corpus["degraded"]  # offline: no AI summaries
+
+
+def test_corpus_cache_skips_unchanged_pages(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_llm(system, prompt):
+        calls["n"] += 1
+        return [{"summary": "s", "type": "service", "topics": ["t"]}] * prompt.count("PAGE ")
+
+    monkeypatch.setattr(site_brain.sources, "llm_json", fake_llm)
+    site_brain.build_corpus(BRAND, fetch=lambda u, c=None: SITE[u], sitemap=lambda d: list(SITE.keys()))
+    first = calls["n"]
+    site_brain.build_corpus(BRAND, fetch=lambda u, c=None: SITE[u], sitemap=lambda d: list(SITE.keys()))
+    assert first >= 1 and calls["n"] == first  # second run: all pages cached
+
+
+def test_expert_review_todos_and_seeds(monkeypatch):
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: REVIEW_JSON)
+    corpus = {"brand_id": "b", "page_count": 2, "pages": [], "degraded": []}
+    review = site_brain.expert_review(BRAND, corpus)
+    assert review["positioning"].startswith("Virtual assistants")
+
+    todos = site_brain.site_todos("b")
+    assert todos[0]["kind"] == "site" and todos[0]["action"].startswith("Add 3 client")
+    assert todos[0]["est_monthly_clicks"] is None  # no invented numbers
+    assert todos == site_brain.site_todos("b")  # stable ids + order
+
+    empty_seed_brand = {**BRAND, "seeds": []}
+    assert site_brain.effective_seeds(empty_seed_brand)["seeds"][0] == "legal virtual assistant"
+    assert site_brain.effective_seeds(BRAND)["seeds"] == BRAND["seeds"]  # own seeds win
+
+
+def test_run_brand_merges_site_todos(monkeypatch):
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: REVIEW_JSON)
+    brand = insights.list_brands()[0]
+    site_brain.expert_review(brand, {"brand_id": brand["id"], "page_count": 1, "pages": [], "degraded": []})
+    run = insights.run_brand(brand, trigger="t")
+    assert any(t["kind"] == "site" for t in run["todos"])
 
 
 # ----------------------------- GSC OAuth connect -----------------------------
