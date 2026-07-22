@@ -26,7 +26,8 @@ def _load_local_env() -> None:
     try:
         for line in env_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
-            if line.startswith("SEO_") and "=" in line:
+            # GOOGLE_CLIENT_* feeds the per-brand Search Console OAuth connect.
+            if line.startswith(("SEO_", "GOOGLE_CLIENT_")) and "=" in line:
                 key, _, value = line.partition("=")
                 os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
     except OSError:

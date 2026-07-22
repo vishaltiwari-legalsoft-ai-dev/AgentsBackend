@@ -1,7 +1,7 @@
 """Tests for the researcher layer: keyword lab, competitors, briefs, audit, advisor."""
 import pytest
 
-from seo_geo_agent import advisor, audit, briefs, competitors, insights, keywords, topics
+from seo_geo_agent import advisor, audit, briefs, competitors, gsc_oauth, insights, keywords, topics
 from seo_geo_agent.sources import CredentialMissing, PageFacts, QueryStat
 
 
@@ -232,6 +232,76 @@ def test_site_checks_flag_missing_foundations():
     assert checks["Sitemap.xml"]["ok"] is False and checks["Sitemap.xml"]["fix"]
     assert checks["Robots.txt"]["ok"] is False
     assert checks["HTTP → HTTPS redirect"]["ok"] is False
+
+
+# ----------------------------- GSC OAuth connect -----------------------------
+
+def _oauth_env(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "sec")
+
+
+def test_oauth_state_roundtrip_and_tamper(monkeypatch):
+    _oauth_env(monkeypatch)
+    token = gsc_oauth.make_state("berry")
+    assert gsc_oauth.read_state(token) == "berry"
+    with pytest.raises(ValueError):
+        gsc_oauth.read_state(token[:-2] + "xx")
+
+
+def test_oauth_needs_config(monkeypatch):
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
+    with pytest.raises(CredentialMissing):
+        gsc_oauth.auth_url("b", "http://cb")
+
+
+def test_match_property_prefers_domain_property():
+    sites = [
+        {"siteUrl": "https://www.berryvirtual.com/", "permissionLevel": "siteOwner"},
+        {"siteUrl": "sc-domain:berryvirtual.com", "permissionLevel": "siteFullUser"},
+        {"siteUrl": "https://other.com/", "permissionLevel": "siteUnverifiedUser"},
+    ]
+    assert gsc_oauth.match_property("berryvirtual.com", sites) == "sc-domain:berryvirtual.com"
+    assert gsc_oauth.match_property("other.com", sites) is None  # unverified doesn't count
+
+
+def test_oauth_complete_stores_connection(monkeypatch):
+    _oauth_env(monkeypatch)
+    monkeypatch.setattr(gsc_oauth, "_exchange",
+                        lambda code, uri: {"refresh_token": "r1", "access_token": "a1"})
+    monkeypatch.setattr(gsc_oauth, "_sites",
+                        lambda tok: [{"siteUrl": "sc-domain:x.com", "permissionLevel": "siteOwner"}])
+    assert gsc_oauth.complete(BRAND, "code", "http://cb")["property"] == "sc-domain:x.com"
+    assert gsc_oauth.connection("b")["refresh_token"] == "r1"
+    gsc_oauth.disconnect("b")
+    assert gsc_oauth.connection("b") is None
+
+
+def test_oauth_complete_rejects_wrong_account(monkeypatch):
+    _oauth_env(monkeypatch)
+    monkeypatch.setattr(gsc_oauth, "_exchange",
+                        lambda code, uri: {"refresh_token": "r1", "access_token": "a1"})
+    monkeypatch.setattr(gsc_oauth, "_sites", lambda tok: [])
+    with pytest.raises(ValueError):
+        gsc_oauth.complete(BRAND, "code", "http://cb")
+
+
+def test_run_brand_uses_connected_property(monkeypatch):
+    brand = insights.list_brands()[0]
+    seen = {}
+    monkeypatch.setattr(insights.gsc_oauth, "service", lambda bid: object())
+    monkeypatch.setattr(insights.gsc_oauth, "connection",
+                        lambda bid: {"property": "sc-domain:custom.com"})
+
+    def fake_fetch(prop, s, e, service=None):
+        seen["prop"], seen["svc"] = prop, service
+        return [row("legal virtual assistant")]
+
+    monkeypatch.setattr(insights, "gsc_fetch", fake_fetch)
+    run = insights.run_brand(brand, trigger="t")
+    assert seen["prop"] == "sc-domain:custom.com" and seen["svc"] is not None
+    assert run["summary"]["mode"] == "search-console"
 
 
 # --------------------------------- advisor ---------------------------------

@@ -14,10 +14,12 @@ import re
 from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from app.security import get_current_user, require_creator
 from seo_geo_agent import advisor as seo_advisor
+from seo_geo_agent import gsc_oauth as seo_oauth
 from seo_geo_agent import audit as seo_audit
 from seo_geo_agent import briefs as seo_briefs
 from seo_geo_agent import competitors as seo_competitors
@@ -93,6 +95,7 @@ def overview(user=Depends(get_current_user)):
         run = insights.latest_run(brand["id"])
         cards.append({
             "brand": brand,
+            "gsc_connected": bool(seo_oauth.connection(brand["id"])),
             "last_run": run and {
                 "at": run["at"],
                 "summary": run["summary"],
@@ -143,7 +146,12 @@ def run_brand(brand_id: str, user=Depends(get_current_user)):
 @router.get("/seo-geo/brands/{brand_id}")
 def brand_detail(brand_id: str, user=Depends(get_current_user)):
     brand = _brand_or_404(brand_id)
-    return {"brand": brand, "run": insights.latest_run(brand_id)}
+    conn = seo_oauth.connection(brand_id)
+    return {
+        "brand": brand,
+        "run": insights.latest_run(brand_id),
+        "gsc": {"connected": bool(conn), "property": (conn or {}).get("property")},
+    }
 
 
 @router.post("/seo-geo/todos/{brand_id}/{todo_id}")
@@ -280,6 +288,59 @@ def draft_score(brand_id: str, payload: DraftIn, user=Depends(get_current_user))
         None,
     )
     return seo_audit.score_draft(brand, payload.text, payload.keyword.strip(), brief)
+
+
+# --------------------- Search Console connect (OAuth) ---------------------
+
+def _oauth_redirect(request: Request) -> str:
+    base = os.environ.get("SEO_OAUTH_REDIRECT_BASE", "") or str(request.base_url).rstrip("/")
+    if "localhost" not in base and base.startswith("http://"):
+        base = "https://" + base.removeprefix("http://")  # Cloud Run sits behind TLS proxy
+    return f"{base}/api/seo-geo/oauth/callback"
+
+
+def _close_page(title: str, body: str, status: int = 200) -> HTMLResponse:
+    return HTMLResponse(
+        f"<html><body style='font-family:sans-serif;max-width:480px;margin:80px auto;text-align:center'>"
+        f"<h2>{title}</h2><p>{body}</p><p>You can close this tab.</p>"
+        f"<script>setTimeout(()=>window.close(),4000)</script></body></html>",
+        status_code=status,
+    )
+
+
+@router.get("/seo-geo/oauth/start/{brand_id}")
+def oauth_start(brand_id: str, request: Request, user=Depends(get_current_user)):
+    _brand_or_404(brand_id)
+    try:
+        return {"url": seo_oauth.auth_url(brand_id, _oauth_redirect(request))}
+    except CredentialMissing as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.get("/seo-geo/oauth/callback")
+def oauth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    """Google redirects the customer's browser here — gated by the signed state."""
+    if error:
+        return _close_page("Not connected", f"Google returned: {error}", status=400)
+    try:
+        brand = _brand_or_404(seo_oauth.read_state(state))
+        result = seo_oauth.complete(brand, code, _oauth_redirect(request))
+        return _close_page(
+            "Search Console connected ✓",
+            f"{brand['name']} is now reading data from <b>{result['property']}</b>. "
+            "Go back to the dashboard and hit Refresh data.",
+        )
+    except ValueError as exc:
+        return _close_page("Not connected", str(exc), status=400)
+    except CredentialMissing as exc:
+        return _close_page("Not connected", str(exc), status=503)
+
+
+@router.post("/seo-geo/oauth/disconnect/{brand_id}")
+def oauth_disconnect(brand_id: str, user=Depends(require_creator)):
+    _brand_or_404(brand_id)
+    seo_oauth.disconnect(brand_id)
+    return {"connected": False}
 
 
 @router.post("/seo-geo/ask/{brand_id}")

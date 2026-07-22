@@ -105,6 +105,21 @@ def test_live_analysis_endpoints_offline_503():
     assert client.get("/api/seo-geo/audit/legalsoft").json()["report"] is None
 
 
+def test_oauth_start_callback_and_disconnect(monkeypatch):
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
+    assert client.get("/api/seo-geo/oauth/start/legalsoft").status_code == 503
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "sec")
+    url = client.get("/api/seo-geo/oauth/start/legalsoft").json()["url"]
+    assert "accounts.google.com" in url and "webmasters.readonly" in url
+    assert client.get("/api/seo-geo/oauth/callback",
+                      params={"code": "c", "state": "junk"}).status_code == 400
+    assert client.post("/api/seo-geo/oauth/disconnect/legalsoft").status_code == 403  # creator only
+    detail = client.get("/api/seo-geo/brands/legalsoft").json()
+    assert detail["gsc"] == {"connected": False, "property": None}
+
+
 def test_ask_expert_offline_503():
     r = client.post("/api/seo-geo/ask/legalsoft", json={"question": "kya karna chahiye?"})
     assert r.status_code == 503

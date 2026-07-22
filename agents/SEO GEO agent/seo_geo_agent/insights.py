@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 from datetime import date, timedelta
 
-from . import competitors, state, topics
+from . import competitors, gsc_oauth, state, topics
 from .sources import CredentialMissing, QueryStat, gsc_fetch
 
 # Aggregate organic CTR by position (rounded from public CTR studies). Position
@@ -283,10 +283,13 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
     degraded: list[str] = []
     rows: list[QueryStat] = []
     prev_rows: list[QueryStat] = []
-    prop = brand.get("gsc_property") or f"sc-domain:{brand['domain']}"
     try:
-        rows = gsc_fetch(prop, end - timedelta(days=28), end)
-        prev_rows = gsc_fetch(prop, end - timedelta(days=56), end - timedelta(days=29))
+        # A customer's own OAuth grant wins; the shared service account is the fallback.
+        svc = gsc_oauth.service(brand["id"])
+        conn = gsc_oauth.connection(brand["id"]) if svc else None
+        prop = conn["property"] if conn else (brand.get("gsc_property") or f"sc-domain:{brand['domain']}")
+        rows = gsc_fetch(prop, end - timedelta(days=28), end, service=svc)
+        prev_rows = gsc_fetch(prop, end - timedelta(days=56), end - timedelta(days=29), service=svc)
     except CredentialMissing as exc:
         degraded.append(f"Search Console: {exc}")
 

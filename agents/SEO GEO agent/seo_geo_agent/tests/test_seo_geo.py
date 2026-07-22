@@ -82,7 +82,7 @@ def test_run_brand_offline_degrades_and_persists(monkeypatch):
 
 def test_todo_status_survives_rerun(monkeypatch):
     brand = insights.list_brands()[0]
-    monkeypatch.setattr(insights, "gsc_fetch", lambda prop, s, e: [row()])
+    monkeypatch.setattr(insights, "gsc_fetch", lambda prop, s, e, service=None: [row()])
     first = insights.run_brand(brand, trigger="test")
     tid = first["todos"][0]["id"]
     insights.set_todo_status(brand["id"], tid, "done")
