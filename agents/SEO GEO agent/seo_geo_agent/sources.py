@@ -111,7 +111,28 @@ def serper_search(query: str, client: httpx.Client | None = None) -> dict:
     }
 
 
+def domain_of(url: str) -> str:
+    host = re.sub(r"^https?://", "", url).split("/")[0].lower()
+    return host[4:] if host.startswith("www.") else host
+
+
 # ------------------------------- LLM adapter -------------------------------
+
+def llm_text(system: str, prompt: str) -> str:
+    """One fast-model completion returned as plain text. Raises ``CredentialMissing``
+    when offline or the provider fails, so callers surface an honest message."""
+    if not state.use_cloud():
+        raise CredentialMissing("offline mode")
+    try:
+        from app.services.openrouter import get_llm
+
+        raw = get_llm(temperature=0.3, fast=True).invoke(
+            [("system", system), ("user", prompt)]
+        ).content
+        return str(raw).strip()
+    except Exception as exc:  # noqa: BLE001
+        raise CredentialMissing(f"LLM unavailable: {exc}") from exc
+
 
 def llm_json(system: str, prompt: str):
     """One fast-model completion, parsed as JSON. Raises ``CredentialMissing``
@@ -244,6 +265,22 @@ def fetch_page(url: str, client: httpx.Client | None = None) -> PageFacts:
         return facts
     except httpx.HTTPError:
         return facts  # status stays 0 -> "unreachable"
+    finally:
+        if own:
+            cli.close()
+
+
+def fetch_text(url: str, client: httpx.Client | None = None) -> dict:
+    """Raw text fetch (robots.txt, redirect checks): {status, text, final_url}."""
+    if not state.use_cloud():
+        raise CredentialMissing("offline mode")
+    own = client is None
+    cli = client or httpx.Client(timeout=15, follow_redirects=True, headers={"User-Agent": FETCH_UA})
+    try:
+        resp = cli.get(url)
+        return {"status": resp.status_code, "text": resp.text[:20_000], "final_url": str(resp.url)}
+    except httpx.HTTPError:
+        return {"status": 0, "text": "", "final_url": url}
     finally:
         if own:
             cli.close()

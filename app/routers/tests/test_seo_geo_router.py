@@ -96,6 +96,12 @@ def test_live_analysis_endpoints_offline_503():
     assert client.get("/api/seo-geo/audit/legalsoft").json()["report"] is None
 
 
+def test_ask_expert_offline_503():
+    r = client.post("/api/seo-geo/ask/legalsoft", json={"question": "kya karna chahiye?"})
+    assert r.status_code == 503
+    assert client.post("/api/seo-geo/ask/legalsoft", json={"question": "  "}).status_code == 422
+
+
 def test_draft_score_endpoint():
     r = client.post("/api/seo-geo/draft-score/legalsoft",
                     json={"text": "Buy now.", "keyword": "legal virtual assistant"})

@@ -9,7 +9,7 @@ import re
 from datetime import date
 
 from . import state
-from .sources import CredentialMissing, PageFacts, fetch_page, fetch_sitemap
+from .sources import CredentialMissing, PageFacts, fetch_page, fetch_sitemap, fetch_text
 from .topics import _tokens
 
 MAX_PAGES = 80
@@ -21,10 +21,38 @@ def _issue(issue: str, severity: str, pages: list[str], fix: str) -> dict:
             "pages": pages[:PAGES_PER_ISSUE], "fix": fix}
 
 
-def site_audit(brand: dict, fetch=fetch_page, sitemap=fetch_sitemap, max_pages: int = MAX_PAGES) -> dict:
+def _site_checks(domain: str, sitemap_urls: list[str], get_text=fetch_text) -> list[dict]:
+    """Foundation checks — the things that should exist before page-level fixes."""
+    checks: list[dict] = []
+
+    def check(name: str, ok: bool, note: str, fix: str) -> None:
+        checks.append({"name": name, "ok": bool(ok), "note": note, "fix": "" if ok else fix})
+
+    check("Sitemap.xml", bool(sitemap_urls),
+          f"{len(sitemap_urls)} URLs listed" if sitemap_urls else "not found at /sitemap.xml",
+          "Publish a sitemap.xml and submit it in Search Console — without it Google discovers pages late.")
+    robots = get_text(f"https://{domain}/robots.txt")
+    robots_ok = robots["status"] == 200 and "user-agent" in robots["text"].lower()
+    check("Robots.txt", robots_ok,
+          "present" if robots_ok else "missing or empty",
+          "Add a robots.txt — it directs crawlers and should point to the sitemap.")
+    check("Robots links sitemap", robots_ok and "sitemap:" in robots["text"].lower(),
+          "sitemap referenced" if robots_ok and "sitemap:" in robots["text"].lower() else "no Sitemap: line",
+          "Add a `Sitemap: https://.../sitemap.xml` line to robots.txt.")
+    http = get_text(f"http://{domain}/")
+    https_ok = http["status"] in (200, 0) and http["final_url"].startswith("https://")
+    check("HTTP → HTTPS redirect", https_ok,
+          "redirects to https" if https_ok else f"lands on {http['final_url']}",
+          "Force-redirect http:// to https:// — split versions dilute rankings and scare visitors.")
+    return checks
+
+
+def site_audit(brand: dict, fetch=fetch_page, sitemap=fetch_sitemap, get_text=fetch_text,
+               max_pages: int = MAX_PAGES) -> dict:
     """Crawl our own site (sitemap-first) and report what's technically broken."""
     domain = brand["domain"]
-    urls = sitemap(domain)
+    sitemap_urls = sitemap(domain)
+    urls = list(sitemap_urls)
     if not urls:
         home = fetch(f"https://{domain}/")
         urls = [f"https://{domain}/"] + [
@@ -91,15 +119,19 @@ def site_audit(brand: dict, fetch=fetch_page, sitemap=fetch_sitemap, max_pages: 
         issues.append(_issue("Images without alt text (4+ on page)", "low", alt_pages,
                              "Describe images in alt text — accessibility + image search."))
 
+    site_checks = _site_checks(domain, sitemap_urls, get_text)
+
     weights = {"high": 12, "medium": 6, "low": 2}
-    score = max(0, 100 - sum(weights[i["severity"]] * min(1, i["count"] / max(1, len(urls))) * 4
-                             for i in issues))
+    score = 100 - sum(weights[i["severity"]] * min(1, i["count"] / max(1, len(urls))) * 4
+                      for i in issues)
+    score -= 8 * sum(1 for c in site_checks if not c["ok"])
     report = {
         "brand_id": brand["id"],
         "at": date.today().isoformat(),
         "pages_checked": len(urls),
         "pages_ok": len(pages),
-        "health_score": round(score),
+        "health_score": max(0, round(score)),
+        "site_checks": site_checks,
         "issues": issues,
     }
     state.save(f"audit-{brand['id']}", report)

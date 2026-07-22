@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.security import get_current_user, require_creator
+from seo_geo_agent import advisor as seo_advisor
 from seo_geo_agent import audit as seo_audit
 from seo_geo_agent import briefs as seo_briefs
 from seo_geo_agent import competitors as seo_competitors
@@ -62,6 +63,10 @@ class PageIn(BaseModel):
 class DraftIn(BaseModel):
     text: str
     keyword: str
+
+
+class AskIn(BaseModel):
+    question: str
 
 
 def _rows_28d(brand: dict) -> tuple[list, list[str]]:
@@ -275,6 +280,19 @@ def draft_score(brand_id: str, payload: DraftIn, user=Depends(get_current_user))
         None,
     )
     return seo_audit.score_draft(brand, payload.text, payload.keyword.strip(), brief)
+
+
+@router.post("/seo-geo/ask/{brand_id}")
+def ask_expert(brand_id: str, payload: AskIn, user=Depends(get_current_user)):
+    """Grounded SEO-strategist chat over everything the agent knows about the brand."""
+    brand = _brand_or_404(brand_id)
+    question = payload.question.strip()
+    if not question:
+        raise HTTPException(status_code=422, detail="Ask a question")
+    try:
+        return seo_advisor.ask(brand, question)
+    except CredentialMissing as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 # ------------------------------- cron -------------------------------

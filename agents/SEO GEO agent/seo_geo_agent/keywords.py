@@ -169,7 +169,60 @@ def score_clusters(clusters: list[dict], rows: list[QueryStat], ranks: dict[str,
         c["best_position"] = best
         c["coverage"] = coverage
         c["opportunity"] = round((volume or 10) * factor, 1)
-    clusters.sort(key=lambda c: c["opportunity"], reverse=True)
+        c["tier"] = _tier(c)
+        c["recommendation"] = _recommendation(c)
+    clusters.sort(key=lambda c: ({"high": 0, "medium": 1, "watch": 2}[c["tier"]], -c["opportunity"]))
+
+
+_BUYER_INTENTS = ("transactional", "commercial", "local")
+
+
+def _tier(c: dict) -> str:
+    """high = act now, medium = plan it, watch = already ranking, defend it."""
+    if c["coverage"] == "ranking":
+        return "watch"
+    if c["intent"] in _BUYER_INTENTS:
+        return "high"
+    return "medium" if c["coverage"] == "gap" else "medium"
+
+
+def _recommendation(c: dict) -> str:
+    buyer = c["intent"] in _BUYER_INTENTS
+    if c["coverage"] == "gap":
+        return (
+            "Buyers search this and we have no page in the top 20 — create a dedicated page this month."
+            if buyer else
+            "We're invisible here — one strong article claims this topic."
+        )
+    if c["coverage"] == "weak":
+        return (
+            f"We rank #{c['best_position']} but below the fold — refreshing the existing page is the "
+            "fastest win in this tier." if buyer else
+            f"Ranks #{c['best_position']} — improve the existing content to reach page-1 visibility."
+        )
+    return "Already ranking — keep the page fresh and defend it; no new work needed."
+
+
+def add_cluster_owners(clusters: list[dict], own_domain: str, search, max_checks: int = 10) -> None:
+    """For the top clusters, record who actually owns the SERP (competitor leverage)."""
+    from .sources import domain_of
+
+    checks = 0
+    for c in clusters:
+        if checks >= max_checks or c["tier"] == "watch":
+            continue
+        try:
+            serp = search(c["name"])
+        except CredentialMissing:
+            return
+        checks += 1
+        owners: list[str] = []
+        for r in serp["organic"]:
+            d = domain_of(r["link"])
+            if d and d != own_domain and d not in owners:
+                owners.append(d)
+        c["owned_by"] = owners[:3]
+        c["aio_present"] = serp["aio_present"]
 
 
 def run_keyword_lab(
@@ -187,6 +240,9 @@ def run_keyword_lab(
         if snaps:
             ranks = {k: e.get("position") for k, e in snaps[-1]["ranks"].items()}
     score_clusters(clusters, rows, ranks)
+    owner_search = search or (sources.serper_search if sources.serper_available() else None)
+    if owner_search:
+        add_cluster_owners(clusters, brand["domain"], owner_search)
     doc = {
         "brand_id": brand["id"],
         "at": date.today().isoformat(),

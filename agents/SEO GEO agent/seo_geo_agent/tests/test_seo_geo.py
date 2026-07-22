@@ -153,7 +153,7 @@ def test_topics_rank_easy_rising_above_hard_falling():
         return WEAK_SERP if "cost" in q or "legal" in q else STRONG_SERP
 
     ranked, notes = topics.build_topics(brand, rows, prev, search=search)
-    assert notes == []
+    assert all("Serper" not in n for n in notes)  # only the offline-LLM ideation note is expected
     top = ranked[0]
     assert "cost" in top["keyword"]
     assert top["trend"] == "rising"

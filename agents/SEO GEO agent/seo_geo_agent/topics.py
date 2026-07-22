@@ -51,6 +51,16 @@ def _trend(candidate: str, rows: list[QueryStat], prev_rows: list[QueryStat]) ->
     return "flat"
 
 
+def _impact(angle: str) -> str:
+    """How this topic grows footfall — the reader's 'why bother' in one line."""
+    return {
+        "pricing guide": "Catches buyers comparing costs — bottom-funnel traffic that converts.",
+        "comparison": "Wins people choosing between options — high-intent visits.",
+        "FAQ answer": "Answers real questions — steady search traffic plus AI-answer citations.",
+        "how-to guide": "Builds topical authority — compounds into rankings for the whole cluster.",
+    }[angle]
+
+
 def _angle(candidate: str) -> str:
     lower = candidate.lower()
     if lower.startswith(QUESTION_STARTS) or lower.endswith("?"):
@@ -131,6 +141,23 @@ def build_topics(
         if r.query.lower().startswith(QUESTION_STARTS) and r.impressions >= 50 and r.position > 10:
             add(r.query, "search data")
 
+    # Fresh ideation: topics the brand does NOT already touch — new ground, not
+    # a rearrangement of what the site/searches surfaced.
+    try:
+        ideas = sources.llm_json(
+            "You are a content strategist. Answer with a JSON array of strings only.",
+            f"Suggest 12 NEW blog topics (plain keyword phrases, not clickbait titles) that would bring "
+            f"qualified visitors to {brand.get('name', brand['domain'])} ({brand['domain']}). Avoid anything "
+            f"close to these existing candidates: {list(candidates.values())[:40]}. Mix buyer-intent and "
+            f"question topics.",
+        )
+        if isinstance(ideas, list):
+            for idea in ideas:
+                if isinstance(idea, str):
+                    add(idea, "new idea")
+    except CredentialMissing as exc:
+        notes.append(f"New-topic ideation skipped: {exc}")
+
     # Score every candidate on volume proxy + trend; SERP-check only the top few.
     scored = []
     for key, (display, source) in candidates.items():
@@ -162,10 +189,13 @@ def build_topics(
         )
         if source == "seed":
             score -= 0.08  # the lab's job is discovery — the user already knows their seeds
+        angle = _angle(display)
         topics.append({
             "keyword": display,
             "source": source,
-            "angle": _angle(display),
+            "priority": "high" if score >= 0.62 else "medium" if score >= 0.45 else "low",
+            "impact": _impact(angle),
+            "angle": angle,
             "volume_est": volume or None,
             "volume_label": f"~{volume:,}/mo (our impressions)" if volume else "interest signal only",
             "trend": trend,

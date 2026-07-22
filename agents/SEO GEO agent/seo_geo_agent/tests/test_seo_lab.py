@@ -1,6 +1,8 @@
-"""Tests for the researcher layer: keyword lab, competitors, briefs, audit."""
-from seo_geo_agent import audit, briefs, competitors, insights, keywords
-from seo_geo_agent.sources import PageFacts, QueryStat
+"""Tests for the researcher layer: keyword lab, competitors, briefs, audit, advisor."""
+import pytest
+
+from seo_geo_agent import advisor, audit, briefs, competitors, insights, keywords, topics
+from seo_geo_agent.sources import CredentialMissing, PageFacts, QueryStat
 
 
 def row(query, page="https://x.com/a", clicks=10, impressions=500, position=8.0):
@@ -59,7 +61,9 @@ def test_cluster_scoring_gap_vs_ranking():
     ranked = {c["name"]: c for c in clusters}
     assert ranked["legal virtual assistant"]["coverage"] == "ranking"
     assert ranked["law firm marketing"]["coverage"] == "gap"
-    assert clusters[0]["name"] == "legal virtual assistant"  # 1000*0.25 > 10*1.0
+    # Act-now tiers sort above already-ranking "watch" clusters, whatever the volume.
+    assert clusters[0]["name"] == "law firm marketing"
+    assert ranked["legal virtual assistant"]["tier"] == "watch"
 
 
 def test_cluster_scoring_uses_rank_snapshot_when_no_gsc():
@@ -68,6 +72,44 @@ def test_cluster_scoring_uses_rank_snapshot_when_no_gsc():
     keywords.score_clusters(clusters, [], ranks={"legal virtual assistant": 12.0})
     assert clusters[0]["coverage"] == "weak"
     assert clusters[0]["best_position"] == 12
+
+
+def test_tiers_and_recommendations():
+    clusters = [
+        {"name": "hire legal virtual assistant", "intent": "transactional",
+         "keywords": ["hire legal virtual assistant"]},
+        {"name": "what is legal intake", "intent": "informational",
+         "keywords": ["what is legal intake"]},
+        {"name": "legal answering service", "intent": "commercial",
+         "keywords": ["legal answering service"]},
+    ]
+    rows = [row("legal answering service", impressions=500, position=2.0)]
+    keywords.score_clusters(clusters, rows)
+    by_name = {c["name"]: c for c in clusters}
+    assert by_name["hire legal virtual assistant"]["tier"] == "high"      # buyer + gap
+    assert by_name["what is legal intake"]["tier"] == "medium"            # info + gap
+    assert by_name["legal answering service"]["tier"] == "watch"          # already ranking
+    assert "create a dedicated page" in by_name["hire legal virtual assistant"]["recommendation"]
+    assert clusters[0]["tier"] == "high"  # high tier sorts first
+
+
+def test_cluster_owners_recorded():
+    clusters = [{"name": "kw one", "intent": "transactional", "keywords": ["kw one"],
+                 "tier": "high", "coverage": "gap", "opportunity": 10}]
+    keywords.add_cluster_owners(clusters, "x.com", search=lambda q: serp_with(2))
+    assert clusters[0]["owned_by"] == ["comp.com", "reddit.com"]  # own domain excluded
+    assert clusters[0]["aio_present"] is False
+
+
+def test_topics_include_new_ideas_with_priority(monkeypatch):
+    monkeypatch.setattr(topics.sources, "llm_json",
+                        lambda system, prompt: ["paralegal outsourcing checklist"])
+    brand = {"id": "b", "domain": "x.com", "seeds": []}
+    ranked, _ = topics.build_topics(brand, [], [], search=None)
+    idea = next(t for t in ranked if t["source"] == "new idea")
+    assert idea["keyword"] == "paralegal outsourcing checklist"
+    assert idea["priority"] in ("high", "medium", "low")
+    assert idea["impact"]
 
 
 def test_run_keyword_lab_persists_and_lists_gaps():
@@ -169,14 +211,39 @@ def test_site_audit_reports_issues_and_score():
         "https://x.com/a": facts("https://x.com/a", title="", meta=""),
         "https://x.com/broken": facts("https://x.com/broken", status=404),
     }
-    report = audit.site_audit(BRAND, fetch=lambda u: site[u],
-                              sitemap=lambda d: list(site.keys()))
+    report = audit.site_audit(
+        BRAND, fetch=lambda u: site[u], sitemap=lambda d: list(site.keys()),
+        get_text=lambda u: {"status": 200, "text": "User-agent: *\nSitemap: https://x.com/sitemap.xml",
+                            "final_url": "https://x.com/"})
     names = [i["issue"] for i in report["issues"]]
     assert "Broken or unreachable pages" in names
     assert "Missing page title" in names
     assert report["pages_checked"] == 3 and report["pages_ok"] == 2
     assert 0 <= report["health_score"] < 100
     assert audit.latest_audit("b")["at"] == report["at"]
+
+
+def test_site_checks_flag_missing_foundations():
+    texts = {
+        "https://x.com/robots.txt": {"status": 404, "text": "", "final_url": ""},
+        "http://x.com/": {"status": 200, "text": "", "final_url": "http://x.com/"},
+    }
+    checks = {c["name"]: c for c in audit._site_checks("x.com", [], get_text=lambda u: texts[u])}
+    assert checks["Sitemap.xml"]["ok"] is False and checks["Sitemap.xml"]["fix"]
+    assert checks["Robots.txt"]["ok"] is False
+    assert checks["HTTP → HTTPS redirect"]["ok"] is False
+
+
+# --------------------------------- advisor ---------------------------------
+
+def test_advisor_context_survives_empty_state():
+    ctx = advisor._context(BRAND)
+    assert "x.com" in ctx and "tech_audit" in ctx
+
+
+def test_advisor_ask_offline_raises():
+    with pytest.raises(CredentialMissing):
+        advisor.ask(BRAND, "what should we do first?")
 
 
 def test_score_draft_good_vs_bad():
