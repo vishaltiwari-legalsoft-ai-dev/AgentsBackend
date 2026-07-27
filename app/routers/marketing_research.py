@@ -33,6 +33,7 @@ from marketing_research_agent.sources.csv_source import CsvSource
 from marketing_research_agent.sources.sheets_source import (
     SheetsSource,
     fetch_all_trackers,
+    fetch_official_spend,
     is_rollup_platform,
 )
 
@@ -95,6 +96,18 @@ def _vendor_label(platform: str) -> str:
     return plat
 
 
+def _latest_official_spend(user_id: str) -> dict[str, float]:
+    """Newest official-spend pull ({"YYYY-MM": spend} from the sheet's Overall
+    tab) — the headline figure the team reads; {} when never pulled."""
+    newest: dict | None = None
+    for run in runs.list_runs(user_id):
+        if run.get("kind") != "official_spend":
+            continue
+        if newest is None or run.get("generated_at", "") > newest.get("generated_at", ""):
+            newest = run
+    return dict((newest or {}).get("months") or {})
+
+
 def _load_dataset(user_id: str) -> dict:
     """Reassemble the user's ingested data into one dataset. Keeps a per-vendor
     view (one entry per source tab/upload) so reports can name vendors."""
@@ -114,6 +127,7 @@ def _load_dataset(user_id: str) -> dict:
         for plat, run in sorted(latest.items())
     ]
     return {"metrics": metrics, "leads": leads, "vendor_metrics": vendor_metrics,
+            "official_spend": _latest_official_spend(user_id),
             "today": date.today(), "sources": sources}
 
 
@@ -208,7 +222,8 @@ def _ingest_sheet_all(user_id: str, year: int) -> list[dict]:
 
     Clears prior sheet datasets first so a re-pull is a clean refresh."""
     for run in runs.list_runs(user_id):
-        if run.get("kind") == "dataset" and str(run.get("platform", "")).startswith("sheets:"):
+        is_sheet_ds = run.get("kind") == "dataset" and str(run.get("platform", "")).startswith("sheets:")
+        if is_sheet_ds or run.get("kind") == "official_spend":
             runs.delete_run(run["id"])
     results = []
     try:
@@ -216,6 +231,17 @@ def _ingest_sheet_all(user_id: str, year: int) -> list[dict]:
             results.append(_persist_sheet_dataset(user_id, found["tab"], found["metrics"], found["gaps"]))
     except Exception as exc:
         results.append({"tab": "*", "error": str(exc)})
+    # The Overall tab's own Spend row — the official headline the console must
+    # match (it includes ledger-only items no vendor tab carries).
+    official = fetch_official_spend(mr_config.SHEETS_SPREADSHEET_ID, year)
+    if official:
+        runs.save_run({
+            "id": runs.new_run_id(), "kind": "official_spend", "user_id": user_id,
+            "agent_id": MR_AGENT_ID, "platform": "sheets-official",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "months": official,
+        })
+        results.append({"tab": "Official total (Overall Report)", "months": len(official)})
     return results
 
 
@@ -381,7 +407,8 @@ def trends_endpoint(user=Depends(get_current_user)):
          "metrics": _rehydrate_metrics(run.get("metrics", []))}
         for plat, run in sorted(latest.items())
     ]
-    return mr_trends.build(vendor_datasets, today=date.today())
+    return mr_trends.build(vendor_datasets, today=date.today(),
+                           official_spend=_latest_official_spend(user["id"]))
 
 
 @router.post("/mr/snapshots/capture")

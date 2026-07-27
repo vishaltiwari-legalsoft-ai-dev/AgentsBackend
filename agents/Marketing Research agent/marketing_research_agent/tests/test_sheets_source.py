@@ -23,18 +23,24 @@ def test_parse_splits_channel_blocks():
     assert len(metrics) == 4
 
 
-def test_meta_spend_uses_investment_column():
+def test_meta_spend_uses_performance_column():
+    """Official basis (decision 2026-07-27): the console must show the figures
+    the team reads on the sheet — the Performance column, not Investment."""
     metrics, _ = parse_tracker(_rows(), year=2026)
     jan_meta = next(m for m in metrics if m.channel == "META" and m.date == date(2026, 1, 1))
-    assert jan_meta.spend == 3964.27  # Investment, not Performance (3603.88)
+    assert jan_meta.spend == 3603.88  # Performance, not Investment (3964.27)
     assert jan_meta.leads == 27 and jan_meta.qualified_leads == 21
     assert jan_meta.demos_booked == 11 and jan_meta.demos_completed == 4
 
 
-def test_google_spend_falls_back_to_performance_when_no_investment():
-    metrics, _ = parse_tracker(_rows(), year=2026)
-    feb_google = next(m for m in metrics if m.channel == "Google" and m.date == date(2026, 2, 1))
-    assert feb_google.spend == 19250.72  # Performance (Investment column empty)
+def test_spend_falls_back_to_investment_when_performance_blank():
+    rows = [
+        ["Meta TestBrand", "Jan (Performance)", "Jan (Investment)"],
+        ["Spend", "", "$500.00"],
+        ["Leads", "3", ""],
+    ]
+    metrics, _ = parse_tracker(rows, year=2026)
+    assert metrics[0].spend == 500.0
 
 
 def test_brand_derived_from_title():
@@ -114,6 +120,37 @@ def test_fetch_all_trackers_via_sheets_api_skips_non_trackers_and_rollups():
     assert len(found) == 1
     assert found[0]["tab"] == "Meta 360 RA" and found[0]["gid"] == 559258152
     assert len(found[0]["metrics"]) == 4
+
+
+def test_parse_official_spend_reads_rollup_performance_spend():
+    from marketing_research_agent.sources.sheets_source import parse_official_spend
+
+    rows = [
+        ["All", "Jan (Performance)", "Jan (Investment)", "1st Quarter",
+         "July (Performance)", "July (Investment)"],
+        ["Budget", "$100.00", "", "", "$77,100.20", "#N/A"],
+        ["Spend", "$1,000.50", "#N/A", "", "$45,461.20", "#N/A"],
+        ["Leads", "10", "", "", "305", ""],
+    ]
+    assert parse_official_spend(rows, 2026) == {"2026-01": 1000.50, "2026-07": 45461.20}
+
+
+def test_fetch_official_spend_reads_the_rollup_tab():
+    from marketing_research_agent.sources.sheets_source import fetch_official_spend
+
+    tabs = [
+        {"gid": 1, "title": "Meta 360 RA"},
+        {"gid": 2, "title": "Marketing 2026 Overall Report"},
+    ]
+    by_title = {
+        "Meta 360 RA": _rows(),
+        "Marketing 2026 Overall Report": [
+            ["All", "July (Performance)", "July (Investment)"],
+            ["Spend", "$45,461.20", "#N/A"],
+        ],
+    }
+    out = fetch_official_spend("sheet1", 2026, service=_FakeService(tabs, by_title))
+    assert out == {"2026-07": 45461.20}
 
 
 def test_is_rollup_tab():

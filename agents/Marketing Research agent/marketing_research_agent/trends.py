@@ -38,7 +38,8 @@ def _add(b: dict, m, *, media: bool = True) -> None:
     b["demos_completed"] += int(m.demos_completed or 0)
 
 
-def build(vendor_datasets: list[dict], today: date | None = None) -> dict:
+def build(vendor_datasets: list[dict], today: date | None = None,
+          official_spend: dict[str, float] | None = None) -> dict:
     today = today or date.today()
     cutoff = (today.year, today.month)
     cur_key = _mkey(*cutoff)
@@ -78,12 +79,21 @@ def build(vendor_datasets: list[dict], today: date | None = None) -> dict:
     monthly_list = []
     for k in sorted(monthly):
         b = monthly[k]
-        monthly_list.append({
+        row = {
             "month": k, "spend": round(b["spend"], 2), "leads": b["leads"],
             "qualified_leads": b["qualified_leads"], "demos_booked": b["demos_booked"],
             "demos_completed": b["demos_completed"],
             "cpql": round(b["spend"] / b["qualified_leads"], 2) if b["qualified_leads"] else None,
-        })
+        }
+        # Official basis (2026-07-27): where the sheet Overall tab reports the
+        # month's Spend, that figure IS the blended number; the vendor-tab sum
+        # stays alongside as the reconciliation trail.
+        v = (official_spend or {}).get(k)
+        if v is not None:
+            row["spend_computed"] = row["spend"]
+            row["spend"] = round(v, 2)
+            row["cpql"] = round(v / b["qualified_leads"], 2) if b["qualified_leads"] else None
+        monthly_list.append(row)
     channels_out = {
         ch: [{"month": k, "spend": round(v["spend"], 2), "leads": v["leads"], "qualified_leads": v["qualified_leads"]}
              for k, v in sorted(per.items())]

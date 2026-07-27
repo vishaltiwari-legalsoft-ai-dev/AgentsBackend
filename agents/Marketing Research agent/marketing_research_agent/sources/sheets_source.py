@@ -167,8 +167,9 @@ def parse_tracker(rows: list[list[str]], year: int, brand: str | None = None) ->
                 return None
             row = rows[i]
             cell = lambda c: row[c] if 0 <= c < len(row) else ""
-            if field == "spend":  # actual billed (Investment), fallback to Performance
-                return _num(cell(inv)) if inv >= 0 and _num(cell(inv)) is not None else _num(cell(perf))
+            # Official basis (decision 2026-07-27): the team reads the sheet's
+            # Performance columns, so every figure — spend included — is
+            # Performance first, Investment (billed) fallback.
             return _num(cell(perf)) if _num(cell(perf)) is not None else _num(cell(inv))
 
         for month, perf, inv in months:
@@ -302,6 +303,54 @@ def is_rollup_platform(platform: str) -> bool:
     plat = str(platform or "")
     title = plat.split(":", 1)[1] if ":" in plat else plat
     return is_rollup_tab(title, [])
+
+
+def parse_official_spend(rows: list[list[str]], year: int) -> dict[str, float]:
+    """The roll-up tab's own Spend row — the sheet's official monthly total,
+    the exact cell the team reads (Performance basis, Investment fallback).
+
+    The roll-up SUMIFS the 'Vendor Spend/Budget' ledger, so it carries spend
+    the vendor tabs never see (Websites, Referral, …); summing vendor tabs can
+    NEVER reproduce it. Keys are "YYYY-MM"."""
+    if not rows:
+        return {}
+    months = _month_columns(rows[0])
+    if not months:
+        return {}
+    title = (rows[0][0] if rows[0] else "").strip()
+    blocks = _find_blocks(rows, title)
+    start, end = (blocks[0][1], blocks[0][2]) if blocks else (1, len(rows))
+    i = _row_for(rows, start, end, _FIELD_LABELS["spend"])
+    if i is None:
+        return {}
+    row = rows[i]
+    cell = lambda c: row[c] if 0 <= c < len(row) else ""
+    out: dict[str, float] = {}
+    for month, perf, inv in months:
+        v = _num(cell(perf))
+        if v is None and inv >= 0:
+            v = _num(cell(inv))
+        if v is not None:
+            out[f"{year:04d}-{month:02d}"] = v
+    return out
+
+
+def fetch_official_spend(spreadsheet_id: str, year: int, *, service=None) -> dict[str, float]:
+    """Official monthly spend from the consolidated roll-up tab, or ``{}`` when
+    the tab or the Sheets API is unavailable (callers then fall back to the
+    vendor-tab sum, and the console labels the figure accordingly)."""
+    try:
+        svc = service or _sheets_service()
+        for tab in list_tabs(spreadsheet_id, service=svc):
+            if not is_rollup_tab(tab["title"], []):
+                continue
+            rows = fetch_tab_values(spreadsheet_id, tab["title"], service=svc)[:60]
+            official = parse_official_spend(rows, year)
+            if official:
+                return official
+        return {}
+    except Exception:
+        return {}
 
 
 def fetch_all_trackers(

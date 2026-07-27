@@ -37,6 +37,42 @@ def test_trends_monthly_spend_excludes_website_channel():
     assert web["spend_mtd"] == 700.0
 
 
+def test_overview_headline_spend_is_the_sheet_official_total():
+    """Decision 2026-07-27: the console headline must equal the Overall tab's
+    Spend cell (Performance, all-in) — with the vendor-tab sum kept alongside
+    as an auditable reconciliation, never silently different."""
+    ds = {"metrics": [_m("Google", 1000.0), _m("Websites", 700.0, leads=20, q=8)],
+          "official_spend": {"2026-07": 45461.20},
+          "today": date(2026, 7, 8), "sources": []}
+    t = reports.overview(ds)["totals"]
+    assert t["spend"] == 45461.20
+    assert t["spend_source"] == "sheet_overall"
+    assert t["spend_computed"] == 1000.0
+    assert t["spend_delta"] == round(45461.20 - 1000.0, 2)
+    # derived costs follow the official figure, matching the sheet's own math
+    assert t["cost_per_demo_booked"] == round(45461.20 / 8, 2)
+    assert t["cost_per_demo_completed"] == round(45461.20 / 4, 2)
+
+
+def test_overview_falls_back_to_computed_when_official_month_missing():
+    ds = {"metrics": [_m("Google", 1000.0)],
+          "official_spend": {"2026-06": 99.0},
+          "today": date(2026, 7, 8), "sources": []}
+    t = reports.overview(ds)["totals"]
+    assert t["spend"] == 1000.0
+    assert "spend_source" not in t
+
+
+def test_trends_monthly_spend_uses_sheet_official_total():
+    vd = [{"vendor": "A", "metrics": [_m("Google", 1000.0)]}]
+    out = trends.build(vd, today=date(2026, 7, 8),
+                       official_spend={"2026-07": 45461.20})
+    row = out["monthly"][0]
+    assert row["spend"] == 45461.20
+    assert row["spend_computed"] == 1000.0
+    assert row["cpql"] == round(45461.20 / 5, 2)
+
+
 def test_is_rollup_platform():
     assert is_rollup_platform("sheets:Marketing 2026 Overall Report")
     assert not is_rollup_platform("sheets:Meta 360 RA")
