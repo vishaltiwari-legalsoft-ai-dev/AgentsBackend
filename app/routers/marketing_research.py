@@ -9,12 +9,14 @@ runs, owned by the authenticated user.
 from __future__ import annotations
 
 import hmac
+import io
 import logging
 import os
 import tempfile
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import StreamingResponse
 
 from app.security import get_current_user
 
@@ -22,6 +24,7 @@ from dataclasses import asdict
 
 from marketing_research_agent import config as mr_config
 from marketing_research_agent import insight as mr_insight
+from marketing_research_agent import pdf_export as mr_pdf
 from marketing_research_agent import profiles as mr_profiles
 from marketing_research_agent import reports, runs, schedule
 from marketing_research_agent import snapshots as mr_snapshots
@@ -606,6 +609,45 @@ def get_report_run(run_id: str, user=Depends(get_current_user)):
     if not run or run.get("user_id") != user["id"]:
         raise HTTPException(404, "run not found")
     return run
+
+
+def _pdf_response(data: bytes, filename: str) -> StreamingResponse:
+    # Streamed (no Content-Length) so Cloud Run's 32 MiB buffered-response cap
+    # never bites — same pattern as the Creative Agent's artifact download.
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/mr/runs/{run_id}/pdf")
+def report_run_pdf(run_id: str, user=Depends(get_current_user)):
+    """The Reports panel document as a PDF — same sections, same order, same
+    figures the user is looking at on screen."""
+    run = runs.get_run(run_id)
+    if not run or run.get("user_id") != user["id"] or run.get("kind") not in reports.KINDS:
+        raise HTTPException(404, "run not found")
+    stamp = str(run.get("generated_at", ""))[:10] or date.today().isoformat()
+    return _pdf_response(mr_pdf.report_pdf(run), f"mr-{run['kind']}-{stamp}.pdf")
+
+
+@router.get("/mr/snapshots/vendor/{slug}/pdf")
+def snapshots_vendor_pdf(slug: str, date_iso: str | None = None,
+                         user=Depends(get_current_user)):
+    """The Vendors panel dossier as a PDF — official summary, day movement and
+    the full section dossier exactly as rendered on screen."""
+    detail = mr_snapshots.vendor_detail(slug, date_iso)
+    if detail is None:
+        raise HTTPException(404, f"no snapshots for vendor '{slug}'")
+    benchmarks = None
+    try:
+        benchmarks = (mr_snapshots.portfolio() or {}).get("benchmarks")
+    except Exception:  # benchmarks only tint cells; the dossier must still export
+        pass
+    snap_date = (detail.get("snapshot") or {}).get("date") or date.today().isoformat()
+    return _pdf_response(mr_pdf.vendor_pdf(detail, benchmarks),
+                         f"mr-vendor-{slug}-{snap_date}.pdf")
 
 
 @router.post("/mr/schedule/{period}")
