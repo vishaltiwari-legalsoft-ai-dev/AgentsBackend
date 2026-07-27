@@ -38,12 +38,27 @@ INK = colors.HexColor("#0f172a")
 MUTED = colors.HexColor("#64748b")
 FAINT = colors.HexColor("#94a3b8")
 ACCENT = colors.HexColor("#1746a2")
+ACCENT_DARK = colors.HexColor("#123a87")
+ACCENT_TINT = colors.HexColor("#eef4ff")
 BORDER = colors.HexColor("#e2e8f0")
 CARD_BG = colors.HexColor("#f8fafc")
 HEAD_BG = colors.HexColor("#f1f5f9")
+WHITE = colors.HexColor("#ffffff")
 RED = colors.HexColor("#dc2626")
+RED_TINT = colors.HexColor("#fdecec")
 AMBER = colors.HexColor("#d97706")
+AMBER_TINT = colors.HexColor("#fdf3e0")
 GREEN = colors.HexColor("#16a34a")
+GREEN_TINT = colors.HexColor("#e8f7ee")
+
+# Traffic-light colors for per-metric statuses (goals.status_for): every
+# flagged figure renders in red, warnings in amber — the report reads like the
+# console's dots, but louder.
+_STATUS_COLOR = {"bad": RED, "warn": AMBER, "good": GREEN}
+
+
+def _hx(c: colors.Color) -> str:
+    return c.hexval().replace("0x", "#")
 
 # Same labels the console shows (frontend reportMeta.ts) — the PDF must read
 # like the screen, so these strings stay in lockstep with it.
@@ -117,9 +132,13 @@ def _styles() -> dict[str, ParagraphStyle]:
     base = dict(fontName="Helvetica", textColor=INK)
     return {
         "eyebrow": ParagraphStyle("eyebrow", fontName="Helvetica-Bold", fontSize=7.5,
-                                  textColor=ACCENT, leading=10, spaceAfter=2,
-                                  # console eyebrow is uppercase-tracked
-                                  ),
+                                  textColor=ACCENT, leading=10, spaceAfter=2),
+        "band_eyebrow": ParagraphStyle("band_eyebrow", fontName="Helvetica-Bold", fontSize=7.5,
+                                       textColor=colors.HexColor("#bcd0f7"), leading=11),
+        "band_title": ParagraphStyle("band_title", fontName="Helvetica-Bold", fontSize=20,
+                                     textColor=WHITE, leading=24),
+        "band_meta": ParagraphStyle("band_meta", fontSize=8, textColor=colors.HexColor("#d7e2f8"),
+                                    leading=11, fontName="Helvetica"),
         "title": ParagraphStyle("title", fontName="Helvetica-Bold", fontSize=19,
                                 textColor=INK, leading=23, spaceAfter=3),
         "meta": ParagraphStyle("meta", fontSize=8, textColor=MUTED, leading=11),
@@ -136,9 +155,140 @@ def _styles() -> dict[str, ParagraphStyle]:
         "kpival": ParagraphStyle("kpival", fontName="Helvetica-Bold", fontSize=13,
                                  textColor=INK, leading=15),
         "kpilabel": ParagraphStyle("kpilabel", fontSize=7, textColor=MUTED, leading=9),
-        "cardname": ParagraphStyle("cardname", fontName="Helvetica-Bold", fontSize=9,
+        "cardname": ParagraphStyle("cardname", fontName="Helvetica-Bold", fontSize=9.5,
                                    textColor=ACCENT, leading=12),
+        "cardspend": ParagraphStyle("cardspend", fontName="Helvetica-Bold", fontSize=15,
+                                    textColor=INK, leading=17),
     }
+
+
+# --- design primitives (accent band, chips, rounded cards, card grids) -------
+
+_PAGE_W = A4[0] - 32 * mm  # printable width inside the 16mm margins
+
+
+def _band(story: list, S, eyebrow: str, title: str, meta: str,
+          chip: tuple[str, colors.Color] | None = None) -> None:
+    """Full-width accent header band with an optional colored verdict chip."""
+    left = [
+        Paragraph(_esc(eyebrow).upper(), S["band_eyebrow"]),
+        Spacer(0, 1.2 * mm),
+        Paragraph(_esc(title), S["band_title"]),
+        Spacer(0, 1.6 * mm),
+        Paragraph(_esc(meta), S["band_meta"]),
+    ]
+    if chip:
+        label, col = chip
+        chip_t = Table(
+            [[Paragraph(f"<b>{_esc(label)}</b>",
+                        ParagraphStyle("chip", fontName="Helvetica-Bold", fontSize=8,
+                                       textColor=WHITE, leading=10, alignment=1))]],
+            colWidths=[34 * mm])
+        chip_t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), col),
+            ("ROUNDEDCORNERS", [5, 5, 5, 5]),
+            ("TOPPADDING", (0, 0), (-1, -1), 4.5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4.5),
+        ]))
+        row = [[left, chip_t]]
+        band = Table(row, colWidths=[_PAGE_W - 44 * mm, 44 * mm])
+    else:
+        band = Table([[left]], colWidths=[_PAGE_W])
+    band.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), ACCENT),
+        ("ROUNDEDCORNERS", [8, 8, 8, 8]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+        ("TOPPADDING", (0, 0), (-1, -1), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 11),
+    ]))
+    story.append(band)
+
+
+def _rounded_card(content: list, *, width: float, bg=WHITE, border=BORDER,
+                  accent: colors.Color | None = None) -> Table:
+    """One card: rounded box, light border, optional colored left accent bar."""
+    inner = Table([[content]], colWidths=[width - (3.5 if accent else 0)])
+    style = [
+        ("BACKGROUND", (0, 0), (-1, -1), bg),
+        ("BOX", (0, 0), (-1, -1), 0.75, border),
+        ("ROUNDEDCORNERS", [6, 6, 6, 6]),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 9),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]
+    if accent is not None:
+        style.append(("LINEBEFORE", (0, 0), (0, -1), 2.5, accent))
+    inner.setStyle(TableStyle(style))
+    return inner
+
+
+def _card_grid(cards: list[Table], *, per_row: int = 2, gap: float = 5 * mm) -> list:
+    """Cards laid out in rows; each row is KeepTogether so a page break never
+    slices through a card (the reason the DOM-capture approach was reverted)."""
+    out: list = []
+    for i in range(0, len(cards), per_row):
+        row = cards[i:i + per_row]
+        cells, widths = [], []
+        for j, c in enumerate(row):
+            if j:
+                cells.append(Spacer(gap, 0))
+                widths.append(gap)
+            cells.append(c)
+            widths.append((_PAGE_W - gap * (per_row - 1)) / per_row)
+        while len(row) < per_row:  # keep last row left-aligned
+            cells.append(Spacer(0, 0))
+            widths.append((_PAGE_W - gap * (per_row - 1)) / per_row)
+            row.append(None)  # type: ignore[arg-type]
+        t = Table([cells], colWidths=widths)
+        t.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        out.append(KeepTogether([t]))
+        out.append(Spacer(0, 3 * mm))
+    return out
+
+
+def _counts_row(pairs: list[tuple[str, str]], S, width: float) -> Table:
+    t = Table(
+        [[Paragraph(f"<b>{_esc(v)}</b>", S["cell"]) for _, v in pairs],
+         [Paragraph(_esc(k), S["kpilabel"]) for k, _ in pairs]],
+        colWidths=[width / len(pairs)] * len(pairs))
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), CARD_BG),
+        ("ROUNDEDCORNERS", [4, 4, 4, 4]),
+        ("TOPPADDING", (0, 0), (-1, 0), 4),
+        ("BOTTOMPADDING", (0, 1), (-1, 1), 4),
+        ("TOPPADDING", (0, 1), (-1, 1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 0.5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    return t
+
+
+def _metric_line(label: str, value: str, S, *, status: str | None = None,
+                 goal: str | None = None) -> Table:
+    col = _STATUS_COLOR.get(status or "")
+    val = f'<font color="{_hx(col)}"><b>{_esc(value)}</b></font>' if col else f"<b>{_esc(value)}</b>"
+    lbl = _esc(label) + (f' <font color="{_hx(FAINT)}" size="6.4">{_esc(goal)}</font>' if goal else "")
+    t = Table([[Paragraph(lbl, S["cellsmall"]), Paragraph(val, S["cell"])]],
+              colWidths=[None, 24 * mm])
+    t.setStyle(TableStyle([
+        ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.4, BORDER),
+        ("TOPPADDING", (0, 0), (-1, -1), 2.2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.2),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    return t
 
 
 def _section(n: int, title: str, S) -> Table:
@@ -228,25 +378,68 @@ def _source_label(platform: str) -> str:
 
 # --- Reports panel PDF -------------------------------------------------------
 
-def _channel_rows(channels: dict, S) -> list[list]:
-    head = ["Channel", "Spend", "Leads", "Qualified", "Booked", "Completed",
-            "C/Lead", "C/Qual. lead", "C/Booked", "C/Completed", "CAC"]
-    rows: list[list] = [[Paragraph(f"<b>{_esc(h)}</b>", S["cellsmall"]) for h in head]]
-    for name, a in channels.items():
-        rows.append([
-            Paragraph(f"<b>{_esc(name)}</b>", S["cell"]),
-            Paragraph(_money(a.get("spend")), S["cell"]),
-            Paragraph(_num(a.get("leads")), S["cell"]),
-            Paragraph(_num(a.get("qualified_leads")), S["cell"]),
-            Paragraph(_num(a.get("demos_booked")), S["cell"]),
-            Paragraph(_num(a.get("demos_completed")), S["cell"]),
-            Paragraph(_money(a.get("cost_per_lead")), S["cell"]),
-            Paragraph(_money(a.get("cost_per_qualified_lead")), S["cell"]),
-            Paragraph(_money(a.get("cost_per_demo_booked")), S["cell"]),
-            Paragraph(_money(a.get("cost_per_demo_completed")), S["cell"]),
-            Paragraph(_money(a.get("cac")), S["cell"]),
-        ])
-    return rows
+def _channel_card(name: str, a: dict, S, width: float) -> Table:
+    """One channel as the console's card: name, hero spend, counts strip and
+    per-metric rows with traffic-light coloring (flagged = red)."""
+    st = a.get("status") or {}
+    g = a.get("goal") or {}
+    inner_w = width - 18 - 3.5  # card paddings + accent bar
+    content: list = [
+        Paragraph(_esc(name).upper(), S["cardname"]),
+        Spacer(0, 1.2 * mm),
+        Paragraph(f"<b>{_esc(_money(a.get('spend')))}</b> "
+                  f'<font color="{_hx(MUTED)}" size="7">SPEND</font>', S["cardspend"]),
+        Spacer(0, 2 * mm),
+        _counts_row([("Leads", _num(a.get("leads"))),
+                     ("Qualified", _num(a.get("qualified_leads"))),
+                     ("Booked", _num(a.get("demos_booked"))),
+                     ("Completed", _num(a.get("demos_completed")))], S, inner_w),
+        Spacer(0, 2 * mm),
+        _metric_line("Cost / Lead", _money(a.get("cost_per_lead")), S),
+        _metric_line("Cost / Qualified Lead", _money(a.get("cost_per_qualified_lead")), S,
+                     status=st.get("cost_per_qualified_lead"), goal="target $200–400"),
+        _metric_line("Cost / Demo Booked", _money(a.get("cost_per_demo_booked")), S,
+                     status=st.get("cost_per_demo_booked"),
+                     goal=f"goal ${g.get('cpd_booked_low')}–{g.get('cpd_booked_high')}" if g else None),
+        _metric_line("Cost / Demo Completed", _money(a.get("cost_per_demo_completed")), S,
+                     status=st.get("cost_per_demo_completed"),
+                     goal=f"goal ${g.get('cpd_completed_low')}–{g.get('cpd_completed_high')}" if g else None),
+        _metric_line("CAC", _money(a.get("cac")), S, status=st.get("cac"), goal="target ≤ $2,500"),
+    ]
+    return _rounded_card(content, width=width, accent=ACCENT)
+
+
+def _vendor_card(v: dict, S, width: float, red_reasons: list[str] | None) -> Table:
+    """One vendor as the console's card; a red-flagged vendor renders in red —
+    name, border and its reasons (house rule: flagged items appear in red)."""
+    flagged = bool(red_reasons)
+    name_col = RED if flagged else ACCENT
+    inner_w = width - 18 - 3.5
+    content: list = [
+        Paragraph(f'<font color="{_hx(name_col)}"><b>{_esc(v.get("vendor", "")).upper()}</b></font>',
+                  S["cardname"]),
+        Spacer(0, 1.2 * mm),
+        Paragraph(f"<b>{_esc(_money(v.get('spend')))}</b> "
+                  f'<font color="{_hx(MUTED)}" size="7">SPEND</font>', S["cardspend"]),
+        Spacer(0, 2 * mm),
+        _counts_row([("Qualified", _num(v.get("qualified_leads"))),
+                     ("Booked", _num(v.get("demos_booked"))),
+                     ("Completed", _num(v.get("demos_completed")))], S, inner_w),
+        Spacer(0, 2 * mm),
+        _metric_line("Cost / Qualified Lead", _money(v.get("cost_per_qualified_lead")), S,
+                     status="bad" if flagged else None),
+        _metric_line("Cost / Demo Booked", _money(v.get("cost_per_demo_booked")), S),
+        _metric_line("Cost / Demo Completed", _money(v.get("cost_per_demo_completed")), S),
+    ]
+    if flagged:
+        content.append(Spacer(0, 1.5 * mm))
+        content.append(Paragraph(
+            f'<font color="{_hx(RED)}">■ {_esc("; ".join(red_reasons or []))}</font>',
+            S["cellsmall"]))
+    return _rounded_card(content, width=width,
+                         bg=RED_TINT if flagged else WHITE,
+                         border=RED if flagged else BORDER,
+                         accent=RED if flagged else ACCENT)
 
 
 def _bullets(items: list, S) -> Paragraph:
@@ -263,25 +456,20 @@ def report_pdf(report: dict) -> bytes:
     summary, recommend = _read_narrative(report.get("markdown") or "")
 
     story: list = []
-    story.append(Paragraph(_esc(meta["eyebrow"]).upper(), S["eyebrow"]))
-    title_bits = [Paragraph(_esc(meta["label"]), S["title"])]
+    chip = None
     if is_campaign:
         groups = s.get("flag_summary") or []
         reds = sum(g.get("count", 0) for g in groups if g.get("level") == "red")
         warns = sum(g.get("count", 0) for g in groups if g.get("level") != "red")
-        label, col = _verdict(reds, warns)
-        title_bits.append(Paragraph(
-            f'<font color="{col.hexval().replace("0x", "#")}"><b>{_esc(label)}</b></font>',
-            S["meta"]))
-    story += title_bits
+        chip = _verdict(reds, warns)
     meta_line = []
     period = s.get("period") or {}
     if period.get("label"):
         meta_line.append(f"Reporting period {period['label']}")
     meta_line.append(f"Generated {_fmt_time(report.get('generated_at'))}")
     meta_line.append("Marketing Research agent")
-    story.append(Paragraph(_esc(" · ".join(meta_line)), S["meta"]))
-    story.append(Spacer(0, 5 * mm))
+    _band(story, S, meta["eyebrow"], meta["label"], " · ".join(meta_line), chip)
+    story.append(Spacer(0, 6 * mm))
 
     n = 0
 
@@ -300,60 +488,72 @@ def report_pdf(report: dict) -> bytes:
             story.append(Paragraph(_esc(para.strip()), S["body"]))
             story.append(Spacer(0, 1.5 * mm))
         if red_vendors:
-            story.append(Spacer(0, 1 * mm))
-            story.append(Paragraph("<b>Vendors on red flag</b>", S["body"]))
+            story.append(Spacer(0, 1.5 * mm))
+            lines: list = [Paragraph(
+                f'<font color="{_hx(RED)}"><b>VENDORS ON RED FLAG</b></font>', S["cellsmall"]),
+                Spacer(0, 1 * mm)]
             for r in red_vendors:
-                story.append(Paragraph(
-                    f"• <b>{_esc(r.get('vendor'))}</b> — {_esc('; '.join(r.get('reasons') or []))}",
-                    S["body"]))
+                lines.append(Paragraph(
+                    f'<font color="{_hx(RED)}">■ <b>{_esc(r.get("vendor"))}</b> — '
+                    f'{_esc("; ".join(r.get("reasons") or []))}</font>', S["body"]))
+                lines.append(Spacer(0, 0.8 * mm))
+            story.append(KeepTogether([
+                _rounded_card(lines, width=_PAGE_W, bg=RED_TINT, border=RED, accent=RED)]))
         if recommend:
-            story.append(Spacer(0, 2 * mm))
-            rec = Table([[Paragraph("<b>Recommend</b>", S["cellsmall"]),
-                          Paragraph(_esc(recommend), S["cell"])]], colWidths=[22 * mm, None])
-            rec.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), CARD_BG),
-                ("BOX", (0, 0), (-1, -1), 0.5, BORDER),
-                ("LINEBEFORE", (0, 0), (0, -1), 2, ACCENT),
-                ("TOPPADDING", (0, 0), (-1, -1), 5),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-                ("LEFTPADDING", (0, 0), (-1, -1), 7),
-            ]))
-            story.append(rec)
+            story.append(Spacer(0, 2.5 * mm))
+            story.append(KeepTogether([_rounded_card(
+                [Paragraph(f'<font color="{_hx(ACCENT)}"><b>RECOMMEND</b></font>', S["cellsmall"]),
+                 Spacer(0, 1 * mm),
+                 Paragraph(_esc(recommend), S["body"])],
+                width=_PAGE_W, bg=ACCENT_TINT, border=ACCENT, accent=ACCENT)]))
 
-    # 02 — What needs attention (campaign kinds, when flags exist)
+    # 02 — What needs attention: one tinted card per flag group; red flags read
+    # in red (house rule 2026-07-27: every flagged item appears in red).
     groups = s.get("flag_summary") or []
     if is_campaign and groups:
         sec("What needs attention")
+        cards = []
         for g in groups:
-            # The flag text already carries its count ("2 campaigns over…") —
-            # the console's count badge becomes a level-colored bullet here.
-            col = RED if g.get("level") == "red" else AMBER
-            story.append(Paragraph(
-                f'<font color="{col.hexval().replace("0x", "#")}"><b>•</b></font>'
-                f'  {_esc(g.get("text", ""))}', S["body"]))
-            story.append(Spacer(0, 1 * mm))
+            is_red = g.get("level") == "red"
+            col, tint = (RED, RED_TINT) if is_red else (AMBER, AMBER_TINT)
+            # the flag text already carries its count ("2 campaigns over…")
+            cards.append(_rounded_card(
+                [Paragraph(
+                    f'<font color="{_hx(col)}"><b>{"RED" if is_red else "WATCH"}</b>  '
+                    f'{_esc(g.get("text", ""))}</font>', S["body"])],
+                width=(_PAGE_W - 5 * mm) / 2, bg=tint, border=col, accent=col))
+        story += _card_grid(cards, per_row=2)
 
     # 03 — Performance detail (shape depends on the report kind, as on screen)
     sec("Performance detail")
     if is_campaign:
         totals = s.get("totals") or {}
         if totals:
-            story.append(_kpi_strip([
+            kpi_cards = []
+            kpi_w = (_PAGE_W - 3 * 5 * mm) / 4
+            for label, value in (
                 ("Total spend", _money(totals.get("spend"))),
                 ("Demos completed", _num(totals.get("demos_completed"))),
                 ("Cost / completed", _money(totals.get("cost_per_demo_completed"))),
                 ("Qualified leads", _num(totals.get("qualified_leads"))),
-            ], S))
+            ):
+                kpi_cards.append(_rounded_card(
+                    [Paragraph(f"<b>{_esc(value)}</b>", S["kpival"]),
+                     Spacer(0, 0.6 * mm),
+                     Paragraph(_esc(label).upper(), S["kpilabel"])],
+                    width=kpi_w, bg=CARD_BG, accent=ACCENT))
+            story += _card_grid(kpi_cards, per_row=4)
             if totals.get("spend_source") == "sheet_overall":
-                story.append(Spacer(0, 1.2 * mm))
                 story.append(Paragraph(
                     _esc(f"Official sheet total (Overall Report). Vendor-tab sum "
                          f"{_money(totals.get('spend_computed'))} · delta {_money(totals.get('spend_delta'))}."),
                     S["small"]))
-            story.append(Spacer(0, 3 * mm))
+                story.append(Spacer(0, 2.5 * mm))
         channels = s.get("channels") or {}
         if channels:
-            story.append(_grid_table(_channel_rows(channels, S)))
+            card_w = (_PAGE_W - 5 * mm) / 2
+            story += _card_grid(
+                [_channel_card(name, a, S, card_w) for name, a in channels.items()], per_row=2)
     elif kind == "utm_attribution":
         attr = s.get("attribution") or {}
         if attr:
@@ -423,38 +623,43 @@ def report_pdf(report: dict) -> bytes:
                             + [Paragraph(_esc(win), S["cell"])])
             story.append(_grid_table(rows))
 
-    # 04 — Vendor detail (the console's vendor cards, one row per vendor)
+    # 04 — Vendor detail: the console's vendor cards; red-flagged vendors in red
     vendors = s.get("vendors") or []
     if vendors:
         sec("Vendor detail")
-        head = ["Vendor", "Spend", "Qualified", "Booked", "Completed",
-                "C/Qual. lead", "C/Demo booked", "C/Demo completed"]
-        rows = [[Paragraph(f"<b>{h}</b>", S["cellsmall"]) for h in head]]
-        for v in vendors:
-            rows.append([
-                Paragraph(f"<b>{_esc(v.get('vendor'))}</b>", S["cell"]),
-                Paragraph(_money(v.get("spend")), S["cell"]),
-                Paragraph(_num(v.get("qualified_leads")), S["cell"]),
-                Paragraph(_num(v.get("demos_booked")), S["cell"]),
-                Paragraph(_num(v.get("demos_completed")), S["cell"]),
-                Paragraph(_money(v.get("cost_per_qualified_lead")), S["cell"]),
-                Paragraph(_money(v.get("cost_per_demo_booked")), S["cell"]),
-                Paragraph(_money(v.get("cost_per_demo_completed")), S["cell"]),
-            ])
-        story.append(_grid_table(rows))
+        red_map = {r.get("vendor"): r.get("reasons") or [] for r in red_vendors}
+        card_w = (_PAGE_W - 5 * mm) / 2
+        story += _card_grid(
+            [_vendor_card(v, S, card_w, red_map.get(v.get("vendor"))) for v in vendors],
+            per_row=2)
 
-    # 05 — Vendor insights & actions
+    # 05 — Vendor insights & actions (accent header, zebra rows)
     insights = s.get("vendor_insights") or []
     if insights:
         sec("Vendor insights & actions")
-        rows = [[Paragraph("<b>Vendor</b>", S["cellsmall"]),
-                 Paragraph("<b>Insights</b>", S["cellsmall"]),
-                 Paragraph("<b>Actions</b>", S["cellsmall"])]]
+        white_head = ParagraphStyle("wh", parent=S["cellsmall"], textColor=WHITE,
+                                    fontName="Helvetica-Bold")
+        rows = [[Paragraph("VENDOR", white_head), Paragraph("INSIGHTS", white_head),
+                 Paragraph("ACTIONS", white_head)]]
         for r in insights:
             rows.append([Paragraph(f"<b>{_esc(r.get('vendor'))}</b>", S["cell"]),
                          _bullets(r.get("insights") or [], S),
                          _bullets(r.get("actions") or [], S)])
-        story.append(_grid_table(rows, col_widths=[32 * mm, None, None]))
+        t = Table(rows, colWidths=[32 * mm, None, None], repeatRows=1)
+        style = [
+            ("BACKGROUND", (0, 0), (-1, 0), ACCENT),
+            ("ROUNDEDCORNERS", [5, 5, 0, 0]),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, BORDER),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 4.5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4.5),
+        ]
+        for i in range(2, len(rows), 2):
+            style.append(("BACKGROUND", (0, i), (-1, i), CARD_BG))
+        t.setStyle(TableStyle(style))
+        story.append(t)
 
     # last — Appendix, data & provenance (always, as on screen)
     sec("Appendix — data & provenance")
@@ -591,12 +796,11 @@ def vendor_pdf(detail: dict, benchmarks: dict | None = None) -> bytes:
     dates = detail.get("dates") or []
 
     story: list = []
-    story.append(Paragraph(f"VENDOR DOSSIER · GID {_esc(detail.get('gid', '—'))}", S["eyebrow"]))
-    story.append(Paragraph(_esc(detail.get("vendor", "Vendor")), S["title"]))
-    story.append(Paragraph(_esc(
-        f"{len(dates)} day{'' if len(dates) == 1 else 's'} captured · showing {snap.get('date', '—')} (MTD)"
-        f" · captured {_fmt_time(snap.get('captured_at'))}"), S["meta"]))
-    story.append(Spacer(0, 5 * mm))
+    _band(story, S, f"Vendor dossier · GID {detail.get('gid', '—')}",
+          detail.get("vendor", "Vendor"),
+          f"{len(dates)} day{'' if len(dates) == 1 else 's'} captured · showing {snap.get('date', '—')} (MTD)"
+          f" · captured {_fmt_time(snap.get('captured_at'))}")
+    story.append(Spacer(0, 6 * mm))
 
     # Official summary — the same 10 cells, same order, same benchmark logic.
     st = _vendor_stats(team)
