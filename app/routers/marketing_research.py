@@ -36,7 +36,7 @@ from marketing_research_agent.sources.csv_source import CsvSource
 from marketing_research_agent.sources.sheets_source import (
     SheetsSource,
     fetch_all_trackers,
-    fetch_official_spend,
+    fetch_official_totals,
     is_rollup_platform,
 )
 
@@ -99,16 +99,22 @@ def _vendor_label(platform: str) -> str:
     return plat
 
 
-def _latest_official_spend(user_id: str) -> dict[str, float]:
-    """Newest official-spend pull ({"YYYY-MM": spend} from the sheet's Overall
-    tab) — the headline figure the team reads; {} when never pulled."""
+def _latest_official_run(user_id: str) -> dict:
+    """Newest official-totals pull from the sheet's Overall tab; {} if never
+    pulled. Carries both the full per-field map ("totals") and the legacy
+    spend-only map ("months")."""
     newest: dict | None = None
     for run in runs.list_runs(user_id):
         if run.get("kind") != "official_spend":
             continue
         if newest is None or run.get("generated_at", "") > newest.get("generated_at", ""):
             newest = run
-    return dict((newest or {}).get("months") or {})
+    return newest or {}
+
+
+def _latest_official_spend(user_id: str) -> dict[str, float]:
+    """Spend-only view ({"YYYY-MM": spend}) — the trends board's headline."""
+    return dict(_latest_official_run(user_id).get("months") or {})
 
 
 def _load_dataset(user_id: str) -> dict:
@@ -129,8 +135,10 @@ def _load_dataset(user_id: str) -> dict:
          "metrics": len(run.get("metrics", [])), "leads": len(run.get("leads", []))}
         for plat, run in sorted(latest.items())
     ]
+    official = _latest_official_run(user_id)
     return {"metrics": metrics, "leads": leads, "vendor_metrics": vendor_metrics,
-            "official_spend": _latest_official_spend(user_id),
+            "official_spend": dict(official.get("months") or {}),
+            "official_totals": dict(official.get("totals") or {}),
             "today": date.today(), "sources": sources}
 
 
@@ -234,17 +242,19 @@ def _ingest_sheet_all(user_id: str, year: int) -> list[dict]:
             results.append(_persist_sheet_dataset(user_id, found["tab"], found["metrics"], found["gaps"]))
     except Exception as exc:
         results.append({"tab": "*", "error": str(exc)})
-    # The Overall tab's own Spend row — the official headline the console must
-    # match (it includes ledger-only items no vendor tab carries).
-    official = fetch_official_spend(mr_config.SHEETS_SPREADSHEET_ID, year)
+    # The Overall tab's own team-level rows — the official headline figures the
+    # console must match (the roll-up aggregates ledger/raw sources no vendor
+    # tab carries). "months" keeps the legacy spend-only shape for old readers.
+    official = fetch_official_totals(mr_config.SHEETS_SPREADSHEET_ID, year)
     if official:
         runs.save_run({
             "id": runs.new_run_id(), "kind": "official_spend", "user_id": user_id,
             "agent_id": MR_AGENT_ID, "platform": "sheets-official",
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "months": official,
+            "months": {k: v["spend"] for k, v in official.items() if "spend" in v},
+            "totals": official,
         })
-        results.append({"tab": "Official total (Overall Report)", "months": len(official)})
+        results.append({"tab": "Official totals (Overall Report)", "months": len(official)})
     return results
 
 
@@ -410,8 +420,10 @@ def trends_endpoint(user=Depends(get_current_user)):
          "metrics": _rehydrate_metrics(run.get("metrics", []))}
         for plat, run in sorted(latest.items())
     ]
+    official = _latest_official_run(user["id"])
     return mr_trends.build(vendor_datasets, today=date.today(),
-                           official_spend=_latest_official_spend(user["id"]))
+                           official_spend=dict(official.get("months") or {}),
+                           official_totals=dict(official.get("totals") or {}))
 
 
 @router.post("/mr/snapshots/capture")

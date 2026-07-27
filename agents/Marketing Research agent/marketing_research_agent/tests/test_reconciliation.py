@@ -63,6 +63,53 @@ def test_overview_falls_back_to_computed_when_official_month_missing():
     assert "spend_source" not in t
 
 
+def test_overview_official_totals_override_every_team_kpi():
+    ds = {"metrics": [_m("Google", 1000.0)],
+          "official_totals": {"2026-07": {
+              "spend": 47166.58, "leads": 331, "qualified_leads": 137,
+              "demos_booked": 137, "demos_completed": 74,
+          }},
+          "today": date(2026, 7, 27), "sources": []}
+    t = reports.overview(ds)["totals"]
+    assert t["spend"] == 47166.58 and t["spend_source"] == "sheet_overall"
+    assert t["leads"] == 331 and t["qualified_leads"] == 137
+    assert t["demos_booked"] == 137 and t["demos_completed"] == 74
+    # derived costs equal the sheet's own math by construction
+    assert t["cost_per_demo_booked"] == round(47166.58 / 137, 2)
+    assert t["cost_per_demo_completed"] == round(47166.58 / 74, 2)
+    # the vendor-tab sums stay alongside as the audit trail
+    assert t["demos_booked_computed"] == 4 and t["leads_computed"] == 10
+
+
+def test_portfolio_prefers_the_overall_rollup_snapshot(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_SNAPSHOTS_DIR", str(tmp_path))
+    snapshots.save_snapshot(_snap("meta-360-ra", "Meta 360 RA", spend=1000.0))
+    roll = _snap("marketing-2026-overall-report", "Marketing 2026 Overall Report", spend=47166.58)
+    roll["canonical"]["team_overall"]["budget"] = {"performance": 78100.2, "investment": None}
+    roll["canonical"]["team_overall"]["leads"] = {"total": 331, "qualified": 137}
+    roll["canonical"]["team_overall"]["demos"] = {"qualified_booked_all": 115, "completed_all": 74}
+    roll["canonical"]["team_overall"]["actualized_revenue"] = {"services_sold": 12}
+    snapshots.save_snapshot(roll)
+    p = snapshots.portfolio()
+    assert p["source"] == "sheet_overall"
+    assert p["total_spend"] == 47166.58 and p["total_budget"] == 78100.2
+    assert p["leads"] == 331 and p["qualified_leads"] == 137
+    assert p["qual_demos_booked"] == 115 and p["demos_completed"] == 74
+    assert p["services_sold"] == 12
+    assert p["show_rate_pct"] == round(74 * 100 / 115, 2)
+    assert p["computed_spend"] == 1000.0   # vendor-sum audit trail
+    assert p["vendors"] == 1               # the roll-up is not a vendor
+
+
+def test_portfolio_falls_back_to_vendor_sum_without_rollup(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_SNAPSHOTS_DIR", str(tmp_path))
+    snapshots.save_snapshot(_snap("meta-360-ra", "Meta 360 RA", spend=1000.0))
+    p = snapshots.portfolio()
+    assert p["source"] == "vendor_sum" and p["total_spend"] == 1000.0
+
+
 def test_trends_monthly_spend_uses_sheet_official_total():
     vd = [{"vendor": "A", "metrics": [_m("Google", 1000.0)]}]
     out = trends.build(vd, today=date(2026, 7, 8),

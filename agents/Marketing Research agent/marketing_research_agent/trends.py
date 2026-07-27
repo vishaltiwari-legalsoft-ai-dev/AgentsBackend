@@ -39,7 +39,8 @@ def _add(b: dict, m, *, media: bool = True) -> None:
 
 
 def build(vendor_datasets: list[dict], today: date | None = None,
-          official_spend: dict[str, float] | None = None) -> dict:
+          official_spend: dict[str, float] | None = None,
+          official_totals: dict[str, dict] | None = None) -> dict:
     today = today or date.today()
     cutoff = (today.year, today.month)
     cur_key = _mkey(*cutoff)
@@ -85,14 +86,22 @@ def build(vendor_datasets: list[dict], today: date | None = None,
             "demos_completed": b["demos_completed"],
             "cpql": round(b["spend"] / b["qualified_leads"], 2) if b["qualified_leads"] else None,
         }
-        # Official basis (2026-07-27): where the sheet Overall tab reports the
-        # month's Spend, that figure IS the blended number; the vendor-tab sum
-        # stays alongside as the reconciliation trail.
-        v = (official_spend or {}).get(k)
-        if v is not None:
+        # Official basis (2026-07-27): where the sheet Overall tab reports a
+        # month's team-level figures, those ARE the blended numbers; each
+        # vendor-tab sum stays alongside as the reconciliation trail.
+        off = dict((official_totals or {}).get(k) or {})
+        sp = (official_spend or {}).get(k)
+        if sp is not None:
+            off.setdefault("spend", sp)
+        if "spend" in off:
             row["spend_computed"] = row["spend"]
-            row["spend"] = round(v, 2)
-            row["cpql"] = round(v / b["qualified_leads"], 2) if b["qualified_leads"] else None
+            row["spend"] = round(off["spend"], 2)
+        for f in ("leads", "qualified_leads", "demos_booked", "demos_completed"):
+            if f in off:
+                row[f"{f}_computed"] = row[f]
+                row[f] = int(off[f])
+        if off:
+            row["cpql"] = round(row["spend"] / row["qualified_leads"], 2) if row["qualified_leads"] else None
         monthly_list.append(row)
     channels_out = {
         ch: [{"month": k, "spend": round(v["spend"], 2), "leads": v["leads"], "qualified_leads": v["qualified_leads"]}

@@ -266,30 +266,53 @@ def _vendor_insights(vendors: list[dict], red_flags: list[dict]) -> list[dict]:
     return _fallback_vendor_insights(vendors, red_map)
 
 
-def _official_spend_for(ds: dict, metrics: list) -> float | None:
-    """The sheet Overall tab's own Spend total for the months these metrics
-    cover (decision 2026-07-27: the headline must be the cell the team reads —
-    Performance basis, all-in). None when any covered month is missing, so a
-    partial figure is never passed off as the official one."""
-    official = ds.get("official_spend") or {}
+# Official fields the headline strip may take from the sheet's Overall tab
+# (decision 2026-07-27, extended same day to every team-level KPI: the console
+# must show the cells the team reads — the roll-up aggregates ledger/raw
+# sources with no vendor tab, so a vendor-tab sum can never reproduce them).
+_OFFICIAL_TOTAL_FIELDS = (
+    "spend", "leads", "qualified_leads", "demos_booked", "demos_completed",
+    "qual_demos_booked", "budget", "services_sold",
+)
+
+
+def _official_totals_for(ds: dict, metrics: list) -> dict[str, float] | None:
+    """Per-field official sums for the months these metrics cover. A field is
+    returned only when every covered month reports it, so a partial figure is
+    never passed off as the official one. Falls back to a spend-only map from
+    runs persisted before the full-totals read existed."""
+    official = ds.get("official_totals") or {}
+    if not official:
+        official = {k: {"spend": v} for k, v in (ds.get("official_spend") or {}).items()}
     if not official or not metrics:
         return None
     keys = {f"{m.date.year:04d}-{m.date.month:02d}" for m in metrics}
     if not keys <= set(official):
         return None
-    return round(sum(official[k] for k in keys), 2)
+    out = {}
+    for field in _OFFICIAL_TOTAL_FIELDS:
+        if all(field in official[k] for k in keys):
+            out[field] = round(sum(official[k][field] for k in keys), 2)
+    return out or None
 
 
-def _apply_official_spend(totals: dict, official: float) -> dict:
-    """Swap the headline to the sheet's official figure; keep the vendor-tab
-    sum + delta alongside so any drift is visible, never silent."""
+def _apply_official_totals(totals: dict, off: dict[str, float]) -> dict:
+    """Swap the headline figures to the sheet's official ones; keep each
+    vendor-tab sum alongside so any drift is visible, never silent. Derived
+    costs are recomputed from the official inputs — which makes them equal the
+    sheet's own derived rows by construction."""
+    if "spend" in off:
+        totals["spend_computed"] = totals.get("spend")
+        totals["spend"] = off["spend"]
+        totals["spend_delta"] = round(off["spend"] - (totals["spend_computed"] or 0), 2)
+        totals["spend_source"] = "sheet_overall"
+    for field in ("leads", "qualified_leads", "demos_booked", "demos_completed"):
+        if field in off:
+            totals[f"{field}_computed"] = totals.get(field)
+            totals[field] = int(off[field])
     div = lambda n, d: round(n / d, 2) if d else None
-    totals["spend_computed"] = totals["spend"]
-    totals["spend"] = official
-    totals["spend_delta"] = round(official - totals["spend_computed"], 2)
-    totals["spend_source"] = "sheet_overall"
-    totals["cost_per_demo_booked"] = div(official, totals.get("demos_booked"))
-    totals["cost_per_demo_completed"] = div(official, totals.get("demos_completed"))
+    totals["cost_per_demo_booked"] = div(totals.get("spend"), totals.get("demos_booked"))
+    totals["cost_per_demo_completed"] = div(totals.get("spend"), totals.get("demos_completed"))
     return totals
 
 
@@ -303,9 +326,9 @@ def _campaign_structured(ds: dict) -> dict:
     for channel, agg in current_agg.items():
         _enrich(channel, agg)
     totals = _enrich("Total", total_block) if total_block is not None else _totals(current_agg)
-    official = _official_spend_for(ds, metrics)
+    official = _official_totals_for(ds, metrics)
     if official is not None:
-        totals = _apply_official_spend(totals, official)
+        totals = _apply_official_totals(totals, official)
     flags = [f.__dict__ for f in cr.flag_all(metrics, ds.get("prior"))]
     structured = {
         "channels": current_agg,

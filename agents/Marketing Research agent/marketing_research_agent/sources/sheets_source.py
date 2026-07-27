@@ -305,13 +305,26 @@ def is_rollup_platform(platform: str) -> bool:
     return is_rollup_tab(title, [])
 
 
-def parse_official_spend(rows: list[list[str]], year: int) -> dict[str, float]:
-    """The roll-up tab's own Spend row — the sheet's official monthly total,
-    the exact cell the team reads (Performance basis, Investment fallback).
+# Team-level rows the roll-up tab reports itself. These are THE official
+# figures (the roll-up aggregates ledger/raw sources — Referral, Websites, … —
+# that have no vendor tab, so a vendor-tab sum can NEVER reproduce them).
+# Order per field = label priority, exact stripped-lowercase match.
+_OFFICIAL_FIELD_LABELS: dict[str, list[str]] = {
+    "budget": ["budget"],
+    "spend": ["spend"],
+    "leads": ["leads"],
+    "qualified_leads": ["qualified leads"],
+    "demos_booked": ["total demos booked (sdr+vapi+direct)", "total demos booked"],
+    "qual_demos_booked": ["qualified demos booked (sdr+vapi+direct)", "qualified demos booked"],
+    "demos_completed": ["demos completed (sdr+vapi+direct)", "total demos completed"],
+    "services_sold": ["total services sold (actualized)"],
+}
 
-    The roll-up SUMIFS the 'Vendor Spend/Budget' ledger, so it carries spend
-    the vendor tabs never see (Websites, Referral, …); summing vendor tabs can
-    NEVER reproduce it. Keys are "YYYY-MM"."""
+
+def parse_official_totals(rows: list[list[str]], year: int) -> dict[str, dict[str, float]]:
+    """The roll-up tab's own team-level rows — the sheet's official monthly
+    figures, the exact cells the team reads (Performance basis, Investment
+    fallback). Keys are "YYYY-MM" → {field: value}."""
     if not rows:
         return {}
     months = _month_columns(rows[0])
@@ -320,37 +333,50 @@ def parse_official_spend(rows: list[list[str]], year: int) -> dict[str, float]:
     title = (rows[0][0] if rows[0] else "").strip()
     blocks = _find_blocks(rows, title)
     start, end = (blocks[0][1], blocks[0][2]) if blocks else (1, len(rows))
-    i = _row_for(rows, start, end, _FIELD_LABELS["spend"])
-    if i is None:
-        return {}
-    row = rows[i]
-    cell = lambda c: row[c] if 0 <= c < len(row) else ""
-    out: dict[str, float] = {}
-    for month, perf, inv in months:
-        v = _num(cell(perf))
-        if v is None and inv >= 0:
-            v = _num(cell(inv))
-        if v is not None:
-            out[f"{year:04d}-{month:02d}"] = v
+    out: dict[str, dict[str, float]] = {}
+    for field, labels in _OFFICIAL_FIELD_LABELS.items():
+        i = _row_for(rows, start, end, labels)
+        if i is None:
+            continue
+        row = rows[i]
+        cell = lambda c: row[c] if 0 <= c < len(row) else ""
+        for month, perf, inv in months:
+            v = _num(cell(perf))
+            if v is None and inv >= 0:
+                v = _num(cell(inv))
+            if v is not None:
+                out.setdefault(f"{year:04d}-{month:02d}", {})[field] = v
     return out
 
 
-def fetch_official_spend(spreadsheet_id: str, year: int, *, service=None) -> dict[str, float]:
-    """Official monthly spend from the consolidated roll-up tab, or ``{}`` when
-    the tab or the Sheets API is unavailable (callers then fall back to the
-    vendor-tab sum, and the console labels the figure accordingly)."""
+def parse_official_spend(rows: list[list[str]], year: int) -> dict[str, float]:
+    """Spend-only view of :func:`parse_official_totals` (kept for callers that
+    predate the full-totals read)."""
+    return {k: v["spend"] for k, v in parse_official_totals(rows, year).items() if "spend" in v}
+
+
+def fetch_official_totals(spreadsheet_id: str, year: int, *, service=None) -> dict[str, dict[str, float]]:
+    """Official monthly team-level figures from the consolidated roll-up tab,
+    or ``{}`` when the tab or the Sheets API is unavailable (callers then fall
+    back to the vendor-tab sum, and the console labels the figure accordingly)."""
     try:
         svc = service or _sheets_service()
         for tab in list_tabs(spreadsheet_id, service=svc):
             if not is_rollup_tab(tab["title"], []):
                 continue
-            rows = fetch_tab_values(spreadsheet_id, tab["title"], service=svc)[:60]
-            official = parse_official_spend(rows, year)
+            rows = fetch_tab_values(spreadsheet_id, tab["title"], service=svc)[:120]
+            official = parse_official_totals(rows, year)
             if official:
                 return official
         return {}
     except Exception:
         return {}
+
+
+def fetch_official_spend(spreadsheet_id: str, year: int, *, service=None) -> dict[str, float]:
+    """Spend-only view of :func:`fetch_official_totals` (back-compat)."""
+    totals = fetch_official_totals(spreadsheet_id, year, service=service)
+    return {k: v["spend"] for k, v in totals.items() if "spend" in v}
 
 
 def fetch_all_trackers(
@@ -373,7 +399,10 @@ def fetch_all_trackers(
         for tab in list_tabs(spreadsheet_id, service=svc):
             rows = fetch_tab_values(spreadsheet_id, tab["title"], service=svc)[:max_rows]
             if is_rollup_tab(tab["title"], rows):
-                continue
+                # Workbook layout rule (user, 2026-07-27): every tab BEFORE the
+                # Overall Report is a vendor; everything after it is ops sheets
+                # (raw data, HubSpot pulls, logs) — never ingest past it.
+                break
             metrics, gaps = parse_tracker(rows, year)
             if metrics:
                 out.append({"tab": tab["title"], "gid": tab["gid"], "metrics": metrics, "gaps": gaps})
@@ -409,7 +438,7 @@ def _fetch_all_trackers_xlsx(
             if len(rows) >= max_rows:
                 break
         if is_rollup_tab(name, rows):
-            continue
+            break  # same layout rule as the API path: vendors end at the roll-up
         metrics, gaps = parse_tracker(rows, year)
         if metrics:
             out.append({"tab": name, "metrics": metrics, "gaps": gaps})

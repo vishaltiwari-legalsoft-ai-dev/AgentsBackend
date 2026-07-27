@@ -17,24 +17,26 @@ def _snap(slug, d="2026-07-09", budget=10000.0, spend=4000.0, leads=10, q=2,
             "prev_month_raw": {"team_overall": [], "channels": {}}}
 
 
-def test_portfolio_sums_vendors_excludes_overall(monkeypatch, tmp_path):
+def test_portfolio_overall_rollup_is_the_official_bar(monkeypatch, tmp_path):
+    """Decision 2026-07-27: the Overall tab aggregates sources with no vendor
+    tab, so when its snapshot exists ITS figures ARE the summary bar; the
+    vendor sum stays as the audit trail and the roll-up is never a vendor."""
     monkeypatch.setenv("MR_OFFLINE", "1")
     monkeypatch.setenv("MR_SNAPSHOTS_DIR", str(tmp_path))
     snapshots.save_snapshot(_snap("meta-360-ra"))
     snapshots.save_snapshot(_snap("hawksem-ls-google", spend=2000.0, q=0, qdb=2, comp=1, sold=0))
-    snapshots.save_snapshot(_snap("marketing-2026-overall-report", spend=99999.0))
+    snapshots.save_snapshot(_snap("marketing-2026-overall-report", spend=99999.0,
+                                  budget=120000.0, leads=50, q=20, qdb=30, comp=15, sold=5))
     p = snapshots.portfolio()
-    assert p["vendors"] == 2
-    assert p["total_budget"] == 20000.0
-    assert p["total_spend"] == 6000.0            # performance basis, overall excluded
-    assert p["budget_utilized_pct"] == 30.0
-    assert p["qualified_leads"] == 2
-    assert p["cost_per_qualified_lead"] == 3000.0
-    assert p["qual_demos_booked"] == 10
-    assert p["cost_per_qual_demo_booked"] == 600.0
-    assert p["demos_completed"] == 4
-    assert p["show_rate_pct"] == 40.0
-    assert p["services_sold"] == 1
+    assert p["vendors"] == 2                       # the roll-up is not a vendor
+    assert p["source"] == "sheet_overall"
+    assert p["total_spend"] == 99999.0 and p["total_budget"] == 120000.0
+    assert p["qualified_leads"] == 20
+    assert p["qual_demos_booked"] == 30 and p["demos_completed"] == 15
+    assert p["cost_per_qual_demo_booked"] == round(99999.0 / 30, 2)
+    assert p["show_rate_pct"] == 50.0
+    assert p["services_sold"] == 5
+    assert p["computed_spend"] == 6000.0 and p["computed_budget"] == 20000.0
     assert p["pacing"]["day"] == 9 and p["pacing"]["days_in_month"] == 31
     assert p["benchmarks"]["cpqdb_max"] == 500
 

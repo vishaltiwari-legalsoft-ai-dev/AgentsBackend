@@ -368,17 +368,48 @@ def list_snapshots(slug: str | None = None, month: str | None = None,
     return out
 
 
+def latest_rollup_snapshot(date_iso: str | None = None) -> dict | None:
+    """Latest snapshot of the consolidated Overall tab — the sheet's own
+    official team totals. Kept out of every vendor listing (it duplicates the
+    vendors), but the portfolio bar reads it as the source of truth."""
+    by_id: dict[str, dict] = {}
+    if _use_cloud():
+        for snap in _cloud_list():
+            if isinstance(snap, dict) and snap.get("vendor_slug") and snap.get("date"):
+                by_id[_doc_id(snap["vendor_slug"], snap["date"])] = snap
+    for p in sorted(_root().glob("*.json")):
+        try:
+            by_id[p.stem] = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    best = None
+    for snap in by_id.values():
+        if "overall" not in (snap.get("vendor_slug") or ""):
+            continue
+        if date_iso and (snap.get("date") or "") > date_iso:
+            continue
+        if best is None or (snap.get("date") or "") > (best.get("date") or ""):
+            best = snap
+    return best
+
+
 def capture_workbook(grids, *, year: int, today: date) -> list[dict]:
-    """Capture every tracker-format tab; skip the rest; never abort the run."""
+    """Capture every tracker-format tab; skip the rest; never abort the run.
+
+    Workbook layout rule (user, 2026-07-27): vendors are the tabs BEFORE the
+    Overall Report. The roll-up itself is captured last — the portfolio bar
+    reads it as the official totals — and nothing after it is touched."""
     results = []
     for g in grids:
         try:
             snap = capture_tab(g.rows, title=g.title, gid=g.gid, year=year, today=today)
             if snap is None:
                 results.append({"tab": g.title, "skipped": True})
-                continue
-            save_snapshot(snap)
-            results.append({"tab": g.title, "slug": snap["vendor_slug"], "captured": True})
+            else:
+                save_snapshot(snap)
+                results.append({"tab": g.title, "slug": snap["vendor_slug"], "captured": True})
+            if "overall" in slugify(g.title):
+                break
         except Exception as exc:  # one bad tab must not kill the daily run
             logger.exception("snapshot capture failed for tab %s", g.title)
             results.append({"tab": g.title, "error": str(exc)})
@@ -570,6 +601,26 @@ def portfolio(date_iso: str | None = None) -> dict | None:
         completed += int(val(t, "demos", "completed_all"))
         sold += int(val(t, "actualized_revenue", "services_sold"))
 
+    # Official override (2026-07-27): the Overall tab aggregates ledger/raw
+    # sources with no vendor tab (Referral, Websites, …), so the vendor sum
+    # above always undercounts. When its snapshot exists for this month, ITS
+    # figures are the summary bar; the vendor sum stays as the audit trail.
+    source, computed_spend, computed_budget = "vendor_sum", round(spend, 2), round(budget, 2)
+    rollup = latest_rollup_snapshot(date_iso)
+    if rollup and (rollup.get("date") or "")[:7] == newest[:7]:
+        t = (rollup.get("canonical") or {}).get("team_overall", {})
+        o_spend = val(t, "spend", pair=True)
+        if o_spend:  # an empty parse must never blank the whole bar
+            spend = o_spend
+            budget = val(t, "budget", pair=True) or budget
+            leads = int(val(t, "leads", "total") or leads)
+            qualified = int(val(t, "leads", "qualified") or qualified)
+            b = val(t, "demos", "qualified_booked_all")
+            qdb = int(b if b else (val(t, "demos", "total_booked_all") or qdb))
+            completed = int(val(t, "demos", "completed_all") or completed)
+            sold = int(val(t, "actualized_revenue", "services_sold") or sold)
+            source = "sheet_overall"
+
     div = lambda n, d: round(n / d, 2) if d else None
     day = int(newest[8:10])
     year, month = int(newest[:4]), int(newest[5:7])
@@ -590,6 +641,9 @@ def portfolio(date_iso: str | None = None) -> dict | None:
         "cost_per_demo_completed": div(spend, completed),
         "show_rate_pct": div(completed * 100, qdb),
         "services_sold": sold,
+        "source": source,
+        "computed_spend": computed_spend,
+        "computed_budget": computed_budget,
         "pacing": {"day": day, "days_in_month": days_in_month,
                    "expected_pct": round(day / days_in_month * 100)},
         "benchmarks": {"cpqdb_max": 500, "ql_ratio_min": 40,
