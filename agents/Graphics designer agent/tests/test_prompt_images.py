@@ -68,3 +68,18 @@ def test_unreadable_ref_warns_but_generates():
     attempt = pipeline.generate(run, 1, variant="A", provider=p)
     assert p.calls[0]["refs"] == 0
     assert any("attached image" in w.lower() for w in attempt["warnings"])
+
+
+# ── never-paint-logo clause: brief text must not make the model paint text ───
+def test_no_painted_logo_clause_gated_on_brief_or_refs():
+    run = create_run("u-npl-1")
+    assert "NEVER PAINT TEXT OR LOGOS" not in pipeline.build_prompt(run, 1, "A")["text"]
+    run["config"]["creative_brief"] = {"goal": "Legal Soft logo bottom-left"}
+    assert "NEVER PAINT TEXT OR LOGOS" in pipeline.build_prompt(run, 1, "A")["text"]
+    assert "NEVER PAINT TEXT OR LOGOS" in pipeline.build_prompt(run, 2, "A")["text"]
+
+
+def test_no_painted_logo_clause_present_with_prompt_images():
+    run = create_run("u-npl-2")
+    run["config"]["prompt_image_refs"] = ["gd/x/stage-1-promptref-t.png"]
+    assert "NEVER PAINT TEXT OR LOGOS" in pipeline.build_prompt(run, 1, "A")["text"]

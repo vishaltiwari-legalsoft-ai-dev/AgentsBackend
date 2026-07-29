@@ -162,3 +162,52 @@ def test_highlight_guard_last_resort_picks_dark_on_light_sky():
     info = to.ensure_highlight_contrast(layers, _base_png((100, 170, 215)), pack)
     assert info is not None
     assert layers[0]["highlight_color"] == "dark"
+
+
+# ── ensure_text_contrast: deterministic ink guard for text layers ────────────
+def _flat_png(color, size=(200, 250)):
+    from io import BytesIO
+
+    from PIL import Image
+
+    buf = BytesIO()
+    Image.new("RGB", size, color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_text_contrast_flips_default_dark_ink_on_dark_background():
+    layers = [
+        {"type": "text", "id": "headline", "x": 0.3, "y": 0.4, "w": 0.5, "color": "dark"},
+        {"type": "text", "id": "subheading-0", "x": 0.3, "y": 0.6, "w": 0.5, "color": "dark"},
+    ]
+    recs = to.ensure_text_contrast(layers, _flat_png((14, 42, 94)))  # deep navy
+    assert [l["color"] for l in layers] == ["white", "white"]
+    assert len(recs) == 2 and all(r["to"] == "white" for r in recs)
+
+
+def test_text_contrast_keeps_dark_ink_on_light_background():
+    layers = [{"type": "text", "id": "headline", "x": 0.5, "y": 0.5, "w": 0.5, "color": "dark"}]
+    assert to.ensure_text_contrast(layers, _flat_png((245, 247, 252))) == []
+    assert layers[0]["color"] == "dark"
+
+
+def test_text_contrast_flips_white_ink_on_light_background():
+    layers = [{"type": "text", "id": "headline", "x": 0.5, "y": 0.5, "w": 0.5, "color": "white"}]
+    recs = to.ensure_text_contrast(layers, _flat_png((245, 247, 252)))
+    assert layers[0]["color"] == "dark"
+    assert recs and recs[0]["from"] == "white" and recs[0]["to"] == "dark"
+
+
+def test_text_contrast_never_touches_explicit_hex_or_cta():
+    layers = [
+        {"type": "text", "id": "headline", "x": 0.5, "y": 0.5, "w": 0.5, "color": "#112233"},
+        {"type": "cta", "id": "cta", "x": 0.5, "y": 0.8, "w": 0.3, "color": "cta"},
+    ]
+    assert to.ensure_text_contrast(layers, _flat_png((14, 42, 94))) == []
+    assert layers[0]["color"] == "#112233" and layers[1]["color"] == "cta"
+
+
+def test_text_contrast_survives_unreadable_base():
+    layers = [{"type": "text", "id": "headline", "x": 0.5, "y": 0.5, "w": 0.5, "color": "dark"}]
+    assert to.ensure_text_contrast(layers, b"not a png") == []
+    assert layers[0]["color"] == "dark"

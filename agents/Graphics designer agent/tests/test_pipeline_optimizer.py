@@ -94,3 +94,44 @@ def test_auto_fonts_are_resolved_and_recorded(monkeypatch):
     assert attempt["fonts"]["headline"] == "Causten ExtraBold"
     # stored config still carries the sentinel — resolution never mutates it
     assert run["config"]["element_styles"]["headline"]["font"] == text_optimizer.AUTO_FONT
+
+
+# ── dark-base legibility + QA-aware auto pick ────────────────────────────────
+def _dark_png(size=(220, 275)):
+    from io import BytesIO
+
+    from PIL import Image
+
+    buf = BytesIO()
+    Image.new("RGB", size, (14, 42, 94)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_dark_base_records_contrast_guard_and_flips_ink(monkeypatch):
+    monkeypatch.setenv("GD_TEXT_OPTIMIZER", "1")
+    monkeypatch.setattr(qa_brain, "check", lambda *a, **k: {"passed": True, "violations": []})
+    run = create_run("u-opt-dark")
+    _seed(run)
+    from graphics_designer_agent.runs import save_artifact
+
+    save_artifact(run["id"], 2, "A", 1, _dark_png())  # overwrite approved base: dark field
+    attempt = pipeline._generate_stage3(run, provider=_FakeProvider())
+    guard = attempt.get("contrast_guard") or []
+    assert any(r["from"] == "dark" and r["to"] == "white" for r in guard)
+
+
+def test_returned_attempt_prefers_qa_passed_style(monkeypatch):
+    monkeypatch.setenv("GD_TEXT_OPTIMIZER", "1")
+    fake = [
+        {"style": "brand_strict", "label": "Brand strict", "png": _dark_png(), "ai": True,
+         "fallback_reason": None, "qa": "skipped", "prompt": "p1"},
+        {"style": "highlighted", "label": "Highlighted", "png": _dark_png(), "ai": True,
+         "fallback_reason": None, "qa": "passed", "prompt": "p2"},
+        {"style": "sharp_minimal", "label": "Sharp minimal", "png": _dark_png(), "ai": True,
+         "fallback_reason": None, "qa": "failed", "prompt": "p3"},
+    ]
+    monkeypatch.setattr(text_optimizer, "optimize", lambda **kw: fake)
+    run = create_run("u-opt-pick")
+    _seed(run)
+    attempt = pipeline._generate_stage3(run, provider=_FakeProvider())
+    assert attempt["style"] == "highlighted" and attempt["qa"] == "passed"

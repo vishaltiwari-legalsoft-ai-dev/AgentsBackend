@@ -344,6 +344,16 @@ def build_prompt(run: dict, stage: int, variant: str, *, remix: bool = False) ->
                 "restyle or incorporate them exactly as the brief directs. Do not invent "
                 "replacement imagery for subjects the user already provided."
             )
+        # A brief that mentions a logo/text must never make the image model PAINT
+        # one — AI-painted wordmarks come out garbled, and the pipeline composites
+        # the real logo (Stage 4) and real text (Stage 3) deterministically.
+        if n or (cfg.get("creative_brief") or {}).get("goal"):
+            text = (
+                f"{text}\n\nNEVER PAINT TEXT OR LOGOS: do not render any logo, wordmark, "
+                "brand name, watermark, button, caption or headline text into the image — "
+                "even if the brief asks for one. All text, the CTA button and the real "
+                "brand logo are composited in later steps of this pipeline."
+            )
 
     return {
         "text": text,
@@ -419,6 +429,11 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
     highlight_guard = (
         text_optimizer.ensure_highlight_contrast(layers, base, pack) if use_optimizer else None
     )
+    # Ink guard (same path): default token inks that vanish on this base — e.g.
+    # dark ink over a dark user photo — flip to the legible token, recorded honestly.
+    contrast_guard = (
+        text_optimizer.ensure_text_contrast(layers, base) if use_optimizer else []
+    )
     canvas_w, canvas_h = _stage_dims(run, 3)
     w, h, px_scale = _hires_canvas(base, canvas_w, canvas_h)
     png = render.render_layers(
@@ -471,6 +486,7 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
             "warnings": [],
             "provider": provider.name if res["ai"] else "deterministic",
             **({"highlight_guard": highlight_guard} if highlight_guard else {}),
+            **({"contrast_guard": contrast_guard} if contrast_guard else {}),
             "created_at": now_iso(),
             "style": res["style"],
             "style_label": res["label"],
@@ -486,7 +502,10 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
     st["variant"] = "T"
     run["state"] = STATE_FOR_STAGE_REVIEW[3]
     save_run(run)
-    return stored[0]  # brand_strict — the auto-pilot pick
+    # Auto-pilot pick: never a QA-skipped/failed style while a QA-passed sibling
+    # exists (order within each group keeps brand_strict first).
+    passed = [a for a in stored if a.get("qa") == "passed"]
+    return (passed or stored)[0]
 
 
 # Width (px) of the live Stage-3 preview. Small enough to render in well under

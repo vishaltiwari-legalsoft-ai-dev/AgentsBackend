@@ -109,6 +109,69 @@ def ensure_highlight_contrast(layers: list[dict], base_png: bytes, pack) -> dict
     return {"from": "gradient", "to": new_color, "reason": reason}
 
 
+# Perceptual-midpoint luminance threshold — same rationale as the highlight
+# guard above: rel-lum is nonlinear, mid gray sits near 0.18, not 0.5.
+_DARK_BG_LUM = 0.18
+
+
+def _layer_bg_lum(img, layer: dict) -> float | None:
+    """Mean relative luminance of the base-image region behind ``layer``.
+    ``None`` when the region can't be sampled (never raises)."""
+    try:
+        cw, ch = img.size
+        x, y, w = float(layer.get("x", 0.5)), float(layer.get("y", 0.5)), float(layer.get("w", 0.5))
+        box = (max(0, int((x - w / 2) * cw)), max(0, int((y - 0.2) * ch)),
+               min(cw, int((x + w / 2) * cw) or cw), min(ch, int((y + 0.2) * ch) or ch))
+        region = img.crop(box) if box[0] < box[2] and box[1] < box[3] else img
+        region.thumbnail((32, 32))
+        px = list(region.getdata())
+        mean = tuple(sum(c[i] for c in px) // len(px) for i in range(3))
+        return _rel_lum(mean)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001 - unsampleable region → no opinion
+        return None
+
+
+def ensure_text_contrast(layers: list[dict], base_png: bytes) -> list[dict]:
+    """Deterministic ink-legibility guard for TEXT layers (optimizer path only).
+
+    The default ink token is "dark", designed for light brand gradients; on a
+    dark base (user photo, dark brand field) it is unreadable. For every text
+    layer still on a TOKEN ink ("dark"/"white" — explicit hex picks are the
+    user's and are never touched), sample the base behind the layer and flip
+    the token when it lacks contrast there. CTA is skipped (its pill provides
+    its own background). Returns honest per-layer flip records ([] = none).
+    Never raises."""
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+
+        img = Image.open(BytesIO(base_png)).convert("RGB")
+    except Exception:  # noqa: BLE001 - unreadable base → never block generation
+        return []
+    records: list[dict] = []
+    for layer in layers:
+        if layer.get("type") != "text":
+            continue
+        tok = layer.get("color")
+        if tok not in ("dark", "white"):
+            continue
+        lum = _layer_bg_lum(img, layer)
+        if lum is None:
+            continue
+        if tok == "dark" and lum <= _DARK_BG_LUM:
+            flip, reason = "white", "default dark ink is illegible on this dark background"
+        elif tok == "white" and lum > _DARK_BG_LUM:
+            flip, reason = "dark", "white ink is illegible on this light background"
+        else:
+            continue
+        layer["color"] = flip
+        records.append({"layer": layer.get("id", "text"), "from": tok, "to": flip,
+                        "reason": reason})
+        logger.info("text contrast guard: %s ink -> %s on %s", tok, flip, layer.get("id"))
+    return records
+
+
 def pick_variant(font_variants: list[dict], weight: int) -> str:
     """Name of the upright variant closest to ``weight`` (obliques excluded)."""
     upright = [v for v in font_variants if (v.get("style") or "normal") == "normal"]
