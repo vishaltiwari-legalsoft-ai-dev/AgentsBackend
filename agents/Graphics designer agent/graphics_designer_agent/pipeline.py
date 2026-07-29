@@ -253,6 +253,23 @@ def _shrink_reference(refs: list[tuple[bytes, str]] | None,
     return out
 
 
+def _prompt_references(run: dict) -> tuple[list[tuple[bytes, str]] | None, list[str]]:
+    """User-attached prompt images (config ``prompt_image_refs``, written by the
+    ``role=prompt`` upload) as extra reference images for Stage-1/2 generation.
+    Unreadable refs are skipped with an attempt warning — an attached image must
+    never fail a generation."""
+    from .runs import read_artifact
+
+    out: list[tuple[bytes, str]] = []
+    warnings: list[str] = []
+    for ref in (run.get("config") or {}).get("prompt_image_refs") or []:
+        try:
+            out.append((read_artifact(run["id"], ref), "image/png"))
+        except Exception:  # noqa: BLE001 - missing/foreign ref → skip, never fail
+            warnings.append(f"Attached image {ref} could not be read — skipped.")
+    return (_shrink_reference(out) if out else None), warnings
+
+
 def build_prompt(run: dict, stage: int, variant: str, *, remix: bool = False) -> dict:
     """Return the exact final prompt + audit diff for a stage (no generation)."""
     cfg = run["config"]
@@ -316,6 +333,17 @@ def build_prompt(run: dict, stage: int, variant: str, *, remix: bool = False) ->
         text = pack.load_prompt("stage4_logo_composite.txt")
     else:
         raise PipelineError(f"invalid stage {stage}")
+
+    if stage in (1, 2):
+        n = len(cfg.get("prompt_image_refs") or [])
+        if n:
+            noun = "IMAGE" if n == 1 else "IMAGES"
+            text = (
+                f"{text}\n\nUSER-ATTACHED {noun}: the user attached {n} reference "
+                f"{noun.lower()} to this brief. Use them as the visual source — manipulate, "
+                "restyle or incorporate them exactly as the brief directs. Do not invent "
+                "replacement imagery for subjects the user already provided."
+            )
 
     return {
         "text": text,
@@ -554,6 +582,12 @@ def generate(run: dict, stage: int, variant: str | None = None,
     if stage > 1 and not refs:
         raise PipelineError(f"Stage {stage} requires the approved Stage {stage - 1} image.")
     refs = _shrink_reference(refs)  # smaller upload + faster ingest (Stage 2 base)
+    prompt_warnings: list[str] = []
+    if stage in (1, 2):
+        prompt_refs, prompt_warnings = _prompt_references(run)
+        if prompt_refs:
+            # Upstream base first (it sets composition), then the user's images.
+            refs = (refs or []) + prompt_refs
     if extra_references:
         # Chained upstream first (it sets composition), then on-brand precedent.
         refs = (refs or []) + (_shrink_reference(extra_references) or [])
@@ -568,6 +602,8 @@ def generate(run: dict, stage: int, variant: str | None = None,
         built["warnings"].append(
             "Provider has no negative-prompt support — Prompt B negative was skipped."
         )
+    if prompt_warnings:
+        built["warnings"].extend(prompt_warnings)
 
     w, h = _stage_dims(run, stage)
     attempt_no = len(run["stages"][key]["attempts"]) + 1
