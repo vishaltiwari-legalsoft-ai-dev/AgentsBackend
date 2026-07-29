@@ -12,6 +12,11 @@ def test_metrics_empty_and_garbage():
     assert ahrefs_paste.parse_metrics("lorem ipsum")["volume"] is None
 
 
+def test_metrics_malformed_numeric_no_raise():
+    """Regression: _num() must not raise ValueError on multi-dot strings."""
+    assert ahrefs_paste.parse_metrics("Volume: 1..2K")["volume"] is None
+
+
 def test_competitor_csv_standard_export():
     text = (
         "Keyword,Current position,Volume,KD,Current URL\n"
@@ -29,6 +34,7 @@ def test_competitor_csv_skips_junk_and_reordered_headers():
     rows = ahrefs_paste.parse_competitor_csv(text)
     assert rows[0]["keyword"] == "intake specialist"
     assert rows[0]["volume"] == 1200
+    assert len(rows) == 1
 
 
 def test_dr_paste_variants():

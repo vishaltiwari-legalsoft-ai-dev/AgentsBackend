@@ -15,7 +15,10 @@ def _num(s: str) -> int | None:
     m = re.match(r"^([\d.]+)\s*([km]?)$", s)
     if not m:
         return None
-    return int(float(m.group(1)) * {"k": 1_000, "m": 1_000_000}.get(m.group(2), 1))
+    try:
+        return int(float(m.group(1)) * {"k": 1_000, "m": 1_000_000}.get(m.group(2), 1))
+    except ValueError:
+        return None
 
 
 def parse_metrics(text: str) -> dict:
@@ -42,6 +45,8 @@ def parse_competitor_csv(text: str) -> list[dict]:
         if header is None:
             if "keyword" in low:
                 header = low
+            continue
+        if len(raw) != len(header):
             continue
         cells = {h: v for h, v in zip(header, raw)}
         kw = (cells.get("keyword") or "").strip()
