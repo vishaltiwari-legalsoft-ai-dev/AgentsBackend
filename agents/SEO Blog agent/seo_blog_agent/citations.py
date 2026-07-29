@@ -47,7 +47,11 @@ def source_citations(outline_doc: dict, dr_pasted: dict[str, int], llm=None, fet
             if (not url.startswith("http") or url in rejected
                     or any(i["url"] == url for i in items) or len(items) >= target):
                 continue
-            page = fetch_raw(url)
+            try:
+                page = fetch_raw(url)
+            except CredentialMissing as exc:
+                return {"items": items, "short_by": max(0, target - len(items)), "rounds": rounds,
+                        "degraded": [f"citation verification unavailable ({exc})"]}
             claim = str(c.get("claim", ""))[:200]
             name = str(c.get("source_name", ""))[:120]
             if page["status"] != 200 or not _claim_on_page(claim, name, page["text"]):

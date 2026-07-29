@@ -75,3 +75,17 @@ def test_revet_applies_gate2_dr_paste():
     assert [c["domain"] for c in out["items"]] == ["clio.com"]
     assert out["items"][0]["dr_status"] == "ok"
     assert out["short_by"] == 1
+
+
+def test_fetch_down_degrades_honestly():
+    def llm(system, prompt):
+        return {"citations": [GOOD]}
+
+    def fetch_down(url):
+        raise CredentialMissing("offline mode")
+
+    doc = citations.source_citations(OUTLINE_DOC, {}, llm=llm, fetch_raw=fetch_down)
+    assert doc["items"] == []
+    assert doc["short_by"] == 2
+    assert doc["degraded"]
+    assert "unavailable" in doc["degraded"][0]
