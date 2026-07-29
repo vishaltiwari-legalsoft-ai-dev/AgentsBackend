@@ -9,11 +9,11 @@ import hashlib
 import logging
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
 from app.security import get_current_user
-from seo_blog_agent import ahrefs_paste, research, rules, state
+from seo_blog_agent import ahrefs_paste, citations, drafting, outline, research, rules, state
 from seo_geo_agent.sources import CredentialMissing
 
 router = APIRouter()
@@ -30,6 +30,18 @@ class RunIn(BaseModel):
 
 class SheetIn(BaseModel):
     sheet: dict
+
+
+class DrIn(BaseModel):
+    dr_paste: str
+
+
+class OutlineIn(BaseModel):
+    outline: list[dict]
+
+
+class DraftPatch(BaseModel):
+    markdown: str
 
 
 def _get_run(run_id: str) -> dict:
@@ -90,3 +102,78 @@ def approve_keywords(run_id: str, payload: SheetIn, user=Depends(get_current_use
     run["gates"]["keywords"] = True
     run["stage"] = "outline"
     return _save_run(run)
+
+
+@router.post("/seo-blog/runs/{run_id}/build-outline")
+def build_outline(run_id: str, user=Depends(get_current_user)):
+    run = _get_run(run_id)
+    if not run["gates"]["keywords"]:
+        raise HTTPException(409, "Approve the keyword sheet first (Gate 1)")
+    try:
+        profiles = [outline.competitor_profile(t["url"]) for t in run["sheet"]["serp"]["top3"]]
+        run["outline_doc"] = outline.build_outline(run["sheet"], profiles)
+        run["citations"] = citations.source_citations(run["outline_doc"], run["pasted"]["dr"])
+    except CredentialMissing as exc:
+        raise HTTPException(503, f"Outline data source unavailable: {exc}") from exc
+    return _save_run(run)
+
+
+@router.post("/seo-blog/runs/{run_id}/vet-citations")
+def vet_citations(run_id: str, payload: DrIn, user=Depends(get_current_user)):
+    run = _get_run(run_id)
+    if not run.get("citations"):
+        raise HTTPException(409, "Build the outline first")
+    run["pasted"]["dr"] = {**run["pasted"]["dr"], **ahrefs_paste.parse_dr(payload.dr_paste)}
+    run["citations"] = citations.revet(run["citations"], run["pasted"]["dr"],
+                                       run["outline_doc"]["targets"]["links"])
+    return _save_run(run)
+
+
+@router.post("/seo-blog/runs/{run_id}/approve-outline")
+def approve_outline(run_id: str, payload: OutlineIn, user=Depends(get_current_user)):
+    run = _get_run(run_id)
+    if not run.get("outline_doc"):
+        raise HTTPException(409, "Build the outline first")
+    run["outline_doc"]["outline"] = payload.outline
+    run["gates"]["outline"] = True
+    run["stage"] = "draft"
+    return _save_run(run)
+
+
+@router.post("/seo-blog/runs/{run_id}/draft")
+def make_draft(run_id: str, user=Depends(get_current_user)):
+    run = _get_run(run_id)
+    if not (run["gates"]["keywords"] and run["gates"]["outline"]):
+        raise HTTPException(409, "Approve keywords and outline first")
+    try:
+        run["draft"] = drafting.build_draft(run["sheet"], run["outline_doc"], run["citations"])
+    except CredentialMissing as exc:
+        raise HTTPException(503, f"Draft generation unavailable: {exc}") from exc
+    return _save_run(run)
+
+
+@router.patch("/seo-blog/runs/{run_id}/draft")
+def edit_draft(run_id: str, payload: DraftPatch, user=Depends(get_current_user)):
+    run = _get_run(run_id)
+    if not run.get("draft"):
+        raise HTTPException(409, "No draft to edit yet")
+    run["draft"]["markdown"] = payload.markdown
+    run["draft"]["edited"] = True
+    run["draft"]["compliance"] = drafting.check_compliance(
+        payload.markdown, run["sheet"], run["outline_doc"], run["citations"])
+    return _save_run(run)
+
+
+@router.get("/seo-blog/runs/{run_id}/export")
+def export_draft(run_id: str, format: str = "md", user=Depends(get_current_user)):
+    run = _get_run(run_id)
+    if not run.get("draft"):
+        raise HTTPException(404, "No draft yet")
+    slug = run["outline_doc"]["meta"]["slug"] or run["id"]
+    if format == "docx":
+        return Response(
+            content=drafting.to_docx(run["draft"]["markdown"]),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f'attachment; filename="{slug}.docx"'})
+    return Response(content=run["draft"]["markdown"], media_type="text/markdown",
+                    headers={"Content-Disposition": f'attachment; filename="{slug}.md"'})

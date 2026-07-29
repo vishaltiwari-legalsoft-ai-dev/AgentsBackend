@@ -95,3 +95,78 @@ def test_kickoff_twice_without_approve_succeeds():
     run2 = client.post("/api/seo-blog/runs", json={"keyword": "legal virtual assistant"}).json()
     assert run1["id"] == run2["id"]
     assert run2["stage"] == "research"
+
+
+# Stage 2-3 endpoints
+
+OUTLINE_DOC = {"competitor_outlines": [], "meta": {"title": "T", "description": "D", "slug": "s"},
+               "targets": {"word_count": 40, "links": 1},
+               "outline": [{"heading": "Costs", "level": 2, "note": "", "keywords": []}],
+               "evaluator": {"rounds": 1, "beats_all": True, "scores": {}, "note": ""}, "degraded": []}
+CITS = {"items": [{"id": "c1", "claim": "x", "source_name": "Clio 2025 Legal Trends Report",
+                   "url": "https://clio.com/report", "domain": "clio.com", "dr": None,
+                   "dr_status": "unverified", "section": "Costs", "verified": True}],
+        "short_by": 0, "rounds": 1, "degraded": []}
+DRAFT_MD = ("# T\n\n## Costs\n\nlegal virtual assistant costs, and again legal virtual assistant, "
+            "with virtual paralegal help per [Clio 2025 Legal Trends Report](https://clio.com/report). "
+            + "word " * 20)
+
+
+def _stage2_ready(monkeypatch):
+    run = client.post("/api/seo-blog/runs", json={"keyword": "legal virtual assistant"}).json()
+    client.post(f"/api/seo-blog/runs/{run['id']}/approve-keywords", json={"sheet": SHEET})
+    monkeypatch.setattr(blog_router.outline, "competitor_profile", lambda url, **kw: {"url": url, "degraded": []})
+    monkeypatch.setattr(blog_router.outline, "build_outline", lambda sheet, profiles, **kw: dict(OUTLINE_DOC))
+    monkeypatch.setattr(blog_router.citations, "source_citations", lambda od, dr, **kw: dict(CITS))
+    return run["id"]
+
+
+def test_build_outline_requires_gate1(monkeypatch):
+    run = client.post("/api/seo-blog/runs", json={"keyword": "x"}).json()
+    assert client.post(f"/api/seo-blog/runs/{run['id']}/build-outline").status_code == 409
+
+
+def test_build_outline_then_gate2(monkeypatch):
+    rid = _stage2_ready(monkeypatch)
+    body = client.post(f"/api/seo-blog/runs/{rid}/build-outline").json()
+    assert body["outline_doc"]["meta"]["slug"] == "s"
+    assert body["citations"]["items"][0]["dr_status"] == "unverified"
+    edited = [{"heading": "Costs (edited)", "level": 2, "note": "", "keywords": []}]
+    body = client.post(f"/api/seo-blog/runs/{rid}/approve-outline", json={"outline": edited}).json()
+    assert body["gates"]["outline"] is True and body["stage"] == "draft"
+    assert body["outline_doc"]["outline"][0]["heading"] == "Costs (edited)"
+
+
+def test_vet_citations_applies_dr(monkeypatch):
+    rid = _stage2_ready(monkeypatch)
+    client.post(f"/api/seo-blog/runs/{rid}/build-outline")
+    body = client.post(f"/api/seo-blog/runs/{rid}/vet-citations", json={"dr_paste": "clio.com 91"}).json()
+    assert body["citations"]["items"][0]["dr"] == 91
+    assert body["pasted"]["dr"] == {"clio.com": 91}
+
+
+def test_draft_flow_and_export(monkeypatch):
+    rid = _stage2_ready(monkeypatch)
+    client.post(f"/api/seo-blog/runs/{rid}/build-outline")
+    client.post(f"/api/seo-blog/runs/{rid}/approve-outline",
+                json={"outline": OUTLINE_DOC["outline"]})
+    monkeypatch.setattr(blog_router.drafting, "build_draft",
+                        lambda s, o, c, **kw: {"markdown": DRAFT_MD, "meta": OUTLINE_DOC["meta"],
+                                               "compliance": blog_router.drafting.check_compliance(
+                                                   DRAFT_MD, SHEET, OUTLINE_DOC, CITS),
+                                               "edited": False})
+    body = client.post(f"/api/seo-blog/runs/{rid}/draft").json()
+    assert body["draft"]["markdown"].startswith("# T")
+    patched = client.patch(f"/api/seo-blog/runs/{rid}/draft",
+                           json={"markdown": DRAFT_MD + " more"}).json()
+    assert patched["draft"]["edited"] is True
+    md = client.get(f"/api/seo-blog/runs/{rid}/export?format=md")
+    assert md.status_code == 200 and "attachment" in md.headers["content-disposition"]
+    docx = client.get(f"/api/seo-blog/runs/{rid}/export?format=docx")
+    assert docx.status_code == 200 and len(docx.content) > 1000
+
+
+def test_draft_requires_both_gates(monkeypatch):
+    rid = _stage2_ready(monkeypatch)
+    assert client.post(f"/api/seo-blog/runs/{rid}/draft").status_code == 409
+    assert client.get(f"/api/seo-blog/runs/{rid}/export?format=md").status_code == 404
