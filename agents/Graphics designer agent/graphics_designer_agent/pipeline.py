@@ -338,12 +338,27 @@ def build_prompt(run: dict, stage: int, variant: str, *, remix: bool = False) ->
         n = len(cfg.get("prompt_image_refs") or [])
         if n:
             noun = "IMAGE" if n == 1 else "IMAGES"
-            text = (
-                f"{text}\n\nUSER-ATTACHED {noun}: the user attached {n} reference "
-                f"{noun.lower()} to this brief. Use them as the visual source — manipulate, "
-                "restyle or incorporate them exactly as the brief directs. Do not invent "
-                "replacement imagery for subjects the user already provided."
-            )
+            if stage == 2:
+                # Authoritative override: the planner/remix can produce a scene
+                # description that writes the subject out (e.g. "no human
+                # presence") — the attached subject must win that conflict.
+                text = (
+                    f"{text}\n\nUSER-ATTACHED {noun} — HIGHEST PRIORITY, OVERRIDES EVERYTHING "
+                    f"ABOVE: the final {n} attached reference {noun.lower()} (after the "
+                    "background) show the REAL subject. The composition MUST feature this "
+                    "subject prominently, adapted per the brief — pose, camera angle, wardrobe, "
+                    "lighting and setting may change; face and likeness may not. If the SUBJECT "
+                    "description above conflicts — for example it describes an empty or vacant "
+                    "scene, or says no human presence — IGNORE that conflict: the attached "
+                    "subject appears anyway. Never output the scene without it."
+                )
+            else:
+                text = (
+                    f"{text}\n\nUSER-ATTACHED {noun}: the user attached {n} reference "
+                    f"{noun.lower()} to this brief. Use them as the visual source — manipulate, "
+                    "restyle or incorporate them exactly as the brief directs. Do not invent "
+                    "replacement imagery for subjects the user already provided."
+                )
         # A brief that mentions a logo/text must never make the image model PAINT
         # one — AI-painted wordmarks come out garbled, and the pipeline composites
         # the real logo (Stage 4) and real text (Stage 3) deterministically.

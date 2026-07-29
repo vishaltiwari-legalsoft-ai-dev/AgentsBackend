@@ -83,3 +83,13 @@ def test_no_painted_logo_clause_present_with_prompt_images():
     run = create_run("u-npl-2")
     run["config"]["prompt_image_refs"] = ["gd/x/stage-1-promptref-t.png"]
     assert "NEVER PAINT TEXT OR LOGOS" in pipeline.build_prompt(run, 1, "A")["text"]
+
+
+def test_stage2_attached_block_overrides_subjectless_scene():
+    run = create_run("u-pi-5")
+    run["config"]["prompt_image_refs"] = ["gd/x/stage-1-promptref-t.png"]
+    p2 = pipeline.build_prompt(run, 2, "A")["text"]
+    assert "HIGHEST PRIORITY" in p2 and "IGNORE that conflict" in p2
+    p1 = pipeline.build_prompt(run, 1, "A")["text"]
+    assert "HIGHEST PRIORITY" not in p1  # stage-1 keeps the visual-source wording
+    assert "user-attached" in p1.lower()

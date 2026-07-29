@@ -71,12 +71,20 @@ def _brief_text(run: dict) -> str:
     return " ".join(str(v) for v in brief.values() if str(v).strip()).strip()
 
 
-def _remix_ask(base_prompt: str, *, stage: int, brief: str, axis_directive: str, pack) -> str:
+def _remix_ask(base_prompt: str, *, stage: int, brief: str, axis_directive: str, pack,
+               attached_subject: bool = False) -> str:
     what = "background gradient prompt" if stage == 1 else "foreground subject description"
     brief_rule = (
         f'1. USER BRIEF (the #1 hard rule — nothing may contradict it): "{brief}". '
         "Let it drive mood and emphasis.\n"
         if brief else ""
+    )
+    subject_rule = (
+        "1b. ATTACHED SUBJECT (hard rule): the user attached a real photo of the "
+        "subject that WILL be composited into this scene. Describe the scene WITH "
+        "that subject present and featured — never an empty or vacant scene, and "
+        "never any phrase like 'no human presence' or 'no people'.\n"
+        if attached_subject and stage == 2 else ""
     )
     keep_rule = (
         "Keep every brand rule from the original intact: the exact opening anchor "
@@ -91,6 +99,7 @@ def _remix_ask(base_prompt: str, *, stage: int, brief: str, axis_directive: str,
         "THIS generation comes out visibly different from previous ones, without "
         "breaking any brand rule.\n\n"
         f"{brief_rule}"
+        f"{subject_rule}"
         f"2. VARIATION AXIS for this attempt: {axis_directive}.\n"
         f"3. {keep_rule}"
         "4. Stay within ±40% of the original's length.\n\n"
@@ -103,17 +112,41 @@ def _fallback(base_prompt: str, modifier: str) -> str:
     return f"{base_prompt.rstrip()} {modifier}"
 
 
+# Phrases that write the composited subject OUT of the scene — the exact failure
+# that produced a person-less creative from a person brief + attached photo.
+_SUBJECTLESS_RE = re.compile(
+    r"\bno (?:human|people|person)s?\b|\bno human presence\b|\bvacant\b|\bunoccupied\b",
+    re.I,
+)
+
+
+def _validate_subject_presence(text: str) -> list[str]:
+    """When the user attached a subject photo, a Stage-2 scene that excludes
+    people contradicts it — reject wording that writes the subject out."""
+    if _SUBJECTLESS_RE.search(text):
+        return ["The description excludes the subject (e.g. 'no human presence' / "
+                "'vacant') but the user attached a subject photo that must appear "
+                "in the scene."]
+    return []
+
+
 def remix_prompt(run: dict, stage: int, base_prompt: str, *, pack) -> RemixResult:
     """Rewrite ``base_prompt`` for this attempt. Never raises: returns either
     the validated AI rewrite or the honestly-labeled deterministic fallback."""
     attempt_count = len(run["stages"][str(stage)]["attempts"])
     key, directive, modifier = axis_for(run["id"], attempt_count)
-    validate = (
-        (lambda t: _validate_gradient_prompt(t, pack=pack)) if stage == 1
-        else _validate_element_subject
+    has_subject_ref = (
+        stage == 2 and bool((run.get("config") or {}).get("prompt_image_refs"))
     )
+    if stage == 1:
+        validate = lambda t: _validate_gradient_prompt(t, pack=pack)  # noqa: E731
+    elif has_subject_ref:
+        validate = lambda t: _validate_element_subject(t) + _validate_subject_presence(t)  # noqa: E731
+    else:
+        validate = _validate_element_subject
     ask = _remix_ask(base_prompt, stage=stage, brief=_brief_text(run),
-                     axis_directive=directive, pack=pack)
+                     axis_directive=directive, pack=pack,
+                     attached_subject=has_subject_ref)
     try:
         llm = _get_llm(temperature=0.9, fast=True)
         errors: list[str] = []
