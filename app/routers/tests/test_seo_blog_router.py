@@ -80,3 +80,18 @@ def test_gate1_approve_keywords():
 
 def test_run_404():
     assert client.get("/api/seo-blog/runs/nope").status_code == 404
+
+
+def test_kickoff_409_when_same_day_run_has_progress():
+    run = client.post("/api/seo-blog/runs", json={"keyword": "legal virtual assistant"}).json()
+    client.post(f"/api/seo-blog/runs/{run['id']}/approve-keywords", json={"sheet": SHEET})
+    r = client.post("/api/seo-blog/runs", json={"keyword": "legal virtual assistant"})
+    assert r.status_code == 409
+    assert "approved progress" in r.json()["detail"]
+
+
+def test_kickoff_twice_without_approve_succeeds():
+    run1 = client.post("/api/seo-blog/runs", json={"keyword": "legal virtual assistant"}).json()
+    run2 = client.post("/api/seo-blog/runs", json={"keyword": "legal virtual assistant"}).json()
+    assert run1["id"] == run2["id"]
+    assert run2["stage"] == "research"

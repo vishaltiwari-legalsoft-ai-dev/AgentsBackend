@@ -53,6 +53,10 @@ def kickoff(payload: RunIn, user=Depends(get_current_user)):
     keyword = payload.keyword.strip()
     if not keyword:
         raise HTTPException(422, "keyword is required")
+    run_id = hashlib.sha1(f"{keyword.lower()}|{date.today().isoformat()}".encode()).hexdigest()[:10]
+    existing = state.load(f"run-{run_id}")
+    if existing and (existing["gates"]["keywords"] or existing["gates"]["outline"]):
+        raise HTTPException(409, "A run for this keyword already exists today with approved progress — open it from the runs list or use a different keyword")
     pasted = {
         "metrics": ahrefs_paste.parse_metrics(payload.metrics_paste),
         "competitor_keywords": {url: ahrefs_paste.parse_competitor_csv(text)
@@ -63,7 +67,6 @@ def kickoff(payload: RunIn, user=Depends(get_current_user)):
         sheet = research.build_research(keyword, pasted)
     except CredentialMissing as exc:
         raise HTTPException(503, f"Research data source unavailable: {exc}") from exc
-    run_id = hashlib.sha1(f"{keyword.lower()}|{date.today().isoformat()}".encode()).hexdigest()[:10]
     run = {"id": run_id, "keyword": keyword, "created": date.today().isoformat(),
            "stage": "research", "gates": {"keywords": False, "outline": False},
            "pasted": pasted, "sheet": sheet, "outline_doc": None, "citations": None, "draft": None}
