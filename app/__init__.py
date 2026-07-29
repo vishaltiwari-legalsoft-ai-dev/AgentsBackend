@@ -13,6 +13,7 @@ _AGENT_ROOTS = [
     _BACKEND_ROOT / "agents" / "Graphics designer agent",
     _BACKEND_ROOT / "agents" / "Marketing Research agent",
     _BACKEND_ROOT / "agents" / "SEO GEO agent",
+    _BACKEND_ROOT / "agents" / "SEO Blog agent",
 ]
 for _root in _AGENT_ROOTS:
     if _root.is_dir() and str(_root) not in sys.path:
