@@ -45,6 +45,9 @@ logger = logging.getLogger("agentos.gd")
 GD_AGENT_ID = "a1"
 GD_AGENT_CATEGORY = "design"
 
+# Brief-attached images per run (mirrored in newfrontend promptAttach.ts).
+MAX_PROMPT_IMAGES = 3
+
 
 def _pack_for_run(run: dict):
     """The brand pack backing a run (defaults to Legal Soft for legacy runs)."""
@@ -1143,12 +1146,16 @@ async def gd_subject_upload(run_id: str, file: UploadFile = File(...),
                             role: str = "subject",
                             user: dict = Depends(get_current_user)) -> dict:
     """Upload an image for this run — the Stage-2 subject (``role=subject``,
-    default) or the Stage-1 background (``role=background``). Accepts
-    PNG/WebP/JPEG and normalizes to PNG. The ref is stored via config
+    default), the Stage-1 background (``role=background``), or a brief-attached
+    prompt image (``role=prompt``). Accepts PNG/WebP/JPEG and normalizes to
+    PNG. Subject/background refs are stored by the client via config
     ``subject_asset_ref`` / ``background_asset_ref`` and consumed by that
-    stage's ``UPLOAD`` variant."""
-    if role not in ("subject", "background"):
-        raise HTTPException(400, "role must be 'subject' or 'background'")
+    stage's ``UPLOAD`` variant. Prompt refs are appended server-side to config
+    ``prompt_image_refs`` (max ``MAX_PROMPT_IMAGES``, deduped) and threaded
+    into Stage-1/2 AI generation as reference images the model manipulates per
+    the brief."""
+    if role not in ("subject", "background", "prompt"):
+        raise HTTPException(400, "role must be 'subject', 'background' or 'prompt'")
     run = _owned_run(run_id, user)
     if (file.content_type or "") not in ("image/png", "image/webp", "image/jpeg"):
         raise HTTPException(400, "Only PNG, WebP or JPEG uploads are supported.")
@@ -1168,6 +1175,17 @@ async def gd_subject_upload(run_id: str, file: UploadFile = File(...),
     except UnidentifiedImageError as exc:
         raise HTTPException(400, "That file doesn't look like a valid image.") from exc
     token = hashlib.sha256(data).hexdigest()[:16]
+    if role == "prompt":
+        refs = list(run["config"].get("prompt_image_refs") or [])
+        rel = save_artifact(run["id"], 1, "promptref", token, data)
+        # Dedupe BEFORE the cap so re-attaching the same image never 400s.
+        if rel not in refs:
+            if len(refs) >= MAX_PROMPT_IMAGES:
+                raise HTTPException(400, f"Max {MAX_PROMPT_IMAGES} attached images per creative.")
+            refs.append(rel)
+            run["config"]["prompt_image_refs"] = refs
+            save_run(run)
+        return {"ref": rel, "role": role}
     stage, variant = (1, "background") if role == "background" else (2, "subject")
     rel = save_artifact(run["id"], stage, variant, token, data)
     return {"ref": rel, "role": role}
