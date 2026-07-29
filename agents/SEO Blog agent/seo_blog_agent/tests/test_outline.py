@@ -85,3 +85,14 @@ def test_llm_down_gives_structural_fallback():
     assert doc["outline"]  # structural fallback from shared competitor themes
     assert any("skipped" in n or "fallback" in n for n in doc["degraded"])
     assert doc["evaluator"]["beats_all"] is None
+
+
+def test_external_links_exact_domain_matching():
+    # Regression test: own_domain "a.com" must not substring-match "legalva.com"
+    html = ('<a href="https://legalva.com/x">external</a> '
+            '<a href="https://sub.a.com/y">subdomain</a> '
+            '<a href="https://a.com/z">same</a> '
+            '<a href="https://www.a.com/w">www same</a>')
+    # legalva.com should count (1), sub.a.com and a.com should be excluded
+    count = outline._external_links(html, "a.com")
+    assert count == 1, f"Expected 1 external link (legalva.com), got {count}"

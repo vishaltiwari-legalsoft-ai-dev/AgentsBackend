@@ -14,7 +14,7 @@ from .research import tokens
 def _external_links(html: str, own_domain: str) -> int:
     hosts = set(re.findall(r'href="https?://([^/">]+)', html))
     cleaned = {h[4:] if h.startswith("www.") else h for h in (x.lower() for x in hosts)}
-    return len({h for h in cleaned if own_domain not in h})
+    return len({h for h in cleaned if not (h == own_domain or h.endswith("." + own_domain))})
 
 
 def competitor_profile(url: str, fetch=None, fetch_raw=None, llm=None) -> dict:
