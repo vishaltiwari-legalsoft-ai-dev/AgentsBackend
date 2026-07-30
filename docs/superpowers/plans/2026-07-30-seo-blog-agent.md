@@ -2384,6 +2384,531 @@ git commit -m "test(blog): full-suite verification pass"
 
 ---
 
+## Amendment A tasks (2026-07-30): Website-first intelligence
+
+Spec §10a. New rules constants used below (add in Task 13): `SITE_SCAN_CAP = 60`, `BLOG_PATH_HINTS = ("/blog", "/insights", "/articles", "/resources", "/news")`, `TOPIC_SUGGESTIONS = 8`, `CANNIBAL_OVERLAP = 0.5`.
+
+---
+
+### Task 13: site_pool.py — site scan, keyword pool, cannibalization guard
+
+**Files:**
+- Create: `agents/SEO Blog agent/seo_blog_agent/site_pool.py`
+- Modify: `agents/SEO Blog agent/seo_blog_agent/rules.py` (append the 4 constants above)
+- Test: `agents/SEO Blog agent/seo_blog_agent/tests/test_site_pool.py`
+
+**Interfaces:**
+- Consumes: `research.tokens`, `state.save/load`, a2 `fetch_sitemap(domain) -> list[str]`, `fetch_page`, `llm_json`, `domain_of`, `CredentialMissing` (all injectable).
+- Produces:
+  - `site_pool.scan_site(website, fetch=None, sitemap=None, llm=None) -> dict` — persisted profile `{domain, scanned, counts: {sitemap_urls, scanned, posts, pages}, pages: [{url,title,h1,headings,meta_description,word_count}], posts: [same + fingerprint: [str]], pool: [{name, keywords, covered_by}], data_source: "site_scan", degraded}`. Also maintains `sites-index` doc `{"sites": [{domain, scanned, counts}]}` newest-first. `CredentialMissing` from sitemap/fetch propagates (router → 503).
+  - `site_pool.load_site(domain) -> dict | None`; `site_pool.list_sites() -> list[dict]`.
+  - `site_pool.cannibalization(profile, keyword) -> list[{url,title,overlap}]` (overlap = |kw∩fp|/|kw| ≥ CANNIBAL_OVERLAP, top 3, sorted desc).
+  - `site_pool.suggest_topics(profile, llm=None) -> {suggested: [{keyword,angle,collisions}], avoided: [{keyword,collisions,covered_by}], degraded}` — only uncovered candidates are ranked; collisions computed honestly for everything shown.
+  - `site_pool.internal_links(profile, keyword) -> list[str]` (top 3 site URLs by token overlap).
+
+- [ ] **Step 1: Write the failing test**
+
+`tests/test_site_pool.py`:
+
+```python
+from seo_geo_agent.sources import CredentialMissing, PageFacts
+from seo_blog_agent import rules, site_pool
+
+SITEMAP = ["https://legalsoft.com/", "https://legalsoft.com/services",
+           "https://legalsoft.com/blog/hire-legal-va", "https://legalsoft.com/blog/intake-guide"]
+
+
+def fake_sitemap(domain):
+    return list(SITEMAP)
+
+
+def fake_fetch(url):
+    if "hire-legal-va" in url:
+        return PageFacts(url=url, status=200, title="How to Hire a Legal Virtual Assistant",
+                         h1=["Hire a Legal Virtual Assistant"], h2=["Costs", "Where to find one"],
+                         meta_description="Hiring guide", word_count=1500)
+    if "intake-guide" in url:
+        return PageFacts(url=url, status=200, title="Client Intake Guide for Law Firms",
+                         h1=["Client Intake Guide"], h2=["Intake forms"], word_count=1200)
+    if url.endswith("/services"):
+        return PageFacts(url=url, status=200, title="Legal Staffing Services",
+                         h1=["Services"], h2=["Virtual paralegals", "Reception"], word_count=600)
+    return PageFacts(url=url, status=200, title="Legal Soft — Legal Virtual Staffing",
+                     h1=["Legal Soft"], h2=["Why us"], word_count=400)
+
+
+def fake_llm(system, prompt):
+    if '"themes"' in system:
+        return {"themes": [
+            {"name": "Legal virtual assistants", "keywords": ["legal virtual assistant cost"],
+             "covered_by": ["https://legalsoft.com/blog/hire-legal-va"]},
+            {"name": "Law firm billing", "keywords": ["law firm billing software"], "covered_by": []},
+        ]}
+    return {"topics": [{"keyword": "law firm billing software", "angle": "comparison for small firms"}]}
+
+
+def no_llm(system, prompt):
+    raise CredentialMissing("no key")
+
+
+def _scan(llm=fake_llm):
+    return site_pool.scan_site("https://www.LegalSoft.com", fetch=fake_fetch,
+                               sitemap=fake_sitemap, llm=llm)
+
+
+def test_scan_classifies_and_persists():
+    p = _scan()
+    assert p["domain"] == "legalsoft.com"
+    assert p["counts"] == {"sitemap_urls": 4, "scanned": 4, "posts": 2, "pages": 2}
+    assert all("fingerprint" in post for post in p["posts"])
+    assert p["data_source"] == "site_scan"
+    assert site_pool.load_site("legalsoft.com")["domain"] == "legalsoft.com"
+    assert site_pool.list_sites()[0]["domain"] == "legalsoft.com"
+
+
+def test_pool_falls_back_without_llm():
+    p = _scan(llm=no_llm)
+    assert p["pool"] and all(t["keywords"] for t in p["pool"])
+    assert any("skipped" in n for n in p["degraded"])
+
+
+def test_cannibalization_overlap():
+    p = _scan()
+    hits = site_pool.cannibalization(p, "hire legal virtual assistant")
+    assert hits and hits[0]["url"] == "https://legalsoft.com/blog/hire-legal-va"
+    assert site_pool.cannibalization(p, "maritime salvage law") == []
+
+
+def test_suggest_topics_avoids_covered():
+    p = _scan()
+    out = site_pool.suggest_topics(p, llm=fake_llm)
+    assert out["suggested"][0]["keyword"] == "law firm billing software"
+    assert out["suggested"][0]["collisions"] == []
+    assert any(a["covered_by"] for a in out["avoided"])
+
+
+def test_suggest_topics_honest_without_llm():
+    p = _scan()
+    out = site_pool.suggest_topics(p, llm=no_llm)
+    assert out["suggested"] and out["degraded"]
+
+
+def test_internal_links_ranked_by_overlap():
+    p = _scan()
+    links = site_pool.internal_links(p, "legal virtual assistant")
+    assert links[0] == "https://legalsoft.com/blog/hire-legal-va"
+    assert len(links) <= 3
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `python -m pytest "agents/SEO Blog agent/seo_blog_agent/tests/test_site_pool.py" -v`
+Expected: FAIL — module missing
+
+- [ ] **Step 3: Write the implementation**
+
+Append to `rules.py`:
+
+```python
+SITE_SCAN_CAP = 60         # pages fetched per site scan (spec §10a — bounds fetch spend)
+BLOG_PATH_HINTS = ("/blog", "/insights", "/articles", "/resources", "/news")
+TOPIC_SUGGESTIONS = 8
+CANNIBAL_OVERLAP = 0.5     # keyword-vs-post fingerprint overlap that flags cannibalization
+```
+
+`site_pool.py`:
+
+```python
+"""Website-first intelligence (spec §10a): scrape the brand's site once, then
+know it. Profile = blog inventory (with topic fingerprints), keyword pool
+(LLM-clustered themes, honest fallback), topic suggestions that never
+silently collide with existing posts. Scraped data is labeled site_scan."""
+from __future__ import annotations
+
+import re
+from datetime import date
+
+from seo_geo_agent import sources
+from seo_geo_agent.sources import CredentialMissing
+
+from . import rules, state
+from .research import tokens
+
+
+def _domain(website: str) -> str:
+    return sources.domain_of(website.strip())
+
+
+def _doc_id(domain: str) -> str:
+    return f"site-{domain.replace('.', '-')}"
+
+
+def _is_blog(url: str) -> bool:
+    path = re.sub(r"^https?://[^/]+", "", url.lower())
+    return any(h in path for h in rules.BLOG_PATH_HINTS)
+
+
+def _keyword_pool(domain: str, pages: list[dict], posts: list[dict], llm) -> tuple[list[dict], list[str]]:
+    counts: dict[str, int] = {}
+    for e in pages + posts:
+        for src in [e["title"], e["meta_description"], *e["headings"]]:
+            for t in tokens(src):
+                counts[t] = counts.get(t, 0) + 1
+    top = [t for t, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:80]]
+    fallback = [{"name": t, "keywords": [t], "covered_by": []} for t in top[:20]]
+    try:
+        raw = llm(
+            'JSON only: {"themes": [{"name": str, "keywords": [str], "covered_by": [str]}]}.',
+            f"Site {domain}. Cluster these site-mined terms into 6-12 content themes its marketer "
+            f"would target: {top}. Page titles for context: {[p['title'] for p in (pages + posts)[:30]]}. "
+            "covered_by = URLs from this list of existing blog posts that already cover the theme "
+            f"(use [] when none): {[p['url'] for p in posts][:30]}",
+        )
+        themes = [
+            {"name": str(t.get("name", ""))[:80],
+             "keywords": [str(k)[:60] for k in t.get("keywords", []) if k][:10],
+             "covered_by": [str(u) for u in t.get("covered_by", [])][:5]}
+            for t in raw.get("themes", []) if isinstance(t, dict) and t.get("name")
+        ]
+        if themes:
+            return themes, []
+        return fallback, ["LLM returned no themes — raw term pool shown"]
+    except CredentialMissing as exc:
+        return fallback, [f"theme clustering skipped ({exc}) — raw term pool shown"]
+
+
+def scan_site(website: str, fetch=None, sitemap=None, llm=None) -> dict:
+    fetch = fetch or sources.fetch_page
+    sitemap = sitemap or sources.fetch_sitemap
+    llm = llm or sources.llm_json
+    domain = _domain(website)
+    degraded: list[str] = []
+    urls = sitemap(domain)  # CredentialMissing propagates — router turns it into a 503
+    if not urls:
+        urls = [f"https://{domain}/"]
+        degraded.append("no sitemap.xml found — scanned the homepage only; Re-scan after fixing it")
+    blog_urls = [u for u in urls if _is_blog(u)]
+    picked = (blog_urls + [u for u in urls if not _is_blog(u)])[:rules.SITE_SCAN_CAP]
+    if len(urls) > len(picked):
+        degraded.append(f"scanned {len(picked)} of {len(urls)} sitemap URLs (cap keeps the scan fast)")
+    pages: list[dict] = []
+    posts: list[dict] = []
+    for u in picked:
+        f = fetch(u)
+        if f.status != 200:
+            degraded.append(f"could not fetch {u} (status {f.status})")
+            continue
+        entry = {"url": u, "title": f.title, "h1": f.h1[:1], "headings": (f.h2 + f.h3)[:12],
+                 "meta_description": f.meta_description, "word_count": f.word_count}
+        if _is_blog(u):
+            fp = tokens(f.title) | tokens(" ".join(f.h1 + f.h2[:6]))
+            posts.append({**entry, "fingerprint": sorted(fp)})
+        else:
+            pages.append(entry)
+    pool, notes = _keyword_pool(domain, pages, posts, llm)
+    degraded += notes
+    profile = {"domain": domain, "scanned": date.today().isoformat(),
+               "counts": {"sitemap_urls": len(urls), "scanned": len(picked),
+                          "posts": len(posts), "pages": len(pages)},
+               "pages": pages, "posts": posts, "pool": pool,
+               "data_source": "site_scan", "degraded": degraded}
+    state.save(_doc_id(domain), profile)
+    index = state.load("sites-index") or {"sites": []}
+    entry = {"domain": domain, "scanned": profile["scanned"], "counts": profile["counts"]}
+    index["sites"] = [entry] + [s for s in index["sites"] if s["domain"] != domain]
+    state.save("sites-index", index)
+    return profile
+
+
+def load_site(domain: str) -> dict | None:
+    return state.load(_doc_id(_domain(domain)))
+
+
+def list_sites() -> list[dict]:
+    return (state.load("sites-index") or {"sites": []})["sites"]
+
+
+def cannibalization(profile: dict, keyword: str) -> list[dict]:
+    """Existing posts a new piece on `keyword` would collide with — flagged, never hidden."""
+    kw = tokens(keyword)
+    out = []
+    for p in profile.get("posts", []):
+        fp = set(p["fingerprint"])
+        if not kw or not fp:
+            continue
+        overlap = len(kw & fp) / len(kw)
+        if overlap >= rules.CANNIBAL_OVERLAP:
+            out.append({"url": p["url"], "title": p["title"], "overlap": round(overlap, 2)})
+    return sorted(out, key=lambda x: -x["overlap"])[:3]
+
+
+def suggest_topics(profile: dict, llm=None) -> dict:
+    llm = llm or sources.llm_json
+    degraded: list[str] = []
+    candidates = []
+    for theme in profile["pool"]:
+        for k in theme["keywords"]:
+            candidates.append({"keyword": k, "theme": theme["name"],
+                               "covered_by": theme["covered_by"],
+                               "collisions": cannibalization(profile, k)})
+    fresh = [c for c in candidates if not c["collisions"] and not c["covered_by"]]
+    risky = [c for c in candidates if c["collisions"] or c["covered_by"]]
+    try:
+        raw = llm(
+            'JSON only: {"topics": [{"keyword": str, "angle": str}]}.',
+            f"From these uncovered candidate keywords for {profile['domain']}: "
+            f"{[c['keyword'] for c in fresh][:40]} — pick the {rules.TOPIC_SUGGESTIONS} strongest "
+            "blog topics and give each a one-line angle. Keywords only from the list.",
+        )
+        picked = [{"keyword": str(t.get("keyword", ""))[:80], "angle": str(t.get("angle", ""))[:160]}
+                  for t in raw.get("topics", []) if isinstance(t, dict) and t.get("keyword")]
+        picked = picked[:rules.TOPIC_SUGGESTIONS]
+        if not picked:
+            degraded.append("LLM returned no topics — showing uncovered pool keywords")
+            picked = [{"keyword": c["keyword"], "angle": f"theme: {c['theme']}"}
+                      for c in fresh[:rules.TOPIC_SUGGESTIONS]]
+    except CredentialMissing as exc:
+        degraded.append(f"topic ranking skipped ({exc}) — showing uncovered pool keywords")
+        picked = [{"keyword": c["keyword"], "angle": f"theme: {c['theme']}"}
+                  for c in fresh[:rules.TOPIC_SUGGESTIONS]]
+    for t in picked:
+        t["collisions"] = cannibalization(profile, t["keyword"])
+    return {"suggested": picked,
+            "avoided": [{"keyword": c["keyword"], "collisions": c["collisions"],
+                         "covered_by": c["covered_by"]} for c in risky[:10]],
+            "degraded": degraded}
+
+
+def internal_links(profile: dict, keyword: str) -> list[str]:
+    kw = tokens(keyword)
+    scored = []
+    for p in profile.get("pages", []) + profile.get("posts", []):
+        t = tokens(p["title"]) | tokens(" ".join(p.get("headings", [])[:6]))
+        if kw & t:
+            scored.append((len(kw & t), p["url"]))
+    return [u for _, u in sorted(scored, key=lambda x: (-x[0], x[1]))[:3]]
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `python -m pytest "agents/SEO Blog agent/seo_blog_agent/tests/test_site_pool.py" -v`
+Expected: 6 PASS (and the whole engine suite still green)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add "agents/SEO Blog agent"
+git commit -m "feat(blog): site_pool — site scan, keyword pool, cannibalization guard"
+```
+
+---
+
+### Task 14: Router — /seo-blog/sites + site-aware kickoff + internal-links hard rule
+
+**Files:**
+- Modify: `app/routers/seo_blog.py` (new endpoints + kickoff site attachment)
+- Modify: `agents/SEO Blog agent/seo_blog_agent/drafting.py` (`_hard_rules` internal-links line)
+- Test: `app/routers/tests/test_seo_blog_router.py` (extend), `agents/SEO Blog agent/seo_blog_agent/tests/test_drafting.py` (extend)
+
+**Interfaces:**
+- Consumes: `site_pool.*` from Task 13; existing router helpers `_get_run`/`_save_run`.
+- Produces HTTP API:
+  - `GET /seo-blog/sites` → `{"sites": [...]}`.
+  - `POST /seo-blog/sites` body `{website}` → full profile (scan or re-scan). 422 blank, 503 CredentialMissing.
+  - `GET /seo-blog/sites/{domain}` → profile; 404 if never scanned.
+  - `POST /seo-blog/sites/{domain}/topics` → `suggest_topics` result; 404 if never scanned.
+  - Kickoff (`POST /seo-blog/runs`) body gains `website: str = ""`; when it names a scanned site, the run doc gains `"site": {"domain", "cannibalization": [...], "internal_links": [...]}` and `run["sheet"]["internal_links"]` is set from `site_pool.internal_links`. Unknown/blank website → `run["site"] = None` (unchanged behavior).
+- `drafting._hard_rules` adds, only when `sheet.get("internal_links")`: `- Link these pages of ours where relevant: {links}.`
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `app/routers/tests/test_seo_blog_router.py`:
+
+```python
+PROFILE = {"domain": "legalsoft.com", "scanned": "2026-07-30",
+           "counts": {"sitemap_urls": 4, "scanned": 4, "posts": 1, "pages": 1},
+           "pages": [], "posts": [{"url": "https://legalsoft.com/blog/hire-legal-va",
+                                   "title": "How to Hire a Legal Virtual Assistant",
+                                   "fingerprint": ["legal", "virtual", "assistant", "hire"]}],
+           "pool": [], "data_source": "site_scan", "degraded": []}
+
+
+def test_sites_scan_and_detail(monkeypatch):
+    from seo_blog_agent import site_pool
+    monkeypatch.setattr(blog_router.site_pool, "scan_site", lambda w, **kw: dict(PROFILE))
+    body = client.post("/api/seo-blog/sites", json={"website": "legalsoft.com"}).json()
+    assert body["domain"] == "legalsoft.com"
+    assert client.post("/api/seo-blog/sites", json={"website": " "}).status_code == 422
+    monkeypatch.setattr(blog_router.site_pool, "load_site", lambda d: dict(PROFILE))
+    assert client.get("/api/seo-blog/sites/legalsoft.com").json()["domain"] == "legalsoft.com"
+    monkeypatch.setattr(blog_router.site_pool, "load_site", lambda d: None)
+    assert client.get("/api/seo-blog/sites/legalsoft.com").status_code == 404
+
+
+def test_sites_topics(monkeypatch):
+    monkeypatch.setattr(blog_router.site_pool, "load_site", lambda d: dict(PROFILE))
+    monkeypatch.setattr(blog_router.site_pool, "suggest_topics",
+                        lambda p: {"suggested": [{"keyword": "law firm billing software",
+                                                  "angle": "a", "collisions": []}],
+                                   "avoided": [], "degraded": []})
+    body = client.post("/api/seo-blog/sites/legalsoft.com/topics").json()
+    assert body["suggested"][0]["keyword"] == "law firm billing software"
+
+
+def test_kickoff_attaches_site_context(monkeypatch):
+    monkeypatch.setattr(blog_router.site_pool, "load_site", lambda d: dict(PROFILE))
+    body = client.post("/api/seo-blog/runs",
+                       json={"keyword": "hire legal virtual assistant",
+                             "website": "legalsoft.com"}).json()
+    assert body["site"]["domain"] == "legalsoft.com"
+    assert body["site"]["cannibalization"][0]["url"].endswith("/blog/hire-legal-va")
+    assert body["sheet"]["internal_links"] == body["site"]["internal_links"]
+
+
+def test_kickoff_without_site_unchanged():
+    body = client.post("/api/seo-blog/runs", json={"keyword": "legal virtual assistant"}).json()
+    assert body["site"] is None
+```
+
+Append to `tests/test_drafting.py`:
+
+```python
+def test_hard_rules_include_internal_links():
+    sheet = dict(SHEET, internal_links=["https://legalsoft.com/services"])
+    seen = {}
+
+    def llm(system, prompt):
+        seen["prompt"] = prompt
+        return GOOD_DRAFT
+
+    drafting.build_draft(sheet, OUTLINE_DOC, CITATIONS, llm=llm)
+    assert "legalsoft.com/services" in seen["prompt"]
+    drafting.build_draft(SHEET, OUTLINE_DOC, CITATIONS, llm=llm)  # no internal_links key
+    assert "Link these pages" not in seen["prompt"]
+```
+
+- [ ] **Step 2: Run tests to verify the new ones fail**
+
+Run: `python -m pytest app/routers/tests/test_seo_blog_router.py "agents/SEO Blog agent/seo_blog_agent/tests/test_drafting.py" -v`
+Expected: existing PASS, new FAIL (missing routes / missing `site` key / missing prompt line)
+
+- [ ] **Step 3: Write the implementation**
+
+`app/routers/seo_blog.py` — import `site_pool` alongside the other engine modules; `RunIn` gains `website: str = ""`; add before `_save_run(run)` in `kickoff` (after building `run`):
+
+```python
+    run["site"] = None
+    if payload.website.strip():
+        profile = site_pool.load_site(payload.website)
+        if profile:
+            run["site"] = {"domain": profile["domain"],
+                           "cannibalization": site_pool.cannibalization(profile, keyword),
+                           "internal_links": site_pool.internal_links(profile, keyword)}
+            run["sheet"]["internal_links"] = run["site"]["internal_links"]
+```
+
+New endpoints (auth like the rest):
+
+```python
+class SiteIn(BaseModel):
+    website: str
+
+
+@router.get("/seo-blog/sites")
+def list_sites(user=Depends(get_current_user)):
+    return {"sites": site_pool.list_sites()}
+
+
+@router.post("/seo-blog/sites")
+def scan_site(payload: SiteIn, user=Depends(get_current_user)):
+    website = payload.website.strip()
+    if not website:
+        raise HTTPException(422, "website is required")
+    try:
+        return site_pool.scan_site(website)
+    except CredentialMissing as exc:
+        raise HTTPException(503, f"Site scan unavailable: {exc}") from exc
+
+
+@router.get("/seo-blog/sites/{domain}")
+def site_detail(domain: str, user=Depends(get_current_user)):
+    profile = site_pool.load_site(domain)
+    if not profile:
+        raise HTTPException(404, "Site not scanned yet")
+    return profile
+
+
+@router.post("/seo-blog/sites/{domain}/topics")
+def site_topics(domain: str, user=Depends(get_current_user)):
+    profile = site_pool.load_site(domain)
+    if not profile:
+        raise HTTPException(404, "Site not scanned yet")
+    try:
+        return site_pool.suggest_topics(profile)
+    except CredentialMissing as exc:  # defensive; suggest_topics degrades internally
+        raise HTTPException(503, f"Topic suggestion unavailable: {exc}") from exc
+```
+
+`drafting.py` `_hard_rules` — append before the return's final line:
+
+```python
+    links_line = ""
+    if sheet.get("internal_links"):
+        links_line = f"\n- Link these pages of ours where relevant: {sheet['internal_links']}."
+```
+and concatenate `links_line` at the end of the returned string.
+
+- [ ] **Step 4: Run the full suites**
+
+Run: `python -m pytest app/routers/tests/test_seo_blog_router.py "agents/SEO Blog agent" -v`
+Expected: all PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add app/routers/seo_blog.py app/routers/tests/test_seo_blog_router.py "agents/SEO Blog agent"
+git commit -m "feat(blog): sites API — scan, topics, site-aware kickoff + internal-link rule"
+```
+
+---
+
+### Task 15: Frontend — website-first kickoff (one question, agent leads)
+
+**Files:**
+- Modify: `lib/api.ts` (site functions + types), `components/console/blog/BlogAgent.tsx` (home screen rework), `app/blog.css` (only if new classes needed, `.blog-*` + tokens only)
+
+**Interfaces:**
+- Consumes Task 14's endpoints. New api.ts additions (same helper style as Task 9):
+
+```ts
+export interface BlogSiteSummary { domain: string; scanned: string; counts: { sitemap_urls: number; scanned: number; posts: number; pages: number }; }
+export interface BlogTopicSuggestion { keyword: string; angle: string; collisions: { url: string; title: string; overlap: number }[]; }
+export interface BlogSiteProfile extends BlogSiteSummary { pages: unknown[]; posts: { url: string; title: string }[]; pool: { name: string; keywords: string[]; covered_by: string[] }[]; data_source: string; degraded: string[]; }
+export const blogSites = () => getJson<{ sites: BlogSiteSummary[] }>("/api/seo-blog/sites");
+export const blogScanSite = (website: string) => postJson<BlogSiteProfile>("/api/seo-blog/sites", { website });
+export const blogSiteDetail = (domain: string) => getJson<BlogSiteProfile>(`/api/seo-blog/sites/${domain}`);
+export const blogSiteTopics = (domain: string) => postJson<{ suggested: BlogTopicSuggestion[]; avoided: { keyword: string; collisions: BlogTopicSuggestion["collisions"]; covered_by: string[] }[]; degraded: string[] }>(`/api/seo-blog/sites/${domain}/topics`, {});
+```
+  `blogCreateRun` payload gains `website?: string`. `BlogRun` gains `site: { domain: string; cannibalization: { url: string; title: string; overlap: number }[]; internal_links: string[] } | null;`.
+
+**Required home-screen behavior (replaces the v1 kickoff form):**
+1. On mount load `blogSites()`. No sites → the screen is ONE input: "Kaunsi website ke liye likhna hai? / Which website do you write for?" + a single **Analyze website** button → `blogScanSite` (busy state: "Reading the site…"). 503 → verbatim toast.
+2. Sites exist → site chips (domain + post/page counts + scanned date) with an active selection, a small "+ add website" inline input, and a **Re-scan** button on the active chip.
+3. Active site → auto-load `blogSiteTopics(domain)` → **"Suggested topics"** list: keyword + angle; collision-free topics get a normal **Write this →** button; colliding ones render the flag `⚠ overlaps <title>` (`.blog-flag`) with the URL, still writable (warn, never block).
+4. **Write this →** calls `blogCreateRun({ keyword, website: domain })` and opens the run (existing Stage-1 screen). Stage 1 additionally shows, when `run.site` is set: cannibalization warning flags (per hit: title + URL + overlap %) and an "Internal links the draft will use" line from `run.site.internal_links`.
+5. Below the topics: a compact "apna keyword" input (writer's own keyword, same `blogCreateRun` with website) and a **collapsed** `<details className="blog-optional">` labeled "Ahrefs data (optional)" containing the v1 metrics + competitor-CSV textareas. Collapsed by default, never blocking.
+6. Runs list stays at the bottom (unchanged behavior).
+7. Every await in try/catch → toast; per-action busy flags; tsc clean; no new deps; `.blog-*` classes + design-system tokens only (add `.blog-optional summary { cursor: pointer; color: var(--text-secondary); }` and a `.blog-chip` row style if needed).
+
+- [ ] **Step 1: Add api.ts functions/types; Step 2: rework BlogAgent home screen + Stage-1 additions; Step 3: `npx tsc --noEmit` clean; Step 4: Commit**
+
+```bash
+git add lib/api.ts components/console/blog/BlogAgent.tsx app/blog.css
+git commit -m "feat(blog): website-first home — analyze site, topic suggestions, collapsed Ahrefs"
+```
+
+---
+
 ## Self-review notes (done at plan time)
 
 - Spec §4 rows 1-12 → Tasks 3 (steps 1-4), 5 (5-8), 6 (9-10), 7 (11-12); gates → Tasks 4 & 8; provenance → Tasks 2/3/6 tests assert labels; escalation paths (503/409/flags) → Tasks 4/8.

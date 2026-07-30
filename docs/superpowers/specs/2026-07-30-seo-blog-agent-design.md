@@ -109,6 +109,16 @@ Auth: same `get_current_user` dependency as other agent routers.
 
 Offline-first, matching a2: SERP/page fixtures, fake LLM, no live calls in CI (existing conftest offline guard). Coverage focus: paste parsers per Ahrefs export format, gap analysis, keyword-count benchmarking, citation verifier (live/dead/claim-mismatch/DR cases), compliance checker, gate state machine. Bar: pytest green + tsc clean.
 
+## 10a. Amendment A (2026-07-30, user feedback): Website-first intelligence
+
+User verdict on v1 kickoff: a wall of fields is not intelligence. Corrected flow — the agent leads with its own discovery:
+
+- **Kickoff = one question: "which website?"** Everything else the agent derives. Ahrefs pastes move into a collapsed "optional" section that never blocks the happy path.
+- **Site scan (per website, re-runnable):** sitemap-driven scrape (reuses a2 `fetch_sitemap`/`fetch_page`, capped at `rules.SITE_SCAN_CAP` pages, blogs prioritized) → persisted profile `site-{domain}`: page/post inventory, each blog post with a topic fingerprint (token set), and a **keyword pool** clustered into themes by LLM (deterministic raw-term fallback, honest `degraded` notes). Scraped data is labeled `data_source: "site_scan"`.
+- **Topic Lab:** the agent proposes topics from the pool that existing posts do NOT already cover. **Cannibalization guard:** token-overlap (`rules.CANNIBAL_OVERLAP`) of a candidate keyword vs each post fingerprint; colliding topics are surfaced with the colliding URL — flagged honestly, never silently dropped; a writer-typed keyword that collides warns but does not block.
+- **Pipeline grounding:** kickoff with a known site attaches `run.site` (domain, cannibalization hits, internal-link candidates from real site pages); `sheet.internal_links` feeds a new hard-rule line in draft generation ("link these internal pages where relevant").
+- Provenance and degradation rules of §6/§8 apply unchanged to all scan/pool/topic outputs.
+
 ## 10. Out of scope (v2 candidates)
 
 - DataForSEO (or Ahrefs API) full-auto data — replaces paste-in
