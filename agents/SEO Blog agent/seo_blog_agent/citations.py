@@ -2,6 +2,8 @@
 vet domain rating. The anti-hallucination gate: no verification, no citation."""
 from __future__ import annotations
 
+import re
+
 from seo_geo_agent import sources
 from seo_geo_agent.sources import CredentialMissing
 
@@ -12,7 +14,17 @@ from .research import tokens
 def _claim_on_page(claim: str, source_name: str, page_text: str) -> bool:
     want = tokens(claim) | tokens(source_name)
     have = tokens(page_text)
-    return bool(want) and len(want & have) >= max(2, len(want) // 3)
+    if not want or len(want & have) < max(2, len(want) // 3):
+        return False
+    # tokens() drops short tokens (len<=2), which silently excludes 2-digit
+    # statistics like "78%" — the exact number a citation claims must still
+    # appear on the page, or the claim is unverifiable (e.g. "78%" vs "27%").
+    nums = re.findall(r"\d+(?:\.\d+)?", claim)
+    if nums and not any(
+        re.search(rf"(?<![\d.]){re.escape(n)}(?![\d.])", page_text) for n in nums
+    ):
+        return False
+    return True
 
 
 def _dr_fields(domain: str, dr_pasted: dict[str, int]) -> dict:

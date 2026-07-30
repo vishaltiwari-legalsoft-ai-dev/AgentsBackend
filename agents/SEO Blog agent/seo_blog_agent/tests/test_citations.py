@@ -11,10 +11,14 @@ DEAD = {"claim": "50% stat", "source_name": "Dead Source Annual Study", "url": "
         "section": "Costs"}
 OFFPAGE = {"claim": "totally different subject entirely", "source_name": "Mismatch Weekly Review",
            "url": "https://mismatch.com/y", "section": "Hiring steps"}
+WRONG_NUM = {"claim": "78% of firms outsource intake", "source_name": "Clio 2025 Legal Trends Report",
+             "url": "https://clio.com/wrong-number", "section": "Costs"}
 
 PAGES = {
     "https://clio.com/report": {"status": 200, "final_url": "https://clio.com/report",
                                 "text": "Clio 2025 Legal Trends Report: 78% of firms outsource intake."},
+    "https://clio.com/wrong-number": {"status": 200, "final_url": "https://clio.com/wrong-number",
+                                      "text": "Clio 2025 Legal Trends Report: 27% of firms outsource intake."},
     "https://dead.com/x": {"status": 404, "final_url": "https://dead.com/x", "text": ""},
     "https://mismatch.com/y": {"status": 200, "final_url": "https://mismatch.com/y",
                                "text": "unrelated page about gardening tips and tomato soil"},
@@ -35,6 +39,31 @@ def test_only_verified_citations_enter():
     assert doc["items"][0]["verified"] is True
     assert doc["items"][0]["dr_status"] == "unverified"  # no DR pasted — honest flag
     assert doc["short_by"] == 1
+
+
+def test_claim_on_page_rejects_wrong_number():
+    # "78% of firms outsource intake" claimed, but the page says 27% — token
+    # overlap alone would pass this (tokens() drops 2-digit numbers), so the
+    # number itself must be checked too.
+    assert citations._claim_on_page(
+        "78% of firms outsource intake", "Clio 2025 Legal Trends Report",
+        "Clio 2025 Legal Trends Report: 27% of firms outsource intake.",
+    ) is False
+
+
+def test_claim_on_page_accepts_matching_number():
+    assert citations._claim_on_page(
+        "78% of firms outsource intake", "Clio 2025 Legal Trends Report",
+        "Clio 2025 Legal Trends Report: 78% of firms outsource intake.",
+    ) is True
+
+
+def test_wrong_number_on_page_is_rejected():
+    def llm(system, prompt):
+        return {"citations": [WRONG_NUM]}
+    doc = citations.source_citations(OUTLINE_DOC, {}, llm=llm, fetch_raw=fake_fetch_raw)
+    assert doc["items"] == []  # page says 27%, claim says 78% — not verified
+    assert doc["short_by"] == 2
 
 
 def test_dr_enforced_when_known():
