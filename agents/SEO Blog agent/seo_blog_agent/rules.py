@@ -8,3 +8,7 @@ CITATION_MAX_ROUNDS = 3    # citation re-request rounds before honest "short by 
 MIN_LINKS = 3
 TOP_N = 3                  # competitor pages analyzed
 FREQUENT_TERMS = 15        # density benchmark terms from the #1 page
+SITE_SCAN_CAP = 60         # pages fetched per site scan (spec §10a — bounds fetch spend)
+BLOG_PATH_HINTS = ("/blog", "/insights", "/articles", "/resources", "/news")
+TOPIC_SUGGESTIONS = 8
+CANNIBAL_OVERLAP = 0.5     # keyword-vs-post fingerprint overlap that flags cannibalization
