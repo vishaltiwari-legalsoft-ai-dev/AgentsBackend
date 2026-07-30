@@ -132,6 +132,8 @@ def suggest_topics(profile: dict, llm=None) -> dict:
                                "collisions": cannibalization(profile, k)})
     fresh = [c for c in candidates if not c["collisions"] and not c["covered_by"]]
     risky = [c for c in candidates if c["collisions"] or c["covered_by"]]
+    # Build mapping of lowercase keyword -> original keyword for untrusted LLM validation
+    allowed = {c["keyword"].lower(): c["keyword"] for c in fresh}
     try:
         raw = llm(
             'JSON only: {"topics": [{"keyword": str, "angle": str}]}.',
@@ -139,11 +141,18 @@ def suggest_topics(profile: dict, llm=None) -> dict:
             f"{[c['keyword'] for c in fresh][:40]} — pick the {rules.TOPIC_SUGGESTIONS} strongest "
             "blog topics and give each a one-line angle. Keywords only from the list.",
         )
-        picked = [{"keyword": str(t.get("keyword", ""))[:80], "angle": str(t.get("angle", ""))[:160]}
-                  for t in raw.get("topics", []) if isinstance(t, dict) and t.get("keyword")]
+        candidates_raw = [{"keyword": str(t.get("keyword", ""))[:80], "angle": str(t.get("angle", ""))[:160]}
+                          for t in raw.get("topics", []) if isinstance(t, dict) and t.get("keyword")]
+        # Validate: LLM output must come from the allowed uncovered list (case-insensitive)
+        picked = []
+        for c in candidates_raw:
+            kw_lower = c["keyword"].lower()
+            if kw_lower in allowed:
+                # Map back to exact original casing for consistency
+                picked.append({"keyword": allowed[kw_lower], "angle": c["angle"]})
         picked = picked[:rules.TOPIC_SUGGESTIONS]
         if not picked:
-            degraded.append("LLM returned no topics — showing uncovered pool keywords")
+            degraded.append("LLM returned off-list topics — showing uncovered pool keywords")
             picked = [{"keyword": c["keyword"], "angle": f"theme: {c['theme']}"}
                       for c in fresh[:rules.TOPIC_SUGGESTIONS]]
     except CredentialMissing as exc:

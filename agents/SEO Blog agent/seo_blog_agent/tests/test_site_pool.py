@@ -85,3 +85,18 @@ def test_internal_links_ranked_by_overlap():
     links = site_pool.internal_links(p, "legal virtual assistant")
     assert links[0] == "https://legalsoft.com/blog/hire-legal-va"
     assert len(links) <= 3
+
+
+def test_suggest_topics_rejects_offlist_llm():
+    """LLM output must not bypass uncovered keyword validation."""
+    def offlist_llm(system, prompt):
+        if '"topics"' in system:
+            return {"topics": [{"keyword": "totally invented keyword", "angle": "x"}]}
+        return {"themes": []}
+
+    p = _scan(llm=offlist_llm)
+    out = site_pool.suggest_topics(p, llm=offlist_llm)
+    # Suggested list must only contain keywords from the uncovered pool (none equal to "totally invented keyword")
+    assert all(t["keyword"] != "totally invented keyword" for t in out["suggested"])
+    # Must have a degradation note about off-list topics
+    assert any("off-list" in n.lower() for n in out["degraded"])
