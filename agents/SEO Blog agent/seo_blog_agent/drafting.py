@@ -7,6 +7,7 @@ import io
 import re
 from pathlib import Path
 
+from seo_blog_agent import llm as blog_llm
 from seo_geo_agent import sources
 
 GUIDELINES_PATH = Path(__file__).with_name("guidelines.md")
@@ -29,7 +30,7 @@ def _hard_rules(sheet: dict, outline_doc: dict) -> str:
 
 
 def build_draft(sheet: dict, outline_doc: dict, citations: dict, llm=None) -> dict:
-    llm = llm or sources.llm_text
+    llm = llm or blog_llm.llm_text
     guidelines = GUIDELINES_PATH.read_text(encoding="utf-8")
     outline_lines = "\n".join(
         f"{'#' * o['level']} {o['heading']}  — {o['note']}"

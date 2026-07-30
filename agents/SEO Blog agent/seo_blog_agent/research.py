@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 
+from seo_blog_agent import llm as blog_llm
 from seo_geo_agent import sources
 from seo_geo_agent.sources import CredentialMissing
 
@@ -113,7 +114,7 @@ def _lsi(keyword: str, serp: dict, frequent: list[str], llm) -> tuple[list[dict]
 def build_research(keyword: str, pasted: dict, search=None, fetch=None, llm=None) -> dict:
     search = search or sources.serper_search
     fetch = fetch or sources.fetch_page
-    llm = llm or sources.llm_json
+    llm = llm or blog_llm.llm_json
     degraded: list[str] = []
 
     serp = search(keyword)  # CredentialMissing propagates — router turns it into a 503

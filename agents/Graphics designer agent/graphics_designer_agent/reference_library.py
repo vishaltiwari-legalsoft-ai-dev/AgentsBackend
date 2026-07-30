@@ -528,7 +528,7 @@ def _enrich_with_llm(record: ReferenceRecord) -> Optional[dict[str, Any]]:
         "\"summary\": \"one sentence describing what this creative communicates\"}."
     )
     try:
-        msg = get_llm(temperature=0.4, fast=True).invoke(prompt)
+        msg = get_llm(temperature=0.4, fast=True, agent_id="a1").invoke(prompt)
         content = getattr(msg, "content", "") or ""
         match = re.search(r"\{.*\}", content, re.DOTALL)
         if not match:

@@ -243,7 +243,7 @@ def _llm_plan(
         f"Return STRICT JSON matching exactly this shape: {shape}. No prose."
     )
     try:
-        msg = get_llm(temperature=0.7, fast=False).invoke(prompt)
+        msg = get_llm(temperature=0.7, fast=False, agent_id="a1").invoke(prompt)
         content = getattr(msg, "content", "") or ""
         match = re.search(r"\{.*\}", content, re.DOTALL)
         if not match:

@@ -91,7 +91,7 @@ def _vision_placement(image_bytes: bytes, headline: str, body: str,
     )
     allowed = ("left", "right") if sides_only else _VALID_PLACEMENTS
     try:
-        out = analyze_images(prompt, [(small, "image/png")])
+        out = analyze_images(prompt, [(small, "image/png")], agent_id="a1")
         match = re.search(r"\{.*\}", out, re.S)
         if not match:
             return None

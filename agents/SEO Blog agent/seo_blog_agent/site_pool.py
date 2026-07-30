@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 from datetime import date
 
+from seo_blog_agent import llm as blog_llm
 from seo_geo_agent import sources
 from seo_geo_agent.sources import CredentialMissing
 
@@ -59,7 +60,7 @@ def _keyword_pool(domain: str, pages: list[dict], posts: list[dict], llm) -> tup
 def scan_site(website: str, fetch=None, sitemap=None, llm=None) -> dict:
     fetch = fetch or sources.fetch_page
     sitemap = sitemap or sources.fetch_sitemap
-    llm = llm or sources.llm_json
+    llm = llm or blog_llm.llm_json
     domain = _domain(website)
     degraded: list[str] = []
     urls = sitemap(domain)  # CredentialMissing propagates — router turns it into a 503
@@ -122,7 +123,7 @@ def cannibalization(profile: dict, keyword: str) -> list[dict]:
 
 
 def suggest_topics(profile: dict, llm=None) -> dict:
-    llm = llm or sources.llm_json
+    llm = llm or blog_llm.llm_json
     degraded: list[str] = []
     candidates = []
     for theme in profile["pool"]:

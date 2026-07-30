@@ -462,7 +462,7 @@ def _study_brand_brochures(brand_id: Optional[str]) -> str:
         "flows, and where photos sit versus text. Be concrete and brief."
     )
     try:
-        notes = analyze_images(prompt, refs[:3])
+        notes = analyze_images(prompt, refs[:3], agent_id="a1")
         return " ".join((notes or "").split())[:500]
     except Exception:  # noqa: BLE001 - study is additive; never block generation
         logger.warning("brochure design-study failed; generating without it", exc_info=True)

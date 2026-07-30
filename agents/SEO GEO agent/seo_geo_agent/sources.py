@@ -118,15 +118,16 @@ def domain_of(url: str) -> str:
 
 # ------------------------------- LLM adapter -------------------------------
 
-def llm_text(system: str, prompt: str) -> str:
+def llm_text(system: str, prompt: str, *, agent_id: str | None = None) -> str:
     """One fast-model completion returned as plain text. Raises ``CredentialMissing``
-    when offline or the provider fails, so callers surface an honest message."""
+    when offline or the provider fails, so callers surface an honest message.
+    ``agent_id`` routes the creator's per-agent model override (agent → global)."""
     if not state.use_cloud():
         raise CredentialMissing("offline mode")
     try:
         from app.services.openrouter import get_llm
 
-        raw = get_llm(temperature=0.3, fast=True).invoke(
+        raw = get_llm(temperature=0.3, fast=True, agent_id=agent_id).invoke(
             [("system", system), ("user", prompt)]
         ).content
         return str(raw).strip()
@@ -134,15 +135,16 @@ def llm_text(system: str, prompt: str) -> str:
         raise CredentialMissing(f"LLM unavailable: {exc}") from exc
 
 
-def llm_json(system: str, prompt: str):
+def llm_json(system: str, prompt: str, *, agent_id: str | None = None):
     """One fast-model completion, parsed as JSON. Raises ``CredentialMissing``
-    on any failure so callers fall back to their deterministic heuristic."""
+    on any failure so callers fall back to their deterministic heuristic.
+    ``agent_id`` routes the creator's per-agent model override (agent → global)."""
     if not state.use_cloud():
         raise CredentialMissing("offline mode")
     try:
         from app.services.openrouter import get_llm
 
-        raw = get_llm(temperature=0.2, fast=True).invoke(
+        raw = get_llm(temperature=0.2, fast=True, agent_id=agent_id).invoke(
             [("system", system), ("user", prompt)]
         ).content
         text = str(raw).strip()

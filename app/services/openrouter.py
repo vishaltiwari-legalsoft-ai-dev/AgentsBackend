@@ -22,16 +22,22 @@ def _default_headers() -> dict[str, str]:
     return {"HTTP-Referer": settings.app_public_url, "X-Title": settings.app_title}
 
 
-def get_llm(temperature: float = 0.4, *, fast: bool = False, model: str | None = None) -> ChatOpenAI:
+def get_llm(
+    temperature: float = 0.4,
+    *,
+    fast: bool = False,
+    model: str | None = None,
+    agent_id: str | None = None,
+) -> ChatOpenAI:
     """LangChain chat model backed by OpenRouter.
 
     ``model`` pins an explicit model id (e.g. the GD planner); otherwise
     ``fast=True`` selects the cheap parsing model and the default is the
-    high-end reasoning model."""
-    resolved = model or (
-        runtime_config.get("openrouter_fast_model")
-        if fast
-        else runtime_config.get("openrouter_model")
+    high-end reasoning model. ``agent_id`` resolves the creator's per-agent
+    model override first (agent → global → env); without it the global
+    default applies."""
+    resolved = model or runtime_config.get_for_agent(
+        agent_id, "openrouter_fast_model" if fast else "openrouter_model"
     )
     return ChatOpenAI(
         model=resolved,
@@ -82,7 +88,9 @@ def _parse_data_url(data_url: str) -> tuple[bytes, str]:
     return base64.b64decode(payload), mime
 
 
-def vision_extract_text(image_bytes: bytes, mime_type: str) -> str:
+def vision_extract_text(
+    image_bytes: bytes, mime_type: str, *, agent_id: str | None = None
+) -> str:
     """OCR + read an image via an OpenRouter vision model.
 
     Returns extracted text plus a short description of key visual content, used
@@ -93,7 +101,7 @@ def vision_extract_text(image_bytes: bytes, mime_type: str) -> str:
     headers = {"Authorization": f"Bearer {api_key}", **_default_headers()}
     data_url = f"data:{mime_type or 'image/png'};base64,{base64.b64encode(image_bytes).decode()}"
     body = {
-        "model": runtime_config.get("openrouter_vision_model"),
+        "model": runtime_config.get_for_agent(agent_id, "openrouter_vision_model"),
         "messages": [
             {
                 "role": "user",
@@ -139,6 +147,8 @@ def analyze_images(
     prompt: str,
     images: list[tuple[bytes, str]],
     model: str | None = None,
+    *,
+    agent_id: str | None = None,
 ) -> str:
     """Analyze one or more images with a vision-capable chat model.
 
@@ -158,7 +168,7 @@ def analyze_images(
         content.append({"type": "image_url", "image_url": {"url": data_url}})
 
     body = {
-        "model": model or runtime_config.get("openrouter_model"),
+        "model": model or runtime_config.get_for_agent(agent_id, "openrouter_model"),
         "messages": [{"role": "user", "content": content}],
     }
     response = httpx.post(url, json=body, headers=headers, timeout=180)
@@ -185,6 +195,7 @@ def generate_image(
     *,
     aspect_ratio: str | None = None,
     image_size: str | None = None,
+    agent_id: str | None = None,
 ) -> tuple[bytes, str]:
     """Render a single image through an OpenRouter image-output model.
 
@@ -211,7 +222,7 @@ def generate_image(
     else:
         messages = [{"role": "user", "content": prompt}]
 
-    image_model = model or runtime_config.get("openrouter_image_model")
+    image_model = model or runtime_config.get_for_agent(agent_id, "openrouter_image_model")
     body: dict = {
         "model": image_model,
         "messages": messages,

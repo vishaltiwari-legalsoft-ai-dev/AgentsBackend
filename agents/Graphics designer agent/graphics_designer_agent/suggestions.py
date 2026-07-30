@@ -372,7 +372,7 @@ def _enrich_direction_with_llm(brief: dict, curated: dict, pack) -> dict | None:
         'headline/copy approach"}'
     )
     try:
-        msg = get_llm(temperature=0.6, fast=True).invoke(prompt)
+        msg = get_llm(temperature=0.6, fast=True, agent_id="a1").invoke(prompt)
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
         match = re.search(r"\{.*\}", content, re.S)
         if not match:
@@ -529,7 +529,7 @@ def _converse_with_llm(history, brief, pack) -> dict | None:
     if not msgs:
         chat.append(("human", "Start the conversation."))
     try:
-        out = get_llm(temperature=0.6).invoke(chat)
+        out = get_llm(temperature=0.6, agent_id="a1").invoke(chat)
         content = out.content if isinstance(out.content, str) else str(out.content)
         match = re.search(r"\{.*\}", content, re.S)
         if not match:
@@ -660,7 +660,7 @@ def _enrich_explore_with_llm(answers: dict, curated: dict, pack) -> dict | None:
         'sentence on combining or pushing the elements"}'
     )
     try:
-        msg = get_llm(temperature=0.7, fast=True).invoke(prompt)
+        msg = get_llm(temperature=0.7, fast=True, agent_id="a1").invoke(prompt)
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
         match = re.search(r"\{.*\}", content, re.S)
         if not match:
@@ -897,9 +897,11 @@ def suggest_gradient(
 def _get_llm(**kwargs):
     """Lazy OpenRouter accessor — a module-level seam tests monkeypatch. Raises
     when the app layer (and its key) is unavailable; callers treat any raise as
-    "LLM path unavailable"."""
+    "LLM path unavailable". Binds agent "a1" so the creator's per-agent model
+    override applies to every GD suggestion call."""
     from app.services.openrouter import get_llm  # lazy — package works without the app
 
+    kwargs.setdefault("agent_id", "a1")
     return get_llm(**kwargs)
 
 

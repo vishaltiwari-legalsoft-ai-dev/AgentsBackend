@@ -121,24 +121,50 @@ MODEL_CATALOG: dict[str, list[dict[str, str | bool]]] = {
     "openrouter_model": TEXT_MODELS,
     "openrouter_fast_model": TEXT_MODELS,
     "openrouter_vision_model": VISION_MODELS,
+    "gd_planner_model": TEXT_MODELS,
 }
 
-# The agents this platform exposes. Mirrors the frontend catalog
-# (newfrontend/lib/console-data.ts). ``live`` marks the agents actually wired to
-# the backend today — only those consume their per-agent model overrides; the
-# rest store config for when they go live. Keep ids in sync with the frontend.
-AGENTS: list[dict[str, str | bool]] = [
-    {"id": "a1", "name": "Graphic Designer", "role": "Brand & visual assets", "category": "design", "live": True},
-    {"id": "a2", "name": "SEO Analyst", "role": "Search & rankings", "category": "seo", "live": False},
-    {"id": "a3", "name": "Copywriter", "role": "Words that convert", "category": "copy", "live": False},
-    {"id": "a4", "name": "Social Scheduler", "role": "Posts & calendars", "category": "social", "live": False},
-    {"id": "a5", "name": "Ads Optimizer", "role": "Paid performance", "category": "ads", "live": False},
-    {"id": "a6", "name": "Market Researcher", "role": "Insights & trends", "category": "data", "live": False},
-    {"id": "a7", "name": "Email Marketer", "role": "Lifecycle & nurture", "category": "copy", "live": False},
-    {"id": "a8", "name": "Brand Strategist", "role": "Positioning & messaging", "category": "design", "live": False},
+# The agents the Agent Configuration panel manages: ONLY the ones actually
+# wired to the backend (ids match newfrontend/lib/console-data.ts). ``fields``
+# lists the model overrides that agent truly consumes — the panel renders only
+# those dropdowns, and the save endpoint rejects anything else, so there are no
+# dead switches. Adding an agent here is a claim that its engine passes its
+# ``agent_id`` into app.services.openrouter (see tests/test_agent_model_overrides.py).
+AGENTS: list[dict[str, str | bool | list[str]]] = [
+    {
+        "id": "a1",
+        "name": "Graphic Designer",
+        "role": "Brand & visual assets",
+        "category": "design",
+        "live": True,
+        "fields": [
+            "openrouter_model",
+            "openrouter_fast_model",
+            "openrouter_image_model",
+            "openrouter_vision_model",
+            "gd_planner_model",
+        ],
+    },
+    {
+        "id": "a6",
+        "name": "Marketing Research",
+        "role": "Campaigns, competitors & funnel",
+        "category": "data",
+        "live": True,
+        "fields": ["openrouter_model"],
+    },
+    {
+        "id": "a9",
+        "name": "SEO Blog Writer",
+        "role": "Ranking blog drafts",
+        "category": "copy",
+        "live": True,
+        "fields": ["openrouter_fast_model"],
+    },
 ]
 
 AGENT_IDS = {str(a["id"]) for a in AGENTS}
+AGENT_FIELDS: dict[str, list[str]] = {str(a["id"]): list(a["fields"]) for a in AGENTS}
 
 
 ABILITIES: list[dict[str, str]] = [

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from seo_blog_agent import llm as blog_llm
 from seo_geo_agent import sources
 from seo_geo_agent.sources import CredentialMissing
 
@@ -20,7 +21,7 @@ def _external_links(html: str, own_domain: str) -> int:
 def competitor_profile(url: str, fetch=None, fetch_raw=None, llm=None) -> dict:
     fetch = fetch or sources.fetch_page
     fetch_raw = fetch_raw or sources.fetch_text
-    llm = llm or sources.llm_json
+    llm = llm or blog_llm.llm_json
     f = fetch(url)
     raw = fetch_raw(url)
     profile = {
@@ -158,7 +159,7 @@ def _evaluate(sheet: dict, profiles: list[dict], items: list[dict], llm) -> tupl
 
 
 def build_outline(sheet: dict, profiles: list[dict], llm=None) -> dict:
-    llm = llm or sources.llm_json
+    llm = llm or blog_llm.llm_json
     degraded: list[str] = [n for p in profiles for n in p["degraded"]]
     avail = [p for p in profiles if p["available"]]
     wc = [p["word_count"] for p in avail if p["word_count"]]

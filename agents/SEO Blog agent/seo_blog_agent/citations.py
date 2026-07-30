@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from seo_blog_agent import llm as blog_llm
 from seo_geo_agent import sources
 from seo_geo_agent.sources import CredentialMissing
 
@@ -33,7 +34,7 @@ def _dr_fields(domain: str, dr_pasted: dict[str, int]) -> dict:
 
 
 def source_citations(outline_doc: dict, dr_pasted: dict[str, int], llm=None, fetch_raw=None) -> dict:
-    llm = llm or sources.llm_json
+    llm = llm or blog_llm.llm_json
     fetch_raw = fetch_raw or sources.fetch_text
     target = outline_doc["targets"]["links"]
     headings = [o["heading"] for o in outline_doc["outline"]]

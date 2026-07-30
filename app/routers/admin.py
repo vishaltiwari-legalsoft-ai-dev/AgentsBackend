@@ -9,7 +9,13 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.security import get_current_user, require_admin, require_creator
-from app.services import agent_config, firestore_repo, runtime_config, storage
+from app.services import (
+    agent_config,
+    firestore_repo,
+    model_catalog,
+    runtime_config,
+    storage,
+)
 from graphics_designer_agent import registry
 
 router = APIRouter()
@@ -137,15 +143,16 @@ def test_openrouter_key(_creator: dict = Depends(require_creator)) -> dict:
 # --------------------------------------------------------------------------- #
 
 def _agents_payload() -> dict:
-    """Every agent with its per-agent overrides and the resolved (effective)
-    model for each field, plus the curated catalog the UI offers as dropdowns."""
+    """Every live agent with the model fields it actually consumes: its saved
+    overrides and the resolved (effective) model per field, plus the curated
+    catalog the UI offers as dropdowns."""
     overrides = firestore_repo.get_app_config(use_cache=False)
     agents_cfg = overrides.get("agents") or {}
-    fields = runtime_config.AGENT_OVERRIDE_FIELDS
 
     agents = []
     for agent in agent_config.AGENTS:
         agent_id = str(agent["id"])
+        fields = agent_config.AGENT_FIELDS[agent_id]
         saved = agents_cfg.get(agent_id) or {}
         agents.append(
             {
@@ -161,19 +168,25 @@ def _agents_payload() -> dict:
 
     return {
         "agents": agents,
-        "fields": list(fields),
-        "catalog": agent_config.MODEL_CATALOG,
+        "fields": list(runtime_config.AGENT_OVERRIDE_FIELDS),
+        # Live premium OpenRouter catalog, tier-classified; curated fallback offline.
+        "catalog": model_catalog.get_catalog(),
+        "tier_labels": model_catalog.TIER_LABELS,
         # The platform-wide fallback shown as the "inherit" option per field.
-        "global_defaults": {f: runtime_config.get(f) for f in fields},
+        "global_defaults": {
+            f: runtime_config.get(f) for f in runtime_config.AGENT_OVERRIDE_FIELDS
+        },
     }
 
 
 class AgentConfigBody(BaseModel):
     # None = leave untouched; "" = clear the override (fall back to global).
+    # Must cover every AGENT_OVERRIDE_FIELDS entry — the save loop reads each.
     openrouter_model: str | None = None
     openrouter_fast_model: str | None = None
     openrouter_image_model: str | None = None
     openrouter_vision_model: str | None = None
+    gd_planner_model: str | None = None
 
 
 @router.get("/admin/agents")
@@ -196,6 +209,7 @@ def update_agent_config(
     """
     if agent_id not in agent_config.AGENT_IDS:
         raise HTTPException(404, f"Unknown agent '{agent_id}'.")
+    agent_fields = agent_config.AGENT_FIELDS[agent_id]
 
     patch: dict[str, str] = {}
     for field in runtime_config.AGENT_OVERRIDE_FIELDS:
@@ -204,8 +218,14 @@ def update_agent_config(
             continue
         value = value.strip()
         if value:
-            allowed = {str(m["id"]) for m in agent_config.MODEL_CATALOG.get(field, [])}
-            if value not in allowed:
+            # A model may only be set on a field this agent actually consumes —
+            # anything else would be a dead switch. Clearing ("") is always
+            # allowed so stale overrides can be removed.
+            if field not in agent_fields:
+                raise HTTPException(
+                    400, f"Agent '{agent_id}' does not use {field}."
+                )
+            if value not in model_catalog.allowed_ids(field):
                 raise HTTPException(400, f"'{value}' is not an allowed {field}.")
         patch[field] = value
 

@@ -13,6 +13,10 @@ from pathlib import Path
 
 _PROMPTS = Path(__file__).resolve().parent / "prompts"
 
+# Agent id in the platform catalog — routes the creator's per-agent model
+# override (Agent Configuration panel) to every MR LLM call.
+MR_AGENT_ID = "a6"
+
 
 def load_prompt(name: str) -> str:
     p = _PROMPTS / f"{name}.txt"
@@ -104,7 +108,7 @@ def llm_json(prompt: str):
 
         from app.services.openrouter import get_llm
 
-        resp = get_llm(temperature=0.1).invoke(prompt)
+        resp = get_llm(temperature=0.1, agent_id=MR_AGENT_ID).invoke(prompt)
         text = getattr(resp, "content", str(resp))
         m = re.search(r"(\{.*\}|\[.*\])", text, re.S)
         return json.loads(m.group(1)) if m else None
@@ -119,7 +123,7 @@ def llm_text(prompt: str) -> str | None:
     try:
         from app.services.openrouter import get_llm
 
-        resp = get_llm(temperature=0.3).invoke(prompt)
+        resp = get_llm(temperature=0.3, agent_id=MR_AGENT_ID).invoke(prompt)
         return getattr(resp, "content", str(resp)) or None
     except Exception:
         return None
@@ -132,7 +136,7 @@ def narrate(kind: str, data: dict) -> str:
         from app.services.openrouter import get_llm
 
         prompt = load_prompt(kind).replace("{data}", json.dumps(data, default=str))
-        llm = get_llm(temperature=0.3)
+        llm = get_llm(temperature=0.3, agent_id=MR_AGENT_ID)
         resp = llm.invoke(prompt)
         return getattr(resp, "content", str(resp))
     except Exception:

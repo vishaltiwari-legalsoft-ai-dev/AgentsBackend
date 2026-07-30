@@ -22,10 +22,21 @@ from graphics_designer_agent import registry
 from app.main import app as fastapi_app
 from app.security import get_current_user
 
-fastapi_app.dependency_overrides[get_current_user] = lambda: {
-    "id": "admin1", "email": "admin@legalsoft.com", "is_admin": True,
-}
+_ADMIN = {"id": "admin1", "email": "admin@legalsoft.com", "is_admin": True}
 client = TestClient(fastapi_app)
+
+
+@pytest.fixture(autouse=True)
+def _as_admin():
+    """(Re)install the admin auth override per test — module-level overrides
+    get popped by other routers' test fixtures when the whole suite runs."""
+    prev = fastapi_app.dependency_overrides.get(get_current_user)
+    fastapi_app.dependency_overrides[get_current_user] = lambda: dict(_ADMIN)
+    yield
+    if prev is None:
+        fastapi_app.dependency_overrides.pop(get_current_user, None)
+    else:
+        fastapi_app.dependency_overrides[get_current_user] = prev
 
 
 @pytest.fixture(autouse=True)
