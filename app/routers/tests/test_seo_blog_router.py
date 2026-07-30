@@ -170,3 +170,50 @@ def test_draft_requires_both_gates(monkeypatch):
     rid = _stage2_ready(monkeypatch)
     assert client.post(f"/api/seo-blog/runs/{rid}/draft").status_code == 409
     assert client.get(f"/api/seo-blog/runs/{rid}/export?format=md").status_code == 404
+
+
+# Sites API — Task 14
+
+PROFILE = {"domain": "legalsoft.com", "scanned": "2026-07-30",
+           "counts": {"sitemap_urls": 4, "scanned": 4, "posts": 1, "pages": 1},
+           "pages": [], "posts": [{"url": "https://legalsoft.com/blog/hire-legal-va",
+                                   "title": "How to Hire a Legal Virtual Assistant",
+                                   "fingerprint": ["legal", "virtual", "assistant", "hire"]}],
+           "pool": [], "data_source": "site_scan", "degraded": []}
+
+
+def test_sites_scan_and_detail(monkeypatch):
+    from seo_blog_agent import site_pool
+    monkeypatch.setattr(blog_router.site_pool, "scan_site", lambda w, **kw: dict(PROFILE))
+    body = client.post("/api/seo-blog/sites", json={"website": "legalsoft.com"}).json()
+    assert body["domain"] == "legalsoft.com"
+    assert client.post("/api/seo-blog/sites", json={"website": " "}).status_code == 422
+    monkeypatch.setattr(blog_router.site_pool, "load_site", lambda d: dict(PROFILE))
+    assert client.get("/api/seo-blog/sites/legalsoft.com").json()["domain"] == "legalsoft.com"
+    monkeypatch.setattr(blog_router.site_pool, "load_site", lambda d: None)
+    assert client.get("/api/seo-blog/sites/legalsoft.com").status_code == 404
+
+
+def test_sites_topics(monkeypatch):
+    monkeypatch.setattr(blog_router.site_pool, "load_site", lambda d: dict(PROFILE))
+    monkeypatch.setattr(blog_router.site_pool, "suggest_topics",
+                        lambda p: {"suggested": [{"keyword": "law firm billing software",
+                                                  "angle": "a", "collisions": []}],
+                                   "avoided": [], "degraded": []})
+    body = client.post("/api/seo-blog/sites/legalsoft.com/topics").json()
+    assert body["suggested"][0]["keyword"] == "law firm billing software"
+
+
+def test_kickoff_attaches_site_context(monkeypatch):
+    monkeypatch.setattr(blog_router.site_pool, "load_site", lambda d: dict(PROFILE))
+    body = client.post("/api/seo-blog/runs",
+                       json={"keyword": "hire legal virtual assistant",
+                             "website": "legalsoft.com"}).json()
+    assert body["site"]["domain"] == "legalsoft.com"
+    assert body["site"]["cannibalization"][0]["url"].endswith("/blog/hire-legal-va")
+    assert body["sheet"]["internal_links"] == body["site"]["internal_links"]
+
+
+def test_kickoff_without_site_unchanged():
+    body = client.post("/api/seo-blog/runs", json={"keyword": "legal virtual assistant"}).json()
+    assert body["site"] is None

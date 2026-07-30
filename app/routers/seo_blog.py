@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
 from app.security import get_current_user
-from seo_blog_agent import ahrefs_paste, citations, drafting, outline, research, rules, state
+from seo_blog_agent import ahrefs_paste, citations, drafting, outline, research, rules, site_pool, state
 from seo_geo_agent.sources import CredentialMissing
 
 router = APIRouter()
@@ -26,6 +26,11 @@ class RunIn(BaseModel):
     keyword: str
     metrics_paste: str = ""
     competitor_keywords_paste: dict[str, str] = {}
+    website: str = ""
+
+
+class SiteIn(BaseModel):
+    website: str
 
 
 class SheetIn(BaseModel):
@@ -82,6 +87,14 @@ def kickoff(payload: RunIn, user=Depends(get_current_user)):
     run = {"id": run_id, "keyword": keyword, "created": date.today().isoformat(),
            "stage": "research", "gates": {"keywords": False, "outline": False},
            "pasted": pasted, "sheet": sheet, "outline_doc": None, "citations": None, "draft": None}
+    run["site"] = None
+    if payload.website.strip():
+        profile = site_pool.load_site(payload.website)
+        if profile:
+            run["site"] = {"domain": profile["domain"],
+                           "cannibalization": site_pool.cannibalization(profile, keyword),
+                           "internal_links": site_pool.internal_links(profile, keyword)}
+            run["sheet"]["internal_links"] = run["site"]["internal_links"]
     return _save_run(run)
 
 
@@ -177,3 +190,38 @@ def export_draft(run_id: str, format: str = "md", user=Depends(get_current_user)
             headers={"Content-Disposition": f'attachment; filename="{slug}.docx"'})
     return Response(content=run["draft"]["markdown"], media_type="text/markdown",
                     headers={"Content-Disposition": f'attachment; filename="{slug}.md"'})
+
+
+@router.get("/seo-blog/sites")
+def list_sites(user=Depends(get_current_user)):
+    return {"sites": site_pool.list_sites()}
+
+
+@router.post("/seo-blog/sites")
+def scan_site(payload: SiteIn, user=Depends(get_current_user)):
+    website = payload.website.strip()
+    if not website:
+        raise HTTPException(422, "website is required")
+    try:
+        return site_pool.scan_site(website)
+    except CredentialMissing as exc:
+        raise HTTPException(503, f"Site scan unavailable: {exc}") from exc
+
+
+@router.get("/seo-blog/sites/{domain}")
+def site_detail(domain: str, user=Depends(get_current_user)):
+    profile = site_pool.load_site(domain)
+    if not profile:
+        raise HTTPException(404, "Site not scanned yet")
+    return profile
+
+
+@router.post("/seo-blog/sites/{domain}/topics")
+def site_topics(domain: str, user=Depends(get_current_user)):
+    profile = site_pool.load_site(domain)
+    if not profile:
+        raise HTTPException(404, "Site not scanned yet")
+    try:
+        return site_pool.suggest_topics(profile)
+    except CredentialMissing as exc:  # defensive; suggest_topics degrades internally
+        raise HTTPException(503, f"Topic suggestion unavailable: {exc}") from exc

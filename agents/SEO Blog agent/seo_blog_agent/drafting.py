@@ -14,6 +14,9 @@ GUIDELINES_PATH = Path(__file__).with_name("guidelines.md")
 
 def _hard_rules(sheet: dict, outline_doc: dict) -> str:
     lsi = [l["term"] for l in sheet["lsi"]]
+    links_line = ""
+    if sheet.get("internal_links"):
+        links_line = f"\n- Link these pages of ours where relevant: {sheet['internal_links']}."
     return (
         f'- Use the exact phrase "{sheet["keyword"]}" between {sheet["usage"]["target_min"]} '
         f"and {sheet['usage']['target_max']} times.\n"
@@ -21,7 +24,7 @@ def _hard_rules(sheet: dict, outline_doc: dict) -> str:
         f"- Target length: {outline_doc['targets']['word_count']} words (stay within 10%).\n"
         "- Cite every listed source inside its section, by its specific name, as a markdown link.\n"
         f"- H1: {outline_doc['meta']['title']}. Meta description: {outline_doc['meta']['description']}. "
-        f"Slug: {outline_doc['meta']['slug']}."
+        f"Slug: {outline_doc['meta']['slug']}." + links_line
     )
 
 

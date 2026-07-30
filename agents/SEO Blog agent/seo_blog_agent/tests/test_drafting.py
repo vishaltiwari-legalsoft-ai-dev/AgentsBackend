@@ -67,3 +67,17 @@ def test_to_docx_roundtrip():
     assert "Title" in texts and "Costs" in texts
     assert any("point one" in t for t in texts)
     assert any("link (https://x.com)" in t for t in texts)
+
+
+def test_hard_rules_include_internal_links():
+    sheet = dict(SHEET, internal_links=["https://legalsoft.com/services"])
+    seen = {}
+
+    def llm(system, prompt):
+        seen["prompt"] = prompt
+        return GOOD_DRAFT
+
+    drafting.build_draft(sheet, OUTLINE_DOC, CITATIONS, llm=llm)
+    assert "legalsoft.com/services" in seen["prompt"]
+    drafting.build_draft(SHEET, OUTLINE_DOC, CITATIONS, llm=llm)  # no internal_links key
+    assert "Link these pages" not in seen["prompt"]
