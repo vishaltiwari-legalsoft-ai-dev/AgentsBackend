@@ -7,6 +7,22 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
 
+@pytest.fixture(autouse=True)
+def _offline_model_catalog(monkeypatch):
+    """Never fetch the live OpenRouter model list in tests — the curated
+    fallback serves the catalog. Individual tests monkeypatch their own fake
+    fetch on top of this when they need live-shaped data."""
+    try:
+        from app.services import model_catalog
+    except ImportError:  # module not built yet (TDD red phase)
+        yield
+        return
+    monkeypatch.setattr(model_catalog, "fetch_openrouter_models", lambda: None)
+    model_catalog.clear_cache()
+    yield
+    model_catalog.clear_cache()
+
+
 @pytest.fixture()
 def kit_pdf(tmp_path: Path) -> Path:
     path = tmp_path / "kit.pdf"
