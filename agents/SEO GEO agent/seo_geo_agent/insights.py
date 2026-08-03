@@ -10,7 +10,7 @@ import hashlib
 from datetime import date, timedelta
 
 from . import competitors, gsc_oauth, site_brain, state, topics
-from .sources import CredentialMissing, QueryStat, gsc_fetch
+from .sources import CredentialMissing, QueryStat, ga_discover_property, ga_fetch_overview, gsc_fetch
 
 # Aggregate organic CTR by position (rounded from public CTR studies). Position
 # 11+ uses the flat tail — precision there doesn't change any ranking decision.
@@ -277,6 +277,34 @@ def _insight_bullets(summary: dict, todos: list[dict]) -> list[str]:
 
 # ---------------------------------- runs ----------------------------------
 
+def _ga_section(brand: dict, end: date) -> dict:
+    """Live GA4 overview for one brand; discovers + pins the property on first use."""
+    prop = brand.get("ga4_property")
+    name = brand.get("ga4_property_name", "")
+    if not prop:
+        found = ga_discover_property(brand["domain"])
+        prop, name = found["property"], found["name"]
+        upsert_brand({**brand, "ga4_property": prop, "ga4_property_name": name})
+    data = ga_fetch_overview(
+        prop,
+        end - timedelta(days=28), end,
+        end - timedelta(days=56), end - timedelta(days=29),
+    )
+    return {"property": prop, "property_name": name, **data}
+
+
+def _ga_bullet(ga: dict) -> str | None:
+    now_s = ga["totals"]["sessions"]
+    prev_s = ga["prev_totals"]["sessions"]
+    if not prev_s:
+        return None
+    trend = "up" if now_s >= prev_s else "down"
+    return (
+        f"Website sessions are {trend} {abs(now_s - prev_s):,} vs the prior 28 days "
+        f"({prev_s:,} → {now_s:,}) — Google Analytics."
+    )
+
+
 def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
     """Pull data, build insights + to-dos + blog topics for one brand, persist."""
     end = today or date.today()
@@ -309,6 +337,17 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
             todos, bullets = [], []
             summary = _summary([], [], [])
 
+    # Live website analytics (GA4) ride along; the run never fails on them.
+    ga = None
+    try:
+        ga = _ga_section(brand, end)
+    except CredentialMissing as exc:
+        degraded.append(f"Google Analytics: {exc}")
+    if ga:
+        bullet = _ga_bullet(ga)
+        if bullet:
+            bullets.append(bullet)
+
     # Site-review findings ride along in the fix list (stable ids keep status).
     todos = (todos + site_brain.site_todos(brand["id"]))[:MAX_TODOS]
 
@@ -324,6 +363,7 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
         "insights": bullets,
         "todos": todos,
         "topics": topic_list,
+        "ga": ga,
     }
     state.save(f"run-{brand['id']}", run)
     return run

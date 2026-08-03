@@ -39,6 +39,151 @@ def gsc_available() -> bool:
     return state.use_cloud()
 
 
+# ------------------------- Google Analytics (GA4) -------------------------
+
+# Metric order is load-bearing: parsing reads metricValues by this position.
+GA_TOTAL_METRICS = ["sessions", "totalUsers", "newUsers", "engagementRate",
+                    "averageSessionDuration", "screenPageViews"]
+
+
+def _ga_service(api: str):
+    if not state.use_cloud():
+        raise CredentialMissing("offline mode")
+    try:
+        from googleapiclient.discovery import build
+
+        return build(api, "v1beta", cache_discovery=False)
+    except Exception as exc:  # noqa: BLE001
+        raise CredentialMissing(f"Google Analytics auth unavailable: {exc}") from exc
+
+
+def ga_discover_property(domain: str, service=None) -> dict:
+    """Find the GA4 property the service account can see for this brand.
+
+    Match order: brand domain root in the property name, else the single
+    visible property. Anything else is ambiguous — the caller degrades and
+    the brand can pin ``ga4_property`` explicitly.
+    """
+    svc = service or _ga_service("analyticsadmin")
+    try:
+        resp = svc.accountSummaries().list(pageSize=200).execute()
+    except CredentialMissing:
+        raise
+    except Exception as exc:  # noqa: BLE001 — 403 = GA not shared with our SA
+        raise CredentialMissing(f"Analytics admin rejected: {exc}") from exc
+    props = [
+        {"property": p.get("property", ""), "name": p.get("displayName", "")}
+        for acct in resp.get("accountSummaries", [])
+        for p in acct.get("propertySummaries", [])
+    ]
+    if not props:
+        raise CredentialMissing("no GA property is shared with the service account")
+    root = domain.split(".")[0].lower()
+    for p in props:
+        if root and root in p["name"].lower().replace(" ", ""):
+            return p
+    if len(props) == 1:
+        return props[0]
+    names = ", ".join(p["name"] for p in props[:5])
+    raise CredentialMissing(
+        f"{len(props)} GA properties visible ({names}) — none match {domain}"
+    )
+
+
+def _ga_ranges(start: date, end: date, prev_start: date, prev_end: date) -> list[dict]:
+    return [
+        {"startDate": start.isoformat(), "endDate": end.isoformat(), "name": "current"},
+        {"startDate": prev_start.isoformat(), "endDate": prev_end.isoformat(), "name": "previous"},
+    ]
+
+
+def _ga_totals(row) -> dict:
+    vals = [v.get("value", "0") for v in row.get("metricValues", [])]
+    sessions, users, new_users, engagement, avg_dur, views = (vals + ["0"] * 6)[:6]
+    return {
+        "sessions": int(float(sessions)),
+        "users": int(float(users)),
+        "new_users": int(float(new_users)),
+        "engagement_rate": float(engagement),
+        "avg_session_sec": float(avg_dur),
+        "pageviews": int(float(views)),
+    }
+
+
+def ga_fetch_overview(prop: str, start: date, end: date,
+                      prev_start: date, prev_end: date, service=None) -> dict:
+    """Traffic totals, top pages, channel split and key events for one property."""
+    svc = service or _ga_service("analyticsdata")
+    ranges = _ga_ranges(start, end, prev_start, prev_end)
+    body = {"requests": [
+        {"dateRanges": ranges, "metrics": [{"name": m} for m in GA_TOTAL_METRICS]},
+        {"dateRanges": ranges[:1], "dimensions": [{"name": "pagePath"}],
+         "metrics": [{"name": "screenPageViews"}, {"name": "sessions"}],
+         "orderBys": [{"metric": {"metricName": "screenPageViews"}, "desc": True}],
+         "limit": 10},
+        {"dateRanges": ranges, "dimensions": [{"name": "sessionDefaultChannelGroup"}],
+         "metrics": [{"name": "sessions"}]},
+    ]}
+    try:
+        reports = svc.properties().batchRunReports(property=prop, body=body).execute().get("reports", [])
+    except CredentialMissing:
+        raise
+    except Exception as exc:  # noqa: BLE001 — 403 = property not shared / wrong scopes
+        raise CredentialMissing(f"Google Analytics rejected {prop}: {exc}") from exc
+    while len(reports) < 3:
+        reports.append({})
+
+    empty = _ga_totals({})
+    totals, prev_totals = dict(empty), dict(empty)
+    for row in reports[0].get("rows", []):
+        which = (row.get("dimensionValues") or [{}])[-1].get("value")
+        if which == "current":
+            totals = _ga_totals(row)
+        elif which == "previous":
+            prev_totals = _ga_totals(row)
+
+    top_pages = [
+        {
+            "path": (row.get("dimensionValues") or [{}])[0].get("value", ""),
+            "views": int(float(row["metricValues"][0]["value"])),
+            "sessions": int(float(row["metricValues"][1]["value"])),
+        }
+        for row in reports[1].get("rows", [])
+    ]
+
+    by_channel: dict[str, dict] = {}
+    for row in reports[2].get("rows", []):
+        dims = row.get("dimensionValues") or []
+        channel = dims[0].get("value", "") if dims else ""
+        which = dims[-1].get("value") if len(dims) > 1 else "current"
+        slot = by_channel.setdefault(channel, {"channel": channel, "sessions": 0, "prev_sessions": 0})
+        key = "sessions" if which == "current" else "prev_sessions"
+        slot[key] = int(float(row["metricValues"][0]["value"]))
+    channels = sorted(by_channel.values(), key=lambda c: c["sessions"], reverse=True)
+
+    # Key events ride separately: a site with none configured (or a metric the
+    # property rejects) must never sink the traffic overview.
+    key_events: list[dict] = []
+    try:
+        resp = svc.properties().runReport(property=prop, body={
+            "dateRanges": ranges[:1], "dimensions": [{"name": "eventName"}],
+            "metrics": [{"name": "keyEvents"}], "limit": 25,
+        }).execute()
+        key_events = [
+            {"event": (row.get("dimensionValues") or [{}])[0].get("value", ""),
+             "count": int(float(row["metricValues"][0]["value"]))}
+            for row in resp.get("rows", [])
+            if float(row["metricValues"][0]["value"]) > 0
+        ]
+        key_events.sort(key=lambda e: e["count"], reverse=True)
+        key_events = key_events[:10]
+    except Exception:  # noqa: BLE001
+        key_events = []
+
+    return {"totals": totals, "prev_totals": prev_totals, "top_pages": top_pages,
+            "channels": channels, "key_events": key_events}
+
+
 def _gsc_service():
     if not state.use_cloud():
         raise CredentialMissing("offline mode")
