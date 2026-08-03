@@ -192,15 +192,71 @@ def test_polish_failure_keeps_raw_draft_and_retry_only_polishes():
 
 def test_leftover_style_violations_are_noted_honestly():
     run = _run_with_ledger()
+    fix_calls = {"n": 0}
 
     def fake_llm(system, prompt, **kw):
         s = system.lower()
         if "editorial writer" in s:
             return _DRAFT_PAYLOAD
-        if "still break" in s:  # the fix call changes nothing
+        if "still break" in s:  # the fix loop keeps failing to fix it
+            fix_calls["n"] += 1
             return {"blocks": []}
         return {"blocks": [{"id": "b1", "text": "We delve into intake here.", "cites": ["ev-1"]}]}
 
     run = drafting.build_draft(run, INVENTORY, llm=fake_llm)
     notes = run["draft"]["notes"]
+    assert fix_calls["n"] == drafting.MAX_FIX_ROUNDS  # kept trying before giving up
     assert any("style check still flags" in n and "delve" in n for n in notes)
+
+
+def test_fix_loop_runs_until_clean_without_leftover_note():
+    run = _run_with_ledger()
+
+    def fake_llm(system, prompt, **kw):
+        s = system.lower()
+        if "editorial writer" in s:
+            return _DRAFT_PAYLOAD
+        if "still break" in s:
+            return {"blocks": [{"id": "b1", "text": "Intake data, stated plainly.", "cites": ["ev-1"]}]}
+        return {"blocks": [{"id": "b1", "text": "We leverage synergy here.", "cites": ["ev-1"]}]}
+
+    run = drafting.build_draft(run, INVENTORY, llm=fake_llm)
+    assert run["draft"]["blocks"][0]["text"] == "Intake data, stated plainly."
+    assert not any("style check still flags" in n for n in run["draft"]["notes"])
+
+
+def test_style_scan_catches_reframes_and_analogy_setups():
+    found = drafting.style_violations(
+        "This isn't about speed. It's not about tools either. Think of it as a bridge between teams."
+    )
+    assert any(v.startswith("reframe") for v in found)
+    assert any("think of it as" in v for v in found)
+
+
+def test_revise_rewrite_goes_through_style_gate():
+    run = _run_with_ledger()
+    run = drafting.build_draft(run, INVENTORY, llm=lambda s, p, **kw: _DRAFT_PAYLOAD)
+
+    def fake_llm(system, prompt, **kw):
+        s = system.lower()
+        if "classif" in s:
+            return {"action": "rewrite", "queries": []}
+        if "still break" in s:
+            return {"blocks": [{"id": "b1", "text": "Plain rewrite, no hype.", "cites": ["ev-1"]}]}
+        return {"text": "We unlock seamless synergy.", "cites": ["ev-1"]}
+
+    run = drafting.revise_block(run, "b1", "tighten", llm=fake_llm)
+    assert run["draft"]["blocks"][0]["text"] == "Plain rewrite, no hype."
+
+
+def test_voice_profile_reaches_draft_and_polish_prompts():
+    run = _run_with_ledger()
+    voice_doc = {"profile": {"tone": "plainspoken operator voice", "summary": "s"}}
+    prompts: list[str] = []
+
+    def fake_llm(system, prompt, **kw):
+        prompts.append(prompt)
+        return _DRAFT_PAYLOAD
+
+    drafting.build_draft(run, INVENTORY, voice=voice_doc, llm=fake_llm)
+    assert all("plainspoken operator voice" in p for p in prompts[:2])

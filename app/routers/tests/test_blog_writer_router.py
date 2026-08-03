@@ -116,6 +116,36 @@ def test_inventory_scan_and_readback(monkeypatch, live_seams):
     assert client.get("/api/blog/brands/nope/inventory").status_code == 404
 
 
+def test_voice_endpoints(monkeypatch, live_seams):
+    monkeypatch.setattr(
+        sources, "fetch_sitemap",
+        lambda d, client=None: ["https://legalsoft.com/blog/one/"],
+    )
+    monkeypatch.setattr(
+        sources, "fetch_page",
+        lambda u, client=None: {"url": u, "title": "One Post", "text": "How we write.", "status": 200},
+    )
+    from blog_writer_agent import llm as _bw_llm
+
+    real_scripted = _bw_llm.llm_json
+
+    def with_voice(system, prompt, **kw):
+        if "voice analyst" in system.lower():
+            return {"tone": "direct", "summary": "Practical posts for law firms."}
+        return real_scripted(system, prompt, **kw)
+
+    monkeypatch.setattr(_bw_llm, "llm_json", with_voice)
+
+    assert client.get("/api/blog/brands/legalsoft/voice").status_code == 404
+    assert client.post("/api/blog/brands/legalsoft/voice").status_code == 409  # no inventory yet
+    client.post("/api/blog/brands/legalsoft/inventory")
+    studied = client.post("/api/blog/brands/legalsoft/voice").json()
+    assert studied["count"] == 1
+    assert studied["profile"]["tone"] == "direct"
+    assert client.get("/api/blog/brands/legalsoft/voice").json()["profile"]["summary"]
+    assert client.get("/api/blog/brands").json()["brands"][0]["voice"]["count"] == 1
+
+
 def test_create_run_validation():
     assert client.post("/api/blog/runs", json={"brand_id": "legalsoft", "topic": "  "}).status_code == 422
     assert client.post("/api/blog/runs", json={"brand_id": "nope", "topic": "x"}).status_code == 404

@@ -20,6 +20,7 @@ from seo_geo_agent import insights
 from seo_geo_agent.sources import CredentialMissing
 
 from blog_writer_agent import drafting, export, inventory, research, visuals
+from blog_writer_agent import voice as bw_voice
 
 router = APIRouter()
 logger = logging.getLogger("agentos.blog_writer")
@@ -66,15 +67,37 @@ def list_brands(user: dict = Depends(get_current_user)) -> dict:
         if not brand.get("enabled", True):
             continue
         inv = inventory.latest(brand["id"])
+        vc = bw_voice.latest(brand["id"])
         brands.append(
             {
                 "id": brand["id"],
                 "name": brand.get("name", brand["id"]),
                 "domain": brand.get("domain", ""),
                 "inventory": {"counts": inv["counts"], "scanned": inv["scanned"]} if inv else None,
+                "voice": {"studied": vc["studied"], "count": vc["count"]} if vc else None,
             }
         )
     return {"brands": brands}
+
+
+@router.get("/blog/brands/{brand_id}/voice")
+def get_voice(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
+    _brand(brand_id)
+    vc = bw_voice.latest(brand_id)
+    if not vc:
+        raise HTTPException(status_code=404, detail="voice not studied yet — run a study first")
+    return vc
+
+
+@router.post("/blog/brands/{brand_id}/voice")
+def study_voice(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
+    brand = _brand(brand_id)
+    try:
+        return bw_voice.study(brand, inventory.latest(brand_id))
+    except CredentialMissing as exc:
+        raise HTTPException(status_code=424, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/blog/brands/{brand_id}/inventory")
@@ -124,7 +147,9 @@ def build_draft(run_id: str, user: dict = Depends(get_current_user)) -> dict:
     if not run["ledger"]:
         raise HTTPException(status_code=409, detail="no evidence yet — run research first")
     try:
-        return drafting.build_draft(run, inventory.latest(run["brand_id"]))
+        return drafting.build_draft(
+            run, inventory.latest(run["brand_id"]), voice=bw_voice.latest(run["brand_id"])
+        )
     except CredentialMissing as exc:
         raise HTTPException(status_code=424, detail=str(exc)) from exc
     except ValueError as exc:
@@ -140,7 +165,7 @@ def comment_block(run_id: str, block_id: str, body: CommentIn, user: dict = Depe
     if not run.get("draft"):
         raise HTTPException(status_code=409, detail="no draft yet — build the draft first")
     try:
-        return drafting.revise_block(run, block_id, comment)
+        return drafting.revise_block(run, block_id, comment, voice=bw_voice.latest(run["brand_id"]))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"unknown block: {block_id}") from exc
     except CredentialMissing as exc:

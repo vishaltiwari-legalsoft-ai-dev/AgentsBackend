@@ -16,6 +16,9 @@ from pathlib import Path
 
 from blog_writer_agent import llm as bw_llm
 from blog_writer_agent import research
+from blog_writer_agent import voice as bw_voice
+
+MAX_FIX_ROUNDS = 3  # style-fix retries before leftovers get an honest note
 
 _GUIDELINES_PATH = Path(__file__).resolve().parent / "guidelines.md"
 _guidelines_cache: str | None = None
@@ -73,11 +76,40 @@ _BANNED_WORDS = (
     "supercharge, captivate"
 ).split(", ")
 _BANNED_PHRASES = [
-    "in today's", "it is important to note", "it is worth noting", "let's dive",
-    "let's explore", "let's unpack", "at the end of the day", "moving forward",
-    "furthermore", "additionally", "moreover", "that said", "on top of that",
-    "let that sink in", "read that again", "this changes everything", "serves as",
-    "stands as", "boasts a", "in this article",
+    # 7C dead openings / 7D dead transitions
+    "in today's", "it is important to note", "it is worth noting", "in order to",
+    "let's dive", "let's explore", "let's unpack", "at the end of the day",
+    "moving forward", "to put this in perspective", "it goes without saying",
+    "nobody is talking about", "most people don't realize", "furthermore",
+    "additionally", "moreover", "that said", "that being said", "with that in mind",
+    "it is also worth mentioning", "on top of that",
+    # 7E engagement bait / 7F hype
+    "let that sink in", "read that again", "this changes everything",
+    "are you paying attention", "game-changer", "10x your",
+    # 7B bloated verbs
+    "serves as", "stands as", "boasts a", "marks a significant",
+    "plays a role in", "aims to", "seeks to",
+    # 9C analogy setups
+    "think of it as", "it's like a", "it is like a", "kind of like",
+    "works like a", "acts like a", "functions as", "a bridge between",
+    "a lens for", "a roadmap for", "the engine of", "the backbone of",
+    "the dna of", "the glue that holds",
+    # 11 meta commentary / disclaimers
+    "in this article", "in this section", "this article will",
+    "let me walk you through", "as of my last update", "based on available information",
+]
+# 8B/8C negative-parallelism shapes a machine can catch with confidence.
+_REFRAME_PATTERNS = [
+    (r"\bisn'?t (?:just |only )?about\b", "reframe: \"isn't about X...\""),
+    (r"\bnot (?:just|only) about\b", "reframe: \"not just about X\""),
+    (r"\bit'?s not (?:about|the)\b[^.?!]*[.?!]\s*it'?s\b", "reframe: \"it's not X. it's Y\""),
+    (r"\bit was never about\b", "reframe: \"it was never about X\""),
+    (r"\bthe (?:real|actual|deeper|hidden) (?:issue|problem|question|answer|point)\b", "reframe: \"the real problem...\""),
+    (r"\bforget [^.?!]{2,40}[.?!]\s*(?:focus|think|start)\b", "reframe: \"forget X. focus on Y\""),
+    (r"\bstop \w+ing[^.?!]{0,40}[.?!]\s*start \w+ing\b", "reframe: \"stop X-ing. start Y-ing\""),
+    (r"\bis dead[.?!]", "reframe: \"X is dead\""),
+    (r"\byou don'?t need [^.?!]{2,60}[.?!]\s*you need\b", "reframe: \"you don't need X. you need Y\""),
+    (r"\bnot [^.?!,;]{2,40}[.?!]\s*(?:just|this is|it'?s)\b", "reframe: \"Not X. Y.\""),
 ]
 
 
@@ -93,6 +125,9 @@ def style_violations(text: str) -> list[str]:
     for phrase in _BANNED_PHRASES:
         if phrase in lowered:
             found.append(f'banned phrase "{phrase}"')
+    for pattern, label in _REFRAME_PATTERNS:
+        if re.search(pattern, lowered):
+            found.append(label)
     return found
 _CLASSIFY_SYSTEM = (
     "You classify a writer's comment on one draft block. Return JSON "
@@ -125,7 +160,14 @@ def _valid_cites(run: dict, cites: list, notes: list[str], where: str) -> list[s
     return good
 
 
-def build_draft(run: dict, inventory: dict | None, *, llm=None) -> dict:
+def _voice_section(voice: dict | None) -> str:
+    digest = bw_voice.digest(voice)
+    if not digest:
+        return ""
+    return f"BRAND VOICE PROFILE (from studying the brand's published posts — match it):\n{digest}\n\n"
+
+
+def build_draft(run: dict, inventory: dict | None, *, voice: dict | None = None, llm=None) -> dict:
     llm = llm or bw_llm.llm_json
 
     # A draft that exists but never got its guideline pass (e.g. the polish
@@ -134,16 +176,17 @@ def build_draft(run: dict, inventory: dict | None, *, llm=None) -> dict:
     if not (existing_draft and not existing_draft.get("guidelines_applied")):
         if not run["ledger"]:
             raise ValueError("no evidence yet — run research before drafting")
-        _draft_raw(run, inventory, llm)
-    apply_guidelines(run, llm=llm)
+        _draft_raw(run, inventory, voice, llm)
+    apply_guidelines(run, voice=voice, llm=llm)
     return run
 
 
-def _draft_raw(run: dict, inventory: dict | None, llm) -> None:
+def _draft_raw(run: dict, inventory: dict | None, voice: dict | None, llm) -> None:
     posts = (inventory or {}).get("posts", [])
     existing = "\n".join(f"- {p['title']} ({p['url']})" for p in posts) or "(none known)"
     payload = llm(
         _DRAFT_SYSTEM,
+        f"{_voice_section(voice)}"
         f"Brand: {run['brand_name']} ({run['domain']})\nTopic: {run['topic']}\n"
         f"Writer notes: {run.get('notes') or '(none)'}\n\n"
         f"Existing posts on the site (do not duplicate; use for internal links):\n{existing}\n\n"
@@ -202,9 +245,32 @@ def _apply_block_edits(run: dict, payload: dict, notes: list[str]) -> int:
     return matched
 
 
-def apply_guidelines(run: dict, *, llm=None) -> dict:
+def _scan_blocks(blocks: list[dict]) -> list[str]:
+    return sorted({v for b in blocks for v in style_violations(b["text"])})
+
+
+def _enforce_style(run: dict, blocks: list[dict], notes: list[str], llm) -> None:
+    """Fix-loop until the mechanical scan is clean or rounds run out; whatever
+    survives gets an honest note — never silently shown as compliant."""
+    violations = _scan_blocks(blocks)
+    rounds = 0
+    while violations and rounds < MAX_FIX_ROUNDS:
+        rounds += 1
+        fix = llm(
+            _FIX_SYSTEM_TPL.format(violations="; ".join(violations)),
+            "Draft blocks:\n"
+            + str([{"id": b["id"], "heading": b["heading"], "text": b["text"], "cites": b["cites"]} for b in blocks]),
+            temperature=0.2,
+        )
+        _apply_block_edits(run, fix, notes)
+        violations = _scan_blocks(blocks)
+    if violations:
+        notes.append("style check still flags: " + "; ".join(violations))
+
+
+def apply_guidelines(run: dict, *, voice: dict | None = None, llm=None) -> dict:
     """The house line-edit: every block rewritten to the company writing rules,
-    then a mechanical scan; whatever still slips through is noted honestly."""
+    then the mechanical scan + fix loop; leftovers are noted honestly."""
     draft = run.get("draft")
     if not draft:
         raise ValueError("no draft yet — nothing to line-edit")
@@ -217,6 +283,7 @@ def apply_guidelines(run: dict, *, llm=None) -> dict:
     payload = llm(
         _POLISH_SYSTEM,
         f"HOUSE WRITING RULES:\n{guidelines_text()}\n\n"
+        f"{_voice_section(voice)}"
         f"Post meta: {draft['meta']}\n\nDraft blocks:\n{blocks_json}",
         temperature=0.3,
     )
@@ -229,18 +296,10 @@ def apply_guidelines(run: dict, *, llm=None) -> dict:
     if isinstance(meta, dict):
         draft["meta"] = {**draft["meta"], **{k: v for k, v in meta.items() if v}}
 
-    violations = sorted({v for b in draft["blocks"] for v in style_violations(b["text"])})
-    if violations and matched:
-        fix = llm(
-            _FIX_SYSTEM_TPL.format(violations="; ".join(violations)),
-            f"Draft blocks:\n"
-            + str([{"id": b["id"], "heading": b["heading"], "text": b["text"], "cites": b["cites"]} for b in draft["blocks"]]),
-            temperature=0.2,
-        )
-        _apply_block_edits(run, fix, notes)
-        violations = sorted({v for b in draft["blocks"] for v in style_violations(b["text"])})
-    if violations:
-        notes.append("style check still flags: " + "; ".join(violations))
+    if matched:
+        _enforce_style(run, draft["blocks"], notes, llm)
+    elif _scan_blocks(draft["blocks"]):
+        notes.append("style check still flags: " + "; ".join(_scan_blocks(draft["blocks"])))
 
     draft["guidelines_applied"] = True
     research.save_run(run)
@@ -254,7 +313,7 @@ def _find_block(run: dict, block_id: str) -> dict:
     raise KeyError(block_id)
 
 
-def revise_block(run: dict, block_id: str, comment: str, *, llm=None, search=None, fetch=None) -> dict:
+def revise_block(run: dict, block_id: str, comment: str, *, voice: dict | None = None, llm=None, search=None, fetch=None) -> dict:
     llm = llm or bw_llm.llm_json
     block = _find_block(run, block_id)
 
@@ -272,6 +331,7 @@ def revise_block(run: dict, block_id: str, comment: str, *, llm=None, search=Non
     rewrite = llm(
         _REWRITE_SYSTEM,
         f"HOUSE WRITING RULES (the rewrite must follow these):\n{guidelines_text()}\n\n"
+        f"{_voice_section(voice)}"
         f"Topic: {run['topic']}\nWriter comment: {comment}\n"
         f"Block ({block['kind']}, heading: {block['heading']}):\n{block['text']}\n\n"
         f"Fresh evidence from targeted research:\n{fresh_digest}\n\n"
@@ -284,5 +344,7 @@ def revise_block(run: dict, block_id: str, comment: str, *, llm=None, search=Non
     block["text"] = rewrite.get("text", block["text"])
     block["cites"] = _valid_cites(run, rewrite.get("cites", block["cites"]), notes, block_id)
     block["last_comment"] = comment
+    # Every AI rewrite goes through the same style gate as the full draft.
+    _enforce_style(run, [block], notes, llm)
     research.save_run(run)
     return run
