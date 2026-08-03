@@ -25,7 +25,9 @@ from seo_geo_agent import audit as seo_audit
 from seo_geo_agent import briefs as seo_briefs
 from seo_geo_agent import competitors as seo_competitors
 from seo_geo_agent import insights, keywords as seo_keywords, sources
-from seo_geo_agent.sources import CredentialMissing
+from seo_geo_agent import pages as seo_pages
+from seo_geo_agent import state as seo_state
+from seo_geo_agent.sources import CredentialMissing, ga_fetch_pages
 
 router = APIRouter()
 logger = logging.getLogger("agentos.seo_geo")
@@ -210,6 +212,32 @@ def get_site_review(brand_id: str, user=Depends(get_current_user)):
     return {"review": seo_site.latest_review(brand_id)}
 
 
+# ------------------------- page intelligence -------------------------
+
+@router.get("/seo-geo/pages/{brand_id}")
+def get_pages(brand_id: str, user=Depends(get_current_user)):
+    _brand_or_404(brand_id)
+    return {"pages": seo_pages.latest(brand_id)}
+
+
+@router.post("/seo-geo/pages/{brand_id}/refresh")
+def refresh_pages(brand_id: str, user=Depends(get_current_user)):
+    brand = _brand_or_404(brand_id)
+    corpus = seo_state.load(f"corpus-{brand_id}") or {}
+    if not corpus.get("pages"):
+        raise HTTPException(status_code=409, detail="Run the site analysis first")
+    rows, _ = _rows_28d(brand)
+    ga_pages = []
+    prop = brand.get("ga4_property")
+    if prop:
+        try:
+            end = date.today()
+            ga_pages = ga_fetch_pages(prop, end - timedelta(days=28), end)
+        except CredentialMissing:
+            pass
+    return seo_pages.build_page_intel(brand, corpus["pages"], ga_pages, rows)
+
+
 @router.post("/seo-geo/todos/{brand_id}/{todo_id}")
 def set_todo_status(brand_id: str, todo_id: str, payload: TodoStatusIn, user=Depends(get_current_user)):
     _brand_or_404(brand_id)
@@ -241,8 +269,6 @@ def get_keywords(brand_id: str, user=Depends(get_current_user)):
 @router.get("/seo-geo/competitors/{brand_id}")
 def get_competitors(brand_id: str, user=Depends(get_current_user)):
     brand = _brand_or_404(brand_id)
-    from seo_geo_agent import state as seo_state
-
     ranks_doc = seo_state.load(f"ranks-{brand_id}") or {}
     sitemap_doc = seo_state.load(f"sitemaps-{brand_id}") or {}
     return {

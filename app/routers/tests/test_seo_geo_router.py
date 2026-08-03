@@ -127,6 +127,26 @@ def test_site_review_endpoints_offline():
     assert detail["plan"] == [] and detail["site_review"] is None
 
 
+def test_pages_endpoints():
+    assert client.get("/api/seo-geo/pages/legalsoft").json()["pages"] is None
+    r = client.post("/api/seo-geo/pages/legalsoft/refresh")
+    assert r.status_code == 409, r.text  # no corpus yet
+    assert r.json()["detail"] == "Run the site analysis first"
+
+    from seo_geo_agent import state as seo_state
+
+    seo_state.save("corpus-legalsoft", {"brand_id": "legalsoft", "pages": [{
+        "url": "https://legalsoft.com/pricing", "title": "Pricing", "word_count": 800,
+        "meta_description": "d", "h1_count": 1, "images_no_alt": 0,
+    }]})
+    r = client.post("/api/seo-geo/pages/legalsoft/refresh")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ai"] is False  # offline: no LLM
+    assert body["pages"][0]["path"] == "/pricing"
+    assert client.get("/api/seo-geo/pages/legalsoft").json()["pages"]["pages"][0]["path"] == "/pricing"
+
+
 def test_ask_expert_offline_503():
     r = client.post("/api/seo-geo/ask/legalsoft", json={"question": "kya karna chahiye?"})
     assert r.status_code == 503

@@ -9,8 +9,15 @@ from __future__ import annotations
 import hashlib
 from datetime import date, timedelta
 
-from . import competitors, gsc_oauth, site_brain, state, topics
-from .sources import CredentialMissing, QueryStat, ga_discover_property, ga_fetch_overview, gsc_fetch
+from . import competitors, gsc_oauth, pages as pages_mod, site_brain, state, topics
+from .sources import (
+    CredentialMissing,
+    QueryStat,
+    ga_discover_property,
+    ga_fetch_overview,
+    ga_fetch_pages,
+    gsc_fetch,
+)
 
 # Aggregate organic CTR by position (rounded from public CTR studies). Position
 # 11+ uses the flat tail — precision there doesn't change any ranking decision.
@@ -347,6 +354,18 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
         bullet = _ga_bullet(ga)
         if bullet:
             bullets.append(bullet)
+
+    # Page-level intelligence rides along too — never fatal to the run.
+    try:
+        corpus = state.load(f"corpus-{brand['id']}") or {}
+        if corpus.get("pages"):
+            ga_pages = []
+            if ga:
+                ga_pages = ga_fetch_pages(
+                    ga["property"], end - timedelta(days=28), end)
+            pages_mod.build_page_intel(brand, corpus["pages"], ga_pages, rows)
+    except CredentialMissing as exc:
+        degraded.append(f"Page analytics: {exc}")
 
     # Site-review findings ride along in the fix list (stable ids keep status).
     todos = (todos + site_brain.site_todos(brand["id"]))[:MAX_TODOS]
