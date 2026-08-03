@@ -97,6 +97,12 @@ def test_competitors_flow():
     assert t.status_code == 200 and t.json()["degraded"]  # offline: no Serper, no fetches
 
 
+def test_competitor_profiles_endpoints_offline():
+    assert client.get("/api/seo-geo/competitors/legalsoft/profiles").json()["profiles"] is None
+    r = client.post("/api/seo-geo/competitors/legalsoft/profiles/refresh")
+    assert r.status_code == 503  # offline: no rank snapshots to build profiles from
+
+
 def test_live_analysis_endpoints_offline_503():
     assert client.post("/api/seo-geo/serp/legalsoft", json={"query": "x"}).status_code == 503
     assert client.post("/api/seo-geo/briefs/legalsoft", json={"keyword": "x"}).status_code == 503

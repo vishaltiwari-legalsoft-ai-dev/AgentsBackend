@@ -167,3 +167,157 @@ def serp_deep_dive(brand: dict, query: str, search=None, fetch=fetch_page) -> di
         "aio_present": serp["aio_present"],
         "pages_analyzed": len(pages),
     }
+
+
+# --------------------------- competitor profiles ---------------------------
+
+MAX_PROFILES = 5
+MAX_CONTENT_POSTS = 5
+MAX_SERPER_PER_COMPETITOR = 2
+MAX_HOT_TOPICS = 5
+
+
+def resolve_top5(brand: dict, ranks_doc: dict | None) -> list[str]:
+    """The competitor set a profile run covers: whatever the brand curated,
+    topped up with SERP-discovered domains until there are 5."""
+    manual = [d for d in brand.get("competitors", []) or [] if d]
+    suggested = (ranks_doc or {}).get("suggested_competitors") or []
+    out: list[str] = []
+    for d in manual + suggested:
+        if d.lower() not in [o.lower() for o in out]:
+            out.append(d)
+    return out[:MAX_PROFILES]
+
+
+def _domain_stats(domain: str, latest_ranks: dict) -> tuple[int, float | None, list[dict]]:
+    """Visibility, average position, and the keywords a competitor beats us on —
+    all read straight off the latest rank snapshot, no extra lookups."""
+    total = len(latest_ranks)
+    positions: list[int] = []
+    won: list[dict] = []
+    for kw, entry in latest_ranks.items():
+        top = [t.lower() for t in entry.get("top", [])]
+        if domain.lower() not in top:
+            continue
+        their_position = top.index(domain.lower()) + 1
+        positions.append(their_position)
+        our_position = entry.get("position")
+        if our_position is None or their_position < our_position:
+            won.append({"keyword": kw, "their_position": their_position, "our_position": our_position})
+    visibility_pct = round(100 * len(positions) / total) if total else 0
+    avg_position = round(sum(positions) / len(positions), 1) if positions else None
+    return visibility_pct, avg_position, won
+
+
+def _match_volume(title: str, clusters: list[dict]):
+    """Honest reach math needs a real number: only fires when a keyword-lab
+    cluster's keyword is actually contained in the post title, and that
+    cluster carries a volume estimate."""
+    title_tokens = _tokens(title)
+    if not title_tokens:
+        return None
+    for c in clusters:
+        volume = c.get("volume_est")
+        if not volume:
+            continue
+        for kw in c.get("keywords", []):
+            kw_tokens = _tokens(kw)
+            if kw_tokens and kw_tokens <= title_tokens:
+                return volume
+    return None
+
+
+def _slug_words(url: str) -> list[str]:
+    path = re.sub(r"^https?://[^/]+", "", url)
+    return [w for w in re.split(r"[^a-z0-9]+", path.lower()) if len(w) > 2]
+
+
+def _hot_topics(urls: list[str]) -> list[str]:
+    """Top recurring token bigrams across a competitor's new URL slugs — plain
+    string munging, no AI, but enough to see what they're publishing about."""
+    counts: dict[str, int] = {}
+    for u in urls:
+        words = _slug_words(u)
+        for a, b in zip(words, words[1:]):
+            bigram = f"{a} {b}"
+            counts[bigram] = counts.get(bigram, 0) + 1
+    return [b for b, _ in sorted(counts.items(), key=lambda kv: -kv[1])][:MAX_HOT_TOPICS]
+
+
+def build_profiles(brand: dict, search=None, fetch=None, fetch_sitemap=None) -> dict:
+    """Full competitor-profile pass for the brand's top 5: visibility + keywords
+    won from the latest rank snapshot, plus a content feed with honestly labelled
+    reach estimates. Persisted to ``competitor-profiles-{brand_id}``."""
+    ranks_doc = state.load(f"ranks-{brand['id']}")
+    if not ranks_doc or not ranks_doc.get("snapshots"):
+        raise CredentialMissing("Run a data refresh first — competitor discovery needs rank snapshots")
+    from . import insights  # lazy: insights imports this module at load time
+
+    fetch = fetch or fetch_page
+    if search is None:
+        search = sources.serper_search if sources.serper_available() else None
+
+    top5 = resolve_top5(brand, ranks_doc)
+    latest_ranks = ranks_doc["snapshots"][-1]["ranks"]
+    lab = kw_lab.latest(brand["id"])
+    clusters = (lab or {}).get("clusters", [])
+
+    notes: list[str] = []
+    feed: dict[str, dict] = {}
+    if top5:
+        try:
+            feed = sitemap_watch({**brand, "competitors": top5}, fetch_sitemap=fetch_sitemap)
+        except CredentialMissing as exc:
+            notes.append(f"Sitemap watch: {exc}")
+
+    profiles = []
+    for domain in top5:
+        visibility_pct, avg_position, keywords_won = _domain_stats(domain, latest_ranks)
+        new_urls = feed.get(domain, {}).get("new_urls", [])
+
+        recent_posts: list[dict] = []
+        calls = 0
+        for url in new_urls[:MAX_CONTENT_POSTS]:
+            try:
+                facts = fetch(url)
+            except CredentialMissing as exc:
+                notes.append(f"Page fetch: {exc}")
+                break
+            title = facts.title or url
+            topic = max(facts.h1, key=len) if facts.h1 else title
+            volume = _match_volume(title, clusters)
+            clicks, basis = None, "no volume data — reach unknown"
+            if volume and search and calls < MAX_SERPER_PER_COMPETITOR:
+                calls += 1
+                try:
+                    serp = search(topic)
+                    position = next(
+                        (r["position"] for r in serp["organic"] if domain in r["link"]), None
+                    )
+                    if position:
+                        clicks = round(volume * insights.ctr_at(position))
+                        basis = "lab volume × CTR curve"
+                except CredentialMissing as exc:
+                    notes.append(f"Serper: {exc}")
+                    search = None
+            recent_posts.append({
+                "url": url, "title": title, "topic": topic,
+                "est_monthly_clicks": clicks, "estimate_basis": basis,
+            })
+
+        profiles.append({
+            "domain": domain,
+            "visibility_pct": visibility_pct,
+            "avg_position": avg_position,
+            "keywords_won": keywords_won,
+            "recent_posts": recent_posts,
+            "hot_topics": _hot_topics(new_urls),
+        })
+
+    doc = {"at": date.today().isoformat(), "notes": notes, "profiles": profiles}
+    state.save(f"competitor-profiles-{brand['id']}", doc)
+    return doc
+
+
+def latest_profiles(brand_id: str) -> dict | None:
+    return state.load(f"competitor-profiles-{brand_id}")

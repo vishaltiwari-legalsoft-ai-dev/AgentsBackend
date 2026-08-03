@@ -314,6 +314,22 @@ def serp_xray(brand_id: str, payload: QueryIn, user=Depends(get_current_user)):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@router.get("/seo-geo/competitors/{brand_id}/profiles")
+def get_competitor_profiles(brand_id: str, user=Depends(get_current_user)):
+    _brand_or_404(brand_id)
+    return {"profiles": seo_competitors.latest_profiles(brand_id)}
+
+
+@router.post("/seo-geo/competitors/{brand_id}/profiles/refresh")
+def refresh_competitor_profiles(brand_id: str, user=Depends(get_current_user)):
+    """Rebuild the top-5 competitor profiles: visibility, keywords won, content feed."""
+    brand = _brand_or_404(brand_id)
+    try:
+        return seo_competitors.build_profiles(brand)
+    except CredentialMissing as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 # ------------------------- briefs & decay plans -------------------------
 
 @router.get("/seo-geo/briefs/{brand_id}")
