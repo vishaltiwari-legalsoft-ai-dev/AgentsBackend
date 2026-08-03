@@ -14,13 +14,16 @@ SYSTEM = ("You are an SEO consultant. For each page return ONE imperative senten
           "the single most impactful next action. Strict JSON only: "
           '[{"path": str, "recommendation": str}]')
 
-PAGE_FLAGS = ("no-title", "title-long", "no-meta", "meta-long", "thin", "no-h1", "images-no-alt")
+PAGE_FLAGS = ("no-title", "title-long", "no-meta", "meta-long", "thin", "no-h1", "images-no-alt",
+              "not-crawled")
 
 TITLE_MAX = 60
 META_MAX = 160
 THIN_WORDS = 300
 
 NO_REC_NOTE = "AI recommendations unavailable — showing rule-based advice"
+NOT_CRAWLED_FLAG = "not-crawled"
+NOT_CRAWLED_REC = "Not in the site crawl — re-run the site analysis to audit this page."
 
 
 def _path(url: str) -> str:
@@ -63,6 +66,8 @@ def _heuristic_rec(page: dict) -> str:
     """Deterministic, honest recommendation when AI is unavailable (or for pages
     outside the top-traffic slice the AI call covers)."""
     flags = page.get("flags") or []
+    if NOT_CRAWLED_FLAG in flags:
+        return NOT_CRAWLED_REC
     if "no-title" in flags:
         return "Write a title tag targeting its main query."
     if "no-meta" in flags:
@@ -115,11 +120,16 @@ def build_page_intel(brand: dict, corpus_pages: list[dict], ga_pages: list[dict]
     """Merge GA + Search Console + on-page health into one per-page table, keyed
     by URL path. A page appears if it's in ANY source; missing-source fields
     default to 0/None. Adds one best-effort AI recommendation pass (top-traffic
-    pages only), falling back to honest heuristics for the rest / on failure."""
+    pages only), falling back to honest heuristics for the rest / on failure.
+    Pages known only from GA/GSC — never crawled into the corpus — have no
+    on-page facts to audit, so they're flagged ``not-crawled`` instead of
+    silently passing as healthy, and are never sent to the AI pass."""
     merged: dict[str, dict] = {}
+    crawled: set[str] = set()
 
     for cp in corpus_pages:
         path = _path(cp.get("url", "") or "")
+        crawled.add(path)
         e = _entry(merged, path)
         e["url"] = cp.get("url")
         e["title"] = cp.get("title") or None
@@ -144,16 +154,22 @@ def build_page_intel(brand: dict, corpus_pages: list[dict], ga_pages: list[dict]
         e["position"] = best.position
         e["best_query"] = best.query
 
+    for path, e in merged.items():
+        if path not in crawled:
+            e["flags"] = [NOT_CRAWLED_FLAG]
+
     merged_list = sorted(merged.values(), key=lambda p: (-p["views"], -p["clicks"]))
+    ai_candidates = [p for p in merged_list if p["path"] in crawled][:MAX_AI_PAGES]
 
     notes: list[str] = []
     ai_used = True
-    try:
-        recs = _ai_recs(merged_list[:MAX_AI_PAGES])
-    except (CredentialMissing, ValueError):  # degrade to heuristics, never crash the run
-        ai_used = False
-        notes.append(NO_REC_NOTE)
-        recs = {}
+    recs: dict[str, str] = {}
+    if ai_candidates:
+        try:
+            recs = _ai_recs(ai_candidates)
+        except (CredentialMissing, ValueError):  # degrade to heuristics, never crash the run
+            ai_used = False
+            notes.append(NO_REC_NOTE)
 
     for p in merged_list:
         p["recommendation"] = recs.get(p["path"]) or _heuristic_rec(p)

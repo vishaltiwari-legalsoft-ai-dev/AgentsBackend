@@ -89,3 +89,47 @@ def test_offline_recs_are_honest_heuristics():
     assert doc["ai"] is False  # offline → llm_text raises → heuristic path
     assert "meta description" in doc["pages"][0]["recommendation"].lower()
     assert pages_mod.latest("b")["pages"]  # persisted
+
+
+def test_page_known_only_from_ga_is_flagged_not_crawled():
+    """A page GA/GSC know about but the site crawl never fetched has no on-page
+    facts to audit — it must not silently pass as 'healthy'."""
+    doc = pages_mod.build_page_intel(
+        {"id": "b", "domain": "x.com"},
+        corpus_pages=[],
+        ga_pages=[{"path": "/mystery", "views": 50, "sessions": 40, "engagement_rate": 0.3}],
+        gsc_rows=[],
+    )
+    p = doc["pages"][0]
+    assert p["flags"] == ["not-crawled"]
+    assert p["recommendation"] == "Not in the site crawl — re-run the site analysis to audit this page."
+
+
+def test_ai_recs_success_used_for_top_traffic_only(monkeypatch):
+    """When the LLM call succeeds, its recommendation wins for the page it names;
+    pages outside the top-MAX_AI_PAGES traffic slice still get honest heuristics."""
+    n = pages_mod.MAX_AI_PAGES + 1
+    corpus_pages = [_corpus_page(url=f"https://x.com/p{i}") for i in range(n)]
+    ga_pages = [{"path": f"/p{i}", "views": n - i, "sessions": 5, "engagement_rate": 0.4}
+                for i in range(n)]
+
+    def fake_llm_text(system, prompt, **kw):
+        return '```json\n[{"path": "/p0", "recommendation": "Ship the pricing table above the fold."}]\n```'
+
+    monkeypatch.setattr(pages_mod, "llm_text", fake_llm_text)
+    doc = pages_mod.build_page_intel({"id": "b", "domain": "x.com"}, corpus_pages, ga_pages, [])
+    assert doc["ai"] is True
+    by_path = {p["path"]: p for p in doc["pages"]}
+    assert by_path["/p0"]["recommendation"] == "Ship the pricing table above the fold."
+    # lowest-traffic page (index n-1) falls outside the top MAX_AI_PAGES slice sent to the LLM
+    beyond = by_path[f"/p{n - 1}"]
+    assert beyond["recommendation"] == "Healthy — keep it fresh and add internal links to weaker pages."
+
+
+def test_ai_recs_malformed_json_falls_back_to_heuristics(monkeypatch):
+    monkeypatch.setattr(pages_mod, "llm_text", lambda system, prompt, **kw: "not json at all")
+    doc = pages_mod.build_page_intel({"id": "b", "domain": "x.com"},
+                                     corpus_pages=[_corpus_page()], ga_pages=[], gsc_rows=[])
+    assert doc["ai"] is False
+    assert pages_mod.NO_REC_NOTE in doc["notes"]
+    assert all(p["recommendation"] for p in doc["pages"])
