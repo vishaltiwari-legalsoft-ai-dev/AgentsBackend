@@ -312,6 +312,20 @@ def _ga_bullet(ga: dict) -> str | None:
     )
 
 
+def _competitor_topic_pool(brand_id: str) -> list[str]:
+    """Flatten hot_topics + recent-post topics across a brand's competitor profiles
+    (Task 5's `competitor-profiles-{id}` doc) into blog-topic-lab candidates.
+    None-safe: no profiles yet is a normal, non-fatal state, not a degraded run."""
+    doc = competitors.latest_profiles(brand_id) or {}
+    pool: list[str] = []
+    for profile in doc.get("profiles") or []:
+        pool.extend(t for t in (profile.get("hot_topics") or []) if t)
+        pool.extend(
+            post.get("topic") for post in (profile.get("recent_posts") or []) if post.get("topic")
+        )
+    return pool
+
+
 def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
     """Pull data, build insights + to-dos + blog topics for one brand, persist."""
     end = today or date.today()
@@ -370,7 +384,11 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
     # Site-review findings ride along in the fix list (stable ids keep status).
     todos = (todos + site_brain.site_todos(brand["id"]))[:MAX_TODOS]
 
-    topic_list, topic_notes = topics.build_topics(site_brain.effective_seeds(brand), rows, prev_rows)
+    topic_list, topic_notes = topics.build_topics(
+        site_brain.effective_seeds(brand), rows, prev_rows,
+        corpus_pages=(state.load(f"corpus-{brand['id']}") or {}).get("pages"),
+        competitor_topics=_competitor_topic_pool(brand["id"]),
+    )
     degraded.extend(topic_notes)
 
     run = {

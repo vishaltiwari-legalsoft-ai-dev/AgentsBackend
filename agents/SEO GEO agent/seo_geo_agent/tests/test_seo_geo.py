@@ -1,7 +1,7 @@
 """Engine tests: estimate math, to-do rules, status persistence, topic ranking."""
 from datetime import date
 
-from seo_geo_agent import insights, topics
+from seo_geo_agent import insights, keywords, topics
 from seo_geo_agent.sources import QueryStat
 
 
@@ -176,3 +176,84 @@ def test_question_angle_detection():
     assert topics._angle("how to hire a paralegal") == "FAQ answer"
     assert topics._angle("virtual assistant cost per hour") == "pricing guide"
     assert topics._angle("clio vs mycase") == "comparison"
+
+
+# ------------------------- blog plan: intent + gaps + cannibalization -------------------------
+
+def test_build_topics_still_works_with_three_args():
+    """Backward compat: existing 3-positional-arg call sites keep working."""
+    brand = {"id": "b", "domain": "x.com", "seeds": ["legal virtual assistant"]}
+    rows = [row(query="legal virtual assistant cost", impressions=900, position=12.0)]
+    ranked, notes = topics.build_topics(brand, rows, [])
+    assert isinstance(ranked, list)
+    assert isinstance(notes, list)
+
+
+def test_every_topic_has_intent():
+    brand = {"id": "b", "domain": "x.com", "seeds": ["legal virtual assistant"]}
+    rows = [row(query="legal virtual assistant cost", impressions=900, position=12.0)]
+    ranked, _ = topics.build_topics(brand, rows, [], search=None)
+    assert ranked
+    for t in ranked:
+        assert t["intent"] == keywords.intent_of(t["keyword"])
+
+
+def test_cannibalizing_candidate_marked_avoided_and_sorted_last():
+    brand = {"id": "b", "domain": "x.com",
+             "seeds": ["legal virtual assistant cost", "paralegal staffing help"]}
+    rows = [
+        row(query="legal virtual assistant cost", impressions=900, position=3.0),
+        row(query="paralegal staffing help", impressions=500, position=3.0),
+    ]
+    corpus_pages = [
+        {"url": "https://x.com/pricing", "title": "Legal Virtual Assistant Cost",
+         "target_query": "legal virtual assistant cost"},
+    ]
+    ranked, _ = topics.build_topics(brand, rows, [], search=None, corpus_pages=corpus_pages)
+    avoided = [t for t in ranked if t.get("avoided")]
+    live = [t for t in ranked if not t.get("avoided")]
+    assert avoided, "expected at least one avoided (cannibalizing) topic"
+    assert live, "expected at least one live (non-cannibalizing) topic"
+    hit = next(t for t in avoided if t["keyword"] == "legal virtual assistant cost")
+    assert hit["avoided_reason"] == "overlaps https://x.com/pricing"
+    # avoided topics sort after live (non-avoided) ones
+    live_indexes = [i for i, t in enumerate(ranked) if not t.get("avoided")]
+    avoided_indexes = [i for i, t in enumerate(ranked) if t.get("avoided")]
+    assert max(live_indexes) < min(avoided_indexes)
+
+
+def test_avoided_topics_never_hidden():
+    brand = {"id": "b", "domain": "x.com", "seeds": ["legal virtual assistant cost"]}
+    rows = [row(query="legal virtual assistant cost", impressions=900, position=3.0)]
+    corpus_pages = [
+        {"url": "https://x.com/pricing", "title": "Legal Virtual Assistant Cost",
+         "target_query": "legal virtual assistant cost"},
+    ]
+    without, _ = topics.build_topics(brand, rows, [], search=None)
+    with_corpus, _ = topics.build_topics(brand, rows, [], search=None, corpus_pages=corpus_pages)
+    # same candidate pool, no candidate is dropped just because it overlaps
+    assert len(with_corpus) == len(without)
+
+
+def test_competitor_topic_tagged_and_never_outranks_seed():
+    brand = {"id": "b", "domain": "x.com", "seeds": ["legal virtual assistant"]}
+    rows = [row(query="legal virtual assistant", impressions=900, position=3.0)]
+    competitor_topics = ["outsourced paralegal staffing"]
+    ranked, _ = topics.build_topics(brand, rows, [], search=None, competitor_topics=competitor_topics)
+    comp = [t for t in ranked if t["source"] == "competitor-content"]
+    assert comp, "expected a competitor-content sourced topic"
+    assert comp[0]["keyword"].lower() == "outsourced paralegal staffing"
+    seed_scores = [t["score"] for t in ranked if t["source"] == "seed"]
+    assert all(comp[0]["score"] <= s for s in seed_scores)
+
+
+def test_live_topics_cap_at_ten():
+    brand = {"id": "b", "domain": "x.com", "seeds": []}
+    rows = [
+        row(query=f"how to fix issue {i}", impressions=60 + i, position=15.0)
+        for i in range(15)
+    ]
+    ranked, _ = topics.build_topics(brand, rows, [], search=None)
+    live = [t for t in ranked if not t.get("avoided")]
+    assert len(live) <= 10
+    assert len(ranked) <= 10  # nothing was avoided here, so the cap applies to the whole list

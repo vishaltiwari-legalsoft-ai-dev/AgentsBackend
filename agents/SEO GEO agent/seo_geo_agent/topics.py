@@ -16,12 +16,38 @@ WEAK_DOMAINS = ("reddit.com", "quora.com", "forum", "medium.com", "pinterest.", 
 MAX_SEEDS = 5          # Serper calls cost money; 5 seeds + 12 checks ≈ $0.01/run
 MAX_SERP_CHECKS = 12
 MAX_TOPICS = 15
+MAX_LIVE_TOPICS = 10   # avoided (cannibalizing) topics ride along beyond this cap — never hidden
+CANNIBAL_OVERLAP = 0.8
 TREND_SCORE = {"rising": 1.0, "new": 0.7, "flat": 0.5, "falling": 0.2}
 DIFFICULTY_SCORE = {"easy win": 1.0, "medium": 0.6, "hard": 0.25, None: 0.5}
 
 
 def _tokens(text: str) -> set[str]:
     return {w for w in text.lower().split() if w not in STOPWORDS and len(w) > 2}
+
+
+def _token_overlap(cand: set[str], other: set[str]) -> bool:
+    """True when `cand` is (near-)covered by `other`: a subset, or sharing >=80% of its tokens."""
+    if not cand or not other:
+        return False
+    if cand <= other:
+        return True
+    shared = cand & other
+    return (len(shared) / len(cand)) >= CANNIBAL_OVERLAP
+
+
+def _cannibalized_by(display: str, corpus_pages: list[dict] | None) -> str | None:
+    """Return the URL of a corpus page this candidate would cannibalize, or None."""
+    if not corpus_pages:
+        return None
+    cand = _tokens(display)
+    if not cand:
+        return None
+    for page in corpus_pages:
+        for field in ("target_query", "title"):
+            if _token_overlap(cand, _tokens(page.get(field) or "")):
+                return page.get("url")
+    return None
 
 
 def _match_impressions(candidate: str, rows: list[QueryStat]) -> int:
@@ -107,8 +133,18 @@ def build_topics(
     prev_rows: list[QueryStat],
     search=None,
     max_checks: int = MAX_SERP_CHECKS,
+    corpus_pages: list[dict] | None = None,
+    competitor_topics: list[str] | None = None,
 ) -> tuple[list[dict], list[str]]:
-    """Return (ranked topics, degradation notes) for one brand."""
+    """Return (ranked topics, degradation notes) for one brand.
+
+    `corpus_pages` (our own crawled/summarised pages) grounds the anti-cannibalization
+    check; `competitor_topics` (flattened hot-topics + recent-post topics from
+    competitor profiles) seeds gap candidates tagged source="competitor-content".
+    Both are optional, offline data — passing neither keeps prior behaviour.
+    """
+    from . import keywords  # lazy: keywords.py imports from this module at load time
+
     notes: list[str] = []
     if search is None:
         if sources.serper_available():
@@ -158,6 +194,12 @@ def build_topics(
     except CredentialMissing as exc:
         notes.append(f"New-topic ideation skipped: {exc}")
 
+    # Competitor gaps: topics rivals cover that we don't yet — from Task 5's
+    # competitor-profiles doc (hot_topics + recent-post topics, flattened by the caller).
+    for topic in competitor_topics or []:
+        if isinstance(topic, str) and topic.strip():
+            add(topic, "competitor-content")
+
     # Score every candidate on volume proxy + trend; SERP-check only the top few.
     scored = []
     for key, (display, source) in candidates.items():
@@ -190,12 +232,14 @@ def build_topics(
         if source == "seed":
             score -= 0.08  # the lab's job is discovery — the user already knows their seeds
         angle = _angle(display)
+        avoided_url = _cannibalized_by(display, corpus_pages)
         topics.append({
             "keyword": display,
             "source": source,
             "priority": "high" if score >= 0.62 else "medium" if score >= 0.45 else "low",
             "impact": _impact(angle),
             "angle": angle,
+            "intent": keywords.intent_of(display),
             "volume_est": volume or None,
             "volume_label": f"~{volume:,}/mo (our impressions)" if volume else "interest signal only",
             "trend": trend,
@@ -203,7 +247,21 @@ def build_topics(
             "est_monthly_clicks": round(volume * 0.11) if volume else None,
             "why": _why(volume, trend, difficulty, evidence),
             "score": round(score, 3),
+            "avoided": bool(avoided_url),
+            "avoided_reason": f"overlaps {avoided_url}" if avoided_url else None,
         })
 
-    topics.sort(key=lambda t: t["score"], reverse=True)
-    return topics[:MAX_TOPICS], notes
+    # Competitor-content candidates are a gap signal, not a mandate — never let
+    # one outrank what the brand itself told us to prioritize (its seeds).
+    seed_scores = [t["score"] for t in topics if t["source"] == "seed"]
+    if seed_scores:
+        seed_floor = min(seed_scores)
+        for t in topics:
+            if t["source"] == "competitor-content" and t["score"] >= seed_floor:
+                t["score"] = round(seed_floor - 0.001, 3)
+
+    # Avoided (cannibalizing) topics are never hidden (a9 rule) but always sort
+    # after live ones, and only live topics count against the display cap.
+    live = sorted((t for t in topics if not t["avoided"]), key=lambda t: t["score"], reverse=True)
+    avoided = sorted((t for t in topics if t["avoided"]), key=lambda t: t["score"], reverse=True)
+    return live[:MAX_LIVE_TOPICS] + avoided, notes
