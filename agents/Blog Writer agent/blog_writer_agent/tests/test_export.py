@@ -68,6 +68,24 @@ def test_visual_docs_list_every_entry():
         assert "What firms lose" in doc
 
 
+def test_inline_links_and_subheadings_render_per_format():
+    run = _run()
+    run["draft"]["blocks"][1]["text"] = (
+        "Read our guide on [legal intake](https://legalsoft.com/blog/existing/).\n"
+        "### Why it matters\nMissed calls cost real money."
+    )
+    html = export.to_html(run)
+    assert '<a href="https://legalsoft.com/blog/existing/">legal intake</a>' in html
+    assert "<h3>Why it matters</h3>" in html
+    assert "](" not in html
+    txt = export.to_text(run)
+    assert "legal intake (https://legalsoft.com/blog/existing/)" in txt
+    assert "###" not in txt
+    md = export.to_markdown(run)
+    assert "[legal intake](https://legalsoft.com/blog/existing/)" in md
+    assert "### Why it matters" in md
+
+
 def test_missing_stage_raises():
     run = _run()
     run["draft"] = None

@@ -38,20 +38,29 @@ _DRAFT_SYSTEM = (
     '[{"kind": "intro"|"section"|"conclusion", "heading", "text", "cites": '
     '[ledger ids]}], "internal_links": [{"url", "title"}]}. Rules: never '
     "overlap an existing post's topic — angle away from them; weave in the "
-    "anecdotes class for lived-experience color; internal_links only from the "
-    "existing-post list; every number or factual assertion needs a cite. "
-    "Voice: lead each section with its main point, short paragraphs of 2-3 "
-    "sentences, one idea per sentence, contractions, second person, specific "
-    "numbers over vague claims, plain verbs (is/has/uses), no em dashes, no "
-    "marketing hype. Write like a human expert, not a content farm."
+    "anecdotes class for lived-experience color; every number or factual "
+    "assertion needs a cite. Structure: many SHORT sections, each an H2 block "
+    "with a numbered, keyword-rich heading and a tight body (minimum words, "
+    "maximum impact — hit the measured section length when structure targets "
+    "are given, default 60-120 words); a block's text may include '### ' "
+    "sub-heading lines. Linking: weave internal links INTO the body text as "
+    "markdown links [natural anchor](url), using ONLY URLs from the "
+    "existing-post list; also return them in internal_links. Voice: lead each "
+    "section with its main point, short paragraphs of 2-3 sentences, one idea "
+    "per sentence, contractions, second person, specific numbers over vague "
+    "claims, plain verbs (is/has/uses), no em dashes, no marketing hype. "
+    "Write like a human expert, not a content farm."
 )
 
 _POLISH_SYSTEM = (
     "You are the house line editor. Edit every draft block to follow the "
     "house writing rules given in the message exactly, without changing "
-    "facts, claims, or which ledger ids are cited. Return JSON "
-    '{"meta": {"title", "description", "slug"}, "blocks": [{"id", "heading", '
-    '"text", "cites"}]} — keep every block id, return every block.'
+    "facts, claims, or which ledger ids are cited. Preserve the draft's "
+    "section structure, numbered headings, '### ' sub-heading lines, and "
+    "inline [anchor](url) links — tighten the prose, never flatten the "
+    'structure. Return JSON {"meta": {"title", "description", "slug"}, '
+    '"blocks": [{"id", "heading", "text", "cites"}]} — keep every block id, '
+    "return every block."
 )
 
 _FIX_SYSTEM_TPL = (
@@ -167,6 +176,49 @@ def _voice_section(voice: dict | None) -> str:
     return f"BRAND VOICE PROFILE (from studying the brand's published posts — match it):\n{digest}\n\n"
 
 
+def _structure_targets(voice: dict | None) -> str:
+    stats = (voice or {}).get("structure") or {}
+    if not stats.get("median_words"):
+        return ""
+    return (
+        "STRUCTURE TARGETS (measured from the brand's published posts — hit them):\n"
+        f"- total length ~{stats['median_words']} words\n"
+        f"- ~{stats['median_h2_sections']} short H2 sections of ~{stats['words_per_section']} words each, "
+        "numbered keyword-rich headings\n"
+        f"- weave ~{max(3, stats['median_internal_links'])} internal links into the body as [anchor](url)\n\n"
+    )
+
+
+_INLINE_LINK = re.compile(r"\[[^\]]+\]\((https?://[^)]+)\)")
+
+
+def structure_check(run: dict, voice: dict | None, inventory: dict | None) -> list[str]:
+    """Measure the draft against the brand's measured structure. Notes, not vetoes."""
+    draft = run.get("draft")
+    if not draft:
+        return []
+    notes: list[str] = []
+    blocks = draft["blocks"]
+    words = sum(len(b["text"].split()) for b in blocks)
+    sections = sum(1 for b in blocks if b.get("heading"))
+    linked = {m for b in blocks for m in _INLINE_LINK.findall(b["text"])}
+
+    stats = (voice or {}).get("structure") or {}
+    median_words = stats.get("median_words") or 0
+    if median_words and not (0.5 * median_words <= words <= 1.7 * median_words):
+        notes.append(f"structure: draft is {words} words; the brand's posts run ~{median_words}")
+    median_h2 = stats.get("median_h2_sections") or 0
+    if median_h2 and sections < max(3, median_h2 // 2):
+        notes.append(f"structure: {sections} H2 sections vs ~{median_h2} in the brand's posts")
+    if (inventory or {}).get("posts"):
+        want = max(3, stats.get("median_internal_links") or 3)
+        if len(linked) < want:
+            notes.append(
+                f"structure: only {len(linked)} internal links woven in; the brand's posts carry ~{want}"
+            )
+    return notes
+
+
 def build_draft(run: dict, inventory: dict | None, *, voice: dict | None = None, llm=None) -> dict:
     llm = llm or bw_llm.llm_json
 
@@ -178,6 +230,10 @@ def build_draft(run: dict, inventory: dict | None, *, voice: dict | None = None,
             raise ValueError("no evidence yet — run research before drafting")
         _draft_raw(run, inventory, voice, llm)
     apply_guidelines(run, voice=voice, llm=llm)
+    for note in structure_check(run, voice, inventory):
+        if note not in run["draft"]["notes"]:
+            run["draft"]["notes"].append(note)
+    research.save_run(run)
     return run
 
 
@@ -186,7 +242,7 @@ def _draft_raw(run: dict, inventory: dict | None, voice: dict | None, llm) -> No
     existing = "\n".join(f"- {p['title']} ({p['url']})" for p in posts) or "(none known)"
     payload = llm(
         _DRAFT_SYSTEM,
-        f"{_voice_section(voice)}"
+        f"{_voice_section(voice)}{_structure_targets(voice)}"
         f"Brand: {run['brand_name']} ({run['domain']})\nTopic: {run['topic']}\n"
         f"Writer notes: {run.get('notes') or '(none)'}\n\n"
         f"Existing posts on the site (do not duplicate; use for internal links):\n{existing}\n\n"

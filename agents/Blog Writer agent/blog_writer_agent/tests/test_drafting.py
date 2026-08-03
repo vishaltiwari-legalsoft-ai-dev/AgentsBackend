@@ -249,6 +249,36 @@ def test_revise_rewrite_goes_through_style_gate():
     assert run["draft"]["blocks"][0]["text"] == "Plain rewrite, no hype."
 
 
+def test_structure_check_measures_against_brand_stats():
+    run = _run_with_ledger()
+    run = drafting.build_draft(run, INVENTORY, llm=lambda s, p, **kw: _DRAFT_PAYLOAD)
+    voice_doc = {"structure": {"median_words": 1500, "median_h2_sections": 16, "median_internal_links": 7}}
+    notes = drafting.structure_check(run, voice_doc, INVENTORY)
+    assert any("words" in n for n in notes)          # tiny draft vs ~1500-word posts
+    assert any("H2 sections" in n for n in notes)    # 2 headed blocks vs ~16
+    assert any("internal links" in n for n in notes)  # no inline links woven in
+    assert drafting.structure_check(run, None, None) == []
+
+
+def test_structure_targets_reach_the_draft_prompt():
+    run = _run_with_ledger()
+    voice_doc = {
+        "profile": {"summary": "s"},
+        "structure": {"median_words": 1500, "median_h2_sections": 16,
+                      "median_internal_links": 7, "words_per_section": 94,
+                      "posts_measured": 6, "uses_h3": 1, "h2_samples": []},
+    }
+    prompts: list[str] = []
+
+    def fake_llm(system, prompt, **kw):
+        prompts.append(prompt)
+        return _DRAFT_PAYLOAD
+
+    drafting.build_draft(run, INVENTORY, voice=voice_doc, llm=fake_llm)
+    assert "STRUCTURE TARGETS" in prompts[0]
+    assert "~1500 words" in prompts[0] and "~94 words each" in prompts[0]
+
+
 def test_voice_profile_reaches_draft_and_polish_prompts():
     run = _run_with_ledger()
     voice_doc = {"profile": {"tone": "plainspoken operator voice", "summary": "s"}}

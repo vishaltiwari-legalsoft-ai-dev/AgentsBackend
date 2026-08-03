@@ -66,3 +66,29 @@ def test_digest_flattens_profile_for_prompts():
     assert "tone: practical, direct" in text
     assert "donts: marketing hype" in text
     assert voice.digest(None) == ""
+
+
+def test_study_measures_real_structure():
+    def structured_fetch(url, client=None):
+        return {
+            "url": url, "title": "T", "status": 200,
+            "text": "Body " * 50,
+            "word_count": 1400,
+            "h2": [f"{i}. Heading {i}" for i in range(1, 17)],
+            "h3": [],
+            "internal_links": [f"https://legalsoft.com/blog/p{i}/" for i in range(7)],
+        }
+
+    doc = voice.study(
+        BRAND, {"posts": INVENTORY["posts"][:2]}, fetch=structured_fetch,
+        llm=lambda s, p, **kw: dict(_PROFILE),
+    )
+    stats = doc["structure"]
+    assert stats["median_words"] == 1400
+    assert stats["median_h2_sections"] == 16
+    assert stats["median_internal_links"] == 7
+    assert stats["words_per_section"] == round(1400 / 16)
+    assert stats["h2_samples"][0] == "1. Heading 1"
+    digest = voice.digest(doc)
+    assert "~1400 words total, 16 H2 sections" in digest
+    assert "real H2 examples" in digest

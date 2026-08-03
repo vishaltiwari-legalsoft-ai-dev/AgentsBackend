@@ -7,6 +7,25 @@ section lists exactly those items — nothing the reader can't trace.
 from __future__ import annotations
 
 import html as _html
+import re
+
+_MD_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
+
+
+def _html_inline(text: str) -> str:
+    """Escape text while converting [anchor](url) markdown links to <a>."""
+    parts: list[str] = []
+    last = 0
+    for m in _MD_LINK.finditer(text):
+        parts.append(_html.escape(text[last:m.start()]))
+        parts.append(f'<a href="{_html.escape(m.group(2))}">{_html.escape(m.group(1))}</a>')
+        last = m.end()
+    parts.append(_html.escape(text[last:]))
+    return "".join(parts)
+
+
+def _plain_inline(text: str) -> str:
+    return _MD_LINK.sub(r"\1 (\2)", text)
 
 
 def _draft(run: dict) -> dict:
@@ -73,7 +92,20 @@ def to_html(run: dict) -> str:
         if block.get("heading"):
             parts.append(f"<h2>{_html.escape(block['heading'])}</h2>")
         sups = "".join(f"<sup>[{numbers[c]}]</sup>" for c in block.get("cites", []) if c in numbers)
-        parts.append(f"<p>{_html.escape(block['text'])}{sups}</p>")
+        paragraphs = []
+        for line in block["text"].split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("### "):
+                paragraphs.append(f"<h3>{_html.escape(line[4:])}</h3>")
+            else:
+                paragraphs.append(f"<p>{_html_inline(line)}</p>")
+        if paragraphs and paragraphs[-1].endswith("</p>"):
+            paragraphs[-1] = paragraphs[-1][: -len("</p>")] + sups + "</p>"
+        elif sups:
+            paragraphs.append(f"<p>{sups}</p>")
+        parts.extend(paragraphs)
     if sources:
         parts.append("<h2>Sources</h2><ol>")
         parts += [
@@ -94,7 +126,8 @@ def to_text(run: dict) -> str:
         if block.get("heading"):
             lines += [block["heading"].upper(), ""]
         marks = _marks(block, numbers)
-        lines += [block["text"] + (f" {marks}" if marks else ""), ""]
+        text = _plain_inline(block["text"]).replace("### ", "")
+        lines += [text + (f" {marks}" if marks else ""), ""]
     if sources:
         lines += ["Sources", ""]
         lines += [f"{n}. {i.get('source_name', i['url'])} — {i['url']}" for n, i in enumerate(sources, 1)]
