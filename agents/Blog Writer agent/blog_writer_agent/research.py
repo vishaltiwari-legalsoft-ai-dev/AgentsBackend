@@ -114,21 +114,32 @@ def _read_urls(run: dict) -> set[str]:
     return {u for r in run["rounds"] for u in r.get("read", [])}
 
 
-def _dedupe_key(item: dict) -> tuple[str, str]:
-    return (item.get("url", "").strip(), item.get("claim", "").strip().lower())
+def _dedupe_key(item: dict) -> str:
+    return item.get("claim", "").strip().lower()
 
 
 def _extract(page: dict, topic: str, llm) -> list[dict]:
     text = (page.get("text") or "")[:6000]
     if not text.strip():
         return []
+    page_url = page.get("final_url") or page.get("url") or ""
     payload = llm(
         _EXTRACT_SYSTEM,
-        f"Topic being researched: {topic}\nPage URL: {page.get('url', '')}\n"
+        f"Topic being researched: {topic}\nPage URL: {page_url}\n"
         f"Page title: {page.get('title', '')}\n\nPage text:\n{text}",
     )
     items = payload.get("evidence", payload) if isinstance(payload, dict) else payload
-    return [i for i in items if isinstance(i, dict) and i.get("claim") and i.get("url")] if isinstance(items, list) else []
+    if not isinstance(items, list):
+        return []
+    kept = []
+    for item in items:
+        if not isinstance(item, dict) or not item.get("claim"):
+            continue
+        # Provenance is ours, never the model's: the ledger cites the page we read.
+        item["url"] = page_url
+        item.setdefault("source_name", page.get("title", "") or page_url)
+        kept.append(item)
+    return kept
 
 
 def _bank(run: dict, extracted: list[dict]) -> int:
@@ -170,7 +181,7 @@ def _run_queries(run: dict, queries: list[dict], reads_cap: int, *, search, fetc
 
 def research_step(run: dict, *, search=None, fetch=None, llm=None) -> dict:
     search = search or _default_search()
-    fetch = fetch or sources.fetch_text
+    fetch = fetch or sources.fetch_page  # parsed body text, not raw HTML
     llm = llm or bw_llm.llm_json
 
     if not run["rounds"]:
@@ -203,7 +214,7 @@ def research_step(run: dict, *, search=None, fetch=None, llm=None) -> dict:
 def mini_research(run: dict, queries: list[str], *, search=None, fetch=None, llm=None) -> list[dict]:
     """Targeted evidence for one block revision; appends to the ledger."""
     search = search or _default_search()
-    fetch = fetch or sources.fetch_text
+    fetch = fetch or sources.fetch_page  # parsed body text, not raw HTML
     llm = llm or bw_llm.llm_json
 
     before = len(run["ledger"])

@@ -50,7 +50,7 @@ def live_seams(monkeypatch):
         lambda q, client=None: {"organic": [{"link": f"https://src.example/{abs(hash(q)) % 1000}", "title": q}]},
     )
     monkeypatch.setattr(
-        sources, "fetch_text",
+        sources, "fetch_page",
         lambda u, client=None: {"url": u, "title": "Source", "text": f"body of {u}", "status": 200},
     )
 
