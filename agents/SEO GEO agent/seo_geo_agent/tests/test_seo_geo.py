@@ -247,6 +247,33 @@ def test_competitor_topic_tagged_and_never_outranks_seed():
     assert all(comp[0]["score"] <= s for s in seed_scores)
 
 
+def test_clamped_competitor_topic_gets_priority_recomputed_from_final_score():
+    """Regression: priority must be derived from the score AFTER the competitor
+    clamp, not the pre-clamp score — a topic clamped to sort at the bottom must
+    not still display the higher priority label its raw score would have earned."""
+    brand = {"id": "b", "domain": "x.com", "seeds": ["legal virtual assistant"]}
+    rows = [
+        row(query="legal virtual assistant", impressions=100, position=3.0),
+        row(query="outsourced paralegal staffing", impressions=1000, position=3.0),
+    ]
+    prev = [row(query="legal virtual assistant", impressions=1000, position=3.0)]
+    competitor_topics = ["outsourced paralegal staffing"]
+
+    ranked, _ = topics.build_topics(brand, rows, prev, search=None, competitor_topics=competitor_topics)
+
+    seed = next(t for t in ranked if t["source"] == "seed")
+    comp = next(t for t in ranked if t["source"] == "competitor-content")
+
+    # the seed's own trend is falling and its volume share is small -> low priority
+    assert seed["priority"] == "low"
+    # the competitor topic's raw score (~0.695, would-be "high") gets clamped
+    # below the seed floor; its displayed priority must reflect that final score
+    assert comp["score"] < seed["score"]
+    assert comp["priority"] == "low"
+    # and it still sorts after every seed topic
+    assert ranked.index(seed) < ranked.index(comp)
+
+
 def test_live_topics_cap_at_ten():
     brand = {"id": "b", "domain": "x.com", "seeds": []}
     rows = [

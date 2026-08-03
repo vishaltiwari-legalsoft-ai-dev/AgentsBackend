@@ -236,7 +236,6 @@ def build_topics(
         topics.append({
             "keyword": display,
             "source": source,
-            "priority": "high" if score >= 0.62 else "medium" if score >= 0.45 else "low",
             "impact": _impact(angle),
             "angle": angle,
             "intent": keywords.intent_of(display),
@@ -259,6 +258,13 @@ def build_topics(
         for t in topics:
             if t["source"] == "competitor-content" and t["score"] >= seed_floor:
                 t["score"] = round(seed_floor - 0.001, 3)
+
+    # Priority is a display label derived from score — compute it last, after the
+    # competitor clamp above has had its final say, so a clamped topic never shows
+    # a priority earned by its pre-clamp score.
+    for t in topics:
+        s = t["score"]
+        t["priority"] = "high" if s >= 0.62 else "medium" if s >= 0.45 else "low"
 
     # Avoided (cannibalizing) topics are never hidden (a9 rule) but always sort
     # after live ones, and only live topics count against the display cap.
