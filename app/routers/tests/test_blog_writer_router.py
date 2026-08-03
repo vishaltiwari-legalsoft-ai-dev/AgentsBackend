@@ -68,6 +68,11 @@ def live_seams(monkeypatch):
             return {"action": "rewrite", "queries": []}
         if "rewrite one block" in s:
             return {"text": "Rewritten per the comment.", "cites": ["ev-1"]}
+        if "house line editor" in s:
+            return {"meta": {}, "blocks": [
+                {"id": "b1", "heading": "", "text": "Opening, line-edited.", "cites": ["ev-1"]},
+                {"id": "b2", "heading": "Body", "text": "Evidence-backed body, line-edited.", "cites": ["ev-1"]},
+            ]}
         if "art director" in s:
             return {"visuals": [{"section": "(top)", "type": "hero", "theme": "navy",
                                  "prompt": "Hero image of a calm reception", "rationale": "tone"}]}
@@ -137,6 +142,8 @@ def test_full_desk_flow(live_seams):
 
     drafted = client.post(f"/api/blog/runs/{rid}/draft").json()
     assert [b["id"] for b in drafted["draft"]["blocks"]] == ["b1", "b2"]
+    assert drafted["draft"]["guidelines_applied"] is True
+    assert drafted["draft"]["blocks"][0]["text"] == "Opening, line-edited."
 
     revised = client.post(f"/api/blog/runs/{rid}/blocks/b1/comment", json={"comment": "punchier"}).json()
     assert revised["draft"]["blocks"][0]["text"] == "Rewritten per the comment."

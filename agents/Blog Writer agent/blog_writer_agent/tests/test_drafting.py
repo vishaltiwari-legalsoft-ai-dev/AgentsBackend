@@ -1,7 +1,8 @@
-"""Drafting: ledger-grounded blocks; per-block comments rewrite or re-research."""
+"""Drafting: ledger-grounded blocks, the house guideline pass, block revision."""
 from __future__ import annotations
 
 import pytest
+from seo_geo_agent.sources import CredentialMissing
 
 from blog_writer_agent import drafting, research
 
@@ -115,3 +116,91 @@ def test_revise_unknown_block_raises_keyerror():
     run = drafting.build_draft(run, INVENTORY, llm=lambda s, p, **kw: _DRAFT_PAYLOAD)
     with pytest.raises(KeyError):
         drafting.revise_block(run, "b99", "hi", llm=lambda s, p, **kw: {"action": "rewrite"})
+
+
+# ------------------------------------------------------------ guideline pass
+
+
+def test_guideline_pass_rewrites_blocks_and_keeps_history():
+    run = _run_with_ledger()
+
+    def fake_llm(system, prompt, **kw):
+        s = system.lower()
+        if "editorial writer" in s:
+            return _DRAFT_PAYLOAD
+        if "house line editor" in s:
+            assert "HOUSE WRITING RULES" in prompt and "BLUF" in prompt
+            return {
+                "meta": {"title": "Polished Title"},
+                "blocks": [
+                    {"id": "b1", "heading": "", "text": "Polished opening.", "cites": ["ev-1"]},
+                    {"id": "b2", "heading": "What firms actually lose", "text": "Polished body.", "cites": ["ev-1"]},
+                    {"id": "b3", "heading": "Where to go next", "text": "Polished close.", "cites": ["ev-2"]},
+                ],
+            }
+        raise AssertionError(f"unexpected: {system[:40]}")
+
+    run = drafting.build_draft(run, INVENTORY, llm=fake_llm)
+    draft = run["draft"]
+    assert draft["guidelines_applied"] is True
+    assert draft["meta"]["title"] == "Polished Title"
+    assert draft["meta"]["slug"] == "missed-calls"  # unedited meta keys survive
+    b1 = draft["blocks"][0]
+    assert b1["text"] == "Polished opening."
+    assert b1["history"] == ["Opening grounded in data."]  # raw version kept
+
+
+def test_style_violations_catches_hard_bans():
+    dirty = "In today's world we delve into synergy — furthermore, it's a game-changer."
+    found = drafting.style_violations(dirty)
+    assert 'banned word "delve"' in found
+    assert "em dash" in found
+    assert any("in today's" in v for v in found)
+    assert any("furthermore" in v for v in found)
+    assert drafting.style_violations("Firms miss 40% of calls. Fix the intake first.") == []
+
+
+def test_polish_failure_keeps_raw_draft_and_retry_only_polishes():
+    run = _run_with_ledger()
+    calls = {"draft": 0}
+
+    def failing_polish(system, prompt, **kw):
+        s = system.lower()
+        if "editorial writer" in s:
+            calls["draft"] += 1
+            return _DRAFT_PAYLOAD
+        raise CredentialMissing("LLM unavailable: boom")
+
+    with pytest.raises(CredentialMissing):
+        drafting.build_draft(run, INVENTORY, llm=failing_polish)
+    run = research.load_run(run["id"])
+    assert run["draft"] is not None and run["draft"]["guidelines_applied"] is False
+    assert calls["draft"] == 1
+
+    def working_polish(system, prompt, **kw):
+        s = system.lower()
+        if "editorial writer" in s:
+            calls["draft"] += 1
+            return _DRAFT_PAYLOAD
+        return {"blocks": [{"id": "b1", "text": "Polished after retry.", "cites": ["ev-1"]}]}
+
+    run = drafting.build_draft(run, INVENTORY, llm=working_polish)
+    assert calls["draft"] == 1  # no redraft — polish only
+    assert run["draft"]["guidelines_applied"] is True
+    assert run["draft"]["blocks"][0]["text"] == "Polished after retry."
+
+
+def test_leftover_style_violations_are_noted_honestly():
+    run = _run_with_ledger()
+
+    def fake_llm(system, prompt, **kw):
+        s = system.lower()
+        if "editorial writer" in s:
+            return _DRAFT_PAYLOAD
+        if "still break" in s:  # the fix call changes nothing
+            return {"blocks": []}
+        return {"blocks": [{"id": "b1", "text": "We delve into intake here.", "cites": ["ev-1"]}]}
+
+    run = drafting.build_draft(run, INVENTORY, llm=fake_llm)
+    notes = run["draft"]["notes"]
+    assert any("style check still flags" in n and "delve" in n for n in notes)
