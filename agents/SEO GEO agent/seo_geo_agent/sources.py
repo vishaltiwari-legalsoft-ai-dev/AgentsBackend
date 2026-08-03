@@ -184,6 +184,31 @@ def ga_fetch_overview(prop: str, start: date, end: date,
             "channels": channels, "key_events": key_events}
 
 
+def ga_fetch_pages(prop: str, start: date, end: date, service=None, limit: int = 50) -> list[dict]:
+    """Per-page GA traffic, ordered by views — feeds the page intelligence table."""
+    svc = service or _ga_service("analyticsdata")
+    body = {
+        "dateRanges": [{"startDate": start.isoformat(), "endDate": end.isoformat()}],
+        "dimensions": [{"name": "pagePath"}],
+        "metrics": [{"name": "screenPageViews"}, {"name": "sessions"}, {"name": "engagementRate"}],
+        "orderBys": [{"metric": {"metricName": "screenPageViews"}, "desc": True}],
+        "limit": limit,
+    }
+    try:
+        resp = svc.properties().runReport(property=prop, body=body).execute()
+    except CredentialMissing:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise CredentialMissing(f"Google Analytics rejected {prop}: {exc}") from exc
+    return [
+        {"path": (r.get("dimensionValues") or [{}])[0].get("value", ""),
+         "views": int(float(r["metricValues"][0]["value"])),
+         "sessions": int(float(r["metricValues"][1]["value"])),
+         "engagement_rate": float(r["metricValues"][2]["value"])}
+        for r in resp.get("rows", [])
+    ]
+
+
 def _gsc_service():
     if not state.use_cloud():
         raise CredentialMissing("offline mode")
