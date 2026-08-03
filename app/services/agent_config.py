@@ -153,6 +153,14 @@ AGENTS: list[dict[str, str | bool | list[str]]] = [
         "live": True,
         "fields": ["openrouter_model"],
     },
+    {
+        "id": "a9",
+        "name": "Blog Writer",
+        "role": "Deep-research blog drafts",
+        "category": "copy",
+        "live": True,
+        "fields": ["openrouter_model"],
+    },
 ]
 
 AGENT_IDS = {str(a["id"]) for a in AGENTS}

@@ -9,6 +9,7 @@ the real wiring for the live agents:
 
 - a1 Graphic Designer (image + planner already wired; text/fast/vision join here)
 - a6 Marketing Research (reasoning model)
+- a9 Blog Writer (reasoning model for research + writing)
 
 Full-app TestClient pattern follows ``test_admin_refresh_packs.py``.
 """
@@ -115,6 +116,23 @@ def test_mr_llm_wrappers_pass_a6(monkeypatch):
     assert seen == ["a6"]
 
 
+def test_blog_llm_adapter_passes_a9(monkeypatch):
+    from blog_writer_agent import llm as blog_llm
+    from blog_writer_agent import state as blog_state
+
+    seen: list[str | None] = []
+
+    def fake_get_llm(*_a, **kw):
+        seen.append(kw.get("agent_id"))
+        return _StubLLM()
+
+    monkeypatch.setattr(openrouter_service, "get_llm", fake_get_llm)
+    monkeypatch.setattr(blog_state, "use_cloud", lambda: True)
+
+    blog_llm.llm_json("system", "prompt")
+    assert seen == ["a9"]
+
+
 # --------------------------------------------------------------------------- #
 # Admin endpoints: panel lists only live agents, each with its real fields.
 # --------------------------------------------------------------------------- #
@@ -125,10 +143,11 @@ def test_agents_payload_lists_only_live_agents_with_their_fields(app_config):
     body = r.json()
 
     by_id = {a["id"]: a for a in body["agents"]}
-    assert set(by_id) == {"a1", "a6"}
+    assert set(by_id) == {"a1", "a6", "a9"}
     assert all(a["live"] for a in body["agents"])
 
     assert by_id["a6"]["fields"] == ["openrouter_model"]
+    assert by_id["a9"]["fields"] == ["openrouter_model"]
     # GD keeps its full set, planner included.
     assert set(by_id["a1"]["fields"]) == set(runtime_config.AGENT_OVERRIDE_FIELDS)
 
