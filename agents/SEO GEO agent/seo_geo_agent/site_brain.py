@@ -88,7 +88,9 @@ def build_corpus(brand: dict, fetch=fetch_page, sitemap=fetch_sitemap, max_pages
                 continue
             h = _hash(facts)
             cached = old.get(url)
-            entry = {"url": url, "title": facts.title, "hash": h, "word_count": facts.word_count}
+            entry = {"url": url, "title": facts.title, "hash": h, "word_count": facts.word_count,
+                     "meta_description": facts.meta_description, "h1_count": len(facts.h1),
+                     "images_no_alt": facts.images_no_alt}
             if cached and cached.get("hash") == h and cached.get("summary"):
                 entry.update({k: cached[k] for k in ("summary", "type", "topics", "target_query", "cta")
                               if k in cached})

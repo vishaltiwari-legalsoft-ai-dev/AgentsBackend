@@ -3,7 +3,8 @@ from datetime import date
 
 import pytest
 
-from seo_geo_agent.sources import CredentialMissing, ga_fetch_pages
+from seo_geo_agent.sources import CredentialMissing, ga_fetch_pages, PageFacts
+from seo_geo_agent import site_brain
 
 
 class _Exec:
@@ -34,3 +35,15 @@ def test_ga_fetch_pages_parses_rows():
     ]})
     pages = ga_fetch_pages("properties/2", date(2026, 7, 6), date(2026, 8, 3), service=svc)
     assert pages == [{"path": "/pricing", "views": 1200, "sessions": 900, "engagement_rate": 0.7}]
+
+
+def test_corpus_entries_carry_on_page_facts():
+    facts = PageFacts(url="https://x.com/a", status=200, title="A", meta_description="d",
+                      h1=["A"], word_count=500, text="body")
+    corpus = site_brain.build_corpus(
+        {"id": "b", "domain": "x.com"},
+        fetch=lambda url, client=None: facts,
+        sitemap=lambda domain, client=None: ["https://x.com/a"],
+    )
+    entry = corpus["pages"][0]
+    assert (entry["meta_description"], entry["h1_count"], entry["images_no_alt"]) == ("d", 1, 0)
