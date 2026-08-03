@@ -14,9 +14,6 @@ SYSTEM = ("You are an SEO consultant. For each page return ONE imperative senten
           "the single most impactful next action. Strict JSON only: "
           '[{"path": str, "recommendation": str}]')
 
-PAGE_FLAGS = ("no-title", "title-long", "no-meta", "meta-long", "thin", "no-h1", "images-no-alt",
-              "not-crawled")
-
 TITLE_MAX = 60
 META_MAX = 160
 THIN_WORDS = 300
@@ -80,6 +77,8 @@ def _heuristic_rec(page: dict) -> str:
         return "Add an H1 matching the target query."
     if "images-no-alt" in flags:
         return "Add alt text to images."
+    if "meta-long" in flags:
+        return "Tighten the meta description under 160 characters — long snippets get truncated."
     return "Healthy — keep it fresh and add internal links to weaker pages."
 
 
@@ -111,19 +110,22 @@ def _entry(merged: dict, path: str) -> dict:
         "path": path, "url": None, "title": None,
         "views": 0, "sessions": 0, "engagement_rate": 0.0,
         "clicks": 0, "impressions": 0, "position": None,
-        "best_query": None, "flags": [], "recommendation": "",
+        "best_query": None, "flags": [], "recommendation": "", "ai": False,
         "word_count": 0,
     })
 
 
-def build_page_intel(brand: dict, corpus_pages: list[dict], ga_pages: list[dict], gsc_rows: list) -> dict:
+def build_page_intel(brand: dict, corpus_pages: list[dict], ga_pages: list[dict], gsc_rows: list,
+                      data_notes: list[str] | None = None) -> dict:
     """Merge GA + Search Console + on-page health into one per-page table, keyed
     by URL path. A page appears if it's in ANY source; missing-source fields
     default to 0/None. Adds one best-effort AI recommendation pass (top-traffic
     pages only), falling back to honest heuristics for the rest / on failure.
     Pages known only from GA/GSC — never crawled into the corpus — have no
     on-page facts to audit, so they're flagged ``not-crawled`` instead of
-    silently passing as healthy, and are never sent to the AI pass."""
+    silently passing as healthy, and are never sent to the AI pass.
+    ``data_notes`` carries upstream GA/GSC degradation notes from the caller so
+    a zeroed-out metric always shows the reason it's zero, not just a number."""
     merged: dict[str, dict] = {}
     crawled: set[str] = set()
 
@@ -161,17 +163,18 @@ def build_page_intel(brand: dict, corpus_pages: list[dict], ga_pages: list[dict]
     merged_list = sorted(merged.values(), key=lambda p: (-p["views"], -p["clicks"]))
     ai_candidates = [p for p in merged_list if p["path"] in crawled][:MAX_AI_PAGES]
 
-    notes: list[str] = []
-    ai_used = True
+    notes: list[str] = list(data_notes or [])
+    ai_used = False
     recs: dict[str, str] = {}
     if ai_candidates:
         try:
             recs = _ai_recs(ai_candidates)
+            ai_used = True
         except (CredentialMissing, ValueError):  # degrade to heuristics, never crash the run
-            ai_used = False
             notes.append(NO_REC_NOTE)
 
     for p in merged_list:
+        p["ai"] = p["path"] in recs
         p["recommendation"] = recs.get(p["path"]) or _heuristic_rec(p)
 
     doc = {"brand_id": brand["id"], "at": date.today().isoformat(),

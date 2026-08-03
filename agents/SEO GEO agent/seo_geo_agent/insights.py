@@ -370,6 +370,7 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
             bullets.append(bullet)
 
     # Page-level intelligence rides along too — never fatal to the run.
+    corpus = {}
     try:
         corpus = state.load(f"corpus-{brand['id']}") or {}
         if corpus.get("pages"):
@@ -377,7 +378,10 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
             if ga:
                 ga_pages = ga_fetch_pages(
                     ga["property"], end - timedelta(days=28), end)
-            pages_mod.build_page_intel(brand, corpus["pages"], ga_pages, rows)
+            # Forward whatever GA/GSC degradation this run already hit — a zeroed
+            # metric in the pages doc must carry the reason, not read as real data.
+            page_notes = [n for n in degraded if n.startswith(("Search Console:", "Google Analytics:"))]
+            pages_mod.build_page_intel(brand, corpus["pages"], ga_pages, rows, data_notes=page_notes)
     except CredentialMissing as exc:
         degraded.append(f"Page analytics: {exc}")
 
@@ -386,7 +390,7 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
 
     topic_list, topic_notes = topics.build_topics(
         site_brain.effective_seeds(brand), rows, prev_rows,
-        corpus_pages=(state.load(f"corpus-{brand['id']}") or {}).get("pages"),
+        corpus_pages=corpus.get("pages"),
         competitor_topics=_competitor_topic_pool(brand["id"]),
     )
     degraded.extend(topic_notes)

@@ -153,6 +153,34 @@ def test_pages_endpoints():
     assert client.get("/api/seo-geo/pages/legalsoft").json()["pages"]["pages"][0]["path"] == "/pricing"
 
 
+def test_pages_refresh_forwards_gsc_failure_note():
+    """A zeroed-out Pages tab must carry the reason it's zero, not read as a
+    real all-zero measurement — offline mode means GSC degrades every time."""
+    from seo_geo_agent import state as seo_state
+
+    seo_state.save("corpus-legalsoft", {"brand_id": "legalsoft", "pages": [{
+        "url": "https://legalsoft.com/pricing", "title": "Pricing", "word_count": 800,
+        "meta_description": "d", "h1_count": 1, "images_no_alt": 0,
+    }]})
+    r = client.post("/api/seo-geo/pages/legalsoft/refresh")
+    assert r.status_code == 200, r.text
+    assert any(n.startswith("Search Console:") for n in r.json()["notes"])
+
+
+def test_pages_refresh_forwards_ga_failure_note():
+    from seo_geo_agent import insights, state as seo_state
+
+    brand = next(b for b in insights.list_brands() if b["id"] == "legalsoft")
+    insights.upsert_brand({**brand, "ga4_property": "properties/999"})
+    seo_state.save("corpus-legalsoft", {"brand_id": "legalsoft", "pages": [{
+        "url": "https://legalsoft.com/pricing", "title": "Pricing", "word_count": 800,
+        "meta_description": "d", "h1_count": 1, "images_no_alt": 0,
+    }]})
+    r = client.post("/api/seo-geo/pages/legalsoft/refresh")
+    assert r.status_code == 200, r.text
+    assert any(n.startswith("Google Analytics:") for n in r.json()["notes"])
+
+
 def test_ask_expert_offline_503():
     r = client.post("/api/seo-geo/ask/legalsoft", json={"question": "kya karna chahiye?"})
     assert r.status_code == 503

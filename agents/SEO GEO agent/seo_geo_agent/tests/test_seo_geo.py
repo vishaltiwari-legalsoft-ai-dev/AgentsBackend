@@ -274,6 +274,32 @@ def test_clamped_competitor_topic_gets_priority_recomputed_from_final_score():
     assert ranked.index(seed) < ranked.index(comp)
 
 
+def test_competitor_clamp_preserves_relative_order():
+    """Regression: when multiple competitor-content topics get clamped below the
+    seed floor, they must not all collapse to one identical clamped score —
+    their relative order (by pre-clamp score) has to survive the clamp."""
+    brand = {"id": "b", "domain": "x.com", "seeds": ["legal virtual assistant"]}
+    rows = [
+        row(query="legal virtual assistant", impressions=5, position=8.0),
+        row(query="outsourced paralegal staffing", impressions=900, position=8.0),
+        row(query="virtual receptionist backup service", impressions=300, position=8.0),
+    ]
+    competitor_topics = ["outsourced paralegal staffing", "virtual receptionist backup service"]
+
+    ranked, _ = topics.build_topics(brand, rows, [], search=None, competitor_topics=competitor_topics)
+
+    seed = next(t for t in ranked if t["source"] == "seed")
+    comp_high = next(t for t in ranked if t["keyword"].lower() == "outsourced paralegal staffing")
+    comp_low = next(t for t in ranked if t["keyword"].lower() == "virtual receptionist backup service")
+
+    # both competitor topics outscore the seed pre-clamp and get pulled below its floor
+    assert comp_high["score"] < seed["score"]
+    assert comp_low["score"] < seed["score"]
+    # but they must not collapse to the same clamped value — the higher-volume
+    # topic keeps its edge over the lower-volume one
+    assert comp_high["score"] > comp_low["score"]
+
+
 def test_live_topics_cap_at_ten():
     brand = {"id": "b", "domain": "x.com", "seeds": []}
     rows = [

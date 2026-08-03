@@ -200,13 +200,18 @@ def ga_fetch_pages(prop: str, start: date, end: date, service=None, limit: int =
         raise
     except Exception as exc:  # noqa: BLE001
         raise CredentialMissing(f"Google Analytics rejected {prop}: {exc}") from exc
-    return [
-        {"path": (r.get("dimensionValues") or [{}])[0].get("value", ""),
-         "views": int(float(r["metricValues"][0]["value"])),
-         "sessions": int(float(r["metricValues"][1]["value"])),
-         "engagement_rate": float(r["metricValues"][2]["value"])}
-        for r in resp.get("rows", [])
-    ]
+    pages: list[dict] = []
+    for r in resp.get("rows", []):
+        try:
+            pages.append({
+                "path": (r.get("dimensionValues") or [{}])[0].get("value", ""),
+                "views": int(float(r["metricValues"][0]["value"])),
+                "sessions": int(float(r["metricValues"][1]["value"])),
+                "engagement_rate": float(r["metricValues"][2]["value"]),
+            })
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue  # one malformed row must not be a fatal (non-CredentialMissing) crash
+    return pages
 
 
 def _gsc_service():

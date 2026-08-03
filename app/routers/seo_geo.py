@@ -226,16 +226,16 @@ def refresh_pages(brand_id: str, user=Depends(get_current_user)):
     corpus = seo_state.load(f"corpus-{brand_id}") or {}
     if not corpus.get("pages"):
         raise HTTPException(status_code=409, detail="Run the site analysis first")
-    rows, _ = _rows_28d(brand)
+    rows, notes = _rows_28d(brand)
     ga_pages = []
     prop = brand.get("ga4_property")
     if prop:
         try:
             end = date.today()
             ga_pages = ga_fetch_pages(prop, end - timedelta(days=28), end)
-        except CredentialMissing:
-            pass
-    return seo_pages.build_page_intel(brand, corpus["pages"], ga_pages, rows)
+        except CredentialMissing as exc:
+            notes.append(f"Google Analytics: {exc}")
+    return seo_pages.build_page_intel(brand, corpus["pages"], ga_pages, rows, data_notes=notes)
 
 
 @router.post("/seo-geo/todos/{brand_id}/{todo_id}")

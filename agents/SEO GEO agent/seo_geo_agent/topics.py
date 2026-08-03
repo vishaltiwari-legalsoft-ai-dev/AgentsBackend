@@ -255,9 +255,15 @@ def build_topics(
     seed_scores = [t["score"] for t in topics if t["source"] == "seed"]
     if seed_scores:
         seed_floor = min(seed_scores)
-        for t in topics:
-            if t["source"] == "competitor-content" and t["score"] >= seed_floor:
-                t["score"] = round(seed_floor - 0.001, 3)
+        # Clamped topics still need relative order among themselves — step each
+        # one down a notch further than the last, ranked by its pre-clamp score,
+        # so a batch of gap topics doesn't all collapse to one identical value.
+        to_clamp = sorted(
+            (t for t in topics if t["source"] == "competitor-content" and t["score"] >= seed_floor),
+            key=lambda t: t["score"], reverse=True,
+        )
+        for i, t in enumerate(to_clamp):
+            t["score"] = round(seed_floor - 0.001 - i * 0.001, 3)
 
     # Priority is a display label derived from score — compute it last, after the
     # competitor clamp above has had its final say, so a clamped topic never shows

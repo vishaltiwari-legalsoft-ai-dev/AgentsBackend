@@ -39,6 +39,18 @@ def test_ga_fetch_pages_parses_rows():
     assert pages == [{"path": "/pricing", "views": 1200, "sessions": 900, "engagement_rate": 0.7}]
 
 
+def test_ga_fetch_pages_skips_malformed_rows():
+    """A row missing metrics must not raise KeyError/IndexError — that's not a
+    CredentialMissing, so it would otherwise escape run_brand's degrade guard."""
+    svc = FakePagesData({"rows": [
+        {"dimensionValues": [{"value": "/good"}],
+         "metricValues": [{"value": "10"}, {"value": "5"}, {"value": "0.5"}]},
+        {"dimensionValues": [{"value": "/bad"}], "metricValues": [{"value": "10"}]},
+    ]})
+    pages = ga_fetch_pages("properties/2", date(2026, 7, 6), date(2026, 8, 3), service=svc)
+    assert pages == [{"path": "/good", "views": 10, "sessions": 5, "engagement_rate": 0.5}]
+
+
 def test_corpus_entries_carry_on_page_facts():
     facts = PageFacts(url="https://x.com/a", status=200, title="A", meta_description="d",
                       h1=["A"], word_count=500, text="body")
@@ -82,6 +94,32 @@ def test_health_flags_fire():
     assert {"no-title", "no-meta", "thin", "no-h1"} <= set(flags)
 
 
+def test_meta_long_only_gets_heuristic_rec():
+    """A page whose only flag is meta-long must not fall through to the
+    generic 'Healthy' fallback — it has a real, actionable issue."""
+    doc = pages_mod.build_page_intel(
+        {"id": "b", "domain": "x.com"},
+        corpus_pages=[_corpus_page(meta_description="d" * 200)],
+        ga_pages=[], gsc_rows=[],
+    )
+    page = doc["pages"][0]
+    assert page["flags"] == ["meta-long"]
+    assert page["recommendation"] == "Tighten the meta description under 160 characters — long snippets get truncated."
+
+
+def test_data_notes_merge_into_persisted_doc():
+    """Upstream GA/GSC degradation notes passed in by the caller (router or
+    run_brand) must land in the persisted doc, not be silently dropped."""
+    doc = pages_mod.build_page_intel(
+        {"id": "b", "domain": "x.com"},
+        corpus_pages=[_corpus_page()],
+        ga_pages=[], gsc_rows=[],
+        data_notes=["Search Console: offline mode", "Google Analytics: no property shared"],
+    )
+    assert "Search Console: offline mode" in doc["notes"]
+    assert "Google Analytics: no property shared" in doc["notes"]
+
+
 def test_offline_recs_are_honest_heuristics():
     doc = pages_mod.build_page_intel({"id": "b", "domain": "x.com"},
                                      corpus_pages=[_corpus_page(meta_description="")],
@@ -103,6 +141,9 @@ def test_page_known_only_from_ga_is_flagged_not_crawled():
     p = doc["pages"][0]
     assert p["flags"] == ["not-crawled"]
     assert p["recommendation"] == "Not in the site crawl — re-run the site analysis to audit this page."
+    # no crawled pages at all -> ai_candidates is empty -> the AI pass never ran;
+    # ai must reflect that honestly rather than defaulting to True
+    assert doc["ai"] is False
 
 
 def test_ai_recs_success_used_for_top_traffic_only(monkeypatch):
@@ -121,9 +162,11 @@ def test_ai_recs_success_used_for_top_traffic_only(monkeypatch):
     assert doc["ai"] is True
     by_path = {p["path"]: p for p in doc["pages"]}
     assert by_path["/p0"]["recommendation"] == "Ship the pricing table above the fold."
+    assert by_path["/p0"]["ai"] is True
     # lowest-traffic page (index n-1) falls outside the top MAX_AI_PAGES slice sent to the LLM
     beyond = by_path[f"/p{n - 1}"]
     assert beyond["recommendation"] == "Healthy — keep it fresh and add internal links to weaker pages."
+    assert beyond["ai"] is False
 
 
 def test_ai_recs_malformed_json_falls_back_to_heuristics(monkeypatch):

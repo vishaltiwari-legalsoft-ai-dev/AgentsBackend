@@ -88,10 +88,15 @@ def rank_shifts(brand_id: str) -> list[dict]:
     return shifts
 
 
-def sitemap_watch(brand: dict, fetch_sitemap=None) -> dict:
-    """Diff each tracked competitor's sitemap vs last check -> new content feed."""
+def sitemap_watch(brand: dict, fetch_sitemap=None, state_key: str | None = None) -> dict:
+    """Diff each tracked competitor's sitemap vs last check -> new content feed.
+
+    ``state_key`` lets independent callers (the manual-competitor tracker vs the
+    top-5 profile builder) keep their own "known domains" state so one doesn't
+    stomp the other's doc — default preserves the original shared doc id."""
     fetch = fetch_sitemap or sources.fetch_sitemap
-    stored = state.load(f"sitemaps-{brand['id']}") or {"domains": {}}
+    key = state_key or f"sitemaps-{brand['id']}"
+    stored = state.load(key) or {"domains": {}}
     feed: dict[str, dict] = {}
     for comp in brand.get("competitors", [])[:8]:
         try:
@@ -109,7 +114,7 @@ def sitemap_watch(brand: dict, fetch_sitemap=None) -> dict:
             "first_check": not known,
         }
     stored["last_feed"] = feed
-    state.save(f"sitemaps-{brand['id']}", stored)
+    state.save(key, stored)
     return feed
 
 
@@ -189,7 +194,7 @@ def resolve_top5(brand: dict, ranks_doc: dict | None) -> list[str]:
     return out[:MAX_PROFILES]
 
 
-def _domain_stats(domain: str, latest_ranks: dict) -> tuple[int, float | None, list[dict]]:
+def _domain_stats(domain: str, latest_ranks: dict) -> tuple[int | None, float | None, list[dict]]:
     """Visibility, average position, and the keywords a competitor beats us on —
     all read straight off the latest rank snapshot, no extra lookups."""
     total = len(latest_ranks)
@@ -204,7 +209,7 @@ def _domain_stats(domain: str, latest_ranks: dict) -> tuple[int, float | None, l
         our_position = entry.get("position")
         if our_position is None or their_position < our_position:
             won.append({"keyword": kw, "their_position": their_position, "our_position": our_position})
-    visibility_pct = round(100 * len(positions) / total) if total else 0
+    visibility_pct = round(100 * len(positions) / total) if total else None
     avg_position = round(sum(positions) / len(positions), 1) if positions else None
     return visibility_pct, avg_position, won
 
@@ -266,7 +271,8 @@ def build_profiles(brand: dict, search=None, fetch=None, fetch_sitemap=None) -> 
     feed: dict[str, dict] = {}
     if top5:
         try:
-            feed = sitemap_watch({**brand, "competitors": top5}, fetch_sitemap=fetch_sitemap)
+            feed = sitemap_watch({**brand, "competitors": top5}, fetch_sitemap=fetch_sitemap,
+                                  state_key=f"profile-sitemaps-{brand['id']}")
         except CredentialMissing as exc:
             notes.append(f"Sitemap watch: {exc}")
 
@@ -283,10 +289,15 @@ def build_profiles(brand: dict, search=None, fetch=None, fetch_sitemap=None) -> 
             except CredentialMissing as exc:
                 notes.append(f"Page fetch {url}: {exc}")
                 break
+            if facts.status != 200 or not (facts.title or facts.text):
+                continue
             title = facts.title or url
             topic = max(facts.h1, key=len) if facts.h1 else title
             volume = _match_volume(title, clusters)
-            clicks, basis = None, "no volume data — reach unknown"
+            clicks = None
+            # A matched volume is real signal even before any SERP check runs —
+            # only claim "no volume data" when there genuinely was none.
+            basis = "volume matched — SERP check unavailable this run" if volume else "no volume data — reach unknown"
             if volume and search and calls < MAX_SERPER_PER_COMPETITOR:
                 calls += 1
                 try:
