@@ -281,7 +281,7 @@ def build_profiles(brand: dict, search=None, fetch=None, fetch_sitemap=None) -> 
             try:
                 facts = fetch(url)
             except CredentialMissing as exc:
-                notes.append(f"Page fetch: {exc}")
+                notes.append(f"Page fetch {url}: {exc}")
                 break
             title = facts.title or url
             topic = max(facts.h1, key=len) if facts.h1 else title
@@ -298,7 +298,7 @@ def build_profiles(brand: dict, search=None, fetch=None, fetch_sitemap=None) -> 
                         clicks = round(volume * insights.ctr_at(position))
                         basis = "lab volume × CTR curve"
                 except CredentialMissing as exc:
-                    notes.append(f"Serper: {exc}")
+                    notes.append(f"Serper {domain}: {exc}")
                     search = None
             recent_posts.append({
                 "url": url, "title": title, "topic": topic,

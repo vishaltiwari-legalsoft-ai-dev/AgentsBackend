@@ -122,6 +122,78 @@ def test_reach_estimate_uses_lab_volume_and_ctr_curve():
     assert post["estimate_basis"] == "lab volume × CTR curve"
 
 
+def test_sitemap_watch_failure_degrades_with_note_and_continues():
+    _seed_ranks(BRAND["id"])
+
+    def fetch_sitemap(domain):
+        raise CredentialMissing("sitemap unreachable")
+
+    doc = competitors.build_profiles(BRAND, fetch_sitemap=fetch_sitemap)
+    assert any(n == "Sitemap watch: sitemap unreachable" for n in doc["notes"])
+    profile = doc["profiles"][0]
+    assert profile["domain"] == "comp.com"
+    assert profile["recent_posts"] == []
+    assert profile["hot_topics"] == []
+    # visibility/keywords_won come from the ranks doc, unaffected by the feed failure
+    assert profile["visibility_pct"] == 67
+
+
+def test_page_fetch_failure_notes_the_url_and_lets_other_domains_build():
+    _seed_ranks(BRAND["id"])
+    brand = {**BRAND, "competitors": ["comp2.com"]}  # manual competitor, tops up with suggested comp.com
+    state.save(f"sitemaps-{BRAND['id']}", {"domains": {
+        "comp2.com": ["https://comp2.com/baseline"],
+        "comp.com": ["https://comp.com/baseline"],
+    }})
+
+    def fetch_sitemap(domain):
+        return {
+            "comp2.com": ["https://comp2.com/baseline", "https://comp2.com/new-post"],
+            "comp.com": ["https://comp.com/baseline", "https://comp.com/new-post"],
+        }[domain]
+
+    def fetch(url):
+        if "comp2.com" in url:
+            raise CredentialMissing("page unreachable")
+        return PageFacts(url=url, status=200, title="Some Title")
+
+    doc = competitors.build_profiles(brand, fetch=fetch, fetch_sitemap=fetch_sitemap)
+    assert any(n == "Page fetch https://comp2.com/new-post: page unreachable" for n in doc["notes"])
+    by_domain = {p["domain"]: p for p in doc["profiles"]}
+    assert by_domain["comp2.com"]["recent_posts"] == []  # broke before appending anything
+    assert len(by_domain["comp.com"]["recent_posts"]) == 1  # the next domain still builds fine
+
+
+def test_serper_failure_notes_domain_and_disables_further_calls():
+    _seed_ranks(BRAND["id"])
+    new_urls = [f"https://comp.com/blog/legal-answering-service-{i}" for i in range(2)]
+    state.save(f"sitemaps-{BRAND['id']}", {"domains": {"comp.com": ["https://comp.com/baseline"]}})
+    state.save(f"keywords-{BRAND['id']}", {"clusters": [
+        {"name": "legal answering service", "intent": "commercial",
+         "keywords": ["legal answering service"], "volume_est": 500},
+    ]})
+
+    def fetch_sitemap(domain):
+        return ["https://comp.com/baseline"] + new_urls
+
+    def fetch(url):
+        return PageFacts(url=url, status=200, title="Legal Answering Service Update")
+
+    calls_made = []
+
+    def search(query):
+        calls_made.append(query)
+        raise CredentialMissing("serper down")
+
+    doc = competitors.build_profiles(BRAND, search=search, fetch=fetch, fetch_sitemap=fetch_sitemap)
+    assert len(calls_made) == 1  # disabled after the first failure — post 2 never retries
+    assert any(n == "Serper comp.com: serper down" for n in doc["notes"])
+    posts = doc["profiles"][0]["recent_posts"]
+    assert len(posts) == 2
+    assert all(p["est_monthly_clicks"] is None for p in posts)
+    assert all(p["estimate_basis"] == "no volume data — reach unknown" for p in posts)
+
+
 def test_serper_cap_two_calls_per_competitor():
     _seed_ranks(BRAND["id"])
     new_urls = [f"https://comp.com/blog/legal-answering-service-{i}" for i in range(3)]
