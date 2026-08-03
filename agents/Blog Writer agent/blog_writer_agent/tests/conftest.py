@@ -19,4 +19,5 @@ import pytest
 def _offline(monkeypatch, tmp_path):
     monkeypatch.setenv("BLOG_OFFLINE", "1")
     monkeypatch.setenv("BLOG_LOCAL_DIR", str(tmp_path / "blog_state"))
+    monkeypatch.setenv("SEO_OFFLINE", "1")  # keeps the serper app-config fallback off Firestore
     monkeypatch.delenv("SEO_SERPER_API_KEY", raising=False)

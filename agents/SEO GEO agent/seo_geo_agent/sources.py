@@ -253,15 +253,30 @@ def gsc_fetch(prop: str, start: date, end: date, service=None) -> list[QueryStat
     ]
 
 
+def _serper_key() -> str:
+    """Env var first; in cloud mode fall back to the admin-managed app config
+    (Firestore ``app_config/global`` → ``seo_serper_api_key``) so prod works
+    without a Cloud Run env change. Offline mode never touches Firestore."""
+    key = os.environ.get("SEO_SERPER_API_KEY", "")
+    if key or not state.use_cloud():
+        return key
+    try:
+        from app.services.firestore_repo import get_app_config
+
+        return str(get_app_config().get("seo_serper_api_key") or "")
+    except Exception:  # noqa: BLE001 — config unreachable = no key, honestly
+        return ""
+
+
 def serper_available() -> bool:
-    return bool(os.environ.get("SEO_SERPER_API_KEY")) and state.use_cloud()
+    return bool(_serper_key()) and state.use_cloud()
 
 
 def serper_search(query: str, client: httpx.Client | None = None) -> dict:
     """One Google SERP via Serper: organic top-10, related searches, PAA, AIO flag."""
-    if not serper_available():
+    key = _serper_key()
+    if not key or not state.use_cloud():
         raise CredentialMissing("SEO_SERPER_API_KEY not set")
-    key = os.environ["SEO_SERPER_API_KEY"]
     own = client is None
     cli = client or httpx.Client(timeout=20)
     try:
