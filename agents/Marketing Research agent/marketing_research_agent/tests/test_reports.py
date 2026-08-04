@@ -159,3 +159,78 @@ def test_narrative_prompt_asks_for_the_shape_the_doc_renders(kind):
     assert "\n- " in prompt, f"{kind}: does not show the '- ' marker"
     assert "no markdown" not in low, f"{kind}: blanket markdown ban contradicts bullets"
     assert "no bullet" not in low, f"{kind}: still forbids the bullets the doc renders"
+
+
+# --- explicit period (month/quarter picker) ----------------------------------
+
+def _pm(year, month, day, spend, channel="Google", campaign="c"):
+    return CampaignMetric(
+        channel=channel, campaign=campaign, utm_source="g", utm_medium="cpc",
+        utm_campaign=campaign, spend=spend, leads=10, qualified_leads=5,
+        demos_booked=2, demos_completed=1, date=date(year, month, day),
+    )
+
+
+def test_monthly_report_builds_explicit_past_month(monkeypatch, tmp_path):
+    """Aug 4: picking July must read July only — not June, not the pre-filled
+    September retainer month, and not month-to-date August."""
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    ds = {"metrics": [_pm(2026, 6, 29, 999.0), _pm(2026, 7, 31, 500.0),
+                      _pm(2026, 8, 1, 100.0), _pm(2026, 9, 1, 2200.0)],
+          "leads": [], "today": date(2026, 8, 4)}
+    r = reports.build("monthly_summary", ds, user_id="u1", period="2026-07")
+    p = r["structured"]["period"]
+    assert p["start"] == "2026-07-01" and p["end"] == "2026-07-31"
+    assert r["structured"]["totals"]["spend"] == 500.0
+
+
+def test_monthly_report_current_month_clamps_to_yesterday(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    ds = {"metrics": [_pm(2026, 7, 1, 500.0)], "leads": [], "today": date(2026, 7, 9)}
+    r = reports.build("monthly_summary", ds, user_id="u1", period="2026-07")
+    p = r["structured"]["period"]
+    assert p["start"] == "2026-07-01" and p["end"] == "2026-07-08"
+
+
+def test_quarterly_report_builds_explicit_quarter(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    ds = {"metrics": [_pm(2026, 4, 1, 100.0), _pm(2026, 6, 1, 200.0), _pm(2026, 7, 1, 400.0)],
+          "leads": [], "today": date(2026, 8, 4)}
+    r = reports.build("quarterly_summary", ds, user_id="u1", period="2026-Q2")
+    p = r["structured"]["period"]
+    assert p["start"] == "2026-04-01" and p["end"] == "2026-06-30"
+    assert r["structured"]["totals"]["spend"] == 300.0
+
+
+def test_explicit_period_without_data_raises_not_falls_back(monkeypatch, tmp_path):
+    """The silent latest-month fallback is for the default path only. An explicit
+    'May 2026' with no May data must error, never show another month's numbers."""
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    ds = {"metrics": [_pm(2026, 6, 29, 999.0)], "leads": [], "today": date(2026, 8, 4)}
+    with pytest.raises(reports.PeriodError) as exc:
+        reports.build("monthly_summary", ds, user_id="u1", period="2026-05")
+    assert "May 2026" in str(exc.value)
+
+
+def test_bad_period_values_raise(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    ds = {"metrics": [_pm(2026, 7, 1, 1.0)], "leads": [], "today": date(2026, 8, 4)}
+    for kind, period in [("monthly_summary", "2026-13"),   # not a month
+                         ("monthly_summary", "julio"),      # not a format
+                         ("quarterly_summary", "2026-Q5"),  # not a quarter
+                         ("daily_summary", "2026-07"),      # kind takes no period
+                         ("icp_signal", "2026-07"),         # non-campaign kind
+                         ("monthly_summary", "2027-01")]:   # future month
+        with pytest.raises(reports.PeriodError):
+            reports.build(kind, ds, user_id="u1", period=period)
+
+
+def test_explicit_month_drops_vendors_without_data_in_month(monkeypatch, tmp_path):
+    """A vendor with no July rows disappears from the July report — it must not
+    fall back to its June numbers (per-vendor honesty)."""
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    july, june = _pm(2026, 7, 1, 500.0), _pm(2026, 6, 1, 300.0)
+    ds = {"metrics": [june, july], "leads": [], "today": date(2026, 8, 4),
+          "vendor_metrics": {"Meta 360 RA": [july], "Old Vendor": [june]}}
+    r = reports.build("monthly_summary", ds, user_id="u1", period="2026-07")
+    assert [v["vendor"] for v in r["structured"]["vendors"]] == ["Meta 360 RA"]
