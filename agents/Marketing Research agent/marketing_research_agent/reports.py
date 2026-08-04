@@ -549,3 +549,33 @@ def overview(ds: dict) -> dict:
         "flag_summary": s["flag_summary"],
         "sources": sources,
     }
+
+
+# --- picker periods -------------------------------------------------------------
+
+def available_periods(dataset: dict) -> dict:
+    """Months/quarters the Reports picker can offer: metric months on/before the
+    month containing yesterday (vendor tabs pre-fill future retainer months),
+    newest first. 'Current' is the month/quarter containing yesterday."""
+    today = dataset.get("today") or date.today()
+    yesterday = today - timedelta(days=1)
+    cur_ym = (yesterday.year, yesterday.month)
+    cur_q = (yesterday.year, (yesterday.month - 1) // 3 + 1)
+    months = sorted(
+        {(m.date.year, m.date.month) for m in dataset.get("metrics", [])
+         if (m.date.year, m.date.month) <= cur_ym},
+        reverse=True,
+    )
+    quarters = sorted({(y, (mo - 1) // 3 + 1) for y, mo in months}, reverse=True)
+    return {
+        "months": [
+            {"period": f"{y:04d}-{mo:02d}", "label": date(y, mo, 1).strftime("%B %Y"),
+             "current": (y, mo) == cur_ym}
+            for y, mo in months
+        ],
+        "quarters": [
+            {"period": f"{y:04d}-Q{q}", "label": f"Q{q} {y}",
+             "current": (y, q) == cur_q}
+            for y, q in quarters
+        ],
+    }

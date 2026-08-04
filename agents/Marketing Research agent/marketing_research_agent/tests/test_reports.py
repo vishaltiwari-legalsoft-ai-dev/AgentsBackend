@@ -234,3 +234,42 @@ def test_explicit_month_drops_vendors_without_data_in_month(monkeypatch, tmp_pat
           "vendor_metrics": {"Meta 360 RA": [july], "Old Vendor": [june]}}
     r = reports.build("monthly_summary", ds, user_id="u1", period="2026-07")
     assert [v["vendor"] for v in r["structured"]["vendors"]] == ["Meta 360 RA"]
+
+
+# --- available periods (picker data) ----------------------------------------
+
+def test_available_periods_lists_data_months_newest_first(monkeypatch, tmp_path):
+    """June/July/September data on Aug 4 → July, June (Sept is a pre-filled
+    future retainer month; no August data so no August entry)."""
+    ds = {"metrics": [_pm(2026, 6, 29, 999.0), _pm(2026, 7, 31, 500.0),
+                      _pm(2026, 9, 1, 2200.0)],
+          "leads": [], "today": date(2026, 8, 4)}
+    p = reports.available_periods(ds)
+    assert [m["period"] for m in p["months"]] == ["2026-07", "2026-06"]
+    assert [m["label"] for m in p["months"]] == ["July 2026", "June 2026"]
+    assert all(m["current"] is False for m in p["months"])
+    assert [q["period"] for q in p["quarters"]] == ["2026-Q3", "2026-Q2"]
+    assert p["quarters"][0]["current"] is True  # Q3 contains yesterday (Aug 3)
+
+
+def test_available_periods_flags_current_month(monkeypatch, tmp_path):
+    ds = {"metrics": [_pm(2026, 7, 31, 500.0), _pm(2026, 8, 1, 100.0)],
+          "leads": [], "today": date(2026, 8, 4)}
+    p = reports.available_periods(ds)
+    assert p["months"][0] == {"period": "2026-08", "label": "August 2026", "current": True}
+    assert p["months"][1]["current"] is False
+
+
+def test_available_periods_on_month_first_day(monkeypatch, tmp_path):
+    """On Aug 1 'yesterday' is July 31 — July is the current/topmost month and a
+    zero-day August window is never offered."""
+    ds = {"metrics": [_pm(2026, 7, 31, 500.0), _pm(2026, 8, 1, 100.0)],
+          "leads": [], "today": date(2026, 8, 1)}
+    p = reports.available_periods(ds)
+    assert [m["period"] for m in p["months"]] == ["2026-07"]
+    assert p["months"][0]["current"] is True
+
+
+def test_available_periods_empty_dataset(monkeypatch, tmp_path):
+    assert reports.available_periods({"metrics": [], "today": date(2026, 8, 4)}) == \
+        {"months": [], "quarters": []}
