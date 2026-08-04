@@ -108,3 +108,54 @@ def test_ingest_pdf_offline_stores_dataset():
         "/api/mr/ingest-pdf",
         files={"file": ("notes.txt", io.BytesIO(b"hi"), "text/plain")},
     ).status_code == 400
+
+
+def _ingest():
+    r = client.post(
+        "/api/mr/ingest",
+        files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+        data={"platform": "google_ads"},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_monthly_report_accepts_explicit_period():
+    _ingest()
+    r = client.post("/api/mr/reports/monthly_summary", json={"period": "2026-06"})
+    assert r.status_code == 200, r.text
+    p = r.json()["structured"]["period"]
+    assert p["start"] == "2026-06-01" and p["end"] == "2026-06-30"
+
+
+def test_explicit_period_without_data_is_422_not_wrong_month():
+    _ingest()
+    r = client.post("/api/mr/reports/monthly_summary", json={"period": "2026-01"})
+    assert r.status_code == 422
+    assert "January 2026" in r.json()["detail"]
+
+
+def test_period_rejected_for_other_kinds():
+    _ingest()
+    assert client.post("/api/mr/reports/daily_summary",
+                       json={"period": "2026-06"}).status_code == 422
+    assert client.post("/api/mr/reports/daily_movement",
+                       json={"period": "2026-06"}).status_code == 422
+
+
+def test_report_periods_endpoint_lists_data_months():
+    _ingest()
+    r = client.get("/api/mr/report-periods")
+    assert r.status_code == 200, r.text
+    months = r.json()["months"]
+    assert "2026-06" in [m["period"] for m in months]
+    assert {"period", "label", "current"} <= set(months[0])
+    assert "2026-Q2" in [q["period"] for q in r.json()["quarters"]]
+
+
+def test_run_list_includes_period_label():
+    _ingest()
+    rep = client.post("/api/mr/reports/monthly_summary", json={"period": "2026-06"})
+    assert rep.status_code == 200, rep.text
+    mine = next(x for x in client.get("/api/mr/runs").json()
+                if x["id"] == rep.json()["id"])
+    assert mine["period"] == "Jun 1–30, 2026"

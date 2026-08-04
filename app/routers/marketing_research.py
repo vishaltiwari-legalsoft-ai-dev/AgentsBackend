@@ -597,19 +597,36 @@ def get_config(user=Depends(get_current_user)):
     }
 
 
+@router.get("/mr/report-periods")
+def report_periods(user=Depends(get_current_user)):
+    """Months and quarters that actually hold tracker data — feeds the Reports
+    panel's month/quarter picker."""
+    return reports.available_periods(_load_dataset(user["id"]))
+
+
 @router.post("/mr/reports/{kind}")
-def make_report(kind: str, user=Depends(get_current_user)):
+def make_report(kind: str, body: dict | None = None, user=Depends(get_current_user)):
+    """Build one report. Body (optional): ``{"period": "2026-07" | "2026-Q3"}`` —
+    monthly/quarterly only. An explicit period never substitutes another month's
+    data: an empty window is a 422, not a silent fallback."""
     if kind not in reports.KINDS:
         raise HTTPException(404, f"unknown report kind '{kind}' (expected one of {reports.KINDS})")
+    period = str((body or {}).get("period") or "").strip() or None
+    if period and kind not in ("monthly_summary", "quarterly_summary"):
+        raise HTTPException(422, f"'{kind}' reports don't take a period.")
     if kind == "daily_movement":
         return reports.build(kind, {"snapshot_deltas": mr_snapshots.deltas_for()}, user_id=user["id"])
-    return reports.build(kind, _load_dataset(user["id"]), user_id=user["id"])
+    try:
+        return reports.build(kind, _load_dataset(user["id"]), user_id=user["id"], period=period)
+    except reports.PeriodError as exc:
+        raise HTTPException(422, str(exc))
 
 
 @router.get("/mr/runs")
 def list_report_runs(user=Depends(get_current_user)):
     return [
-        {"id": r["id"], "kind": r.get("kind"), "generated_at": r.get("generated_at")}
+        {"id": r["id"], "kind": r.get("kind"), "generated_at": r.get("generated_at"),
+         "period": ((r.get("structured") or {}).get("period") or {}).get("label")}
         for r in runs.list_runs(user["id"])
         if r.get("kind") in reports.KINDS
     ]

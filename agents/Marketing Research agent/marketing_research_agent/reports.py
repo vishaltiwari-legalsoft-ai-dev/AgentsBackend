@@ -136,19 +136,60 @@ def _period_window(kind: str, today: date) -> tuple[date, date]:
     return end.replace(day=1), end
 
 
+class PeriodError(ValueError):
+    """A user-facing problem with an explicitly requested report period."""
+
+
+_MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
+_QUARTER_RE = re.compile(r"^(\d{4})-Q([1-4])$")
+
+
+def _month_end(year: int, month: int) -> date:
+    nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    return nxt - timedelta(days=1)
+
+
+def _explicit_window(kind: str, period: str, today: date) -> tuple[date, date, str]:
+    """Window + human name for an explicitly requested period ('2026-07' /
+    '2026-Q2'). The end is clamped to yesterday while the period is still in
+    progress (reports always run through yesterday)."""
+    yesterday = today - timedelta(days=1)
+    if kind == "monthly_summary":
+        m = _MONTH_RE.match(period)
+        if not m or not 1 <= int(m.group(2)) <= 12:
+            raise PeriodError(f"'{period}' is not a month (expected YYYY-MM).")
+        y, mo = int(m.group(1)), int(m.group(2))
+        start, end = date(y, mo, 1), _month_end(y, mo)
+        name = start.strftime("%B %Y")
+    elif kind == "quarterly_summary":
+        q = _QUARTER_RE.match(period)
+        if not q:
+            raise PeriodError(f"'{period}' is not a quarter (expected YYYY-Q1..Q4).")
+        y, qn = int(q.group(1)), int(q.group(2))
+        start, end = date(y, 3 * qn - 2, 1), _month_end(y, 3 * qn)
+        name = f"Q{qn} {y}"
+    else:
+        raise PeriodError(f"'{kind}' reports don't take a period.")
+    if start > yesterday:
+        raise PeriodError(f"No tracker data for {name} yet.")
+    return start, min(end, yesterday), name
+
+
 def _period_label(start: date, end: date) -> str:
     if (start.year, start.month) == (end.year, end.month):
         return f"{start.strftime('%b')} {start.day}–{end.day}, {end.year}"
     return f"{start.strftime('%b')} {start.day} – {end.strftime('%b')} {end.day}, {end.year}"
 
 
-def _clip_to_period(metrics: list, start: date, end: date) -> list:
+def _clip_to_period(metrics: list, start: date, end: date, fallback: bool = True) -> list:
     """Keep the months the window touches (the tracker is a monthly grid).
-    Falls back to the latest month on/before the window's end so a report never
-    silently aggregates pre-filled future retainer months or goes empty."""
+    With ``fallback`` (default reports only), falls back to the latest month
+    on/before the window's end so a report never silently aggregates pre-filled
+    future retainer months or goes empty; explicit periods pass fallback=False
+    and handle emptiness honestly upstream."""
     lo, hi = (start.year, start.month), (end.year, end.month)
     kept = [m for m in metrics if lo <= (m.date.year, m.date.month) <= hi]
-    if not kept and metrics:
+    if not kept and fallback and metrics:
         past = {(m.date.year, m.date.month) for m in metrics
                 if (m.date.year, m.date.month) <= hi}
         if past:
@@ -422,20 +463,47 @@ def _markdown(kind: str, structured: dict) -> str:
     return f"# {title}\n\n{narrative}"
 
 
-def build(kind: str, dataset: dict, user_id: str) -> dict:
-    """Build, persist, and return one report deliverable."""
+def build(kind: str, dataset: dict, user_id: str, period: str | None = None) -> dict:
+    """Build, persist, and return one report deliverable.
+
+    ``period`` (monthly/quarterly only) pins the report to an explicit month
+    ('2026-07') or quarter ('2026-Q2') instead of today's default window.
+    Explicit periods never substitute another month's data — an empty window
+    raises :class:`PeriodError`."""
     if kind not in KINDS:
         raise ValueError(f"unknown report kind: {kind}")
+    if period is not None and kind not in ("monthly_summary", "quarterly_summary"):
+        raise PeriodError(f"'{kind}' reports don't take a period.")
     if kind in CAMPAIGN_KINDS:
         today = dataset.get("today") or date.today()
-        start, end = _period_window(kind, today)
-        dataset = {
-            **dataset,
-            "metrics": _clip_to_period(dataset.get("metrics", []), start, end),
-            "vendor_metrics": {
+        if period is not None:
+            try:
+                start, end, name = _explicit_window(kind, period, today)
+            except PeriodError:
+                raise
+            except ValueError:
+                # date() overflow for degenerate years (0000, 9999-12) — same
+                # user answer as any malformed period.
+                raise PeriodError(f"'{period}' is not a valid period.")
+            metrics = _clip_to_period(dataset.get("metrics", []), start, end, fallback=False)
+            if not metrics:
+                raise PeriodError(f"No tracker data for {name}.")
+            vendor_metrics = {
+                v: kept
+                for v, ms in (dataset.get("vendor_metrics") or {}).items()
+                if (kept := _clip_to_period(ms, start, end, fallback=False))
+            }
+        else:
+            start, end = _period_window(kind, today)
+            metrics = _clip_to_period(dataset.get("metrics", []), start, end)
+            vendor_metrics = {
                 v: _clip_to_period(ms, start, end)
                 for v, ms in (dataset.get("vendor_metrics") or {}).items()
-            } or None,
+            }
+        dataset = {
+            **dataset,
+            "metrics": metrics,
+            "vendor_metrics": vendor_metrics or None,
             "with_vendor_insights": True,
         }
         structured = _structured(kind, dataset)
@@ -487,4 +555,34 @@ def overview(ds: dict) -> dict:
         "channels": s["channels"],
         "flag_summary": s["flag_summary"],
         "sources": sources,
+    }
+
+
+# --- picker periods -------------------------------------------------------------
+
+def available_periods(dataset: dict) -> dict:
+    """Months/quarters the Reports picker can offer: metric months on/before the
+    month containing yesterday (vendor tabs pre-fill future retainer months),
+    newest first. 'Current' is the month/quarter containing yesterday."""
+    today = dataset.get("today") or date.today()
+    yesterday = today - timedelta(days=1)
+    cur_ym = (yesterday.year, yesterday.month)
+    cur_q = (yesterday.year, (yesterday.month - 1) // 3 + 1)
+    months = sorted(
+        {(m.date.year, m.date.month) for m in dataset.get("metrics", [])
+         if (m.date.year, m.date.month) <= cur_ym},
+        reverse=True,
+    )
+    quarters = sorted({(y, (mo - 1) // 3 + 1) for y, mo in months}, reverse=True)
+    return {
+        "months": [
+            {"period": f"{y:04d}-{mo:02d}", "label": date(y, mo, 1).strftime("%B %Y"),
+             "current": (y, mo) == cur_ym}
+            for y, mo in months
+        ],
+        "quarters": [
+            {"period": f"{y:04d}-Q{q}", "label": f"Q{q} {y}",
+             "current": (y, q) == cur_q}
+            for y, q in quarters
+        ],
     }
