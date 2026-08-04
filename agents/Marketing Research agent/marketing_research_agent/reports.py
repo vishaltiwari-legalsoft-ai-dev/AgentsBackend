@@ -477,7 +477,14 @@ def build(kind: str, dataset: dict, user_id: str, period: str | None = None) -> 
     if kind in CAMPAIGN_KINDS:
         today = dataset.get("today") or date.today()
         if period is not None:
-            start, end, name = _explicit_window(kind, period, today)
+            try:
+                start, end, name = _explicit_window(kind, period, today)
+            except PeriodError:
+                raise
+            except ValueError:
+                # date() overflow for degenerate years (0000, 9999-12) — same
+                # user answer as any malformed period.
+                raise PeriodError(f"'{period}' is not a valid period.")
             metrics = _clip_to_period(dataset.get("metrics", []), start, end, fallback=False)
             if not metrics:
                 raise PeriodError(f"No tracker data for {name}.")

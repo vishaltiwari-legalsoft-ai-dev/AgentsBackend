@@ -220,7 +220,9 @@ def test_bad_period_values_raise(monkeypatch, tmp_path):
                          ("quarterly_summary", "2026-Q5"),  # not a quarter
                          ("daily_summary", "2026-07"),      # kind takes no period
                          ("icp_signal", "2026-07"),         # non-campaign kind
-                         ("monthly_summary", "2027-01")]:   # future month
+                         ("monthly_summary", "2027-01"),    # future month
+                         ("monthly_summary", "0000-01"),    # degenerate year
+                         ("quarterly_summary", "9999-Q4")]:  # year overflow in _month_end
         with pytest.raises(reports.PeriodError):
             reports.build(kind, ds, user_id="u1", period=period)
 
