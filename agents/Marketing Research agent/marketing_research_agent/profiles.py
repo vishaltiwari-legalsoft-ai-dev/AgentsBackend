@@ -168,14 +168,17 @@ def _llm_profile(grid: TabGrid, year: int) -> TabProfile:
 
 # --- caching ---------------------------------------------------------------
 
-def _cache_path() -> Path:
+def _cache_path(scope: str = "") -> Path:
+    """One cache file per workbook. ``scope=""`` is the primary tracker and
+    keeps the original filename, so existing deployments' caches stay valid."""
     root = Path(os.environ.get("MR_RUNS_DIR") or (Path(__file__).resolve().parents[1] / "runs"))
     root.mkdir(parents=True, exist_ok=True)
-    return root / "workbook_profiles.json"
+    suffix = re.sub(r"[^A-Za-z0-9_-]", "", scope)
+    return root / (f"workbook_profiles_{suffix}.json" if suffix else "workbook_profiles.json")
 
 
-def load_cached(signature: str) -> list[TabProfile] | None:
-    p = _cache_path()
+def load_cached(signature: str, scope: str = "") -> list[TabProfile] | None:
+    p = _cache_path(scope)
     if not p.exists():
         return None
     try:
@@ -187,26 +190,28 @@ def load_cached(signature: str) -> list[TabProfile] | None:
     return [TabProfile(**d) for d in data.get("profiles", [])]
 
 
-def save_cache(signature: str, profiles: list[TabProfile]) -> None:
-    _cache_path().write_text(
+def save_cache(signature: str, profiles: list[TabProfile], scope: str = "") -> None:
+    _cache_path(scope).write_text(
         json.dumps({"signature": signature, "profiles": [asdict(p) for p in profiles]}, indent=2),
         encoding="utf-8",
     )
 
 
-def profile_workbook(grids: list[TabGrid], *, year: int, use_cache: bool = True, deep: bool = True) -> list[TabProfile]:
+def profile_workbook(grids: list[TabGrid], *, year: int, use_cache: bool = True, deep: bool = True,
+                     scope: str = "") -> list[TabProfile]:
     """Profile every tab.
 
     ``deep`` uses the LLM (refined, cached by workbook signature); otherwise a
     fast heuristic pass (no LLM, not cached) for snappy catalog display. A cached
-    deep profile is always preferred when available."""
+    deep profile is always preferred when available. ``scope`` keys the cache
+    per workbook (empty = the primary tracker)."""
     sig = grid_signature(grids)
     if use_cache:
-        cached = load_cached(sig)
+        cached = load_cached(sig, scope)
         if cached is not None:
             return cached
     if not deep:
         return [_heuristic_profile(g, year) for g in grids]
     profiles = [_llm_profile(g, year) for g in grids]
-    save_cache(sig, profiles)
+    save_cache(sig, profiles, scope)
     return profiles

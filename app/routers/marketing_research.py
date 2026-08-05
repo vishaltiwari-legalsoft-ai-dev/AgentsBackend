@@ -28,6 +28,7 @@ from marketing_research_agent import pdf_export as mr_pdf
 from marketing_research_agent import profiles as mr_profiles
 from marketing_research_agent import reports, runs, schedule
 from marketing_research_agent import snapshots as mr_snapshots
+from marketing_research_agent import sources_registry as mr_sources_registry
 from marketing_research_agent import trends as mr_trends
 from marketing_research_agent import workbook as mr_workbook
 from marketing_research_agent.config import COLUMN_MAPS
@@ -38,6 +39,7 @@ from marketing_research_agent.sources.sheets_source import (
     fetch_all_trackers,
     fetch_official_totals,
     is_rollup_platform,
+    workbook_meta,
 )
 
 router = APIRouter()
@@ -470,17 +472,43 @@ def snapshots_vendor(slug: str, date_iso: str | None = None, user=Depends(get_cu
 
 
 def _workbook_grids():
+    """The PRIMARY workbook only — the snapshot/cron path. Vendor snapshots and
+    official numbers never read secondary sheets."""
     return mr_workbook.fetch_workbook(mr_config.SHEETS_SPREADSHEET_ID)
+
+
+def _workbook_bundle(*, deep: bool, use_cache: bool = True):
+    """(grids, profiles) across every connected workbook — the Ask/catalog
+    substrate. Each workbook is profiled against its own cache; secondary tab
+    titles are namespaced "<label> · <tab>" so answers cite which sheet, and a
+    broken secondary never blocks the primary."""
+    grids = _workbook_grids()
+    profs = mr_profiles.profile_workbook(grids, year=mr_config.SHEETS_YEAR, deep=deep, use_cache=use_cache)
+    for src in mr_sources_registry.extra_sources():
+        try:
+            egrids = mr_workbook.fetch_workbook(src["id"])
+            eprofs = mr_profiles.profile_workbook(
+                egrids, year=mr_config.SHEETS_YEAR, deep=deep, use_cache=use_cache, scope=src["id"])
+        except Exception:
+            logger.warning("MR secondary sheet %s unreadable; skipping", src["id"])
+            continue
+        label = str(src.get("label") or src["id"][:8])
+        for g in egrids:
+            g.title = f"{label} · {g.title}"
+        for p in eprofs:
+            p.title = f"{label} · {p.title}"
+        grids.extend(egrids)
+        profs.extend(eprofs)
+    return grids, profs
 
 
 @router.get("/mr/workbook")
 def workbook_catalog(user=Depends(get_current_user)):
     """The agent's understanding of every tab (fast heuristic, or cached deep)."""
     try:
-        grids = _workbook_grids()
+        _, profs = _workbook_bundle(deep=False)
     except Exception as exc:
         raise HTTPException(502, f"Could not read the spreadsheet: {exc}")
-    profs = mr_profiles.profile_workbook(grids, year=mr_config.SHEETS_YEAR, deep=False)
     return {"tabs": [asdict(p) for p in profs], "count": len(profs)}
 
 
@@ -488,10 +516,9 @@ def workbook_catalog(user=Depends(get_current_user)):
 def workbook_scan(user=Depends(get_current_user)):
     """Deep-profile every tab with the LLM and cache the result."""
     try:
-        grids = _workbook_grids()
+        _, profs = _workbook_bundle(deep=True, use_cache=False)
     except Exception as exc:
         raise HTTPException(502, f"Could not read the spreadsheet: {exc}")
-    profs = mr_profiles.profile_workbook(grids, year=mr_config.SHEETS_YEAR, use_cache=False, deep=True)
     return {"tabs": [asdict(p) for p in profs], "count": len(profs)}
 
 
@@ -503,15 +530,68 @@ def ask(body: dict | None = None, user=Depends(get_current_user)):
     if not question:
         raise HTTPException(400, "question is required")
     try:
-        grids = _workbook_grids()
+        grids, profs = _workbook_bundle(deep=False)
     except Exception as exc:
         raise HTTPException(502, f"Could not read the spreadsheet: {exc}")
-    profs = mr_profiles.profile_workbook(grids, year=mr_config.SHEETS_YEAR, deep=False)
     grid_map = {g.title: g.rows for g in grids}
     return mr_insight.answer(
         question, profs, grid_map,
         timeframe=body.get("timeframe"), year=mr_config.SHEETS_YEAR,
     )
+
+
+@router.get("/mr/sources")
+def sheet_sources(user=Depends(get_current_user)):
+    """Connected workbooks (multi-sheet). The primary tracker is always first."""
+    return {
+        "enabled": mr_sources_registry.multi_sheet_enabled(),
+        "service_account": mr_sources_registry.service_account_email(),
+        "sources": mr_sources_registry.list_sources(),
+    }
+
+
+@router.post("/mr/sources")
+def add_sheet_source(body: dict | None = None, user=Depends(get_current_user)):
+    """Connect another Google Sheet by pasted link. Access is validated up
+    front; the response carries the agent's first-pass read of every tab."""
+    if not mr_sources_registry.multi_sheet_enabled():
+        raise HTTPException(403, "Multi-sheet support is disabled on this deployment (MR_MULTI_SHEET).")
+    body = body or {}
+    sid = mr_sources_registry.parse_spreadsheet_id(str(body.get("url") or body.get("id") or ""))
+    if not sid:
+        raise HTTPException(400, "Paste a Google Sheets link (or its spreadsheet id).")
+    sa = mr_sources_registry.service_account_email()
+    try:
+        meta = workbook_meta(sid)
+    except Exception:
+        raise HTTPException(
+            403, f"Could not open that sheet. Share it with {sa} as Viewer, then try again.")
+    try:
+        src = mr_sources_registry.add_source(sid, label=str(meta.get("title") or sid))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    # First-pass understanding, cached per workbook — never fails the add.
+    try:
+        grids = mr_workbook.fetch_workbook(sid)
+        profs = mr_profiles.profile_workbook(grids, year=mr_config.SHEETS_YEAR, deep=False, scope=sid)
+        tabs = [asdict(p) for p in profs]
+    except Exception:
+        tabs = []
+    return {"source": src, "tabs": tabs, "tab_count": len(meta.get("tabs") or [])}
+
+
+@router.delete("/mr/sources/{spreadsheet_id}")
+def remove_sheet_source(spreadsheet_id: str, user=Depends(get_current_user)):
+    """Disconnect a secondary sheet — the agent stops reading it immediately."""
+    if not mr_sources_registry.multi_sheet_enabled():
+        raise HTTPException(403, "Multi-sheet support is disabled on this deployment (MR_MULTI_SHEET).")
+    try:
+        removed = mr_sources_registry.remove_source(spreadsheet_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if not removed:
+        raise HTTPException(404, "source not found")
+    return {"removed": spreadsheet_id}
 
 
 @router.get("/mr/connectors")

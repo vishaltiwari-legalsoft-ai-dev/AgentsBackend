@@ -207,8 +207,9 @@ def _sheets_service():
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
-def list_tabs(spreadsheet_id: str, *, service=None) -> list[dict]:
-    """Every tab via the Sheets API: ``{gid, title, hidden, rows, cols}``."""
+def workbook_meta(spreadsheet_id: str, *, service=None) -> dict:
+    """Workbook title + tab list in one Sheets API call:
+    ``{"title", "tabs": [{gid, title, hidden, rows, cols}]}``."""
     svc = service or _sheets_service()
     meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     tabs = []
@@ -222,7 +223,13 @@ def list_tabs(spreadsheet_id: str, *, service=None) -> list[dict]:
             "rows": grid.get("rowCount"),
             "cols": grid.get("columnCount"),
         })
-    return tabs
+    title = (meta.get("properties") or {}).get("title") or spreadsheet_id
+    return {"title": title, "tabs": tabs}
+
+
+def list_tabs(spreadsheet_id: str, *, service=None) -> list[dict]:
+    """Every tab via the Sheets API: ``{gid, title, hidden, rows, cols}``."""
+    return workbook_meta(spreadsheet_id, service=service)["tabs"]
 
 
 def fetch_tab_values(spreadsheet_id: str, title: str, *, service=None) -> list[list[str]]:
