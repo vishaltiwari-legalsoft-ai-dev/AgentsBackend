@@ -25,6 +25,10 @@ OVERRIDE_FIELDS: tuple[str, ...] = (
     "openrouter_image_model",
     "openrouter_vision_model",
     "gd_planner_model",
+    # GEO agent engine keys (see Settings.perplexity_api_key etc.)
+    "perplexity_api_key",
+    "gemini_api_key",
+    "openai_api_key",
 )
 
 # Model fields that may additionally be overridden *per agent* in the creator's

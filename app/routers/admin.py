@@ -30,6 +30,15 @@ _MODEL_FIELDS = (
     "openrouter_vision_model",
 )
 
+# Secret API keys manageable from the UI. Value = the prefix a valid key must
+# start with ("" = provider has no stable prefix, accept any non-empty value).
+_SECRET_FIELDS: dict[str, str] = {
+    "openrouter_api_key": "sk-",
+    "perplexity_api_key": "pplx-",
+    "openai_api_key": "sk-",
+    "gemini_api_key": "",
+}
+
 def _mask(secret: str) -> str:
     """Show only enough of a secret to recognise it — never the full value."""
     if not secret:
@@ -61,6 +70,18 @@ def _settings_payload() -> dict:
         "sources": {
             f: ("override" if overrides.get(f) else "env") for f in _MODEL_FIELDS
         },
+        # GEO engine keys (and any future secrets) — masked, with provenance.
+        "keys": {
+            f: {
+                "set": bool(runtime_config.get(f)),
+                "hint": _mask(runtime_config.get(f)),
+                "source": (
+                    "override" if overrides.get(f)
+                    else "env" if getattr(settings, f, "") else "unset"
+                ),
+            }
+            for f in _SECRET_FIELDS
+        },
         # Curated model choices so the UI offers dropdowns instead of free text.
         "catalog": agent_config.MODEL_CATALOG,
     }
@@ -73,6 +94,9 @@ class AdminSettingsBody(BaseModel):
     openrouter_fast_model: str | None = None
     openrouter_image_model: str | None = None
     openrouter_vision_model: str | None = None
+    perplexity_api_key: str | None = None
+    gemini_api_key: str | None = None
+    openai_api_key: str | None = None
 
 
 @router.get("/admin/settings")
@@ -91,15 +115,17 @@ def update_admin_settings(
     value reverts to the environment default. The raw key is never logged.
     """
     patch: dict[str, str] = {}
-    for field in ("openrouter_api_key", *_MODEL_FIELDS):
+    for field in (*_SECRET_FIELDS, *_MODEL_FIELDS):
         value = getattr(body, field)
         if value is None:
             continue
         patch[field] = value.strip()
 
-    key = patch.get("openrouter_api_key")
-    if key and not key.startswith("sk-"):
-        raise HTTPException(400, "An OpenRouter API key should start with 'sk-'.")
+    for field, prefix in _SECRET_FIELDS.items():
+        value = patch.get(field)
+        if value and prefix and not value.startswith(prefix):
+            label = field.replace("_", " ")
+            raise HTTPException(400, f"A {label} should start with '{prefix}'.")
 
     if patch:
         firestore_repo.set_app_config(patch)

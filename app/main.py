@@ -20,6 +20,7 @@ from app.routers import (
     brands,
     canva,
     creative_agent,
+    geo,
     graphics_designer,
     health,
     library,
@@ -82,6 +83,7 @@ for router in (
     creative_agent,
     marketing_research,
     seo_geo,
+    geo,
 ):
     app.include_router(router.router, prefix="/api")
 

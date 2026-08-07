@@ -161,6 +161,17 @@ AGENTS: list[dict[str, str | bool | list[str]]] = [
         "live": True,
         "fields": ["openrouter_model"],
     },
+    {
+        "id": "a10",
+        "name": "GEO",
+        "role": "AI answer visibility",
+        "category": "seo",
+        "live": True,
+        # GEO's LLM use is parsing-grade (prompt universe, sentiment) via
+        # sources.llm_json(agent_id="a10") — fast model only. Engine polling
+        # itself goes to the providers' own APIs, not OpenRouter.
+        "fields": ["openrouter_fast_model"],
+    },
 ]
 
 AGENT_IDS = {str(a["id"]) for a in AGENTS}

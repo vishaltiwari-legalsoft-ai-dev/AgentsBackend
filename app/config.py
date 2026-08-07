@@ -76,6 +76,15 @@ class Settings(BaseSettings):
     app_public_url: str = "http://localhost:3000"
     app_title: str = "AgentOS"
 
+    # GEO agent (a10) — direct engine keys for AI-answer polling. These bypass
+    # OpenRouter on purpose: citation metadata (Perplexity search_results,
+    # Gemini groundingMetadata, OpenAI url_citation) only comes from the
+    # providers' own APIs. All three are optional; each engine simply reports
+    # itself unavailable until its key exists (env or Settings → Secrets).
+    perplexity_api_key: str = ""
+    gemini_api_key: str = ""
+    openai_api_key: str = ""
+
     # Google Cloud
     gcp_project_id: str = ""
     google_application_credentials: str = ""
