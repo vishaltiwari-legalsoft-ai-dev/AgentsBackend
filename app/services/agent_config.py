@@ -259,15 +259,3 @@ def normalize_settings(
         "enabled_tools": tools,
         "enabled_abilities": abilities,
     }
-
-
-def public_settings_payload() -> dict:
-    defaults = normalize_settings(None, None, None)
-    return {
-        "agent_id": "a1",
-        "agent_name": "Graphic Designer",
-        "image_models": IMAGE_MODELS,
-        "abilities": ABILITIES,
-        "tools": TOOLS,
-        "defaults": defaults,
-    }

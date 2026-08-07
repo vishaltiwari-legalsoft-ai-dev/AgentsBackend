@@ -1,7 +1,7 @@
 """AgentOS backend — FastAPI application entry point.
 
-Deployed on Google Cloud Run; serves the LangGraph agent + supporting APIs to
-the Next.js frontend (hosted on Vercel) over CORS.
+Deployed on Google Cloud Run; serves the agent APIs to the Next.js frontend
+(hosted on Vercel) over CORS.
 """
 
 from __future__ import annotations
@@ -15,19 +15,16 @@ from fastapi.responses import JSONResponse
 from app.config import settings
 from app.routers import (
     admin,
-    agent,
     auth,
     blog_writer,
     brands,
     canva,
-    conversations,
     creative_agent,
     graphics_designer,
     health,
     library,
     marketing_research,
     reference_library,
-    references,
     seo_geo,
 )
 from app.services.gd_brand_source import firestore_spec_source
@@ -62,23 +59,23 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
         headers["Access-Control-Allow-Origin"] = origin
         headers["Access-Control-Allow-Credentials"] = "true"
         headers["Vary"] = "Origin"
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"Internal server error: {exc}"},
-        headers=headers,
+    # Exception text can carry file paths / doc ids / model names — keep it in
+    # the server log only outside local dev.
+    detail = (
+        f"Internal server error: {exc}"
+        if settings.app_env == "development"
+        else "Internal server error"
     )
+    return JSONResponse(status_code=500, content={"detail": detail}, headers=headers)
 
 
 for router in (
     health,
     auth,
-    agent,
     blog_writer,
     brands,
     library,
     reference_library,
-    references,
-    conversations,
     admin,
     canva,
     graphics_designer,

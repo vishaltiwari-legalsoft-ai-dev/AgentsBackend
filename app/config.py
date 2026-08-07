@@ -100,10 +100,6 @@ class Settings(BaseSettings):
     # Brand all Drive-synced references are filed under (one-brand folder today).
     gd_drive_brand_name: str = "Legal Soft"
 
-    # Brand-wise master prompt library CSV. Empty = use the bundled
-    # app/data/Sample_master_prompt_brandwise - Sheet2.csv.
-    master_prompts_csv: str = ""
-
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]

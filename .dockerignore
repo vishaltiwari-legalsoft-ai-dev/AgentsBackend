@@ -6,5 +6,6 @@ __pycache__/
 .venv/
 venv/
 gcp-service-account.json
+deploy.env.yaml
 *.log
 .pytest_cache/

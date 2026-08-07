@@ -325,8 +325,9 @@ API docs: `http://localhost:8080/docs`
 - **Image:** Python 3.12-slim + cairo dev libs (for SVG rasterization).
 - **Port:** `8080` (Cloud Run injects `$PORT`).
 - **Resources:** 2 GiB RAM, 2 CPU, 600s timeout (CI/CD config).
-- **Deploy:** `gcloud run deploy agentos-backend --source . --allow-unauthenticated`
-- **CI/CD:** Push to `main` → GitHub Actions → Cloud Run (env vars set once on service).
+- **Deploy:** `gcloud run deploy agentsbackend --source . --region us-central1 --allow-unauthenticated`
+  (the live service is `agentsbackend` — deploys are manual; there is no CI/CD.
+  Env vars are set once on the service and preserved across deploys.)
 
 ### 9.3 Graceful Degradation
 

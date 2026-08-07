@@ -1,23 +1,25 @@
-# AgentOS Backend (FastAPI + LangGraph)
+# AgentOS Backend (FastAPI)
 
-Python API that runs the AgentOS agent and supporting services. Deploys to
-Google Cloud Run.
+Python API that runs the AgentOS agents (Graphics Designer, Marketing Research,
+SEO GEO, Blog Writer) and supporting services. Deploys to Google Cloud Run.
 
 ## Layout
 
 ```
-app/   
+app/
   main.py              FastAPI app, CORS, error handler, router mounting
   config.py            Typed settings (pydantic-settings) from .env
-  models.py            Pydantic request/response schemas
-  security.py          JWT issue/verify + password hashing (bcrypt)
+  security.py          Google Sign-In verification + app JWT issue/verify
   services/
-    openrouter.py      LLM (LangChain) + image generation
+    openrouter.py      LLM (via OpenRouter) + image generation
     firestore_repo.py  Firestore data access
     storage.py         Cloud Storage upload + signed URLs
     canva.py           Canva Connect OAuth + asset import
-  routers/             health, agent, brands, references, auth, canva
+  routers/             health, auth, brands, library, admin, canva,
+                       graphics_designer, creative_agent, marketing_research,
+                       seo_geo, blog_writer, reference_library
   ingest.py            Brand Kits ingestion (python -m app.ingest)
+agents/                The agent packages (added to sys.path by app/__init__.py)
 Dockerfile             Cloud Run image (Python 3.12)
 ```
 
@@ -33,19 +35,12 @@ uvicorn app.main:app --reload --port 8080
 
 API docs: <http://localhost:8080/docs>
 
-## Endpoints
+## Auth
 
-| Method | Path | Auth | Purpose |
-|--------|------|------|---------|
-| GET | `/api/health` | – | Liveness |
-| GET | `/api/agent/settings` | Bearer | Graphic Designer configuration options |
-| GET | `/api/brands` | – | List brands |
-| GET | `/api/brands/{id}` | – | Brand detail + creatives |
-| POST | `/api/auth/register` / `/api/auth/login` | – | Get a JWT |
-| POST | `/api/upload-reference` | Bearer | Upload a reference file (`file`) |
-| GET | `/api/references` | Bearer | The user's uploads |
-| GET | `/api/canva/authorize` · `/api/canva/callback` | – | Canva OAuth |
-| POST | `/api/canva/import` | – | Import an asset into Canva |
+Login is Google-only: the frontend posts a Google ID token to
+`POST /api/auth/google` and receives an app JWT (HS256, `JWT_SECRET`).
+Essentially every other route requires that JWT as a Bearer token; admin and
+creator routes check the role claims baked into it.
 
 ## Ingest Brand Kits
 
@@ -53,19 +48,21 @@ API docs: <http://localhost:8080/docs>
 python -m app.ingest
 ```
 
-Reads `BRAND_KITS_DIR` (defaults to `./Brand Kits`), treats each top-level folder
-as a brand, uploads files to GCS, and records metadata in Firestore. Never reads
-`LS DESIGN PRODUCTIONS/`.
+Reads `BRAND_KITS_DIR`, treats each top-level folder as a brand (folders
+starting with `_` are skipped), uploads files to GCS, and records metadata in
+Firestore.
 
 ## Deploy to Cloud Run
 
+The live service is **`agentsbackend`** (us-central1) — deploys are manual:
+
 ```bash
-gcloud run deploy agentos-backend \
+gcloud run deploy agentsbackend \
   --source . \
   --region us-central1 \
-  --allow-unauthenticated \
-  --service-account agentos-backend@PROJECT.iam.gserviceaccount.com
+  --allow-unauthenticated
 ```
 
-Then set env vars in the Cloud Run service (see `../credentials.md`). With the
-service account attached, you can omit `GOOGLE_APPLICATION_CREDENTIALS`.
+Runtime env vars are set once on the Cloud Run service and preserved across
+deploys (see `deploy.env.yaml.example` and `../credentials.md`). With the
+service account attached, leave `GOOGLE_APPLICATION_CREDENTIALS` unset.

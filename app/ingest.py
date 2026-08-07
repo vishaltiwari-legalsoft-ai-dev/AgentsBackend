@@ -60,6 +60,11 @@ def _discover_brands(base: Path) -> list[tuple[str, Path]]:
     for entry in sorted(base.iterdir()):
         if not entry.is_dir():
             continue
+        # Underscore-prefixed folders are tooling, not brands (e.g.
+        # `_reference_mock` holds AI-generated mock PNGs — ingesting it would
+        # file AI output as human brand precedent).
+        if entry.name.startswith("_"):
+            continue
 
         if "brand kit" in entry.name.lower():
             results.append((_brand_name(entry.name), entry))

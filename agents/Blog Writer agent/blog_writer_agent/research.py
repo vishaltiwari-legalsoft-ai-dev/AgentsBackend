@@ -56,7 +56,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def new_run(brand: dict, topic: str, notes: str = "") -> dict:
+def new_run(brand: dict, topic: str, notes: str = "", user_id: str = "") -> dict:
     slug = "".join(c if c.isalnum() else "-" for c in topic.lower()).strip("-")[:32]
     run = {
         "id": f"bw-{slug}-{uuid.uuid4().hex[:6]}",
@@ -65,6 +65,7 @@ def new_run(brand: dict, topic: str, notes: str = "") -> dict:
         "domain": brand.get("domain", ""),
         "topic": topic,
         "notes": notes,
+        "user_id": user_id,
         "created": _now(),
         "status": "research",
         "rounds": [],
@@ -85,6 +86,9 @@ def save_run(run: dict) -> None:
         "brand_id": run["brand_id"],
         "brand_name": run["brand_name"],
         "topic": run["topic"],
+        # Legacy runs predate ownership — an absent/empty user_id means
+        # "visible to everyone", never invent one.
+        "user_id": run.get("user_id", ""),
         "created": run["created"],
         "status": run["status"],
     }

@@ -333,78 +333,9 @@ def list_users() -> list[dict[str, Any]]:
     return users
 
 
-# --------------------------------------------------------------------------- #
-# Conversations (chat history)
-# --------------------------------------------------------------------------- #
-
-def create_conversation(user_id: str, title: str) -> dict[str, Any]:
-    conv_id = uuid.uuid4().hex
-    payload = {
-        "user_id": user_id,
-        "title": title[:120] or "New chat",
-        "messages": [],
-        "created_at": _now(),
-        "updated_at": _now(),
-    }
-    _db().collection("conversations").document(conv_id).set(payload)
-    return payload | {"id": conv_id}
-
-
-def list_conversations(user_id: str) -> list[dict[str, Any]]:
-    """Conversation summaries for a user (no message bodies), newest first."""
-    docs = (
-        _db()
-        .collection("conversations")
-        .where(filter=firestore.FieldFilter("user_id", "==", user_id))
-        .stream()
-    )
-    convos = [
-        {
-            "id": doc.id,
-            "title": (doc.to_dict() or {}).get("title", "Chat"),
-            "updated_at": (doc.to_dict() or {}).get("updated_at", ""),
-        }
-        for doc in docs
-    ]
-    convos.sort(key=lambda c: c.get("updated_at", ""), reverse=True)
-    return convos
-
-
-def get_conversation(conv_id: str, user_id: str) -> Optional[dict[str, Any]]:
-    doc = _db().collection("conversations").document(conv_id).get()
-    if not doc.exists:
-        return None
-    data = doc.to_dict() or {}
-    if data.get("user_id") != user_id:
-        return None  # ownership check
-    return data | {"id": doc.id}
-
-
-def append_messages(conv_id: str, new_messages: list[dict[str, Any]]) -> None:
-    """Append messages and bump updated_at (transactional read-modify-write)."""
-    ref = _db().collection("conversations").document(conv_id)
-    snapshot = ref.get()
-    if not snapshot.exists:
-        return
-    data = snapshot.to_dict() or {}
-    messages = data.get("messages", [])
-    messages.extend(new_messages)
-    ref.set({"messages": messages, "updated_at": _now()}, merge=True)
-
-
-def set_conversation_title(conv_id: str, title: str) -> None:
-    _db().collection("conversations").document(conv_id).set(
-        {"title": title[:120]}, merge=True
-    )
-
-
-def delete_conversation(conv_id: str, user_id: str) -> bool:
-    ref = _db().collection("conversations").document(conv_id)
-    snapshot = ref.get()
-    if not snapshot.exists or (snapshot.to_dict() or {}).get("user_id") != user_id:
-        return False
-    ref.delete()
-    return True
+# NOTE: The chat-agent "conversations" collection lost its last writer when the
+# V1 chat rail was removed; its accessors are gone too. The collection name
+# stays in TELEMETRY_COLLECTIONS so the admin purge can still clear old docs.
 
 
 # --------------------------------------------------------------------------- #

@@ -53,10 +53,16 @@ def _brand(brand_id: str) -> dict:
     raise HTTPException(status_code=404, detail=f"unknown brand: {brand_id}")
 
 
-def _run(run_id: str) -> dict:
+def _run(run_id: str, user: dict | None = None) -> dict:
     run = research.load_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail=f"unknown run: {run_id}")
+    # Ownership: runs created before user stamping (no user_id) stay visible to
+    # everyone; stamped runs are owner + admin only.
+    if user is not None:
+        owner = run.get("user_id") or ""
+        if owner and owner != user.get("id") and not user.get("is_admin"):
+            raise HTTPException(status_code=404, detail=f"unknown run: {run_id}")
     return run
 
 
@@ -116,12 +122,19 @@ def scan_inventory(brand_id: str, user: dict = Depends(get_current_user)) -> dic
 
 @router.get("/blog/runs")
 def list_runs(user: dict = Depends(get_current_user)) -> dict:
-    return {"runs": research.list_runs()}
+    runs = [
+        r
+        for r in research.list_runs()
+        if not r.get("user_id")
+        or r["user_id"] == user.get("id")
+        or user.get("is_admin")
+    ]
+    return {"runs": runs}
 
 
 @router.get("/blog/runs/{run_id}")
 def get_run(run_id: str, user: dict = Depends(get_current_user)) -> dict:
-    return _run(run_id)
+    return _run(run_id, user)
 
 
 @router.post("/blog/runs")
@@ -129,12 +142,14 @@ def create_run(body: RunIn, user: dict = Depends(get_current_user)) -> dict:
     topic = body.topic.strip()
     if not topic:
         raise HTTPException(status_code=422, detail="topic is required")
-    return research.new_run(_brand(body.brand_id), topic, body.notes.strip())
+    return research.new_run(
+        _brand(body.brand_id), topic, body.notes.strip(), user_id=str(user.get("id") or "")
+    )
 
 
 @router.post("/blog/runs/{run_id}/research/step")
 def research_step(run_id: str, user: dict = Depends(get_current_user)) -> dict:
-    run = _run(run_id)
+    run = _run(run_id, user)
     try:
         return research.research_step(run)
     except CredentialMissing as exc:
@@ -143,7 +158,7 @@ def research_step(run_id: str, user: dict = Depends(get_current_user)) -> dict:
 
 @router.post("/blog/runs/{run_id}/draft")
 def build_draft(run_id: str, user: dict = Depends(get_current_user)) -> dict:
-    run = _run(run_id)
+    run = _run(run_id, user)
     if not run["ledger"]:
         raise HTTPException(status_code=409, detail="no evidence yet — run research first")
     try:
@@ -158,7 +173,7 @@ def build_draft(run_id: str, user: dict = Depends(get_current_user)) -> dict:
 
 @router.post("/blog/runs/{run_id}/blocks/{block_id}/comment")
 def comment_block(run_id: str, block_id: str, body: CommentIn, user: dict = Depends(get_current_user)) -> dict:
-    run = _run(run_id)
+    run = _run(run_id, user)
     comment = body.comment.strip()
     if not comment:
         raise HTTPException(status_code=422, detail="comment is required")
@@ -174,7 +189,7 @@ def comment_block(run_id: str, block_id: str, body: CommentIn, user: dict = Depe
 
 @router.post("/blog/runs/{run_id}/visuals")
 def plan_visuals(run_id: str, user: dict = Depends(get_current_user)) -> dict:
-    run = _run(run_id)
+    run = _run(run_id, user)
     try:
         return visuals.plan_visuals(run, _brand(run["brand_id"]))
     except CredentialMissing as exc:
@@ -185,7 +200,7 @@ def plan_visuals(run_id: str, user: dict = Depends(get_current_user)) -> dict:
 
 @router.get("/blog/runs/{run_id}/export")
 def export_run(run_id: str, format: str = "md", user: dict = Depends(get_current_user)) -> PlainTextResponse:
-    run = _run(run_id)
+    run = _run(run_id, user)
     if format not in _EXPORTS:
         raise HTTPException(status_code=422, detail=f"unknown format: {format}")
     render, media_type, name_tpl = _EXPORTS[format]
