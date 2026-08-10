@@ -159,3 +159,42 @@ def test_run_list_includes_period_label():
     mine = next(x for x in client.get("/api/mr/runs").json()
                 if x["id"] == rep.json()["id"])
     assert mine["period"] == "Jun 1–30, 2026"
+
+
+def test_lead_analysis_endpoint_before_any_pull_is_honest():
+    r = client.get("/api/mr/lead-analysis")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["has_data"] is False and "hint" in body
+
+
+def test_ingest_sheet_captures_lead_analysis(monkeypatch, tmp_path):
+    """The sheet pull auto-detects the lead tab in a connected workbook, persists
+    the per-vendor summary, and /mr/lead-analysis serves it."""
+    from app.routers import marketing_research as mrr
+    from marketing_research_agent.workbook import TabGrid
+
+    header = ["Demo Month", "Campaign", "Brand", "Source", "Meeting Outcome",
+              "Deal Stage", "$ Amount", "MRR", "No. of Services Sold"]
+    rows = [header,
+            ["August", "Meta 360 RA", "RA", "Meta", "Completed", "Contract Sent",
+             "$2,000.00", "$2,000.00", "1"],
+            ["August", "Meta 360 RA", "RA", "Meta", "No Show", "Demo No Show", "", "", ""]]
+    tab = TabGrid(title="Lead Analysis", gid=9, hidden=False, rows=rows,
+                  n_rows=len(rows), n_cols=len(header))
+
+    monkeypatch.setenv("MR_SOURCES_FILE", str(tmp_path / "sources.json"))
+    monkeypatch.setattr(mrr, "fetch_all_trackers", lambda sid, year: [])
+    monkeypatch.setattr(mrr, "fetch_official_totals", lambda sid, year: {})
+    monkeypatch.setattr(mrr.mr_workbook, "fetch_workbook", lambda sid, **kw: [tab])
+    monkeypatch.setattr(mrr, "fetch_tab_values", lambda sid, title: rows)
+
+    r = client.post("/api/mr/ingest-sheet", json={})
+    assert r.status_code == 200, r.text
+    assert any(str(t.get("tab", "")).startswith("Lead analysis") for t in r.json()["tabs"])
+
+    body = client.get("/api/mr/lead-analysis").json()
+    assert body["has_data"] is True and body["tab"] == "Lead Analysis"
+    v = body["months"]["2026-08"]["vendors"][0]
+    assert v["booked"] == 2 and v["completed"] == 1 and v["no_show"] == 1
+    assert v["services_sold"] == 1 and v["amount"] == 2000.0

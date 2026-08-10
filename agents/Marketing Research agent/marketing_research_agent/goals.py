@@ -44,6 +44,14 @@ _DEFAULT_THRESHOLDS: dict[str, float] = {
     "cac_red": CAC_RED,
     "cac_target": 2500.0,
     "mgmt_fee_limit": MGMT_FEE_LIMIT,
+    # Lead-analysis flag lines (requirements doc 2026-08-10). Percent units;
+    # rates are over resolved demos (see lead_analysis.py).
+    "bad_lead_rate_red": 30.0,
+    "no_show_rate_red": 30.0,
+    "canceled_rate_red": 20.0,
+    "zero_completed_min_demos": 3.0,
+    "ql_ratio_great": 75.0,
+    "booking_rate_broken": 15.0,
 }
 
 

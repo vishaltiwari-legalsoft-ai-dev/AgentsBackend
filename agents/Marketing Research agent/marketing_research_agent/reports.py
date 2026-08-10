@@ -12,7 +12,7 @@ import json
 import re
 from datetime import date, datetime, timedelta, timezone
 
-from . import analysis, config, goals, runs
+from . import analysis, config, goals, lead_analysis, runs
 from .modules import campaign_reporting as cr
 from .modules import funnel_analysis as fa
 from .modules import opportunity_research as orr
@@ -357,6 +357,41 @@ def _apply_official_totals(totals: dict, off: dict[str, float]) -> dict:
     return totals
 
 
+def _apply_lead_quality(structured: dict, ds: dict) -> None:
+    """Fold the lead sheet's per-vendor outcome picture into a campaign report:
+    a ``lead_quality`` section for the window's months, and the lead flags
+    merged into ``red_flag_vendors`` (matched campaigns under their tracker
+    vendor name, unmatched ones under the campaign name itself)."""
+    lead = ds.get("lead_summary")
+    if not lead or not lead.get("months"):
+        return
+    keys = ds.get("lead_month_keys")
+    if keys is None:
+        keys = [lead["latest_month"]] if lead.get("latest_month") else []
+    keys = [k for k in keys if k in lead["months"]]
+    if not keys:
+        return
+    structured["lead_quality"] = {
+        "months": {k: lead["months"][k] for k in keys},
+        "unmatched_campaigns": lead.get("unmatched_campaigns") or [],
+    }
+    extra = lead_analysis.red_flag_entries(lead, keys)
+    if extra:
+        merged = {r["vendor"]: r for r in structured.get("red_flag_vendors") or []}
+        for e in extra:
+            r = merged.setdefault(e["vendor"], {"vendor": e["vendor"], "reasons": []})
+            r["reasons"].extend(m for m in e["reasons"] if m not in r["reasons"])
+        structured["red_flag_vendors"] = list(merged.values())
+
+
+def _month_keys(start: date, end: date) -> list[str]:
+    keys, y, m = [], start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        keys.append(f"{y:04d}-{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return keys
+
+
 def _campaign_structured(ds: dict) -> dict:
     metrics = ds.get("metrics", [])
     previous = ds.get("previous_metrics")
@@ -387,6 +422,7 @@ def _campaign_structured(ds: dict) -> dict:
         structured["red_flag_vendors"] = red
         if ds.get("with_vendor_insights"):
             structured["vendor_insights"] = _vendor_insights(vendors, red)
+    _apply_lead_quality(structured, ds)
     if previous is not None:
         structured["week_over_week"] = cr.week_over_week(
             current_agg, cr.aggregate_by_channel(previous)
@@ -505,6 +541,7 @@ def build(kind: str, dataset: dict, user_id: str, period: str | None = None) -> 
             "metrics": metrics,
             "vendor_metrics": vendor_metrics or None,
             "with_vendor_insights": True,
+            "lead_month_keys": _month_keys(start, end),
         }
         structured = _structured(kind, dataset)
         structured["period"] = {
@@ -541,19 +578,27 @@ def overview(ds: dict) -> dict:
     sources = ds.get("sources", [])
     if not metrics:
         return {"has_data": False, "month": None, "totals": None,
-                "channels": {}, "flag_summary": [], "sources": sources}
+                "channels": {}, "flag_summary": [], "lead_quality": None,
+                "sources": sources}
     today = ds.get("today") or date.today()
     months = {(m.date.year, m.date.month) for m in metrics}
     current = {ym for ym in months if ym <= (today.year, today.month)}
     latest = max(current) if current else min(months)
+    month_key = f"{latest[0]:04d}-{latest[1]:02d}"
     month_metrics = [m for m in metrics if (m.date.year, m.date.month) == latest]
-    s = _campaign_structured({**ds, "metrics": month_metrics, "vendor_metrics": None})
+    s = _campaign_structured({**ds, "metrics": month_metrics, "vendor_metrics": None,
+                              "lead_month_keys": [month_key]})
+    lead_block = ((s.get("lead_quality") or {}).get("months") or {}).get(month_key)
+    flag_summary = s["flag_summary"]
+    if lead_block:
+        flag_summary = flag_summary + lead_analysis.flag_summary(lead_block)
     return {
         "has_data": True,
-        "month": f"{latest[0]:04d}-{latest[1]:02d}",
+        "month": month_key,
         "totals": s["totals"],
         "channels": s["channels"],
-        "flag_summary": s["flag_summary"],
+        "flag_summary": flag_summary,
+        "lead_quality": lead_block,
         "sources": sources,
     }
 

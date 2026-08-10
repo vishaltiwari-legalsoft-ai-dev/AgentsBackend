@@ -25,6 +25,7 @@ from dataclasses import asdict
 
 from marketing_research_agent import config as mr_config
 from marketing_research_agent import insight as mr_insight
+from marketing_research_agent import lead_analysis as mr_leads
 from marketing_research_agent import pdf_export as mr_pdf
 from marketing_research_agent import profiles as mr_profiles
 from marketing_research_agent import reports, runs, schedule
@@ -39,6 +40,7 @@ from marketing_research_agent.sources.sheets_source import (
     SheetsSource,
     fetch_all_trackers,
     fetch_official_totals,
+    fetch_tab_values,
     is_rollup_platform,
     workbook_meta,
 )
@@ -129,6 +131,72 @@ def _latest_official_spend(user_id: str) -> dict[str, float]:
     return dict(_latest_official_run(user_id).get("months") or {})
 
 
+def _latest_lead_run(user_id: str) -> dict | None:
+    """Newest persisted lead-analysis summary run; None if never captured."""
+    newest: dict | None = None
+    for run in runs.list_runs(user_id):
+        if run.get("kind") != "lead_analysis":
+            continue
+        if newest is None or run.get("generated_at", "") > newest.get("generated_at", ""):
+            newest = run
+    return newest
+
+
+def _tracker_rollups_by_month(user_id: str) -> dict[str, dict[str, dict]]:
+    """Tracker funnel counts per month per vendor slug — the join the lead
+    sheet's QL-ratio/booking-rate rule needs (the lead sheet has no lead totals,
+    only booked-demo rows)."""
+    out: dict[str, dict[str, dict]] = {}
+    for plat, run in _latest_datasets(user_id).items():
+        vendor = _vendor_label(plat)
+        slug = mr_snapshots.slugify(vendor)
+        for m in _rehydrate_metrics(run.get("metrics", [])):
+            ym = f"{m.date.year:04d}-{m.date.month:02d}"
+            r = out.setdefault(ym, {}).setdefault(
+                slug, {"vendor": vendor, "leads": 0, "qualified_leads": 0, "demos_booked": 0})
+            r["leads"] += m.leads
+            r["qualified_leads"] += m.qualified_leads
+            r["demos_booked"] += m.demos_booked
+    return out
+
+
+def _refresh_lead_analysis(user_id: str, year: int) -> dict | None:
+    """Find the lead-analysis tab across every connected workbook (auto-detected
+    by its header row — nothing to configure), aggregate it, and persist the
+    summary as a run. Returns a result row, or None when no tab exists."""
+    workbooks = [{"id": mr_config.SHEETS_SPREADSHEET_ID, "label": "Primary marketing tracker"}]
+    workbooks += [{"id": s["id"], "label": str(s.get("label") or s["id"][:8])}
+                  for s in mr_sources_registry.extra_sources()]
+    found: tuple[dict, str] | None = None
+    for wb in workbooks:
+        try:
+            grids = mr_workbook.fetch_workbook(wb["id"], max_rows=20)  # header scan only
+        except Exception:
+            continue  # an unreadable secondary never blocks the others
+        for g in grids:
+            if mr_leads.find_lead_tab(g.rows):
+                found = (wb, g.title)
+                break
+        if found:
+            break
+    if not found:
+        return None
+    wb, tab = found
+    rows = fetch_tab_values(wb["id"], tab)  # full tab — lead sheets outgrow the grid cap
+    records, gaps = mr_leads.parse_lead_rows(rows, year=year)
+    summary = mr_leads.summarize(records, tracker_rollups=_tracker_rollups_by_month(user_id))
+    runs.save_run({
+        "id": runs.new_run_id(), "kind": "lead_analysis", "user_id": user_id,
+        "agent_id": MR_AGENT_ID, "platform": "sheets-leads",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source_label": wb["label"], "tab": tab, "gaps": gaps,
+        "summary": summary,
+    })
+    flags = sum(b.get("flag_count", 0) for b in summary["months"].values())
+    return {"tab": f"Lead analysis ({tab})", "rows": len(records),
+            "months": len(summary["months"]), "lead_flags": flags}
+
+
 def _load_dataset(user_id: str) -> dict:
     """Reassemble the user's ingested data into one dataset. Keeps a per-vendor
     view (one entry per source tab/upload) so reports can name vendors."""
@@ -148,9 +216,11 @@ def _load_dataset(user_id: str) -> dict:
         for plat, run in sorted(latest.items())
     ]
     official = _latest_official_run(user_id)
+    lead_run = _latest_lead_run(user_id)
     return {"metrics": metrics, "leads": leads, "vendor_metrics": vendor_metrics,
             "official_spend": dict(official.get("months") or {}),
             "official_totals": dict(official.get("totals") or {}),
+            "lead_summary": (lead_run or {}).get("summary"),
             "today": date.today(), "sources": sources}
 
 
@@ -250,7 +320,7 @@ def _ingest_sheet_all(user_id: str, year: int) -> list[dict]:
     Clears prior sheet datasets first so a re-pull is a clean refresh."""
     for run in runs.list_runs(user_id):
         is_sheet_ds = run.get("kind") == "dataset" and str(run.get("platform", "")).startswith("sheets:")
-        if is_sheet_ds or run.get("kind") == "official_spend":
+        if is_sheet_ds or run.get("kind") in ("official_spend", "lead_analysis"):
             runs.delete_run(run["id"])
     results = []
     try:
@@ -271,6 +341,14 @@ def _ingest_sheet_all(user_id: str, year: int) -> list[dict]:
             "totals": official,
         })
         results.append({"tab": "Official totals (Overall Report)", "months": len(official)})
+    # Lead-analysis sheet (demo-level rows) — runs AFTER the tracker pull so the
+    # QL-ratio/booking-rate rule joins against fresh funnel counts.
+    try:
+        lead = _refresh_lead_analysis(user_id, year)
+        if lead:
+            results.append(lead)
+    except Exception as exc:
+        results.append({"tab": "Lead analysis", "error": str(exc)})
     return results
 
 
@@ -428,6 +506,23 @@ async def ingest_pdf(file: UploadFile = File(...), user=Depends(get_current_user
 def overview(user=Depends(get_current_user)):
     """Live dashboard state — latest-month KPIs vs 2026 goals. Persists nothing."""
     return reports.overview(_load_dataset(user["id"]))
+
+
+@router.get("/mr/lead-analysis")
+def lead_analysis_view(user=Depends(get_current_user)):
+    """The lead sheet's per-vendor Meeting Outcome / Deal Stage picture + the
+    five lead-quality flags. Data refreshes with every sheet pull (UI or cron)."""
+    run = _latest_lead_run(user["id"])
+    if not run:
+        return {"has_data": False, "hint": (
+            "No lead-analysis tab found yet. Connect the lead sheet from the Data tab "
+            "(share it with the service account) and pull — the agent detects the tab "
+            "by its columns automatically.")}
+    summary = run.get("summary") or {}
+    return {"has_data": bool(summary.get("months")),
+            "generated_at": run.get("generated_at"),
+            "source_label": run.get("source_label"), "tab": run.get("tab"),
+            "gaps": run.get("gaps", []), **summary}
 
 
 @router.get("/mr/trends")
