@@ -1,0 +1,50 @@
+# Content Optimizer — single source of truth for every weight/threshold.
+# Layer 8 (feedback loop) retunes by emitting a new version of THIS file;
+# code must never carry a magic number that belongs here.
+version: 1
+
+terms:
+  prevalence_exponent: 2.0        # k in importance = tfidf x prevalence^k (allowed 1.5-3)
+  rank_weight_offset: 1.5         # w(r) = 1 / log2(r + offset), normalized
+  ngram_max: 3
+  nested_ngram_overlap: 0.8       # suppress sub-gram when a super-gram covers >= this share of its count
+  count_range_percentiles: [25, 75]
+  high_dispersion_cqd: 0.5        # quartile coefficient of dispersion above which -> low confidence
+  short_doc_words: 200            # corpus docs shorter than this -> low-confidence ranges
+  range_widen_factor: 1.5         # multiply band half-width when confidence is low
+
+structure:
+  percentiles: [25, 75]
+  rank_weighted: false
+  small_n: 6                      # below this: widen band + low confidence
+  small_n_widen_factor: 1.5
+  bimodal_min_separation: 2.5     # robust gap-split separation to call a feature bimodal
+  bimodal_min_fraction: 0.25      # each mode must hold at least this share of docs
+  features:                       # whitelist — nothing outside this list may be profiled
+    - word_count
+    - h2_count
+    - h3_count
+    - paragraph_count
+    - avg_sentence_len
+    - image_count
+    - list_count
+    - table_count
+    - internal_links
+    - external_links
+    - question_headings
+    - numeric_density
+
+score:
+  weights: { term: 0.5, semantic: 0.3, structure: 0.2 }
+  band_decay_factor: 1.5          # zero credit at decay_factor x band-width outside the band
+  semantic_floor_credit: 0.6      # credit for a missing term whose subtopic is covered
+  coverage_complete: 0.9          # share of subtopics covered to count coverage as "complete"
+  shortness_floor: 0.5            # min word-count band score when coverage is complete (never punish concise+complete)
+  stuffing_p90_multiplier: 2.0    # per-term density above corpus P90 x this -> stuffing
+  stuffing_penalty_points: 10     # points subtracted from the total per detection run
+
+semantic:
+  similarity_threshold: 0.62      # calibrate per embedding model (Phase 2)
+
+# Per-vertical overrides, deep-merged over the base (e.g. health: {score: {weights: {...}}}).
+verticals: {}

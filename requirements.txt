@@ -23,3 +23,4 @@ PyMuPDF>=1.24           # render reference PDF pages for the reference library
 google-api-python-client>=2.130  # Google Drive ingestion for the reference library
 openpyxl>=3.1
 cairosvg           # Element Library — rasterize icon/sticker SVGs (Linux/Cloud Run; optional locally)
+PyYAML>=6.0        # GEO Content Optimizer — opt_config.yaml is the single source of truth for weights

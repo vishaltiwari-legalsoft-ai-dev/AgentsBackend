@@ -1,0 +1,17 @@
+{
+  "comment": "Synthetic frozen corpus matching the worked example in docs/content_optimization_theory (section 5/6). 18 usable cold-brew winners; doc 18 is the 11,800-word encyclopedic outlier that must never move a band. ratio_counts_5doc is the 5-doc golden sub-fixture for term importance.",
+  "keyword": "how to make cold brew coffee",
+  "locale": "en-US",
+  "word_counts": [620, 850, 1100, 1250, 1400, 1500, 1600, 1700, 1750, 1800, 1900, 2000, 2150, 2300, 2500, 2700, 3400, 11800],
+  "h2_counts": [3, 4, 5, 5, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 9, 9, 10, 14],
+  "image_counts": [2, 3, 4, 4, 5, 5, 6, 6, 6, 7, 7, 8, 8, 9, 9, 10, 11, 15],
+  "question_heading_counts": [1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 6],
+  "ratio_counts_5doc": [4, 3, 0, 5, 2],
+  "draft": {
+    "word_count": 400,
+    "h2_count": 1,
+    "image_count": 0,
+    "question_heading_count": 0,
+    "sub_scores": { "term": 0.31, "semantic": 0.44, "structure": 0.12 }
+  }
+}
