@@ -19,6 +19,7 @@ import pytest
 os.environ.setdefault("MR_OFFLINE", "1")
 os.environ.setdefault("SEO_OFFLINE", "1")
 os.environ.setdefault("BLOG_OFFLINE", "1")
+os.environ.setdefault("BROWSER_OFFLINE", "1")
 
 
 @pytest.fixture(autouse=True)

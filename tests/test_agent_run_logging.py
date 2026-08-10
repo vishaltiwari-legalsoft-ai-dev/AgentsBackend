@@ -111,7 +111,7 @@ def test_mandate_scan_sees_the_known_agents():
     found: set[str] = set()
     for py in ROUTERS_DIR.glob("*.py"):
         found.update(_AGENT_ID_RE.findall(py.read_text(encoding="utf-8")))
-    assert {"a1", "a2", "a6", "a9", "a10"} <= found
+    assert {"a1", "a2", "a6", "a9", "a10", "a11"} <= found
 
 
 def test_firestore_console_urls(monkeypatch):

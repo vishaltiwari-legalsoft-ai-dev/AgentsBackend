@@ -172,6 +172,17 @@ AGENTS: list[dict[str, str | bool | list[str]]] = [
         # itself goes to the providers' own APIs, not OpenRouter.
         "fields": ["openrouter_fast_model"],
     },
+    {
+        "id": "a11",
+        "name": "Browser Agent",
+        "role": "Web copilot in your Chrome",
+        "category": "data",
+        "live": True,
+        # One strong reasoning model per act-loop step, via
+        # browser_agent.brain.decide(agent_id="a11"). The Chrome extension is
+        # a thin sensor/actuator — every LLM call happens here.
+        "fields": ["openrouter_model"],
+    },
 ]
 
 AGENT_IDS = {str(a["id"]) for a in AGENTS}

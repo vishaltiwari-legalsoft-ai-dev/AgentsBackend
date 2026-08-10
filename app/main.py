@@ -18,6 +18,7 @@ from app.routers import (
     auth,
     blog_writer,
     brands,
+    browser_agent,
     canva,
     creative_agent,
     geo,
@@ -84,6 +85,7 @@ for router in (
     marketing_research,
     seo_geo,
     geo,
+    browser_agent,
 ):
     app.include_router(router.router, prefix="/api")
 

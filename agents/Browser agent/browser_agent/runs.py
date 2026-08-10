@@ -1,0 +1,252 @@
+"""Run lifecycle: create → step (idempotent) → stop. The extension owns the loop.
+
+Each ``step`` call carries one observation and returns one decided action. The
+``seq`` counter makes replays safe: a re-POST of the current seq returns the
+cached decision (that is how the extension resumes after MV3 kills its service
+worker mid-run), and anything else out of order is an honest 409.
+"""
+from __future__ import annotations
+
+import os
+import uuid
+from datetime import datetime, timezone
+
+from browser_agent import actions, brain, state
+
+TERMINAL = frozenset({"completed", "failed", "stopped"})
+
+_INDEX_DOC = "runs-index"
+_INDEX_CAP = 200
+_MAX_FINDING_CHARS = 8_000
+_MAX_FINDINGS = 40
+
+
+class ProtocolMismatch(ValueError):
+    """Extension protocol version differs from the server's."""
+
+
+class OutOfSync(ValueError):
+    """Step seq is neither a replay of the current step nor the next one."""
+
+
+def disabled() -> bool:
+    return os.environ.get("BROWSER_AGENT_DISABLED", "0") == "1"
+
+
+def policy() -> dict:
+    """The safety policy handed to the extension at run start (and enforced here)."""
+    blocked = actions.parse_domains(
+        os.environ.get("BROWSER_BLOCKED_DOMAINS", actions.DEFAULT_BLOCKED_DOMAINS)
+    )
+    allowed = actions.parse_domains(os.environ.get("BROWSER_ALLOWED_DOMAINS", ""))
+    try:
+        step_cap = int(os.environ.get("BROWSER_MAX_STEPS", "40"))
+    except ValueError:
+        step_cap = 40
+    return {
+        "step_cap": max(1, min(step_cap, 200)),
+        "allowed": sorted(allowed),
+        "blocked": sorted(blocked),
+    }
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def create_run(user: dict, goal: str, mode: str, start_url: str | None) -> dict:
+    pol = policy()
+    run = {
+        "id": uuid.uuid4().hex[:12],
+        "protocol": actions.PROTOCOL,
+        "goal": goal.strip(),
+        "mode": mode,
+        "start_url": start_url,
+        "status": "running",
+        "user": str(user.get("email") or ""),
+        "user_id": str(user.get("id") or ""),
+        "created_at": _now(),
+        "updated_at": _now(),
+        "step_cap": pol["step_cap"],
+        "allowed": pol["allowed"],
+        "blocked": pol["blocked"],
+        "sensitive_confirm": True,
+        "steps_used": 0,
+        "seq": 0,
+        "steps": [],
+        "findings": [],
+        "pending": None,
+        "last_decision": None,
+        "tracked_end": False,
+    }
+    _persist(run)
+    return run
+
+
+def get_run(run_id: str) -> dict | None:
+    return state.load(f"run-{run_id}")
+
+
+def list_runs(user_id: str | None = None, limit: int = 50) -> list[dict]:
+    index = state.load(_INDEX_DOC) or {}
+    rows = index.get("runs") or []
+    if user_id is not None:
+        rows = [r for r in rows if r.get("user_id") == user_id]
+    return rows[: max(1, min(limit, _INDEX_CAP))]
+
+
+def _index_entry(run: dict) -> dict:
+    return {
+        "id": run["id"],
+        "goal": str(run.get("goal") or "")[:160],
+        "mode": run.get("mode"),
+        "status": run.get("status"),
+        "steps_used": run.get("steps_used", 0),
+        "step_cap": run.get("step_cap", 0),
+        "user": run.get("user"),
+        "user_id": run.get("user_id"),
+        "created_at": run.get("created_at"),
+        "updated_at": run.get("updated_at"),
+        "summary": str(run.get("summary") or "")[:200],
+    }
+
+
+def _persist(run: dict) -> None:
+    state.save(f"run-{run['id']}", run)
+    index = state.load(_INDEX_DOC) or {"runs": []}
+    rows = [r for r in index.get("runs") or [] if r.get("id") != run["id"]]
+    rows.insert(0, _index_entry(run))
+    state.save(_INDEX_DOC, {"runs": rows[:_INDEX_CAP]})
+
+
+def _response(
+    run: dict,
+    action: dict | None,
+    *,
+    requires_confirmation: bool = False,
+) -> dict:
+    return {
+        "protocol": actions.PROTOCOL,
+        "action": action,
+        "done": run["status"] in TERMINAL,
+        "status": run["status"],
+        "requires_confirmation": requires_confirmation,
+        "steps_remaining": max(0, int(run["step_cap"]) - int(run["steps_used"])),
+        "summary": run.get("summary"),
+        "fail_reason": run.get("fail_reason"),
+    }
+
+
+def _veto(run: dict, action: actions.Action) -> str | None:
+    """Policy check on a decided action; returns the honest refusal or None."""
+    if run.get("mode") == "monitor" and action.kind in actions.MUTATING_KINDS:
+        return f'monitor mode is read-only — "{action.kind}" is not allowed'
+    if action.kind in ("navigate", "open_tab"):
+        return actions.check_url(
+            action.url or "", set(run.get("allowed") or []), set(run.get("blocked") or [])
+        )
+    return None
+
+
+def step(run: dict, body: dict) -> tuple[dict, dict]:
+    """Advance the run by one decision. Returns (run, response)."""
+    if run["status"] in TERMINAL:
+        return run, _response(run, None)
+
+    if int(body.get("protocol") or 0) != actions.PROTOCOL:
+        raise ProtocolMismatch(
+            f"extension protocol {body.get('protocol')!r} unsupported "
+            f"(server speaks {actions.PROTOCOL}) — please update the extension"
+        )
+
+    seq = int(body.get("seq") or 0)
+
+    # Replay of the current step — cached decision (worker-death resume) and
+    # the confirmation handshake both land here.
+    if seq == run["seq"] and run.get("last_decision"):
+        decision = run["last_decision"]
+        if run.get("pending") and body.get("confirmed"):
+            run["pending"] = None
+            run["status"] = "running"
+            decision = dict(decision, requires_confirmation=False, status="running")
+            run["last_decision"] = decision
+            run["updated_at"] = _now()
+            _persist(run)
+        return run, decision
+
+    if seq != run["seq"] + 1:
+        raise OutOfSync(f"expected seq {run['seq']} (replay) or {run['seq'] + 1}, got {seq}")
+
+    # Attach the result of the previous action; harvest extracted page text.
+    last = body.get("last_result")
+    if isinstance(last, dict) and run["steps"]:
+        run["steps"][-1]["result"] = {"ok": bool(last.get("ok")), "error": last.get("error")}
+        extracted = last.get("extracted")
+        if extracted and len(run["findings"]) < _MAX_FINDINGS:
+            run["findings"].append(str(extracted)[:_MAX_FINDING_CHARS])
+
+    run["seq"] = seq
+
+    if run["steps_used"] >= run["step_cap"]:
+        run["status"] = "failed"
+        run["fail_reason"] = f"step cap reached ({run['step_cap']})"
+        response = _response(run, None)
+        run["last_decision"] = response
+        run["updated_at"] = _now()
+        _persist(run)
+        return run, response
+
+    action = brain.decide(run, body)
+    veto = _veto(run, action)
+    if veto:
+        retry = dict(body, last_result={"ok": False, "error": veto})
+        action = brain.decide(run, retry)
+        veto = _veto(run, action)
+        if veto:
+            action = actions.Action(kind="fail", reason=veto, why="Blocked by policy.")
+
+    elements = (body.get("dom") or {}).get("elements") or []
+    sensitive = bool(run.get("sensitive_confirm", True)) and actions.is_sensitive(
+        action, elements
+    )
+    act_dict = action.model_dump(exclude_none=True)
+
+    run["steps_used"] += 1
+    run["steps"].append(
+        {"seq": seq, "action": act_dict, "at": _now(), "sensitive": sensitive, "result": None}
+    )
+
+    if action.kind == "done":
+        run["status"] = "completed"
+        run["summary"] = action.summary
+        if action.extracted is not None:
+            run["extracted"] = action.extracted
+        response = _response(run, act_dict)
+    elif action.kind == "fail":
+        run["status"] = "failed"
+        run["fail_reason"] = action.reason
+        response = _response(run, act_dict)
+    elif sensitive and not body.get("confirmed"):
+        run["status"] = "awaiting_confirmation"
+        run["pending"] = act_dict
+        response = _response(run, act_dict, requires_confirmation=True)
+    elif action.kind == "ask_user":
+        run["status"] = "awaiting_user"
+        response = _response(run, act_dict)
+    else:
+        run["status"] = "running"
+        response = _response(run, act_dict)
+
+    run["last_decision"] = response
+    run["updated_at"] = _now()
+    _persist(run)
+    return run, response
+
+
+def stop_run(run: dict) -> dict:
+    if run["status"] not in TERMINAL:
+        run["status"] = "stopped"
+        run["updated_at"] = _now()
+        run["last_decision"] = _response(run, None)
+        _persist(run)
+    return run
