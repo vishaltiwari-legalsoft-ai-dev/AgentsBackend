@@ -49,6 +49,12 @@ Actions (field "kind" plus the listed required fields):
 
 Every action also takes "why": one short plain-language line shown to the user.
 
+Any action with an "index" MUST also carry "expect": the text shown for that
+element in the list, copied exactly. Element numbers are re-assigned every step,
+so a dropdown opening or a panel closing renumbers everything. "expect" is how
+we catch that: if the element at your index no longer matches, the step is
+refused and you get to look again instead of clicking something at random.
+
 When a screenshot is attached, it is the current viewport. Use it to work out
 why the text view isn't matching what you expect — an overlay or dialog covering
 the control, a element that looks clickable but isn't the real input, a field

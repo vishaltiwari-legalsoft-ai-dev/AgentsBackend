@@ -47,6 +47,11 @@ INTERNAL_KINDS = ("next_subtask",)
 class Action(BaseModel):
     kind: str
     index: int | None = None  # distilled-DOM element index (click/type/select)
+    # What the model believes sits at that index. Indexes are re-assigned every
+    # step, so a dropdown opening renumbers the page underneath the model. The
+    # extension checks this label before acting and refuses on a mismatch —
+    # which turns "clicked the wrong thing" into "look again".
+    expect: str | None = None
     url: str | None = None  # navigate / open_tab
     text: str | None = None  # type: text · key: key combo · ask_user: question
     value: str | None = None  # select: option value or visible label

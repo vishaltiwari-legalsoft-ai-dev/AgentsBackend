@@ -230,6 +230,21 @@ def test_canvas_app_failure_says_why(monkeypatch):
     assert "canvas" in resp["action"]["reason"]
 
 
+def test_fingerprint_notices_a_change_anywhere_in_the_list(monkeypatch):
+    """An autocomplete dropdown opening below the fold is real progress; a
+    fingerprint that only looked at the first few labels would miss it and call
+    a working run stuck."""
+    base = _page(1, labels=tuple(f"row {i}" for i in range(20)))
+    changed = _page(1, labels=tuple(f"row {i}" for i in range(19)) + ("suggestion",))
+    assert runs.page_fingerprint(base) != runs.page_fingerprint(changed)
+
+
+def test_fingerprint_is_stable_for_an_unchanged_screen():
+    a = _page(1, labels=("To", "Subject", "Body"))
+    b = _page(2, labels=("To", "Subject", "Body"))
+    assert runs.page_fingerprint(a) == runs.page_fingerprint(b)
+
+
 def test_progress_resets_the_stall_counter(monkeypatch):
     """A screen that keeps changing is work, however long it takes."""
     _stub_brain(monkeypatch, actions.Action(kind="scroll", why="more"))

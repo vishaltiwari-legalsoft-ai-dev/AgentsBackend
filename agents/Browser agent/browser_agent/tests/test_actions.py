@@ -19,6 +19,15 @@ def test_valid_click_round_trips():
     assert a.kind == "click" and a.index == 3
 
 
+def test_click_carries_the_expected_label():
+    """Indexes are re-assigned every step, so the label is what makes a click
+    checkable rather than a guess at a moving number."""
+    a = actions.validate_action(
+        {"kind": "click", "index": 55, "expect": "To recipients", "why": "focus To"}
+    )
+    assert a.expect == "To recipients"
+
+
 def test_done_carries_summary_and_extracted():
     a = actions.validate_action(
         {"kind": "done", "summary": "Found 3 stories", "extracted": [{"t": "x"}]}

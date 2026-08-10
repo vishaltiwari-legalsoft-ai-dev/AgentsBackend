@@ -7,6 +7,7 @@ worker mid-run), and anything else out of order is an honest 409.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from datetime import datetime, timezone
@@ -171,12 +172,17 @@ def page_fingerprint(body: dict) -> str:
     worst loop: the same click landing forever on an unchanged page. Comparing
     the screen instead catches it, while leaving genuine repetition (scrolling a
     long page changes which elements are in view) alone.
+
+    Hashes EVERY label, not the first handful: a dropdown opening near the
+    bottom of a compose window is real progress, and a fingerprint that ignored
+    it would call a working run stuck.
     """
     dom = body.get("dom") or {}
     elements = dom.get("elements") or []
-    labels = "|".join(str(e.get("text") or "")[:24] for e in elements[:12])
+    labels = "|".join(str(e.get("text") or "")[:32] for e in elements)
+    digest = hashlib.md5(labels.encode("utf-8", "replace")).hexdigest()[:12]
     url = (body.get("tab") or {}).get("url") or ""
-    return f"{url}#{len(elements)}#{labels}"
+    return f"{url}#{len(elements)}#{digest}"
 
 
 def repeat_count(run: dict, action: actions.Action, page_fp: str) -> int:
