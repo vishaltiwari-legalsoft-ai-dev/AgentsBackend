@@ -132,6 +132,50 @@ def source_gap(answers: list[dict], own_domain: str, top_n: int = 20) -> list[di
     ]
 
 
+def prompt_rollup(answers: list[dict]) -> list[dict]:
+    """Per-question view — the most intuitive artifact in the product: for
+    every buyer question, how often the brand appeared, which rivals showed
+    up instead, and on which engines. Errors excluded; every rate carries n."""
+    rows: dict[str, dict] = {}
+    for a in _ok(answers):
+        pid = a.get("prompt_id", "")
+        if not pid:
+            continue
+        row = rows.setdefault(pid, {
+            "prompt_id": pid,
+            "text": a.get("prompt_text", ""),
+            "intent": a.get("intent", ""),
+            "n": 0, "self_hits": 0, "cited_hits": 0,
+            "rivals": defaultdict(int), "engines_hit": set(),
+        })
+        row["n"] += 1
+        mentions = a.get("mentions") or {}
+        if "self" in mentions:
+            row["self_hits"] += 1
+            row["engines_hit"].add(a.get("engine", ""))
+        if a.get("brand_cited"):
+            row["cited_hits"] += 1
+        for entity in mentions:
+            if entity != "self":
+                row["rivals"][entity] += 1
+
+    out = []
+    for row in rows.values():
+        rivals = sorted(row["rivals"].items(), key=lambda kv: -kv[1])
+        out.append({
+            "prompt_id": row["prompt_id"],
+            "text": row["text"],
+            "intent": row["intent"],
+            "n": row["n"],
+            "self_rate": round(row["self_hits"] / row["n"], 3) if row["n"] else 0.0,
+            "cited_rate": round(row["cited_hits"] / row["n"], 3) if row["n"] else 0.0,
+            "rivals": [{"key": k, "count": c} for k, c in rivals[:4]],
+            "engines_hit": sorted(e for e in row["engines_hit"] if e),
+        })
+    out.sort(key=lambda r: (-r["self_rate"], r["text"]))
+    return out
+
+
 def engine_report(answers: list[dict], entities: list[str], own_domain: str) -> dict:
     """Full per-engine + blended report over one set of answer records."""
     by_engine: dict[str, list[dict]] = defaultdict(list)
@@ -156,4 +200,5 @@ def engine_report(answers: list[dict], entities: list[str], own_domain: str) -> 
         "competitors": {
             e: mention_stats(answers, e) for e in entities if e != "self"
         },
+        "prompt_rollup": prompt_rollup(answers),
     }

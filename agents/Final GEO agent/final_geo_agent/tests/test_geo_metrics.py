@@ -85,3 +85,21 @@ def test_engine_report_shapes_and_engine_split():
     assert report["blended"]["mention"]["rate"] == 1.0
     assert "source_gap" in report and "competitors" in report
     assert report["competitors"]["comp"]["rate"] == 0.0
+
+
+def test_prompt_rollup_appear_vs_missing():
+    answers = [
+        ans("p1", 1, mentions={"self": 1}),
+        ans("p1", 2, mentions={"self": 2, "rival": 1}),
+        ans("p2", 1, mentions={"rival": 1}),
+        ans("p2", 2, mentions={"rival": 1, "other": 2}),
+        ans("p3", 1),                                   # nobody named
+        ans("p3", 2, error="HTTP 429"),                 # errors never count
+    ]
+    answers[0]["prompt_text"] = "best legal intake service"
+    rollup = {r["prompt_id"]: r for r in geo_metrics.prompt_rollup(answers)}
+    assert rollup["p1"]["self_rate"] == 1.0 and rollup["p1"]["n"] == 2
+    assert rollup["p2"]["self_rate"] == 0.0
+    assert rollup["p2"]["rivals"][0] == {"key": "rival", "count": 2}
+    assert rollup["p3"]["n"] == 1                       # error row excluded
+    assert rollup["p1"]["engines_hit"] == ["perplexity"]
