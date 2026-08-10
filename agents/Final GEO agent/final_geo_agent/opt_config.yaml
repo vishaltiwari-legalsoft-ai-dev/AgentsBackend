@@ -77,7 +77,8 @@ extract:
 
 semantic:
   similarity_threshold: 0.62      # draft chunk vs subtopic centroid: covered at/above this
-  embed_model: text-embedding-3-small
+  embed_model: text-embedding-3-small      # OpenAI (when openai_api_key present)
+  gemini_embed_model: text-embedding-004   # Gemini free-tier fallback (gemini_api_key)
   chunk_max_sentences: 4          # sentence-window chunking when a section runs long
   chunk_overlap_sentences: 1
   cluster_merge_threshold: 0.70   # chunk joins a subtopic cluster at/above this sim

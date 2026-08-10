@@ -37,8 +37,8 @@ class Embedder(Protocol):
 
 
 class OpenAIEmbedder:
-    """Prod embedder. Missing key raises CredentialMissing so the pipeline
-    degrades to lexical-only scoring with an honest confidence label."""
+    """Direct OpenAI embeddings. Missing key raises CredentialMissing so the
+    pipeline degrades to lexical-only scoring with an honest confidence label."""
 
     def __init__(self, model: str):
         self.model = model
@@ -62,6 +62,54 @@ class OpenAIEmbedder:
             rows = sorted(resp.json()["data"], key=lambda r: r["index"])
             vectors.extend(r["embedding"] for r in rows)
         return vectors
+
+
+class GeminiEmbedder:
+    """Gemini embeddings — free tier, same key the GEO engine polling uses.
+    This is the path for teams whose only LLM account is OpenRouter, which
+    offers chat but no embeddings endpoint."""
+
+    def __init__(self, model: str):
+        self.model = model
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        key = runtime_config.get("gemini_api_key")
+        if not key:
+            raise CredentialMissing(
+                "Gemini API key required for the semantic layer (Settings → Secrets)."
+            )
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), EMBED_BATCH):
+            batch = texts[start:start + EMBED_BATCH]
+            resp = httpx.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:batchEmbedContents",
+                params={"key": key},
+                json={"requests": [
+                    {"model": f"models/{self.model}", "content": {"parts": [{"text": t}]}}
+                    for t in batch
+                ]},
+                timeout=EMBED_TIMEOUT,
+            )
+            resp.raise_for_status()
+            vectors.extend(e["values"] for e in resp.json()["embeddings"])
+        return vectors
+
+
+class AutoEmbedder:
+    """Whichever embedding key is configured wins: OpenAI first, else Gemini,
+    else CredentialMissing — the pipeline then runs lexical-only, labelled."""
+
+    def __init__(self, cfg: SemanticCfg):
+        self.cfg = cfg
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        if runtime_config.get("openai_api_key"):
+            return OpenAIEmbedder(self.cfg.embed_model).embed(texts)
+        if runtime_config.get("gemini_api_key"):
+            return GeminiEmbedder(self.cfg.gemini_embed_model).embed(texts)
+        raise CredentialMissing(
+            "No embedding key — add openai_api_key or gemini_api_key (free tier) in Settings → Secrets."
+        )
 
 
 class Chunk(BaseModel):

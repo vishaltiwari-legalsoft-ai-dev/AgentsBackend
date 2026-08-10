@@ -244,7 +244,7 @@ def analyze(keyword: str, locale: str = "en-US", draft: str = "", *,
             density_p90[e["term"]] = round(opt_terms.percentile(densities, 90), 3)
 
     # Layer 4 — subtopics from article chunks (doc_idx aligns with articles)
-    embedder = embedder or opt_semantic.OpenAIEmbedder(cfg.semantic.embed_model)
+    embedder = embedder or opt_semantic.AutoEmbedder(cfg.semantic)
     subtopics: list[opt_semantic.Subtopic] = []
     degraded: list[str] = []
     try:
@@ -299,7 +299,7 @@ def rescore(analysis_id: str, draft: str, embedder=None) -> dict:
     if not doc:
         raise KeyError(f"unknown analysis: {analysis_id}")
     cfg = load_config(doc["meta"].get("vertical"))
-    embedder = embedder or opt_semantic.OpenAIEmbedder(cfg.semantic.embed_model)
+    embedder = embedder or opt_semantic.AutoEmbedder(cfg.semantic)
     report = _score_draft(doc, draft, embedder, cfg)
     doc["last_report"] = report
     state.save(ANALYSIS_DOC.format(aid=analysis_id), doc)

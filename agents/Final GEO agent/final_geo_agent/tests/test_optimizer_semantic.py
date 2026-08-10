@@ -149,3 +149,26 @@ def test_openai_embedder_needs_key(monkeypatch):
     monkeypatch.setattr(opt_semantic.runtime_config, "get", lambda *a, **k: "")
     with pytest.raises(CredentialMissing):
         opt_semantic.OpenAIEmbedder("text-embedding-3-small").embed(["hello"])
+
+
+def test_auto_embedder_openai_first_gemini_fallback(monkeypatch):
+    from seo_geo_agent.sources import CredentialMissing
+    used: list[str] = []
+    monkeypatch.setattr(opt_semantic.OpenAIEmbedder, "embed",
+                        lambda self, texts: used.append("openai") or [[1.0]] * len(texts))
+    monkeypatch.setattr(opt_semantic.GeminiEmbedder, "embed",
+                        lambda self, texts: used.append("gemini") or [[1.0]] * len(texts))
+    keys = {"openai_api_key": "", "gemini_api_key": "g-key"}
+    monkeypatch.setattr(opt_semantic.runtime_config, "get", lambda k, *a, **kw: keys.get(k, ""))
+
+    auto = opt_semantic.AutoEmbedder(CFG)
+    auto.embed(["x"])
+    assert used == ["gemini"]                      # OpenRouter-only teams: free Gemini key works
+
+    keys["openai_api_key"] = "o-key"
+    auto.embed(["x"])
+    assert used[-1] == "openai"                    # direct OpenAI wins when present
+
+    keys.update(openai_api_key="", gemini_api_key="")
+    with pytest.raises(CredentialMissing):
+        auto.embed(["x"])                          # no key -> honest degradation upstream
