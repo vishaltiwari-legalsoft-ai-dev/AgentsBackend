@@ -97,8 +97,20 @@ def _dom_block(dom: dict | None) -> str:
         block = block[:_MAX_DOM_CHARS] + "\n…(re-truncated by server)"
     excerpt = str(dom.get("text_excerpt") or "")[:_MAX_TEXT_EXCERPT]
     truncated = bool(dom.get("truncated"))
+    warning = ""
+    if dom.get("canvas_app"):
+        warning = (
+            "\nNOTE: this page paints its real content onto a <canvas> (Google "
+            "Sheets, Docs, Slides, Figma and similar). The cells, text and "
+            "shapes are pixels — they are NOT elements, and no element index "
+            "will ever refer to them. You can use the surrounding chrome "
+            "(menus, toolbars, dialogs) but you cannot read or type into the "
+            "document body. If the task needs that, reply \"fail\" and say so "
+            "plainly instead of hunting for elements that do not exist.\n"
+        )
     return (
-        f"Interactive elements (truncated: {str(truncated).lower()}):\n{block}\n\n"
+        f"Interactive elements (truncated: {str(truncated).lower()}):\n{block}\n"
+        f"{warning}\n"
         f"Page text excerpt:\n{excerpt}"
     )
 

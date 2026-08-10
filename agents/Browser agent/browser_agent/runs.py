@@ -22,6 +22,11 @@ _MAX_FINDINGS = 40
 # Identical failing steps in a row mean the page isn't responding the way the
 # model thinks. Burning the whole step cap on that helps nobody.
 _STUCK_AFTER = 4
+# Steps allowed on one unchanging screen before we call it. The repeat guard
+# above only catches the SAME action twice; real stuck-ness usually looks like
+# variety — Escape, click, reload, Escape — none of which move the page. Counting
+# steps-without-progress catches the cycle the repeat guard walks straight past.
+_NO_PROGRESS_AFTER = 8
 # Repeats before we ask the extension for a screenshot. Text alone can't explain
 # why a click does nothing on an app like Gmail — an overlay, a control that only
 # looks focusable, an element the model is reading as the wrong thing. One repeat
@@ -187,13 +192,40 @@ def repeat_count(run: dict, action: actions.Action, page_fp: str) -> int:
     return repeats
 
 
-def stuck_on(run: dict, action: actions.Action, page_fp: str) -> str | None:
-    """The repeat this action would make, if it is one worth giving up on."""
+def steps_without_progress(run: dict, page_fp: str) -> int:
+    """Consecutive steps taken while the screen stayed exactly the same."""
+    count = 0
+    for step in reversed(run.get("steps") or []):
+        if step.get("page_fp") != page_fp:
+            break
+        count += 1
+    return count
+
+
+def stuck_on(
+    run: dict, action: actions.Action, page_fp: str, *, canvas_app: bool = False
+) -> str | None:
+    """Why this run should stop, if flailing is all that is left."""
+    # Whichever guard fires, the canvas explanation is the one that actually
+    # tells the user what to do differently — so it rides along with both.
+    canvas_note = (
+        " This page draws its content on a canvas, which I can't read or click "
+        "into — the cells and text simply aren't in the page for me to work with."
+        if canvas_app
+        else ""
+    )
+
     repeats = repeat_count(run, action, page_fp)
     if repeats >= _STUCK_AFTER:
         return (
             f'tried the same "{action.kind}" step {repeats} times and the page '
-            "never changed — it isn't responding the way I expected"
+            f"never changed.{canvas_note or ' It is not responding the way I expected.'}"
+        )
+    stalled = steps_without_progress(run, page_fp)
+    if stalled >= _NO_PROGRESS_AFTER:
+        return (
+            f"{stalled} steps on the same screen with no progress."
+            f"{canvas_note or ' Nothing I try changes this screen.'}"
         )
     return None
 
@@ -287,7 +319,8 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
             action = actions.Action(kind="fail", reason=veto, why="Blocked by policy.")
 
     page_fp = page_fingerprint(body)
-    stuck = stuck_on(run, action, page_fp)
+    canvas_app = bool((body.get("dom") or {}).get("canvas_app"))
+    stuck = stuck_on(run, action, page_fp, canvas_app=canvas_app)
     if stuck:
         action = actions.Action(kind="fail", reason=stuck, why="Going in circles.")
 

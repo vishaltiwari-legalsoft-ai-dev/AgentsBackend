@@ -186,6 +186,63 @@ def test_same_action_on_a_changed_page_is_not_stuck(monkeypatch):
     assert run["status"] == "running"
 
 
+def test_varied_flailing_on_one_screen_is_caught(monkeypatch):
+    """The Google Sheets run: Escape, click, reload, Escape, click… every action
+    different, so the repeat guard never fires, and 40 steps go nowhere."""
+    moves = [
+        actions.Action(kind="key", text="Escape", why="close overlays"),
+        actions.Action(kind="click", index=10, why="close the panel"),
+        actions.Action(kind="key", text="Escape", why="close overlays"),
+        actions.Action(kind="navigate", url="https://docs.google.com/x", why="reload"),
+        actions.Action(kind="click", index=19, why="close the popup"),
+        actions.Action(kind="key", text="Escape", why="close overlays"),
+        actions.Action(kind="click", index=88, why="close another panel"),
+        actions.Action(kind="scroll", why="look around"),
+        actions.Action(kind="key", text="Escape", why="close overlays"),
+    ]
+    it = iter(moves)
+    monkeypatch.setattr(brain, "decide", lambda run, obs: next(it, moves[-1]))
+
+    run = runs.create_run(USER, "put the names in the sheet", "act", None)
+    resp = None
+    for seq in range(1, runs._NO_PROGRESS_AFTER + 2):
+        run, resp = runs.step(run, _page(seq, last_result={"ok": True}))
+        if resp["done"]:
+            break
+    assert resp["action"]["kind"] == "fail"
+    assert "no progress" in resp["action"]["reason"]
+    assert run["steps_used"] <= runs._NO_PROGRESS_AFTER + 1
+
+
+def test_canvas_app_failure_says_why(monkeypatch):
+    monkeypatch.setattr(
+        brain, "decide", lambda run, obs: actions.Action(kind="key", text="Escape", why="x")
+    )
+    run = runs.create_run(USER, "type into the sheet", "act", None)
+    resp = None
+    for seq in range(1, runs._NO_PROGRESS_AFTER + 2):
+        body = _page(seq, last_result={"ok": True})
+        body["dom"]["canvas_app"] = True
+        run, resp = runs.step(run, body)
+        if resp["done"]:
+            break
+    assert resp["action"]["kind"] == "fail"
+    assert "canvas" in resp["action"]["reason"]
+
+
+def test_progress_resets_the_stall_counter(monkeypatch):
+    """A screen that keeps changing is work, however long it takes."""
+    _stub_brain(monkeypatch, actions.Action(kind="scroll", why="more"))
+    run = runs.create_run(USER, "read a long page", "act", None)
+    resp = None
+    for seq in range(1, runs._NO_PROGRESS_AFTER + 4):
+        run, resp = runs.step(
+            run, _page(seq, labels=(f"row {seq}",), last_result={"ok": True})
+        )
+    assert resp["action"]["kind"] == "scroll"
+    assert run["status"] == "running"
+
+
 def test_screenshot_is_requested_once_repetition_starts(monkeypatch):
     _stub_brain(monkeypatch, actions.Action(kind="click", index=0, why="focus"))
     run = runs.create_run(USER, "send an email", "act", None)
