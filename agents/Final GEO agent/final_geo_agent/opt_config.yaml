@@ -6,6 +6,7 @@ version: 1
 terms:
   prevalence_exponent: 2.0        # k in importance = tfidf x prevalence^k (allowed 1.5-3)
   rank_weight_offset: 1.5         # w(r) = 1 / log2(r + offset), normalized
+  universal_idf_floor: 1.0        # idf floored at log((N+this)/N) so terms used by EVERY winner never zero out
   ngram_max: 3
   nested_ngram_overlap: 0.8       # suppress sub-gram when a super-gram covers >= this share of its count
   count_range_percentiles: [25, 75]
@@ -43,8 +44,33 @@ score:
   stuffing_p90_multiplier: 2.0    # per-term density above corpus P90 x this -> stuffing
   stuffing_penalty_points: 10     # points subtracted from the total per detection run
 
+extract:
+  link_density_max: 0.5           # DOM block is boilerplate above this link-chars share
+  min_block_chars: 25             # blocks shorter than this are boilerplate unless inside content
+  thin_doc_words: 150             # below -> paywall/teaser suspect, doc excluded
+  max_doc_words: 8000             # cap any single document's contribution (comment-swamp guard)
+  interstitial_max_share: 0.35    # share of sentences matching interstitial phrases -> drop doc
+  min_content_image_px: 200       # imgs smaller than this without alt = decorative, not counted
+  shingle_size: 5                 # words per shingle for near-duplicate detection
+  duplicate_jaccard: 0.7          # above -> syndicated copy, keep the higher-ranked one
+  comment_class_tokens: [comment, disqus, respond, discussion]
+  interstitial_phrases:
+    - we value your privacy
+    - accept all cookies
+    - cookie settings
+    - subscribe to our newsletter
+    - enable javascript
+    - please sign in
+
 semantic:
-  similarity_threshold: 0.62      # calibrate per embedding model (Phase 2)
+  similarity_threshold: 0.62      # draft chunk vs subtopic centroid: covered at/above this
+  embed_model: text-embedding-3-small
+  chunk_max_sentences: 4          # sentence-window chunking when a section runs long
+  chunk_overlap_sentences: 1
+  cluster_merge_threshold: 0.70   # chunk joins a subtopic cluster at/above this sim
+  min_cluster_docs: 3             # a subtopic must appear in >= this many distinct winners
+  hubness_max_matches: 3          # draft chunk matching more centroids than this is generic -> no evidence
+  reciprocal_top_k: 2             # centroid must be in the matching chunk's top-K nearest centroids
 
 # Per-vertical overrides, deep-merged over the base (e.g. health: {score: {weights: {...}}}).
 verticals: {}

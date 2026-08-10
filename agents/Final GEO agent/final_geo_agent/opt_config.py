@@ -20,6 +20,7 @@ _CONFIG_PATH = pathlib.Path(__file__).with_name("opt_config.yaml")
 class TermsCfg(BaseModel):
     prevalence_exponent: float = Field(ge=1.0, le=3.0)
     rank_weight_offset: float = Field(gt=0)
+    universal_idf_floor: float = Field(ge=0)
     ngram_max: int = Field(ge=1, le=4)
     nested_ngram_overlap: float = Field(gt=0, le=1)
     count_range_percentiles: tuple[float, float]
@@ -62,8 +63,28 @@ class ScoreCfg(BaseModel):
     stuffing_penalty_points: float = Field(ge=0)
 
 
+class ExtractCfg(BaseModel):
+    link_density_max: float = Field(gt=0, le=1)
+    min_block_chars: int
+    thin_doc_words: int
+    max_doc_words: int
+    interstitial_max_share: float = Field(gt=0, le=1)
+    min_content_image_px: int
+    shingle_size: int = Field(ge=2)
+    duplicate_jaccard: float = Field(gt=0, le=1)
+    comment_class_tokens: list[str]
+    interstitial_phrases: list[str]
+
+
 class SemanticCfg(BaseModel):
     similarity_threshold: float = Field(gt=0, lt=1)
+    embed_model: str
+    chunk_max_sentences: int = Field(ge=1)
+    chunk_overlap_sentences: int = Field(ge=0)
+    cluster_merge_threshold: float = Field(gt=0, lt=1)
+    min_cluster_docs: int = Field(ge=1)
+    hubness_max_matches: int = Field(ge=1)
+    reciprocal_top_k: int = Field(ge=1)
 
 
 class OptimizerConfig(BaseModel):
@@ -71,6 +92,7 @@ class OptimizerConfig(BaseModel):
     terms: TermsCfg
     structure: StructureCfg
     score: ScoreCfg
+    extract: ExtractCfg
     semantic: SemanticCfg
 
 

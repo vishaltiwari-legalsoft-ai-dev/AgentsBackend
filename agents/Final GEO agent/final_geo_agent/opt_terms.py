@@ -42,6 +42,10 @@ def importance(counts_by_rank: list[int], cfg: TermsCfg) -> float:
     if n == 0 or df == 0:
         return 0.0
     idf = math.log(n / df)
+    # a term used by EVERY winner has idf 0, which would erase exactly the
+    # highest-consensus terms — floor it so prevalence can do its job
+    if cfg.universal_idf_floor > 0:
+        idf = max(idf, math.log((n + cfg.universal_idf_floor) / n))
     weights = rank_weights(n, cfg.rank_weight_offset)
     weighted_tfidf = sum(w * sublinear_tf(c) for w, c in zip(weights, counts_by_rank)) * idf
     return weighted_tfidf * prevalence(counts_by_rank) ** cfg.prevalence_exponent
