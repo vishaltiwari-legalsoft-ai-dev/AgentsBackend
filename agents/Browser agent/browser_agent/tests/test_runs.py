@@ -5,18 +5,36 @@ test pins the loop mechanics, not the model.
 """
 from __future__ import annotations
 
+import json
+
 import app  # noqa: F401 - registers agent roots on sys.path
 import pytest
 
-from browser_agent import actions, brain, runs
+from browser_agent import actions, brain, planner, runs
 
 USER = {"id": "u1", "email": "owner@legalsoft.com"}
+
+
+_PLAN = {
+    "subtasks": [
+        {"id": "s1", "title": "Open compose", "goal": "open it", "steps": [],
+         "edge_cases": [], "done_when": "visible", "status": "pending"},
+        {"id": "s2", "title": "Fill recipient", "goal": "fill it", "steps": [],
+         "edge_cases": [], "done_when": "filled", "status": "pending"},
+    ],
+    "notes": "", "planned": True, "goal": "send an email",
+}
 
 
 @pytest.fixture(autouse=True)
 def _local(monkeypatch, tmp_path):
     monkeypatch.setenv("BROWSER_OFFLINE", "1")
     monkeypatch.setenv("BROWSER_LOCAL_DIR", str(tmp_path / "browser_state"))
+    # Planning is exercised in test_planner; here it must not make a real call.
+    monkeypatch.setattr(
+        planner, "build_plan",
+        lambda goal, **_kw: json.loads(json.dumps(_PLAN)) | {"goal": goal},
+    )
 
 
 def _stub_brain(monkeypatch, action: actions.Action):
@@ -200,6 +218,64 @@ def test_screenshot_reaches_the_brain(monkeypatch):
     run = runs.create_run(USER, "goal", "act", None)
     runs.step(run, _page(1, screenshot="data:image/jpeg;base64,ZZZ"))
     assert seen["screenshot"] == "data:image/jpeg;base64,ZZZ"
+
+
+# --------------------------------------------------------------------------- #
+# Plan-driven execution
+# --------------------------------------------------------------------------- #
+
+def test_run_starts_on_the_first_subtask():
+    run = runs.create_run(USER, "send an email", "act", None)
+    assert run["plan"]["subtasks"][0]["title"] == "Open compose"
+    assert planner.current(run["plan"])["id"] == "s1"
+
+
+def test_next_subtask_advances_and_asks_again_for_a_real_action(monkeypatch):
+    """The model saying "milestone reached" must still yield ONE executable
+    action, because the extension has nothing to do with a bookkeeping reply."""
+    replies = iter([
+        actions.Action(kind="next_subtask", why="compose is open"),
+        actions.Action(kind="click", index=3, why="focus the To field"),
+    ])
+    monkeypatch.setattr(brain, "decide", lambda run, obs: next(replies))
+
+    run = runs.create_run(USER, "send an email", "act", None)
+    run, resp = runs.step(run, _step_body(1))
+
+    assert resp["action"]["kind"] == "click"  # never "next_subtask"
+    assert planner.current(run["plan"])["id"] == "s2"
+    assert resp["subtask"] == "Fill recipient"
+    assert resp["subtask_progress"] == [1, 2]
+    assert run["steps"][-1]["completed"] == ["Open compose"]
+
+
+def test_finishing_the_last_subtask_completes_the_run(monkeypatch):
+    monkeypatch.setattr(
+        brain, "decide", lambda run, obs: actions.Action(kind="next_subtask", why="done")
+    )
+    run = runs.create_run(USER, "send an email", "act", None)
+    run, resp = runs.step(run, _step_body(1))
+    assert run["status"] == "completed"
+    assert resp["done"] is True
+    assert planner.progress(run["plan"]) == (2, 2)
+
+
+def test_steps_record_which_subtask_they_belong_to(monkeypatch):
+    _stub_brain(monkeypatch, actions.Action(kind="wait", why="settle"))
+    run = runs.create_run(USER, "send an email", "act", None)
+    run, _ = runs.step(run, _step_body(1))
+    assert run["steps"][-1]["subtask"] == "Open compose"
+
+
+def test_a_failed_plan_still_runs(monkeypatch):
+    monkeypatch.setattr(
+        planner, "build_plan", lambda goal, **_kw: planner.fallback_plan(goal, "model down")
+    )
+    _stub_brain(monkeypatch, actions.Action(kind="wait", why="settle"))
+    run = runs.create_run(USER, "do a thing", "act", None)
+    assert run["plan"]["planned"] is False
+    run, resp = runs.step(run, _step_body(1))
+    assert resp["action"]["kind"] == "wait"  # degraded, not dead
 
 
 def test_extracted_result_becomes_a_finding(monkeypatch):

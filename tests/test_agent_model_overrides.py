@@ -150,10 +150,19 @@ def test_agents_payload_lists_only_live_agents_with_their_fields(app_config):
     assert by_id["a9"]["fields"] == ["openrouter_model"]
     # GEO's LLM use is parsing-grade only (prompt universe, sentiment).
     assert by_id["a10"]["fields"] == ["openrouter_fast_model"]
-    # Browser Agent: reasoning model per act-loop step, fast model for digests.
-    assert by_id["a11"]["fields"] == ["openrouter_model", "openrouter_fast_model"]
-    # GD keeps its full set, planner included.
-    assert set(by_id["a1"]["fields"]) == set(runtime_config.AGENT_OVERRIDE_FIELDS)
+    # Browser Agent: premium planner up front, reasoning model per act-loop
+    # step, fast model for tab digests.
+    assert by_id["a11"]["fields"] == [
+        "browser_planner_model", "openrouter_model", "openrouter_fast_model",
+    ]
+    # GD keeps its full set, its planner included. Every field an agent declares
+    # must be one a Creator is allowed to override.
+    assert set(by_id["a1"]["fields"]) == {
+        "openrouter_model", "openrouter_fast_model", "openrouter_image_model",
+        "openrouter_vision_model", "gd_planner_model",
+    }
+    for agent in body["agents"]:
+        assert set(agent["fields"]) <= set(runtime_config.AGENT_OVERRIDE_FIELDS)
 
     # The planner dropdown needs options too.
     assert body["catalog"].get("gd_planner_model")

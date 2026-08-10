@@ -37,6 +37,12 @@ ACTION_KINDS = (
 # also never attaches the debugger on the extension side.
 MUTATING_KINDS = frozenset({"navigate", "click", "type", "select", "key", "open_tab"})
 
+# Handled entirely on the server: the model uses this to say a sub-task of the
+# plan is finished, and we immediately ask it for a real action on the next one.
+# Deliberately NOT in ACTION_KINDS — the extension's wire contract is unchanged,
+# so adding planning did not need a protocol bump.
+INTERNAL_KINDS = ("next_subtask",)
+
 
 class Action(BaseModel):
     kind: str
@@ -71,7 +77,7 @@ def validate_action(raw: object) -> Action:
     if not isinstance(raw, dict):
         raise ValueError("action must be a JSON object")
     kind = raw.get("kind")
-    if kind not in ACTION_KINDS:
+    if kind not in ACTION_KINDS and kind not in INTERNAL_KINDS:
         raise ValueError(f"model proposed unknown action {kind!r}")
     known = {k: v for k, v in raw.items() if k in Action.model_fields}
     action = Action(**known)  # pydantic ValidationError is a ValueError

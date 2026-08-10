@@ -190,6 +190,7 @@ def create_run(body: RunIn, user: dict = Depends(get_current_user)) -> dict:
         "blocked": run["blocked"],
         "sensitive_confirm": run["sensitive_confirm"],
         "status": run["status"],
+        "plan": run["plan"],
     }
 
 

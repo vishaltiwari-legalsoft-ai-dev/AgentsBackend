@@ -42,6 +42,8 @@ Actions (field "kind" plus the listed required fields):
 - {"kind":"wait"}                          wait ~1.5s for the page to settle
 - {"kind":"extract"}                       get the full page text (next step)
 - {"kind":"ask_user","text":...}           ask the user a question and pause
+- {"kind":"next_subtask"}                  the current sub-task's done_when is
+                                           satisfied — move to the next one
 - {"kind":"done","summary":...,"extracted":...}  finish with your findings
 - {"kind":"fail","reason":...}             give up honestly — never fake success
 
@@ -71,6 +73,11 @@ Rules:
    it. Try something else: a different element, scroll, wait, or say why you are
    stuck. Repeating an ineffective action is the single most common way these
    runs fail.
+7. Work ONLY on the current sub-task shown below. Its plan lists the micro-steps
+   and the edge cases someone already thought through — when the page matches a
+   listed risk, apply that handling instead of improvising. When its "done_when"
+   is visibly true, reply "next_subtask". Reply "done" only when the LAST
+   sub-task is finished.
 """
 
 
@@ -142,6 +149,40 @@ def _findings_block(run: dict) -> str:
     return text
 
 
+def _plan_block(run: dict) -> str:
+    """The current sub-task, its micro-steps and its pre-thought edge cases."""
+    from browser_agent import planner  # local import: avoids a cycle
+
+    plan = run.get("plan") or {}
+    subtasks = plan.get("subtasks") or []
+    if not subtasks:
+        return ""
+    active = planner.current(plan)
+    done, total = planner.progress(plan)
+
+    outline = "\n".join(
+        f'  {"[x]" if s.get("status") == "done" else "[ ]"} {i + 1}. {s.get("title")}'
+        for i, s in enumerate(subtasks)
+    )
+    if not active:
+        return f"PLAN ({done}/{total} done):\n{outline}\n\nAll sub-tasks are done — reply \"done\".\n"
+
+    steps = "\n".join(f"  - {s}" for s in active.get("steps") or []) or "  (none listed)"
+    edges = (
+        "\n".join(f'  - If {e["risk"]} → {e["handle"]}' for e in active.get("edge_cases") or [])
+        or "  (none listed)"
+    )
+    notes = f"\nOverall notes: {plan['notes']}" if plan.get("notes") else ""
+    return (
+        f"PLAN ({done}/{total} sub-tasks done):\n{outline}\n\n"
+        f"CURRENT SUB-TASK: {active.get('title')}\n"
+        f"  Goal: {active.get('goal')}\n"
+        f"  Finished when: {active.get('done_when')}\n"
+        f"  Micro-steps:\n{steps}\n"
+        f"  Edge cases to watch for:\n{edges}{notes}\n"
+    )
+
+
 def _user_prompt(run: dict, observation: dict) -> str:
     tab = observation.get("tab") or {}
     tabs = (observation.get("tabs") or [])[:_MAX_TABS]
@@ -161,6 +202,7 @@ def _user_prompt(run: dict, observation: dict) -> str:
         f"GOAL: {run.get('goal', '')}\n"
         f"MODE: {run.get('mode', 'act')}\n"
         f"STEPS REMAINING: {remaining}\n\n"
+        f"{_plan_block(run)}\n"
         f"Recent steps:\n{_history_block(run)}\n"
         f"{_tried_here(run, _runs.page_fingerprint(observation))}\n"
         f"Collected findings:\n{_findings_block(run)}\n\n"

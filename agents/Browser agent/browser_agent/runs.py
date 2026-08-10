@@ -11,7 +11,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 
-from browser_agent import actions, brain, state
+from browser_agent import actions, brain, planner, state
 
 TERMINAL = frozenset({"completed", "failed", "stopped"})
 
@@ -64,10 +64,13 @@ def _now() -> str:
 
 def create_run(user: dict, goal: str, mode: str, start_url: str | None) -> dict:
     pol = policy()
+    # Plan before touching the browser: a bad first move costs every step after it.
+    plan = planner.build_plan(goal.strip(), start_url=start_url)
     run = {
         "id": uuid.uuid4().hex[:12],
         "protocol": actions.PROTOCOL,
         "goal": goal.strip(),
+        "plan": plan,
         "mode": mode,
         "start_url": start_url,
         "status": "running",
@@ -143,6 +146,8 @@ def _response(
         # Asks the extension to attach a screenshot to the NEXT observation, so
         # the model can look at the page when the text view stops explaining it.
         "want_screenshot": want_screenshot,
+        "subtask": (planner.current(run.get("plan") or {}) or {}).get("title"),
+        "subtask_progress": list(planner.progress(run.get("plan") or {})),
         "steps_remaining": max(0, int(run["step_cap"]) - int(run["steps_used"])),
         "summary": run.get("summary"),
         "fail_reason": run.get("fail_reason"),
@@ -253,6 +258,26 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
         return run, response
 
     action = brain.decide(run, body)
+
+    # "next_subtask" never leaves the server: mark the milestone done and ask
+    # again for a real action on the new sub-task, so the extension still gets
+    # exactly one executable action per step.
+    advanced: list[str] = []
+    while action.kind == "next_subtask" and len(advanced) < len(
+        (run.get("plan") or {}).get("subtasks") or []
+    ):
+        finished = planner.current(run.get("plan") or {})
+        following = planner.advance(run.get("plan") or {})
+        advanced.append(str((finished or {}).get("title") or ""))
+        if not following:
+            action = actions.Action(
+                kind="done",
+                summary=f"Completed every step of the plan for: {run.get('goal', '')}",
+                why="The last sub-task is finished.",
+            )
+            break
+        action = brain.decide(run, body)
+
     veto = _veto(run, action)
     if veto:
         retry = dict(body, last_result={"ok": False, "error": veto})
@@ -279,10 +304,12 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
     )
     act_dict = action.model_dump(exclude_none=True)
 
+    active = planner.current(run.get("plan") or {})
     run["steps_used"] += 1
     run["steps"].append(
         {"seq": seq, "action": act_dict, "at": _now(), "sensitive": sensitive,
-         "page_fp": page_fp, "saw_page": bool(body.get("screenshot")), "result": None}
+         "page_fp": page_fp, "saw_page": bool(body.get("screenshot")),
+         "subtask": (active or {}).get("title"), "completed": advanced, "result": None}
     )
 
     if action.kind == "done":

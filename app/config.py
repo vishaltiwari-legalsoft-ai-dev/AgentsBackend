@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     # Auto-mode planner (Graphics Designer): plans gradient/element/text/logo
     # from the user's brief. Routed through OpenRouter like every model here.
     gd_planner_model: str = "openai/gpt-5.6-sol"
+    # Browser Agent planner: breaks a task into sub-tasks, micro-steps and the
+    # edge cases for each before any clicking starts. Worth a premium model —
+    # it runs once per run, and a bad plan wastes every step that follows.
+    browser_planner_model: str = "openai/gpt-5.6-sol"
     # Sent as HTTP-Referer/X-Title to OpenRouter for attribution (optional).
     app_public_url: str = "http://localhost:3000"
     app_title: str = "AgentOS"
