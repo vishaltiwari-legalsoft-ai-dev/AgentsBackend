@@ -177,6 +177,13 @@ AGENTS: list[dict[str, str | bool | list[str]]] = [
 AGENT_IDS = {str(a["id"]) for a in AGENTS}
 AGENT_FIELDS: dict[str, list[str]] = {str(a["id"]): list(a["fields"]) for a in AGENTS}
 
+# Display labels for the per-agent run tables (admin Database panel). Every
+# agent that logs runs appears here — including ones absent from AGENTS above
+# because they expose no model overrides (a2 uses shared SEO credentials).
+AGENT_LABELS: dict[str, str] = {str(a["id"]): str(a["name"]) for a in AGENTS} | {
+    "a2": "SEO Analyst",
+}
+
 
 ABILITIES: list[dict[str, str]] = [
     {

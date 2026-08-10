@@ -33,6 +33,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from app.security import get_current_user
+from app.services import run_tracking
 
 # On sys.path via app.__init__ (agent root registered there).
 from graphics_designer_agent import reference_library as rl
@@ -42,6 +43,22 @@ from graphics_designer_agent.creative import runs as cruns
 from graphics_designer_agent.creative import types as ctypes
 
 router = APIRouter()
+
+# The Creative rail is the Graphics Designer's document arm — same agent (a1)
+# in the catalog, so its activity lands in the same per-agent run table.
+CREATIVE_AGENT_ID = "a1"
+CREATIVE_AGENT_NAME = "Graphics Designer"
+
+
+def _track(user: dict, action: str, task: str, run: dict | None = None,
+           *, usage_action: str = "generate") -> None:
+    """Mandatory usage trail → agent_runs__a1 + master runs (admin DB panel)."""
+    run_tracking.record_activity(
+        user, agent_id=CREATIVE_AGENT_ID, agent_name=CREATIVE_AGENT_NAME,
+        category="design", action=action, task=task,
+        brand_id=(run or {}).get("brand_id"), run_id=(run or {}).get("id"),
+        usage_action=usage_action,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -113,6 +130,9 @@ def create(body: CreateBody, user: dict = Depends(get_current_user)) -> dict:
         brand_id=body.brand_id, brief=body.brief, autonomous=body.autonomous,
         text_mode=body.text_mode,
     )
+    _track(user, "creative_run",
+           f"{body.creative_type} — “{body.brief[:160]}”" if body.brief else body.creative_type,
+           run, usage_action="session")
     return _to_client(run)
 
 
@@ -183,11 +203,15 @@ def approve(run_id: str, user: dict = Depends(get_current_user)) -> dict:
 def generate(run_id: str, user: dict = Depends(get_current_user)) -> dict:
     run = _owned(run_id, user)
     try:
-        return _to_client(pipeline.produce(run))
+        result = pipeline.produce(run)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:  # engine missing (reportlab/python-pptx)
         raise HTTPException(503, str(exc)) from exc
+    _track(user, "creative_generate",
+           f"Rendered {result.get('creative_type', '')} — {len(result.get('artifacts', []))} artifacts",
+           result)
+    return _to_client(result)
 
 
 class AutoBody(BaseModel):
@@ -200,7 +224,7 @@ def autonomous(run_id: str, body: AutoBody = Body(default=AutoBody()),
                user: dict = Depends(get_current_user)) -> dict:
     run = _owned(run_id, user)
     try:
-        return _to_client(pipeline.run_autonomous(run, count=body.count, use_llm=body.use_llm))
+        result = pipeline.run_autonomous(run, count=body.count, use_llm=body.use_llm)
     except pipeline.AutonomyError as exc:
         # Acknowledgement required first — 428 Precondition Required.
         raise HTTPException(428, str(exc)) from exc
@@ -208,6 +232,10 @@ def autonomous(run_id: str, body: AutoBody = Body(default=AutoBody()),
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
+    _track(user, "creative_autonomous",
+           f"Autonomous {result.get('creative_type', '')} run — "
+           f"{len(result.get('artifacts', []))} artifacts", result)
+    return _to_client(result)
 
 
 @router.post("/creative/runs/{run_id}/override")

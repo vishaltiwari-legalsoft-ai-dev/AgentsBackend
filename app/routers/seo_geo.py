@@ -18,6 +18,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from app.security import get_current_user, require_creator
+from app.services import run_tracking
 from seo_geo_agent import advisor as seo_advisor
 from seo_geo_agent import gsc_oauth as seo_oauth
 from seo_geo_agent import site_brain as seo_site
@@ -33,7 +34,19 @@ router = APIRouter()
 logger = logging.getLogger("agentos.seo_geo")
 
 SEO_AGENT_ID = "a2"  # "SEO Analyst" slot in the frontend agent catalog
+SEO_AGENT_NAME = "SEO Analyst"
 TODO_STATUSES = {"todo", "assigned", "done"}
+
+
+def _track(user: dict, action: str, task: str, brand: dict | None = None,
+           *, usage_action: str = "generate") -> None:
+    """Mandatory usage trail → agent_runs__a2 + master runs (admin DB panel)."""
+    run_tracking.record_activity(
+        user, agent_id=SEO_AGENT_ID, agent_name=SEO_AGENT_NAME, category="seo",
+        action=action, task=task,
+        brand=(brand or {}).get("name"), brand_id=(brand or {}).get("id"),
+        usage_action=usage_action,
+    )
 
 
 class BrandIn(BaseModel):
@@ -156,6 +169,8 @@ def remove_brand(brand_id: str, user=Depends(require_creator)):
 def run_brand(brand_id: str, user=Depends(get_current_user)):
     brand = _brand_or_404(brand_id)
     run = insights.run_brand(brand, trigger=f"manual:{user['email']}")
+    _track(user, "run", f"Full SEO refresh — {len(run['todos'])} to-dos, "
+                        f"{len(run['topics'])} topics", brand, usage_action="session")
     return {"at": run["at"], "summary": run["summary"], "degraded": run["degraded"],
             "todo_count": len(run["todos"]), "topic_count": len(run["topics"])}
 
@@ -201,9 +216,11 @@ def run_site_review(brand_id: str, user=Depends(get_current_user)):
     """Crawl the brand's site, build the corpus, and run the expert review."""
     brand = _brand_or_404(brand_id)
     try:
-        return seo_site.analyze(brand)
+        review = seo_site.analyze(brand)
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    _track(user, "site_review", f"Expert site review of {brand['domain']}", brand)
+    return review
 
 
 @router.get("/seo-geo/site-review/{brand_id}")
@@ -235,7 +252,9 @@ def refresh_pages(brand_id: str, user=Depends(get_current_user)):
             ga_pages = ga_fetch_pages(prop, end - timedelta(days=28), end)
         except CredentialMissing as exc:
             notes.append(f"Google Analytics: {exc}")
-    return seo_pages.build_page_intel(brand, corpus["pages"], ga_pages, rows, data_notes=notes)
+    intel = seo_pages.build_page_intel(brand, corpus["pages"], ga_pages, rows, data_notes=notes)
+    _track(user, "pages_refresh", f"Rebuilt page intelligence for {brand['domain']}", brand)
+    return intel
 
 
 @router.post("/seo-geo/todos/{brand_id}/{todo_id}")
@@ -253,9 +272,11 @@ def set_todo_status(brand_id: str, todo_id: str, payload: TodoStatusIn, user=Dep
 def run_keyword_lab(brand_id: str, user=Depends(get_current_user)):
     brand = seo_site.effective_seeds(_brand_or_404(brand_id))
     rows, notes = _rows_28d(brand)
-    return seo_keywords.run_keyword_lab(
+    lab = seo_keywords.run_keyword_lab(
         brand, rows, trigger=f"manual:{user['email']}", extra_notes=notes
     )
+    _track(user, "keyword_lab", f"Keyword lab run — {len(lab.get('clusters', []))} clusters", brand)
+    return lab
 
 
 @router.get("/seo-geo/keywords/{brand_id}")
@@ -301,6 +322,7 @@ def track_competitors(brand_id: str, user=Depends(get_current_user)):
         feed = seo_competitors.sitemap_watch(brand)
     except CredentialMissing as exc:
         degraded.append(f"Sitemap watch: {exc}")
+    _track(user, "competitor_track", "Rank snapshot + competitor sitemap check", brand)
     return {"shifts": seo_competitors.rank_shifts(brand_id), "feed": feed, "degraded": degraded}
 
 
@@ -309,9 +331,11 @@ def serp_xray(brand_id: str, payload: QueryIn, user=Depends(get_current_user)):
     """Reverse-engineer the top of the SERP for any query, on demand."""
     brand = _brand_or_404(brand_id)
     try:
-        return seo_competitors.serp_deep_dive(brand, payload.query.strip())
+        result = seo_competitors.serp_deep_dive(brand, payload.query.strip())
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    _track(user, "serp_xray", f"SERP X-ray: “{payload.query.strip()}”", brand)
+    return result
 
 
 @router.get("/seo-geo/competitors/{brand_id}/profiles")
@@ -325,9 +349,11 @@ def refresh_competitor_profiles(brand_id: str, user=Depends(get_current_user)):
     """Rebuild the top-5 competitor profiles: visibility, keywords won, content feed."""
     brand = _brand_or_404(brand_id)
     try:
-        return seo_competitors.build_profiles(brand)
+        profiles = seo_competitors.build_profiles(brand)
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    _track(user, "competitor_profiles", "Rebuilt top-competitor profiles", brand)
+    return profiles
 
 
 # ------------------------- briefs & decay plans -------------------------
@@ -343,9 +369,11 @@ def build_brief(brand_id: str, payload: KeywordIn, user=Depends(get_current_user
     brand = _brand_or_404(brand_id)
     rows, _ = _rows_28d(brand)
     try:
-        return seo_briefs.build_brief(brand, payload.keyword.strip(), rows)
+        brief = seo_briefs.build_brief(brand, payload.keyword.strip(), rows)
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    _track(user, "brief", f"Content brief for “{payload.keyword.strip()}”", brand)
+    return brief
 
 
 @router.post("/seo-geo/update-plan/{brand_id}")
@@ -353,11 +381,13 @@ def build_update_plan(brand_id: str, payload: PageIn, user=Depends(get_current_u
     brand = _brand_or_404(brand_id)
     rows, _ = _rows_28d(brand)
     try:
-        return seo_briefs.update_plan(brand, payload.page.strip(), rows)
+        plan = seo_briefs.update_plan(brand, payload.page.strip(), rows)
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _track(user, "update_plan", f"Update plan for {payload.page.strip()}", brand)
+    return plan
 
 
 # ------------------------- audit & draft scoring -------------------------
@@ -366,9 +396,11 @@ def build_update_plan(brand_id: str, payload: PageIn, user=Depends(get_current_u
 def run_audit(brand_id: str, user=Depends(get_current_user)):
     brand = _brand_or_404(brand_id)
     try:
-        return seo_audit.site_audit(brand)
+        report = seo_audit.site_audit(brand)
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    _track(user, "audit", f"Technical site audit of {brand['domain']}", brand)
+    return report
 
 
 @router.get("/seo-geo/audit/{brand_id}")
@@ -385,7 +417,9 @@ def draft_score(brand_id: str, payload: DraftIn, user=Depends(get_current_user))
          if b["keyword"].lower() == payload.keyword.strip().lower()),
         None,
     )
-    return seo_audit.score_draft(brand, payload.text, payload.keyword.strip(), brief)
+    score = seo_audit.score_draft(brand, payload.text, payload.keyword.strip(), brief)
+    _track(user, "draft_score", f"Scored a draft for “{payload.keyword.strip()}”", brand)
+    return score
 
 
 # --------------------- Search Console connect (OAuth) ---------------------
@@ -449,9 +483,11 @@ def ask_expert(brand_id: str, payload: AskIn, user=Depends(get_current_user)):
     if not question:
         raise HTTPException(status_code=422, detail="Ask a question")
     try:
-        return seo_advisor.ask(brand, question)
+        answer = seo_advisor.ask(brand, question)
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    _track(user, "ask", f"Asked: {question}", brand)
+    return answer
 
 
 # ------------------------------- cron -------------------------------
@@ -485,4 +521,6 @@ def cron_run(request: Request):
         except Exception as exc:  # noqa: BLE001 — one bad brand must not kill the sweep
             logger.exception("seo cron failed for %s", brand["id"])
             results[brand["id"]] = {"ok": False, "error": str(exc)}
+    _track(run_tracking.CRON_USER, "cron",
+           f"Scheduled sweep across {len(results)} brands", usage_action="session")
     return {"brands": results}

@@ -460,7 +460,8 @@ _MAX_CELL_CHARS = 2000
 # Columns surfaced first (when present) so the most useful fields lead the table;
 # everything else follows alphabetically.
 _PREFERRED_COLUMNS = (
-    "id", "email", "name", "action", "agent_name", "status", "stage",
+    "id", "email", "name", "user", "action", "task", "agent_name", "status",
+    "run_status", "run_summary", "stage",
     "brand", "brand_name", "title", "file_name", "file_type", "agent_id",
     "category", "request_count", "user_id", "session_id", "brand_id", "ip",
     "started_at", "last_seen_at", "created_at", "updated_at", "last_login",
@@ -496,6 +497,17 @@ def _ordered_columns(rows: list[dict]) -> list[str]:
     return preferred + rest
 
 
+def _firestore_console_url(collection: str | None = None) -> str:
+    """Deep link into the Firebase console for our database / one collection."""
+    db = settings.firestore_database or "(default)"
+    db_segment = "-default-" if db == "(default)" else db
+    base = (
+        f"https://console.firebase.google.com/project/{settings.gcp_project_id}"
+        f"/firestore/databases/{db_segment}/data"
+    )
+    return f"{base}/~2F{collection}" if collection else base
+
+
 @router.get("/admin/db/collections")
 def list_db_collections(_admin: dict = Depends(require_admin)) -> dict:
     """Super Admin: the inspectable collections with their live document counts.
@@ -503,21 +515,26 @@ def list_db_collections(_admin: dict = Depends(require_admin)) -> dict:
     ``count`` is ``null`` for any collection whose count couldn't be read; if
     *every* count is null we report ``connected: false`` so the UI can say
     "couldn't reach the database" instead of implying everything is empty.
+    Every entry carries a ``console_url`` deep link into the Firebase console
+    so the same collection can be inspected at the source.
     """
     collections = [
-        {**c, "count": firestore_repo.count_collection(c["name"])}
+        {**c, "count": firestore_repo.count_collection(c["name"]),
+         "console_url": _firestore_console_url(c["name"])}
         for c in firestore_repo.VIEWABLE_COLLECTIONS
     ]
-    # Per-agent Table-1 collections (agent_runs__<id>) are created on demand, so
-    # discover them dynamically and label each with its agent's name.
-    agent_names = {str(a["id"]): a["name"] for a in agent_config.AGENTS}
-    for cname in firestore_repo.list_agent_run_collections():
+    # Per-agent run tables (agent_runs__<id>): every catalogued agent gets its
+    # table listed (0 rows until it logs), plus any table discovered in the
+    # database whose agent has since left the catalog.
+    known = {f"agent_runs__{aid}" for aid in agent_config.AGENT_LABELS}
+    for cname in sorted(known | set(firestore_repo.list_agent_run_collections())):
         agent_id = cname[len("agent_runs__"):]
         collections.append({
             "name": cname,
-            "label": f"Runs — {agent_names.get(agent_id, agent_id)}",
-            "description": f"Per-stage run history for agent '{agent_id}' (Table 1).",
+            "label": f"Runs — {agent_config.AGENT_LABELS.get(agent_id, agent_id)}",
+            "description": f"Who used agent '{agent_id}' and what task they ran (its own table).",
             "count": firestore_repo.count_collection(cname),
+            "console_url": _firestore_console_url(cname),
         })
     connected = any(c["count"] is not None for c in collections)
     return {
@@ -525,6 +542,7 @@ def list_db_collections(_admin: dict = Depends(require_admin)) -> dict:
         "connected": connected,
         "database": settings.firestore_database,
         "project": settings.gcp_project_id,
+        "console_url": _firestore_console_url(),
     }
 
 

@@ -16,6 +16,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from app.security import get_current_user
+from app.services import run_tracking
 from seo_geo_agent import insights
 from seo_geo_agent.sources import CredentialMissing
 
@@ -26,6 +27,18 @@ router = APIRouter()
 logger = logging.getLogger("agentos.blog_writer")
 
 BLOG_AGENT_ID = "a9"  # "Blog Writer" slot in the frontend agent catalog
+BLOG_AGENT_NAME = "Blog Writer"
+
+
+def _track(user: dict, action: str, task: str, run: dict | None = None,
+           *, usage_action: str = "generate") -> None:
+    """Mandatory usage trail → agent_runs__a9 + master runs (admin DB panel)."""
+    run_tracking.record_activity(
+        user, agent_id=BLOG_AGENT_ID, agent_name=BLOG_AGENT_NAME, category="copy",
+        action=action, task=task,
+        brand_id=(run or {}).get("brand_id"), run_id=(run or {}).get("id"),
+        usage_action=usage_action,
+    )
 
 _EXPORTS = {
     "md": (export.to_markdown, "text/markdown", "{slug}.md"),
@@ -99,11 +112,14 @@ def get_voice(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
 def study_voice(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
     brand = _brand(brand_id)
     try:
-        return bw_voice.study(brand, inventory.latest(brand_id))
+        vc = bw_voice.study(brand, inventory.latest(brand_id))
     except CredentialMissing as exc:
         raise HTTPException(status_code=424, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    _track(user, "voice_study", f"Studied brand voice for {brand.get('name', brand_id)}",
+           {"brand_id": brand_id})
+    return vc
 
 
 @router.get("/blog/brands/{brand_id}/inventory")
@@ -117,7 +133,10 @@ def get_inventory(brand_id: str, user: dict = Depends(get_current_user)) -> dict
 
 @router.post("/blog/brands/{brand_id}/inventory")
 def scan_inventory(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
-    return inventory.scan(_brand(brand_id))
+    inv = inventory.scan(_brand(brand_id))
+    _track(user, "inventory_scan", f"Scanned content inventory for {brand_id}",
+           {"brand_id": brand_id})
+    return inv
 
 
 @router.get("/blog/runs")
@@ -142,18 +161,22 @@ def create_run(body: RunIn, user: dict = Depends(get_current_user)) -> dict:
     topic = body.topic.strip()
     if not topic:
         raise HTTPException(status_code=422, detail="topic is required")
-    return research.new_run(
+    run = research.new_run(
         _brand(body.brand_id), topic, body.notes.strip(), user_id=str(user.get("id") or "")
     )
+    _track(user, "run_created", f"New blog run: “{topic}”", run, usage_action="session")
+    return run
 
 
 @router.post("/blog/runs/{run_id}/research/step")
 def research_step(run_id: str, user: dict = Depends(get_current_user)) -> dict:
     run = _run(run_id, user)
     try:
-        return research.research_step(run)
+        result = research.research_step(run)
     except CredentialMissing as exc:
         raise HTTPException(status_code=424, detail=str(exc)) from exc
+    _track(user, "research_step", f"Research step on “{run.get('topic', '')}”", run)
+    return result
 
 
 @router.post("/blog/runs/{run_id}/draft")
@@ -162,13 +185,15 @@ def build_draft(run_id: str, user: dict = Depends(get_current_user)) -> dict:
     if not run["ledger"]:
         raise HTTPException(status_code=409, detail="no evidence yet — run research first")
     try:
-        return drafting.build_draft(
+        result = drafting.build_draft(
             run, inventory.latest(run["brand_id"]), voice=bw_voice.latest(run["brand_id"])
         )
     except CredentialMissing as exc:
         raise HTTPException(status_code=424, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    _track(user, "draft", f"Drafted “{run.get('topic', '')}”", run)
+    return result
 
 
 @router.post("/blog/runs/{run_id}/blocks/{block_id}/comment")
@@ -180,22 +205,26 @@ def comment_block(run_id: str, block_id: str, body: CommentIn, user: dict = Depe
     if not run.get("draft"):
         raise HTTPException(status_code=409, detail="no draft yet — build the draft first")
     try:
-        return drafting.revise_block(run, block_id, comment, voice=bw_voice.latest(run["brand_id"]))
+        result = drafting.revise_block(run, block_id, comment, voice=bw_voice.latest(run["brand_id"]))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"unknown block: {block_id}") from exc
     except CredentialMissing as exc:
         raise HTTPException(status_code=424, detail=str(exc)) from exc
+    _track(user, "revise_block", f"Revision: {comment}", run)
+    return result
 
 
 @router.post("/blog/runs/{run_id}/visuals")
 def plan_visuals(run_id: str, user: dict = Depends(get_current_user)) -> dict:
     run = _run(run_id, user)
     try:
-        return visuals.plan_visuals(run, _brand(run["brand_id"]))
+        result = visuals.plan_visuals(run, _brand(run["brand_id"]))
     except CredentialMissing as exc:
         raise HTTPException(status_code=424, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    _track(user, "visuals", f"Planned visuals for “{run.get('topic', '')}”", run)
+    return result
 
 
 @router.get("/blog/runs/{run_id}/export")
@@ -210,6 +239,7 @@ def export_run(run_id: str, format: str = "md", user: dict = Depends(get_current
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     slug = (run.get("draft") or {}).get("meta", {}).get("slug") or run["id"]
     filename = name_tpl.format(slug=slug)
+    _track(user, f"export:{format}", f"Exported “{slug}” as {format}", run)
     return PlainTextResponse(
         content,
         media_type=media_type,

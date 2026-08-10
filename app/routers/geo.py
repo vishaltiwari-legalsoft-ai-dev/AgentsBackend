@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from app.security import get_current_user, require_creator
+from app.services import run_tracking
 from seo_geo_agent import insights
 from seo_geo_agent import geo_engines, geo_metrics, geo_poll, geo_prompts
 from seo_geo_agent.sources import CredentialMissing
@@ -21,6 +22,18 @@ router = APIRouter()
 logger = logging.getLogger("agentos.geo")
 
 GEO_AGENT_ID = "a10"
+GEO_AGENT_NAME = "GEO"
+
+
+def _track(user: dict, action: str, task: str, brand: dict | None = None,
+           *, usage_action: str = "generate") -> None:
+    """Mandatory usage trail → agent_runs__a10 + master runs (admin DB panel)."""
+    run_tracking.record_activity(
+        user, agent_id=GEO_AGENT_ID, agent_name=GEO_AGENT_NAME, category="seo",
+        action=action, task=task,
+        brand=(brand or {}).get("name"), brand_id=(brand or {}).get("id"),
+        usage_action=usage_action,
+    )
 
 
 def _brand_or_404(brand_id: str) -> dict:
@@ -101,11 +114,14 @@ def get_prompts(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
 def generate_prompts(brand_id: str, _creator: dict = Depends(require_creator)) -> dict:
     brand = _brand_or_404(brand_id)
     try:
-        return geo_prompts.generate_universe(brand)
+        universe = geo_prompts.generate_universe(brand)
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    _track(_creator, "prompts_generate",
+           f"Generated prompt universe — {len(universe.get('prompts', []))} prompts", brand)
+    return universe
 
 
 @router.put("/geo/brands/{brand_id}/prompts")
@@ -141,13 +157,16 @@ def poll_step(
 ) -> dict:
     brand = _brand_or_404(brand_id)
     try:
-        return geo_poll.poll_step(
+        result = geo_poll.poll_step(
             brand, engines=body.engines, runs=body.runs, batch_size=body.batch_size
         )
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    engines = ", ".join(body.engines) if body.engines else "all engines"
+    _track(user, "poll_step", f"AI answer poll ({engines}, batch {body.batch_size})", brand)
+    return result
 
 
 @router.get("/geo/brands/{brand_id}/report")

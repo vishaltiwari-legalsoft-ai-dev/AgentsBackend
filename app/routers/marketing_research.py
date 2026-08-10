@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from fastapi.responses import StreamingResponse
 
 from app.security import get_current_user
+from app.services import run_tracking
 
 from dataclasses import asdict
 
@@ -46,7 +47,16 @@ router = APIRouter()
 logger = logging.getLogger("agentos.mr")
 
 MR_AGENT_ID = "a6"  # "Market Researcher" slot in the frontend agent catalog
+MR_AGENT_NAME = "Marketing Research"
 _FULL_RANGE = DateRange(start=date(2000, 1, 1), end=date(2100, 1, 1))
+
+
+def _track(user: dict, action: str, task: str, *, usage_action: str = "generate") -> None:
+    """Mandatory usage trail → agent_runs__a6 + master runs (admin DB panel)."""
+    run_tracking.record_activity(
+        user, agent_id=MR_AGENT_ID, agent_name=MR_AGENT_NAME, category="data",
+        action=action, task=task, usage_action=usage_action,
+    )
 
 
 def _save_csv_tmp(content: bytes) -> str:
@@ -175,6 +185,8 @@ async def ingest(
         "gaps": [g.__dict__ for g in (m_gaps + l_gaps)],
     }
     runs.save_run(run)
+    _track(user, "ingest",
+           f"Uploaded {platform} export — {len(metrics)} metrics, {len(leads)} leads")
     return {
         "dataset_id": run["id"],
         "platform": platform,
@@ -211,6 +223,8 @@ def ingest_sheet(
     else:
         results = _ingest_sheet_all(user["id"], year)
 
+    ok = sum(1 for r in results if "error" not in r)
+    _track(user, "ingest_sheet", f"Sheet pull — {ok}/{len(results)} tabs ingested")
     return {"spreadsheet_id": mr_config.SHEETS_SPREADSHEET_ID, "year": year, "tabs": results}
 
 
@@ -284,6 +298,8 @@ def cron_refresh(request: Request):
         return out
     out["capture"] = mr_snapshots.capture_workbook(grids, year=mr_config.SHEETS_YEAR, today=today)
     out["exported"] = mr_snapshots.export_all_to_gcs(today)
+    _track(run_tracking.CRON_USER, "cron_refresh",
+           f"Scheduled refresh for {today.isoformat()}", usage_action="session")
     return out
 
 
@@ -403,6 +419,7 @@ async def ingest_pdf(file: UploadFile = File(...), user=Depends(get_current_user
         "gaps": gaps,
     }
     runs.save_run(run)
+    _track(user, "ingest_pdf", f"Parsed PDF “{name}” — {len(metrics)} metrics")
     return {"dataset_id": run["id"], "platform": run["platform"],
             "metrics": len(metrics), "leads": 0, "gaps": gaps}
 
@@ -439,6 +456,7 @@ def snapshots_capture(user=Depends(get_current_user)):
         raise HTTPException(502, f"Could not read the spreadsheet: {exc}")
     results = mr_snapshots.capture_workbook(grids, year=mr_config.SHEETS_YEAR, today=today)
     exported = mr_snapshots.export_all_to_gcs(today)
+    _track(user, "snapshot", f"Captured {len(results)} tab snapshots for {today.isoformat()}")
     return {"date": today.isoformat(), "tabs": results, "exported": exported}
 
 
@@ -519,6 +537,7 @@ def workbook_scan(user=Depends(get_current_user)):
         _, profs = _workbook_bundle(deep=True, use_cache=False)
     except Exception as exc:
         raise HTTPException(502, f"Could not read the spreadsheet: {exc}")
+    _track(user, "workbook_scan", f"Deep-profiled {len(profs)} workbook tabs")
     return {"tabs": [asdict(p) for p in profs], "count": len(profs)}
 
 
@@ -534,10 +553,12 @@ def ask(body: dict | None = None, user=Depends(get_current_user)):
     except Exception as exc:
         raise HTTPException(502, f"Could not read the spreadsheet: {exc}")
     grid_map = {g.title: g.rows for g in grids}
-    return mr_insight.answer(
+    answer = mr_insight.answer(
         question, profs, grid_map,
         timeframe=body.get("timeframe"), year=mr_config.SHEETS_YEAR,
     )
+    _track(user, "ask", f"Asked: {question}")
+    return answer
 
 
 @router.get("/mr/sources")
@@ -577,6 +598,7 @@ def add_sheet_source(body: dict | None = None, user=Depends(get_current_user)):
         tabs = [asdict(p) for p in profs]
     except Exception:
         tabs = []
+    _track(user, "connect_sheet", f"Connected sheet “{src.get('label', sid)}”")
     return {"source": src, "tabs": tabs, "tab_count": len(meta.get("tabs") or [])}
 
 
@@ -695,11 +717,15 @@ def make_report(kind: str, body: dict | None = None, user=Depends(get_current_us
     if period and kind not in ("monthly_summary", "quarterly_summary"):
         raise HTTPException(422, f"'{kind}' reports don't take a period.")
     if kind == "daily_movement":
-        return reports.build(kind, {"snapshot_deltas": mr_snapshots.deltas_for()}, user_id=user["id"])
-    try:
-        return reports.build(kind, _load_dataset(user["id"]), user_id=user["id"], period=period)
-    except reports.PeriodError as exc:
-        raise HTTPException(422, str(exc))
+        report = reports.build(kind, {"snapshot_deltas": mr_snapshots.deltas_for()}, user_id=user["id"])
+    else:
+        try:
+            report = reports.build(kind, _load_dataset(user["id"]), user_id=user["id"], period=period)
+        except reports.PeriodError as exc:
+            raise HTTPException(422, str(exc))
+    _track(user, f"report:{kind}",
+           f"Built {kind} report" + (f" for {period}" if period else ""))
+    return report
 
 
 @router.get("/mr/runs")
@@ -769,4 +795,6 @@ def trigger_schedule(period: str, user=Depends(get_current_user)):
     }.get(period)
     if not fn:
         raise HTTPException(404, f"unknown period '{period}'")
-    return fn(_load_dataset(user["id"]), user_id=user["id"])
+    result = fn(_load_dataset(user["id"]), user_id=user["id"])
+    _track(user, f"schedule:{period}", f"Ran the {period} schedule")
+    return result
