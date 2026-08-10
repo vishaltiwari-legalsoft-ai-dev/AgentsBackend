@@ -19,6 +19,9 @@ _INDEX_DOC = "runs-index"
 _INDEX_CAP = 200
 _MAX_FINDING_CHARS = 8_000
 _MAX_FINDINGS = 40
+# Identical failing steps in a row mean the page isn't responding the way the
+# model thinks. Burning the whole step cap on that helps nobody.
+_STUCK_AFTER = 4
 
 
 class ProtocolMismatch(ValueError):
@@ -137,6 +140,31 @@ def _response(
     }
 
 
+def _fingerprint(action: dict) -> str:
+    return f"{action.get('kind')}:{action.get('index')}:{action.get('url')}:{action.get('text')}"
+
+
+def stuck_on(run: dict, action: actions.Action) -> str | None:
+    """The repeat this action would make, if it is one worth giving up on."""
+    fingerprint = _fingerprint(action.model_dump(exclude_none=True))
+    repeats = 1
+    for step in reversed(run.get("steps") or []):
+        if _fingerprint(step.get("action") or {}) != fingerprint:
+            break
+        # A step that worked and is being repeated on purpose (scrolling down a
+        # long page) is fine; only a run of failures counts as stuck.
+        result = step.get("result") or {}
+        if result.get("ok"):
+            break
+        repeats += 1
+    if repeats >= _STUCK_AFTER:
+        return (
+            f'repeated the same "{action.kind}" step {repeats} times without it '
+            "working — the page isn't responding the way I expected"
+        )
+    return None
+
+
 def _veto(run: dict, action: actions.Action) -> str | None:
     """Policy check on a decided action; returns the honest refusal or None."""
     if run.get("mode") == "monitor" and action.kind in actions.MUTATING_KINDS:
@@ -204,6 +232,10 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
         veto = _veto(run, action)
         if veto:
             action = actions.Action(kind="fail", reason=veto, why="Blocked by policy.")
+
+    stuck = stuck_on(run, action)
+    if stuck:
+        action = actions.Action(kind="fail", reason=stuck, why="Going in circles.")
 
     elements = (body.get("dom") or {}).get("elements") or []
     sensitive = bool(run.get("sensitive_confirm", True)) and actions.is_sensitive(

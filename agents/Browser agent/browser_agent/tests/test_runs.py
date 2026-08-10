@@ -132,6 +132,33 @@ def test_stop_is_terminal(monkeypatch):
     assert resp["done"] is True and run["status"] == "stopped"
 
 
+def test_repeated_failing_action_gives_up_honestly(monkeypatch):
+    """The click-type-click loop seen on a real site: the same step, failing,
+    forever. It should stop and say so, not burn the whole step cap."""
+    _stub_brain(monkeypatch, actions.Action(kind="click", index=0, why="try again"))
+    run = runs.create_run(USER, "goal", "act", None)
+    body = lambda seq: _step_body(  # noqa: E731
+        seq, last_result={"ok": False, "error": "nothing happened"}
+    )
+    resp = None
+    for seq in range(1, runs._STUCK_AFTER + 1):
+        run, resp = runs.step(run, body(seq))
+    assert resp["action"]["kind"] == "fail"
+    assert "same" in resp["action"]["reason"]
+    assert run["steps_used"] < run["step_cap"]  # gave up early, as intended
+
+
+def test_repeating_a_working_action_is_fine(monkeypatch):
+    """Scrolling a long page repeats the same step on purpose — not stuck."""
+    _stub_brain(monkeypatch, actions.Action(kind="scroll", why="more"))
+    run = runs.create_run(USER, "read it all", "act", None)
+    resp = None
+    for seq in range(1, runs._STUCK_AFTER + 2):
+        run, resp = runs.step(run, _step_body(seq, last_result={"ok": True}))
+    assert resp["action"]["kind"] == "scroll"
+    assert run["status"] == "running"
+
+
 def test_extracted_result_becomes_a_finding(monkeypatch):
     _stub_brain(monkeypatch, actions.Action(kind="scroll", why="more"))
     run = runs.create_run(USER, "research", "act", None)
