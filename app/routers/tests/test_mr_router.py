@@ -198,3 +198,15 @@ def test_ingest_sheet_captures_lead_analysis(monkeypatch, tmp_path):
     v = body["months"]["2026-08"]["vendors"][0]
     assert v["booked"] == 2 and v["completed"] == 1 and v["no_show"] == 1
     assert v["services_sold"] == 1 and v["amount"] == 2000.0
+
+    # The Leads panel prints: latest month by default, explicit month by query,
+    # honest 422 for a month that has no rows.
+    pdf = client.get("/api/mr/lead-analysis/pdf")
+    assert pdf.status_code == 200 and pdf.content.startswith(b"%PDF")
+    assert "mr-leads-2026-08.pdf" in pdf.headers["content-disposition"]
+    assert client.get("/api/mr/lead-analysis/pdf?month=2026-08").status_code == 200
+    assert client.get("/api/mr/lead-analysis/pdf?month=2026-01").status_code == 422
+
+
+def test_lead_analysis_pdf_404_before_any_pull():
+    assert client.get("/api/mr/lead-analysis/pdf").status_code == 404

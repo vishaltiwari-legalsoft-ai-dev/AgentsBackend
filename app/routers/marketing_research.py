@@ -862,6 +862,22 @@ def report_run_pdf(run_id: str, user=Depends(get_current_user)):
     return _pdf_response(mr_pdf.report_pdf(run), f"mr-{run['kind']}-{stamp}.pdf")
 
 
+@router.get("/mr/lead-analysis/pdf")
+def lead_analysis_pdf(month: str | None = None, user=Depends(get_current_user)):
+    """The Leads panel as a PDF — same story line, red-flag card and vendor
+    table the user is looking at. ``month`` (YYYY-MM) defaults to the latest;
+    an unknown month is a 422, never a silently substituted one."""
+    run = _latest_lead_run(user["id"])
+    if not run or not (run.get("summary") or {}).get("months"):
+        raise HTTPException(404, "no lead-analysis data yet")
+    try:
+        data = mr_pdf.leads_pdf(run, month=month)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    label = month or (run.get("summary") or {}).get("latest_month") or "latest"
+    return _pdf_response(data, f"mr-leads-{label}.pdf")
+
+
 @router.get("/mr/snapshots/vendor/{slug}/pdf")
 def snapshots_vendor_pdf(slug: str, date_iso: str | None = None,
                          user=Depends(get_current_user)):

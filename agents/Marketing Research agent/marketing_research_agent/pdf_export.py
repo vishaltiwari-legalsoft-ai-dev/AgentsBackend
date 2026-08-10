@@ -1,6 +1,6 @@
 """Console-faithful PDF exports (2026-07-27).
 
-Two downloads, each mirroring the panel the user is looking at, section for
+Three downloads, each mirroring the panel the user is looking at, section for
 section, in the console's own order and wording:
 
 - ``report_pdf``  → the Reports panel document (``MrReportDoc``): eyebrow /
@@ -9,6 +9,8 @@ section, in the console's own order and wording:
   vendor detail cards, vendor insights & actions, appendix.
 - ``vendor_pdf``  → the Vendors panel dossier (``VendorsView``): official
   summary grid, day movement, budget & spend + section groups, channel blocks.
+- ``leads_pdf``   → the Leads panel (``LeadsView``): month story, red-flag
+  card, brand/source mix, per-vendor outcome table, provenance.
 
 Print-friendly white theme (client-forwardable); pure function over the same
 dicts the console API returns — no I/O, no LLM, nothing existing is touched.
@@ -679,6 +681,156 @@ def report_pdf(report: dict) -> bytes:
 
     buf = BytesIO()
     _doc(buf, meta["label"]).build(story, onFirstPage=_footer, onLaterPages=_footer)
+    return buf.getvalue()
+
+
+# --- Leads panel PDF ---------------------------------------------------------
+
+_MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July",
+                "August", "September", "October", "November", "December")
+
+
+def _month_label(ym: str) -> str:
+    try:
+        y, m = ym.split("-")
+        return f"{_MONTH_NAMES[int(m) - 1]} {y}"
+    except (ValueError, IndexError):
+        return str(ym)
+
+
+def _outcome_cell(n, rate) -> str:
+    return f"{_num(n)} · {rate:.0f}%" if _is_num(rate) else _num(n)
+
+
+def leads_pdf(run: dict, month: str | None = None) -> bytes:
+    """Render the Leads panel for one month exactly as LeadsView lays it out.
+
+    ``run`` is the persisted lead_analysis run; ``month`` picks a specific
+    "YYYY-MM" block (default: the latest). An unknown month raises ValueError —
+    the router turns that into an honest 422, never a substituted month."""
+    S = _styles()
+    summary = run.get("summary") or {}
+    months = summary.get("months") or {}
+    active = month or summary.get("latest_month")
+    if not months or active not in months:
+        raise ValueError(f"No lead-analysis data for {month or 'any month'}.")
+    block = months[active]
+    vendors = block.get("vendors") or []
+    t = block.get("totals") or {}
+    flagged = [v for v in vendors if v.get("flags")]
+    flag_count = block.get("flag_count", 0)
+
+    story: list = []
+    src = str(run.get("tab") or "Lead sheet") + (
+        f" in {run.get('source_label')}" if run.get("source_label") else "")
+    _band(story, S, "Lead analysis · Marketing", f"Leads — {_month_label(active)}",
+          f"From “{src}” · updated {_fmt_time(run.get('generated_at'))} · Marketing Research agent",
+          _verdict(flag_count, 0))
+    story.append(Spacer(0, 6 * mm))
+
+    n = 0
+
+    def sec(title: str):
+        nonlocal n
+        n += 1
+        story.append(Spacer(0, 3.5 * mm))
+        story.append(_section(n, title, S))
+        story.append(Spacer(0, 2.5 * mm))
+
+    # 01 — Month at a glance: the console's story line + outcome counts strip.
+    sec("Month at a glance")
+    nv = len(vendors)
+    line = (f"{_num(t.get('booked'))} demos booked across {nv} vendor{'' if nv == 1 else 's'} — "
+            f"{_num(t.get('completed'))} completed, {_num(t.get('no_show'))} no-shows, "
+            f"{_num(t.get('canceled'))} canceled, {_num(t.get('bad_lead'))} bad leads, "
+            f"{_num(t.get('pending'))} upcoming.")
+    if t.get("services_sold"):
+        line += (f" {_num(t.get('services_sold'))} service"
+                 f"{'' if t.get('services_sold') == 1 else 's'} sold ({_money(t.get('mrr'))} MRR).")
+    story.append(Paragraph(_esc(line), S["body"]))
+    story.append(Spacer(0, 2.5 * mm))
+    story.append(_kpi_strip([
+        ("Booked", _num(t.get("booked"))),
+        ("Completed", _outcome_cell(t.get("completed"), t.get("completed_rate_pct"))),
+        ("No-shows", _outcome_cell(t.get("no_show"), t.get("no_show_rate_pct"))),
+        ("Canceled", _outcome_cell(t.get("canceled"), t.get("canceled_rate_pct"))),
+        ("Bad leads", _outcome_cell(t.get("bad_lead"), t.get("bad_lead_rate_pct"))),
+        ("Upcoming", _num(t.get("pending"))),
+    ], S))
+    mixes = []
+    for label, counts in (("Brand", t.get("brands") or {}), ("Source", t.get("sources") or {})):
+        if counts:
+            ordered = sorted(counts.items(), key=lambda kv: -kv[1])
+            mixes.append(f"<b>{label}</b>  " + " · ".join(f"{_esc(k)} {v}" for k, v in ordered))
+    if mixes:
+        story.append(Spacer(0, 2 * mm))
+        story.append(Paragraph("&nbsp;&nbsp;&nbsp;".join(mixes), S["small"]))
+
+    # 02 — Red flags: same card as the console, grouped by vendor, message
+    # verbatim (each message names its fix direction). Green line when clean.
+    sec("Red flags")
+    if flagged:
+        lines: list = [Paragraph(
+            f'<font color="{_hx(RED)}"><b>{flag_count} RED FLAG{"" if flag_count == 1 else "S"} '
+            f'ACROSS {len(flagged)} VENDOR{"" if len(flagged) == 1 else "S"}</b></font>',
+            S["cellsmall"]), Spacer(0, 1 * mm)]
+        for v in flagged:
+            name = v.get("matched_vendor") or v.get("campaign")
+            for f in v.get("flags") or []:
+                lines.append(Paragraph(
+                    f'<font color="{_hx(RED)}">■ <b>{_esc(name)}</b> — {_esc(f.get("message"))}</font>',
+                    S["body"]))
+                lines.append(Spacer(0, 0.8 * mm))
+        story.append(KeepTogether([
+            _rounded_card(lines, width=_PAGE_W, bg=RED_TINT, border=RED, accent=RED)]))
+    else:
+        story.append(Paragraph(
+            f'<font color="{_hx(GREEN)}">No red flags this month — outcomes are inside every line.</font>',
+            S["body"]))
+
+    # 03 — Vendor table: same columns as the console; flagged cells in red.
+    sec("Vendors")
+    _FLAG_COL = {"zero_completed": 2, "no_show_rate": 3, "canceled_rate": 4, "bad_lead_rate": 5}
+    head = ("Vendor", "Booked", "Completed", "No-shows", "Canceled", "Bad leads",
+            "Upcoming", "Contract sent", "Sold")
+    rows = [[Paragraph(f"<b>{h}</b>", S["cellsmall"]) for h in head]]
+    for v in vendors:
+        tripped = {f.get("metric") for f in v.get("flags") or []}
+        cells = [
+            _esc(v.get("matched_vendor") or v.get("campaign")),
+            _num(v.get("booked")),
+            _outcome_cell(v.get("completed"), v.get("completed_rate_pct")),
+            _outcome_cell(v.get("no_show"), v.get("no_show_rate_pct")),
+            _outcome_cell(v.get("canceled"), v.get("canceled_rate_pct")),
+            _outcome_cell(v.get("bad_lead"), v.get("bad_lead_rate_pct")),
+            _num(v.get("pending")),
+            _num((v.get("deal_stages") or {}).get("contract_sent", 0)),
+            _num(v.get("services_sold")),
+        ]
+        red_cols = {col for metric, col in _FLAG_COL.items() if metric in tripped}
+        if tripped:
+            cells[0] = f'<font color="{_hx(RED)}"><b>{cells[0]}</b></font>'
+        rows.append([Paragraph(
+            f'<font color="{_hx(RED)}"><b>{c}</b></font>' if i in red_cols else c,
+            S["cell"]) for i, c in enumerate(cells)])
+    story.append(_grid_table(rows, col_widths=[36 * mm] + [None] * 8))
+
+    # last — provenance: the honest notes the console shows under the table.
+    sec("Data notes & provenance")
+    unmatched = summary.get("unmatched_campaigns") or []
+    if unmatched:
+        story.append(Paragraph(_esc(
+            "Not matched to any tracker vendor tab: " + ", ".join(unmatched) +
+            " — their QL-ratio / booking-rate check couldn't run."), S["small"]))
+    for gap in run.get("gaps") or []:
+        story.append(Paragraph(_esc(f"Data note: {gap}"), S["small"]))
+    story.append(Paragraph(_esc(
+        f"Source: {src} · pulled {_fmt_time(run.get('generated_at'))}"
+        f" · refreshes with every sheet pull · months on file: "
+        + ", ".join(sorted(months))), S["small"]))
+
+    buf = BytesIO()
+    _doc(buf, f"Leads — {_month_label(active)}").build(story, onFirstPage=_footer, onLaterPages=_footer)
     return buf.getvalue()
 
 
