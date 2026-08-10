@@ -1,8 +1,8 @@
 """GEO polling + prompt universe — offline, engines faked at the adapter seam."""
 import pytest
 
-from seo_geo_agent import geo_engines, geo_poll, geo_prompts
-from seo_geo_agent.geo_engines import EngineAnswer
+from final_geo_agent import geo_engines, geo_poll, geo_prompts
+from final_geo_agent.geo_engines import EngineAnswer
 from seo_geo_agent.sources import CredentialMissing
 
 BRAND = {"id": "legalsoft", "name": "Legal Soft", "domain": "legalsoft.com",

@@ -4,7 +4,7 @@ httpx is stubbed at the module seam; no network, no keys."""
 import httpx
 import pytest
 
-from seo_geo_agent import geo_engines
+from final_geo_agent import geo_engines
 
 
 class FakeResp:

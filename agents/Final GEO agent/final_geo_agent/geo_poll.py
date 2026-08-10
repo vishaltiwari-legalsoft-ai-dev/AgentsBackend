@@ -17,7 +17,7 @@ import datetime as dt
 import re
 
 from seo_geo_agent import state
-from seo_geo_agent import geo_engines, geo_prompts
+from final_geo_agent import geo_engines, geo_prompts
 from seo_geo_agent.sources import CredentialMissing, llm_json
 
 DEFAULT_DAILY_CAP = 2000

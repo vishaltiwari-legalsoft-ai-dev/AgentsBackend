@@ -1,5 +1,5 @@
 """GEO metrics — pure-math unit tests (no I/O, no network)."""
-from seo_geo_agent import geo_metrics
+from final_geo_agent import geo_metrics
 
 
 def ans(prompt_id, run, engine="perplexity", mentions=None, citations=None, error=None):

@@ -9,8 +9,8 @@ import pathlib
 
 import pytest
 
-from seo_geo_agent import opt_score, opt_structure, opt_terms
-from seo_geo_agent.opt_config import load_config
+from final_geo_agent import opt_score, opt_structure, opt_terms
+from final_geo_agent.opt_config import load_config
 
 FIXTURE = json.loads(
     (pathlib.Path(__file__).parent / "fixtures" / "coldbrew_corpus.json").read_text()

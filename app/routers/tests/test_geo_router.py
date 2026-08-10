@@ -14,8 +14,9 @@ from fastapi.testclient import TestClient
 
 from app.main import app as fastapi_app
 from app.security import get_current_user
-from seo_geo_agent import geo_engines, insights
-from seo_geo_agent.geo_engines import EngineAnswer
+from final_geo_agent import geo_engines
+from seo_geo_agent import insights
+from final_geo_agent.geo_engines import EngineAnswer
 
 client = TestClient(fastapi_app)
 

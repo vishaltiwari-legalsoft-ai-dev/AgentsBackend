@@ -14,8 +14,8 @@ from pydantic import BaseModel, Field
 
 from app.security import get_current_user, require_creator
 from app.services import run_tracking
+from final_geo_agent import geo_engines, geo_metrics, geo_poll, geo_prompts
 from seo_geo_agent import insights
-from seo_geo_agent import geo_engines, geo_metrics, geo_poll, geo_prompts
 from seo_geo_agent.sources import CredentialMissing
 
 router = APIRouter()
