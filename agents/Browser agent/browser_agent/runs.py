@@ -22,6 +22,11 @@ _MAX_FINDINGS = 40
 # Identical failing steps in a row mean the page isn't responding the way the
 # model thinks. Burning the whole step cap on that helps nobody.
 _STUCK_AFTER = 4
+# Repeats before we ask the extension for a screenshot. Text alone can't explain
+# why a click does nothing on an app like Gmail — an overlay, a control that only
+# looks focusable, an element the model is reading as the wrong thing. One repeat
+# is noise; two means the text view isn't enough, so let the model look.
+_LOOK_AFTER = 2
 
 
 class ProtocolMismatch(ValueError):
@@ -127,6 +132,7 @@ def _response(
     action: dict | None,
     *,
     requires_confirmation: bool = False,
+    want_screenshot: bool = False,
 ) -> dict:
     return {
         "protocol": actions.PROTOCOL,
@@ -134,6 +140,9 @@ def _response(
         "done": run["status"] in TERMINAL,
         "status": run["status"],
         "requires_confirmation": requires_confirmation,
+        # Asks the extension to attach a screenshot to the NEXT observation, so
+        # the model can look at the page when the text view stops explaining it.
+        "want_screenshot": want_screenshot,
         "steps_remaining": max(0, int(run["step_cap"]) - int(run["steps_used"])),
         "summary": run.get("summary"),
         "fail_reason": run.get("fail_reason"),
@@ -144,23 +153,42 @@ def _fingerprint(action: dict) -> str:
     return f"{action.get('kind')}:{action.get('index')}:{action.get('url')}:{action.get('text')}"
 
 
-def stuck_on(run: dict, action: actions.Action) -> str | None:
-    """The repeat this action would make, if it is one worth giving up on."""
+def page_fingerprint(body: dict) -> str:
+    """A cheap "is this still the same screen?" signature.
+
+    Clicking a control that does nothing still reports success — the click was
+    dispatched, it just achieved nothing — so counting failures alone misses the
+    worst loop: the same click landing forever on an unchanged page. Comparing
+    the screen instead catches it, while leaving genuine repetition (scrolling a
+    long page changes which elements are in view) alone.
+    """
+    dom = body.get("dom") or {}
+    elements = dom.get("elements") or []
+    labels = "|".join(str(e.get("text") or "")[:24] for e in elements[:12])
+    url = (body.get("tab") or {}).get("url") or ""
+    return f"{url}#{len(elements)}#{labels}"
+
+
+def repeat_count(run: dict, action: actions.Action, page_fp: str) -> int:
+    """How many times in a row this exact action has been tried on this screen."""
     fingerprint = _fingerprint(action.model_dump(exclude_none=True))
     repeats = 1
     for step in reversed(run.get("steps") or []):
         if _fingerprint(step.get("action") or {}) != fingerprint:
             break
-        # A step that worked and is being repeated on purpose (scrolling down a
-        # long page) is fine; only a run of failures counts as stuck.
-        result = step.get("result") or {}
-        if result.get("ok"):
-            break
+        if step.get("page_fp") != page_fp:
+            break  # the screen moved on, so this isn't the same attempt again
         repeats += 1
+    return repeats
+
+
+def stuck_on(run: dict, action: actions.Action, page_fp: str) -> str | None:
+    """The repeat this action would make, if it is one worth giving up on."""
+    repeats = repeat_count(run, action, page_fp)
     if repeats >= _STUCK_AFTER:
         return (
-            f'repeated the same "{action.kind}" step {repeats} times without it '
-            "working — the page isn't responding the way I expected"
+            f'tried the same "{action.kind}" step {repeats} times and the page '
+            "never changed — it isn't responding the way I expected"
         )
     return None
 
@@ -233,9 +261,17 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
         if veto:
             action = actions.Action(kind="fail", reason=veto, why="Blocked by policy.")
 
-    stuck = stuck_on(run, action)
+    page_fp = page_fingerprint(body)
+    stuck = stuck_on(run, action, page_fp)
     if stuck:
         action = actions.Action(kind="fail", reason=stuck, why="Going in circles.")
+
+    # Ask for a look once repetition starts, unless we already had one this step.
+    want_screenshot = (
+        not body.get("screenshot")
+        and action.kind not in ("done", "fail")
+        and repeat_count(run, action, page_fp) >= _LOOK_AFTER
+    )
 
     elements = (body.get("dom") or {}).get("elements") or []
     sensitive = bool(run.get("sensitive_confirm", True)) and actions.is_sensitive(
@@ -245,7 +281,8 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
 
     run["steps_used"] += 1
     run["steps"].append(
-        {"seq": seq, "action": act_dict, "at": _now(), "sensitive": sensitive, "result": None}
+        {"seq": seq, "action": act_dict, "at": _now(), "sensitive": sensitive,
+         "page_fp": page_fp, "saw_page": bool(body.get("screenshot")), "result": None}
     )
 
     if action.kind == "done":
@@ -267,7 +304,7 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
         response = _response(run, act_dict)
     else:
         run["status"] = "running"
-        response = _response(run, act_dict)
+        response = _response(run, act_dict, want_screenshot=want_screenshot)
 
     run["last_decision"] = response
     run["updated_at"] = _now()

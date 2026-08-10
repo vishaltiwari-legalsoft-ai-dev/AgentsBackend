@@ -47,6 +47,13 @@ Actions (field "kind" plus the listed required fields):
 
 Every action also takes "why": one short plain-language line shown to the user.
 
+When a screenshot is attached, it is the current viewport. Use it to work out
+why the text view isn't matching what you expect — an overlay or dialog covering
+the control, a element that looks clickable but isn't the real input, a field
+that is already filled, a menu that never opened. Then pick the element index
+from the list that matches what you SEE. The indexes are not on the image; map
+by the element's text and position.
+
 Rules:
 1. Use ONLY element indexes present in the DOM index. If what you need is not
    there, scroll or extract — never invent an index.
@@ -60,6 +67,10 @@ Rules:
 5. When the goal is achieved, reply "done" with a concise summary (and
    "extracted" for structured data). If you are stuck after trying, reply
    "fail" with the honest reason. Do not loop on the same failing action.
+6. If a step has already been tried and the page did not change, do NOT repeat
+   it. Try something else: a different element, scroll, wait, or say why you are
+   stuck. Repeating an ineffective action is the single most common way these
+   runs fail.
 """
 
 
@@ -94,8 +105,31 @@ def _history_block(run: dict) -> str:
         act = s.get("action") or {}
         result = s.get("result") or {}
         outcome = "ok" if result.get("ok") else (result.get("error") or "pending")
-        lines.append(f'{s.get("seq")}. {act.get("kind")} — {act.get("why", "")} → {outcome}')
+        target = f' [{act.get("index")}]' if act.get("index") is not None else ""
+        lines.append(
+            f'{s.get("seq")}. {act.get("kind")}{target} — {act.get("why", "")} → {outcome}'
+        )
     return "\n".join(lines)
+
+
+def _tried_here(run: dict, page_fp: str) -> str:
+    """Steps already attempted on THIS screen — the antidote to the retry loop."""
+    tried: list[str] = []
+    for step in reversed(run.get("steps") or []):
+        if step.get("page_fp") != page_fp:
+            break
+        act = step.get("action") or {}
+        label = f'{act.get("kind")} [{act.get("index")}]' if act.get("index") is not None \
+            else str(act.get("kind"))
+        if label not in tried:
+            tried.append(label)
+    if not tried:
+        return ""
+    return (
+        "\nAlready tried on this exact screen, with NO change to the page: "
+        + ", ".join(reversed(tried))
+        + ". Do not repeat these — try something different.\n"
+    )
 
 
 def _findings_block(run: dict) -> str:
@@ -121,11 +155,14 @@ def _user_prompt(run: dict, observation: dict) -> str:
     reply = observation.get("user_reply")
     reply_line = f"\nUser replied to your question: {reply}" if reply else ""
     remaining = max(0, int(run.get("step_cap", 0)) - int(run.get("steps_used", 0)))
+    from browser_agent import runs as _runs  # local import: avoids a cycle
+
     return (
         f"GOAL: {run.get('goal', '')}\n"
         f"MODE: {run.get('mode', 'act')}\n"
         f"STEPS REMAINING: {remaining}\n\n"
-        f"Recent steps:\n{_history_block(run)}\n\n"
+        f"Recent steps:\n{_history_block(run)}\n"
+        f"{_tried_here(run, _runs.page_fingerprint(observation))}\n"
         f"Collected findings:\n{_findings_block(run)}\n\n"
         f"Active tab: {str(tab.get('title') or '')[:80]} — {tab.get('url', '')}\n"
         f"Open tabs:\n{tabs_lines or '(none reported)'}\n\n"
@@ -151,10 +188,24 @@ def _parse_action(content: object) -> actions.Action:
     return actions.validate_action(json.loads(text[start : end + 1]))
 
 
+def _user_message(text: str, screenshot: str | None) -> tuple[str, object]:
+    """A plain text turn, or a multimodal one when the model should look."""
+    if not screenshot:
+        return ("user", text)
+    return (
+        "user",
+        [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": screenshot}},
+        ],
+    )
+
+
 def decide(run: dict, observation: dict) -> actions.Action:
     """One LLM call (plus one retry on garbage) → one validated Action."""
     system = _SYSTEM
     user = _user_prompt(run, observation)
+    screenshot = observation.get("screenshot") or None
     llm = openrouter.get_llm(temperature=0.2, agent_id=AGENT_ID)
 
     last_error = ""
@@ -163,7 +214,7 @@ def decide(run: dict, observation: dict) -> actions.Action:
             f"{user}\n\nYour previous reply was invalid: {last_error}. "
             "Reply again with exactly one valid action JSON object."
         )
-        response = llm.invoke([("system", system), ("user", prompt)])
+        response = llm.invoke([("system", system), _user_message(prompt, screenshot)])
         try:
             return _parse_action(getattr(response, "content", response))
         except (ValueError, json.JSONDecodeError) as exc:

@@ -130,6 +130,9 @@ class StepIn(BaseModel):
     last_result: dict | None = None
     user_reply: str | None = Field(default=None, max_length=2000)
     confirmed: bool = False
+    # A viewport screenshot as a data: URL, attached only when the server asked
+    # for one (see want_screenshot). ~4MB covers a full-width JPEG comfortably.
+    screenshot: str | None = Field(default=None, max_length=4_000_000)
 
 
 @router.get("/browser/status")

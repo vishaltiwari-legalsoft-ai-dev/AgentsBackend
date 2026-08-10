@@ -132,31 +132,74 @@ def test_stop_is_terminal(monkeypatch):
     assert resp["done"] is True and run["status"] == "stopped"
 
 
-def test_repeated_failing_action_gives_up_honestly(monkeypatch):
-    """The click-type-click loop seen on a real site: the same step, failing,
-    forever. It should stop and say so, not burn the whole step cap."""
-    _stub_brain(monkeypatch, actions.Action(kind="click", index=0, why="try again"))
-    run = runs.create_run(USER, "goal", "act", None)
-    body = lambda seq: _step_body(  # noqa: E731
-        seq, last_result={"ok": False, "error": "nothing happened"}
+def _page(seq: int, *, url="https://mail.google.com/", labels=("To", "Subject"), **kw):
+    """One observation of a screen; same labels + url = the same screen."""
+    return _step_body(
+        seq,
+        tab={"id": 1, "url": url, "title": "Gmail"},
+        dom={"elements": [{"i": i, "tag": "div", "text": t} for i, t in enumerate(labels)]},
+        **kw,
     )
+
+
+def test_repeated_click_on_an_unchanged_page_gives_up(monkeypatch):
+    """The real Gmail failure: the click 'succeeds' every time (CDP dispatched
+    it) but the page never moves, so counting failures alone never fires."""
+    _stub_brain(monkeypatch, actions.Action(kind="click", index=0, why="focus the To field"))
+    run = runs.create_run(USER, "send an email", "act", None)
     resp = None
     for seq in range(1, runs._STUCK_AFTER + 1):
-        run, resp = runs.step(run, body(seq))
+        run, resp = runs.step(run, _page(seq, last_result={"ok": True}))
     assert resp["action"]["kind"] == "fail"
-    assert "same" in resp["action"]["reason"]
-    assert run["steps_used"] < run["step_cap"]  # gave up early, as intended
+    assert "never changed" in resp["action"]["reason"]
+    assert run["steps_used"] < run["step_cap"]
 
 
-def test_repeating_a_working_action_is_fine(monkeypatch):
-    """Scrolling a long page repeats the same step on purpose — not stuck."""
+def test_same_action_on_a_changed_page_is_not_stuck(monkeypatch):
+    """Scrolling repeats the same step by design; each scroll shows new elements."""
     _stub_brain(monkeypatch, actions.Action(kind="scroll", why="more"))
     run = runs.create_run(USER, "read it all", "act", None)
     resp = None
     for seq in range(1, runs._STUCK_AFTER + 2):
-        run, resp = runs.step(run, _step_body(seq, last_result={"ok": True}))
+        run, resp = runs.step(
+            run, _page(seq, labels=(f"row {seq}", f"row {seq + 1}"), last_result={"ok": True})
+        )
     assert resp["action"]["kind"] == "scroll"
     assert run["status"] == "running"
+
+
+def test_screenshot_is_requested_once_repetition_starts(monkeypatch):
+    _stub_brain(monkeypatch, actions.Action(kind="click", index=0, why="focus"))
+    run = runs.create_run(USER, "send an email", "act", None)
+
+    run, first = runs.step(run, _page(1, last_result={"ok": True}))
+    assert first["want_screenshot"] is False  # one attempt is not a loop
+
+    run, second = runs.step(run, _page(2, last_result={"ok": True}))
+    assert second["want_screenshot"] is True  # same click, same screen — look
+
+
+def test_no_screenshot_requested_when_one_was_supplied(monkeypatch):
+    _stub_brain(monkeypatch, actions.Action(kind="click", index=0, why="focus"))
+    run = runs.create_run(USER, "send an email", "act", None)
+    run, _ = runs.step(run, _page(1, last_result={"ok": True}))
+    run, resp = runs.step(
+        run, _page(2, last_result={"ok": True}, screenshot="data:image/jpeg;base64,AAAA")
+    )
+    assert resp["want_screenshot"] is False
+
+
+def test_screenshot_reaches_the_brain(monkeypatch):
+    seen: dict = {}
+
+    def capture(run, obs):
+        seen["screenshot"] = obs.get("screenshot")
+        return actions.Action(kind="wait", why="settle")
+
+    monkeypatch.setattr(brain, "decide", capture)
+    run = runs.create_run(USER, "goal", "act", None)
+    runs.step(run, _page(1, screenshot="data:image/jpeg;base64,ZZZ"))
+    assert seen["screenshot"] == "data:image/jpeg;base64,ZZZ"
 
 
 def test_extracted_result_becomes_a_finding(monkeypatch):
