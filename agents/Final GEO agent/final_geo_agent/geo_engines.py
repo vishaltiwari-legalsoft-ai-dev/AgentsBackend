@@ -22,9 +22,14 @@ from app.services import runtime_config
 
 from seo_geo_agent.sources import domain_of
 
-# One place to change engine targets. Answer text is capped so a day of poll
-# docs stays far under Firestore's 1 MB doc limit.
+# One place to change engine targets. Answer text AND citations are capped in
+# to_dict so a day of poll docs stays under Firestore's 1 MB doc limit — an
+# uncapped Gemini citation list (500-char redirect URLs) blew a prod day-doc
+# past the limit on 2026-08-10.
 ANSWER_TEXT_CAP = 4000
+CITATIONS_CAP = 10
+CITATION_URL_CAP = 400
+CITATION_TITLE_CAP = 120
 REQUEST_TIMEOUT = 45
 PERPLEXITY_MODEL = "sonar"
 GEMINI_MODEL = "gemini-flash-latest"  # alias survives model turnover; pinned 2.5 404s for new keys
@@ -66,7 +71,14 @@ class EngineAnswer:
             "engine": self.engine,
             "model": self.model,
             "text": self.text[:ANSWER_TEXT_CAP],
-            "citations": self.citations,
+            "citations": [
+                {
+                    "url": (c.get("url") or "")[:CITATION_URL_CAP],
+                    "domain": c.get("domain", ""),
+                    "title": (c.get("title") or "")[:CITATION_TITLE_CAP],
+                }
+                for c in self.citations[:CITATIONS_CAP]
+            ],
             "latency_ms": self.latency_ms,
             "error": self.error,
             "via": self.via,

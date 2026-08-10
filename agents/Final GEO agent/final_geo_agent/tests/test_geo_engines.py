@@ -158,3 +158,16 @@ def test_poll_engine_unknown_engine():
 def test_answer_text_capped():
     ans = geo_engines.EngineAnswer(engine="perplexity", text="x" * 10000)
     assert len(ans.to_dict()["text"]) == geo_engines.ANSWER_TEXT_CAP
+
+
+def test_to_dict_caps_citations_and_lengths():
+    ans = geo_engines.EngineAnswer(
+        engine="gemini", text="x" * 9000,
+        citations=[{"url": "https://vertexaisearch.example/" + "r" * 900,
+                    "domain": f"site{i}.com", "title": "t" * 500} for i in range(30)],
+    )
+    d = ans.to_dict()
+    assert len(d["text"]) == geo_engines.ANSWER_TEXT_CAP
+    assert len(d["citations"]) == geo_engines.CITATIONS_CAP        # 1MB day-doc guard
+    assert len(d["citations"][0]["url"]) == geo_engines.CITATION_URL_CAP
+    assert len(d["citations"][0]["title"]) == geo_engines.CITATION_TITLE_CAP

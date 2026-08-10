@@ -14,6 +14,7 @@ does nothing.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 
 from seo_geo_agent import state
@@ -239,7 +240,14 @@ def poll_step(
         docs[engine]["answers"].append(record)
 
     for engine in {engine for engine, _p, _r in batch}:
-        state.save(poll_doc_id(brand["id"], engine, day), docs[engine])
+        doc = docs[engine]
+        # Firestore hard-caps docs at 1 MB. Records are slimmed at the source
+        # (text + citation caps in EngineAnswer.to_dict); this is the honest
+        # last resort if a doc still balloons: drop oldest answers, say so.
+        while len(json.dumps(doc["answers"])) > 900_000 and doc["answers"]:
+            doc["answers"].pop(0)
+            doc["overflow_trimmed"] = int(doc.get("overflow_trimmed", 0)) + 1
+        state.save(poll_doc_id(brand["id"], engine, day), doc)
 
     cfg.setdefault("counters", {})[day] = used + calls
     # keep only the trailing 30 day-counters so the config doc never grows
