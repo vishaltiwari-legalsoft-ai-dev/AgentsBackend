@@ -147,7 +147,13 @@ def _pending_tasks(
 ) -> list[tuple[str, dict, int]]:
     tasks: list[tuple[str, dict, int]] = []
     for engine, doc in docs.items():
-        done = {(a["prompt_id"], a["run"]) for a in doc.get("answers", [])}
+        # only SUCCESSFUL answers complete a task — an errored run (quota,
+        # outage) stays pending so the next poll retries it instead of
+        # writing the whole day off
+        done = {
+            (a["prompt_id"], a["run"])
+            for a in doc.get("answers", []) if not a.get("error")
+        }
         for prompt in prompts:
             for run in range(1, runs + 1):
                 if (prompt["id"], run) not in done:
@@ -224,6 +230,12 @@ def poll_step(
                 record["sentiment"] = _sentiment(
                     prompt["text"], answer.text, brand.get("name", "")
                 )
+        # a retry replaces the task's earlier error record — the doc keeps one
+        # honest latest attempt per (prompt, run), not a pile of stale 429s
+        docs[engine]["answers"] = [
+            a for a in docs[engine]["answers"]
+            if not (a["prompt_id"] == prompt["id"] and a["run"] == run and a.get("error"))
+        ]
         docs[engine]["answers"].append(record)
 
     for engine in {engine for engine, _p, _r in batch}:

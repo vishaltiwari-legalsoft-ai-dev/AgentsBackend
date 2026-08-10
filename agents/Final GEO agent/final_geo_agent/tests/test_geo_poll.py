@@ -106,6 +106,34 @@ def test_poll_step_batches_resume_and_parse(fake_engine):
     assert record["citations"][0]["domain"] == "g2.com"
 
 
+def test_errored_runs_retry_and_replace_on_next_poll(monkeypatch):
+    """A 429-style failed run must stay PENDING (not eat the day) and the
+    retry must replace the stale error record, not pile up next to it."""
+    seed_prompts(1)
+    behavior = {"fail": True}
+
+    def scripted(engine, prompt):
+        if behavior["fail"]:
+            return EngineAnswer(engine=engine, error="HTTP 429: quota exceeded")
+        return EngineAnswer(engine=engine, model="fake", text="Legal Soft wins.")
+
+    monkeypatch.setattr(geo_engines, "available_engines",
+                        lambda: {"perplexity": True, "gemini": False, "chatgpt": False})
+    monkeypatch.setattr(geo_engines, "poll_engine", scripted)
+
+    first = geo_poll.poll_step(BRAND, runs=1, batch_size=10)
+    assert (first["done"], first["total"]) == (1, 1)
+    assert geo_poll.recent_answers(BRAND["id"], days=1)[0]["error"]
+
+    behavior["fail"] = False
+    retry = geo_poll.poll_step(BRAND, runs=1, batch_size=10)   # quota back -> retried
+    assert (retry["done"], retry["total"]) == (1, 1)
+    answers = geo_poll.recent_answers(BRAND["id"], days=1)
+    assert len(answers) == 1                       # error record replaced, not appended
+    assert answers[0]["error"] is None
+    assert answers[0]["brand_mentioned"] is True
+
+
 def test_poll_step_honors_daily_cap(fake_engine):
     seed_prompts(3)
     geo_poll.ensure_config(BRAND)
