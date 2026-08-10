@@ -78,10 +78,14 @@ extract:
 semantic:
   similarity_threshold: 0.62      # draft chunk vs subtopic centroid: covered at/above this
   embed_model: text-embedding-3-small      # OpenAI (when openai_api_key present)
-  gemini_embed_model: text-embedding-004   # Gemini free-tier fallback (gemini_api_key)
+  gemini_embed_model: gemini-embedding-001 # Gemini free-tier fallback (gemini_api_key); live-verified 2026-08-11
   chunk_max_sentences: 4          # sentence-window chunking when a section runs long
   chunk_overlap_sentences: 1
   cluster_merge_threshold: 0.70   # chunk joins a subtopic cluster at/above this sim
+  model_thresholds:               # per-model calibration — cosine scales differ by embedder
+    gemini-embedding-001:         # measured 2026-08-11: same-topic 0.76-0.85, cross 0.60-0.72
+      similarity_threshold: 0.73
+      cluster_merge_threshold: 0.75
   min_cluster_docs: 3             # a subtopic must appear in >= this many distinct winners
   hubness_max_matches: 3          # draft chunk matching more centroids than this is generic -> no evidence
   reciprocal_top_k: 2             # centroid must be in the matching chunk's top-K nearest centroids

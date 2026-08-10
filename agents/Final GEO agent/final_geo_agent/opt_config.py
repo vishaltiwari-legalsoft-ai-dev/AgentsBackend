@@ -94,6 +94,7 @@ class SemanticCfg(BaseModel):
     similarity_threshold: float = Field(gt=0, lt=1)
     embed_model: str
     gemini_embed_model: str
+    model_thresholds: dict[str, dict[str, float]] = {}
     chunk_max_sentences: int = Field(ge=1)
     chunk_overlap_sentences: int = Field(ge=0)
     cluster_merge_threshold: float = Field(gt=0, lt=1)

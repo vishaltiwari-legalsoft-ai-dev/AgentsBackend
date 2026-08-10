@@ -27,7 +27,7 @@ from seo_geo_agent.sources import domain_of
 ANSWER_TEXT_CAP = 4000
 REQUEST_TIMEOUT = 45
 PERPLEXITY_MODEL = "sonar"
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-flash-latest"  # alias survives model turnover; pinned 2.5 404s for new keys
 OPENAI_MODEL = "gpt-4o-mini"
 
 # engine id -> runtime_config/settings field holding its key

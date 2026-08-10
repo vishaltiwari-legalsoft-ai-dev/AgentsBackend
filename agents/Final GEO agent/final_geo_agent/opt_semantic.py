@@ -97,19 +97,37 @@ class GeminiEmbedder:
 
 class AutoEmbedder:
     """Whichever embedding key is configured wins: OpenAI first, else Gemini,
-    else CredentialMissing — the pipeline then runs lexical-only, labelled."""
+    else CredentialMissing — the pipeline then runs lexical-only, labelled.
+    ``last_model`` records which model actually embedded, so snapshots can pin
+    it (a draft must be re-scored in the same vector space as its corpus)."""
 
     def __init__(self, cfg: SemanticCfg):
         self.cfg = cfg
+        self.last_model = ""
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         if runtime_config.get("openai_api_key"):
+            self.last_model = self.cfg.embed_model
             return OpenAIEmbedder(self.cfg.embed_model).embed(texts)
         if runtime_config.get("gemini_api_key"):
+            self.last_model = self.cfg.gemini_embed_model
             return GeminiEmbedder(self.cfg.gemini_embed_model).embed(texts)
         raise CredentialMissing(
             "No embedding key — add openai_api_key or gemini_api_key (free tier) in Settings → Secrets."
         )
+
+
+def embedder_for_model(model: str, cfg: SemanticCfg):
+    """The embedder that produces the given model's vector space."""
+    if model == cfg.gemini_embed_model:
+        return GeminiEmbedder(model)
+    return OpenAIEmbedder(model or cfg.embed_model)
+
+
+def cfg_for_model(cfg: SemanticCfg, model: str) -> SemanticCfg:
+    """Per-model threshold calibration — cosine scales are model-specific."""
+    overrides = cfg.model_thresholds.get(model)
+    return cfg.model_copy(update=overrides) if overrides else cfg
 
 
 class Chunk(BaseModel):

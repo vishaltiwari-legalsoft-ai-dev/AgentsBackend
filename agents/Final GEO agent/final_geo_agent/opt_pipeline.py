@@ -17,6 +17,8 @@ import datetime as dt
 import re
 import uuid
 
+import httpx
+
 from seo_geo_agent import state
 from seo_geo_agent.sources import CredentialMissing
 
@@ -118,14 +120,21 @@ def _score_draft(doc: dict, draft: str, embedder, cfg: OptimizerConfig) -> dict:
     sem_score: float | None = None
     coverage = None
     degraded = list(doc["meta"].get("degraded", []))
+    # the draft must live in the SAME vector space as the snapshot's centroids
+    embed_model = doc.get("embed_model", "")
+    sem_cfg = opt_semantic.cfg_for_model(cfg.semantic, embed_model)
+    if embedder is None or isinstance(embedder, opt_semantic.AutoEmbedder):
+        embedder = opt_semantic.embedder_for_model(embed_model, cfg.semantic)
     if subtopics:
         try:
-            chunks = opt_semantic.chunk_draft(draft, cfg.semantic)
+            chunks = opt_semantic.chunk_draft(draft, sem_cfg)
             vectors = embedder.embed([c.text for c in chunks]) if chunks else []
-            coverage = opt_semantic.coverage(model, chunks, vectors, cfg.semantic)
+            coverage = opt_semantic.coverage(model, chunks, vectors, sem_cfg)
             sem_score = coverage.score
         except CredentialMissing:
             degraded.append("semantic_unavailable_at_scoring")
+        except httpx.HTTPError as exc:  # bad key/outage: degrade, don't kill the score
+            degraded.append(f"semantic_error: {type(exc).__name__}")
     else:
         degraded.append("semantic_unavailable")
 
@@ -247,16 +256,22 @@ def analyze(keyword: str, locale: str = "en-US", draft: str = "", *,
     embedder = embedder or opt_semantic.AutoEmbedder(cfg.semantic)
     subtopics: list[opt_semantic.Subtopic] = []
     degraded: list[str] = []
+    embed_model = ""
     try:
         chunks = []
         for di, d in enumerate(articles):
             chunks.extend(opt_semantic.chunk_doc(d, di, cfg.semantic))
         if chunks:
             vectors = embedder.embed([c.text for c in chunks])
-            subtopics = opt_semantic.build_subtopics(chunks, vectors, cfg.semantic, cfg.terms).subtopics
+            embed_model = getattr(embedder, "last_model", "") or getattr(embedder, "model", "")
+            sem_cfg = opt_semantic.cfg_for_model(cfg.semantic, embed_model)
+            subtopics = opt_semantic.build_subtopics(chunks, vectors, sem_cfg, cfg.terms).subtopics
     except CredentialMissing:
         degraded.append("semantic_unavailable")
         warnings.append("No embedding key configured — scoring is lexical-only (lower confidence).")
+    except httpx.HTTPError as exc:  # bad key/outage: analysis still lands, labelled
+        degraded.append(f"semantic_error: {type(exc).__name__}")
+        warnings.append("Embedding call failed — scoring is lexical-only for this run (lower confidence).")
 
     # Layer 5 — structure (articles only)
     feature_values: dict[str, list[float]] = {}
@@ -280,6 +295,7 @@ def analyze(keyword: str, locale: str = "en-US", draft: str = "", *,
         },
         "results": result_rows,
         "term_profile": profile,
+        "embed_model": embed_model,
         "subtopics": [s.model_dump() for s in subtopics],
         "structure_bands": {f: b.model_dump() for f, b in bands.items()},
         "corpus_median_words": corpus_median,
@@ -299,7 +315,7 @@ def rescore(analysis_id: str, draft: str, embedder=None) -> dict:
     if not doc:
         raise KeyError(f"unknown analysis: {analysis_id}")
     cfg = load_config(doc["meta"].get("vertical"))
-    embedder = embedder or opt_semantic.AutoEmbedder(cfg.semantic)
+    # embedder resolution happens inside _score_draft, pinned to the snapshot's model
     report = _score_draft(doc, draft, embedder, cfg)
     doc["last_report"] = report
     state.save(ANALYSIS_DOC.format(aid=analysis_id), doc)

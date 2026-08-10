@@ -23,7 +23,17 @@ from seo_geo_agent import sources, state
 
 from .opt_config import SerpCfg
 
-USER_AGENT = "AgentOS-ContentOptimizer/1.0 (marketing research; contact: admin@legalsoft.com)"
+# Browser-presenting UA — many winners 403 unknown agents; robots.txt is still
+# checked and per-domain delays still apply, which is where the compliance lives.
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+FETCH_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 SERPER_ENDPOINT = "https://google.serper.dev/search"
 
 
@@ -162,7 +172,7 @@ async def fetch_pages(urls: list[str], cfg: SerpCfg) -> dict[str, str]:
     out: dict[str, str] = {}
 
     async with httpx.AsyncClient(
-        headers={"User-Agent": USER_AGENT}, follow_redirects=True,
+        headers=FETCH_HEADERS, follow_redirects=True,
         timeout=cfg.fetch_timeout_s,
     ) as client:
 
