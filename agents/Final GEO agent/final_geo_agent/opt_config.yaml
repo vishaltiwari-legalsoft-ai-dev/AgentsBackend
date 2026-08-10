@@ -44,6 +44,19 @@ score:
   stuffing_p90_multiplier: 2.0    # per-term density above corpus P90 x this -> stuffing
   stuffing_penalty_points: 10     # points subtracted from the total per detection run
 
+serp:
+  top_n: 20                       # organic results requested (10-50)
+  fetch_concurrency: 6            # simultaneous page fetches
+  per_domain_delay_s: 1.0         # politeness gap between hits on one domain
+  fetch_timeout_s: 20
+  fetch_retries: 2                # exponential backoff + jitter on top
+  article_share_min: 0.4          # below this share of usable articles -> "query may not want an article"
+  volatility_overlap_low: 0.5     # URL overlap vs previous snapshot below this -> volatile SERP label
+  forum_domains: [reddit.com, quora.com, stackexchange.com, stackoverflow.com]
+  video_domains: [youtube.com, youtu.be, vimeo.com, tiktok.com]
+  product_domains: [amazon., ebay., etsy., flipkart., walmart.]
+  product_path_tokens: ["/product", "/shop", "/store", "/buy", "/collections", "/dp/"]
+
 extract:
   link_density_max: 0.5           # DOM block is boilerplate above this link-chars share
   min_block_chars: 25             # blocks shorter than this are boilerplate unless inside content

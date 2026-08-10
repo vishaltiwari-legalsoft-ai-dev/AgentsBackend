@@ -63,6 +63,20 @@ class ScoreCfg(BaseModel):
     stuffing_penalty_points: float = Field(ge=0)
 
 
+class SerpCfg(BaseModel):
+    top_n: int = Field(ge=10, le=50)
+    fetch_concurrency: int = Field(ge=1, le=16)
+    per_domain_delay_s: float = Field(ge=0)
+    fetch_timeout_s: float = Field(gt=0)
+    fetch_retries: int = Field(ge=0, le=5)
+    article_share_min: float = Field(gt=0, le=1)
+    volatility_overlap_low: float = Field(ge=0, le=1)
+    forum_domains: list[str]
+    video_domains: list[str]
+    product_domains: list[str]
+    product_path_tokens: list[str]
+
+
 class ExtractCfg(BaseModel):
     link_density_max: float = Field(gt=0, le=1)
     min_block_chars: int
@@ -92,6 +106,7 @@ class OptimizerConfig(BaseModel):
     terms: TermsCfg
     structure: StructureCfg
     score: ScoreCfg
+    serp: SerpCfg
     extract: ExtractCfg
     semantic: SemanticCfg
 

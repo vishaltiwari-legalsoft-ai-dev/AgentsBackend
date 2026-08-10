@@ -76,6 +76,7 @@ class Subtopic(BaseModel):
     doc_idxs: list[int]
     chunk_count: int
     centroid: list[float]
+    member_terms: list[str] = []   # top lemmas inside the cluster — maps terms to subtopics
 
 
 class SubtopicModel(BaseModel):
@@ -176,8 +177,8 @@ def _greedy_clusters(vectors: np.ndarray, cfg: SemanticCfg) -> list[list[int]]:
     return clusters
 
 
-def _label(member_texts: list[str], other_texts: list[str], terms_cfg: TermsCfg) -> str:
-    """Contrastive top terms: frequent inside the cluster, rare outside."""
+def _label(member_texts: list[str], other_texts: list[str], terms_cfg: TermsCfg) -> tuple[str, list[str]]:
+    """Contrastive top terms (label) + the cluster's own vocabulary (mapping)."""
     inside, _ = opt_text.count_terms(" ".join(member_texts), terms_cfg)
     outside, _ = opt_text.count_terms(" ".join(other_texts), terms_cfg)
     scored = {
@@ -185,7 +186,8 @@ def _label(member_texts: list[str], other_texts: list[str], terms_cfg: TermsCfg)
         for term, count in inside.items() if count >= 2
     }
     top = [t for t, _ in Counter(scored).most_common(3)]
-    return ", ".join(top) if top else "subtopic"
+    member_terms = [t for t, _ in inside.most_common(30)]
+    return (", ".join(top) if top else "subtopic"), member_terms
 
 
 def build_subtopics(
@@ -206,7 +208,7 @@ def build_subtopics(
         headings = [chunks[i].heading for i in members if chunks[i].heading]
         question_headings = [h for h in headings if h.endswith("?")]
         common = Counter(question_headings or headings).most_common(1)
-        label = _label(member_texts, other_texts, terms_cfg)
+        label, member_terms = _label(member_texts, other_texts, terms_cfg)
         centroid = arr[members].mean(axis=0)
         centroid /= (np.linalg.norm(centroid) or 1.0)
         subtopics.append(Subtopic(
@@ -215,6 +217,7 @@ def build_subtopics(
             doc_idxs=doc_idxs,
             chunk_count=len(members),
             centroid=centroid.tolist(),
+            member_terms=member_terms,
         ))
     subtopics.sort(key=lambda s: (-len(s.doc_idxs), -s.chunk_count))
     return SubtopicModel(subtopics=subtopics, n_docs=n_docs, embed_model=cfg.embed_model)

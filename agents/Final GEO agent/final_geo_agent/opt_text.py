@@ -147,6 +147,7 @@ def term_profile(
             "prevalence": round(opt_terms.prevalence(counts_by_rank), 3),
             "range": [lo, hi],
             "confidence": confidence,
+            "counts": counts_by_rank,   # per-doc counts, rank order — winner scoring + debug
         })
     profile.sort(key=lambda e: -e["importance"])
     return profile[:top_n]

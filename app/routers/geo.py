@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from app.security import get_current_user, require_creator
 from app.services import run_tracking
-from final_geo_agent import geo_engines, geo_metrics, geo_poll, geo_prompts
+from final_geo_agent import geo_engines, geo_metrics, geo_poll, geo_prompts, opt_pipeline
 from seo_geo_agent import insights
 from seo_geo_agent.sources import CredentialMissing
 
@@ -207,3 +207,61 @@ def answers(
         rows = [a for a in rows if a.get("engine") == engine]
     rows.sort(key=lambda a: a.get("at", ""), reverse=True)
     return {"answers": rows[:200], "total": len(rows)}
+
+
+# ------------------------- Content Optimizer (Layers 1-6) -------------------------
+
+
+class OptimizerAnalyzeIn(BaseModel):
+    keyword: str = Field(min_length=2, max_length=200)
+    locale: str = Field(default="en-US", max_length=10)
+    draft: str = Field(default="", max_length=200_000)
+    vertical: str | None = None
+    own_domain: str = Field(default="", max_length=200)
+
+
+class OptimizerRescoreIn(BaseModel):
+    analysis_id: str = Field(min_length=3, max_length=80)
+    draft: str = Field(min_length=1, max_length=200_000)
+
+
+@router.post("/geo/optimizer/analyze")
+def optimizer_analyze(body: OptimizerAnalyzeIn, user: dict = Depends(get_current_user)) -> dict:
+    """Fresh SERP snapshot + profiles (+ draft score when a draft is sent).
+    Costs one Serper call + ~20 page fetches + embeddings; snapshot is pinned."""
+    _track(user, "optimizer_analyze", f"Content Optimizer: {body.keyword}")
+    try:
+        return opt_pipeline.analyze(
+            body.keyword, body.locale, body.draft,
+            own_domain=body.own_domain, vertical=body.vertical,
+        )
+    except CredentialMissing as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/geo/optimizer/rescore")
+def optimizer_rescore(body: OptimizerRescoreIn, user: dict = Depends(get_current_user)) -> dict:
+    """Re-score an edited draft against the PINNED snapshot — deterministic,
+    no new SERP call. Refresh = run analyze again explicitly."""
+    _track(user, "optimizer_rescore", f"Re-score draft vs {body.analysis_id}")
+    try:
+        return opt_pipeline.rescore(body.analysis_id, body.draft)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CredentialMissing as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.get("/geo/optimizer/analyses")
+def optimizer_analyses(user: dict = Depends(get_current_user)) -> dict:
+    return {"analyses": opt_pipeline.list_analyses()}
+
+
+@router.get("/geo/optimizer/analyses/{analysis_id}")
+def optimizer_analysis(analysis_id: str, user: dict = Depends(get_current_user)) -> dict:
+    doc = opt_pipeline.get_analysis(analysis_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Unknown analysis")
+    return doc
