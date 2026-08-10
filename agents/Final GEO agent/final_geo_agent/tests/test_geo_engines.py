@@ -99,10 +99,55 @@ def test_transport_exception_is_captured(monkeypatch):
     assert ans.error and "ConnectTimeout" in ans.error
 
 
-def test_poll_engine_without_key_reports_unavailable(monkeypatch):
+def test_poll_engine_without_any_key_reports_unavailable(monkeypatch):
     monkeypatch.setattr(geo_engines, "engine_key", lambda e: "")
+    monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "")
     ans = geo_engines.poll_engine("perplexity", "q")
     assert ans.error == "no API key configured"
+
+
+OPENROUTER_OK = {
+    "choices": [{"message": {
+        "content": "Legal Soft leads this space.",
+        "annotations": [
+            {"type": "url_citation",
+             "url_citation": {"url": "https://clutch.co/profile/x", "title": "Clutch"}},
+        ],
+    }}],
+}
+
+
+def test_openrouter_fallback_when_no_native_key(monkeypatch):
+    monkeypatch.setattr(geo_engines, "engine_key", lambda e: "")
+    monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "or-key")
+    patch_post(monkeypatch, FakeResp(200, OPENROUTER_OK))
+    ans = geo_engines.poll_engine("chatgpt", "best legal va")
+    assert ans.error is None and ans.via == "openrouter"
+    assert ans.model == geo_engines.OPENROUTER_ENGINE_MODELS["chatgpt"]
+    assert [c["domain"] for c in ans.citations] == ["clutch.co"]
+
+
+def test_native_quota_error_falls_back_to_openrouter(monkeypatch):
+    monkeypatch.setattr(geo_engines, "engine_key", lambda e: "native-key")
+    monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "or-key")
+    calls = []
+
+    def post(url, **kw):
+        calls.append(url)
+        if "openrouter" in url:
+            return FakeResp(200, OPENROUTER_OK)
+        return FakeResp(429, text="quota exceeded")
+
+    monkeypatch.setattr(geo_engines.httpx, "post", post)
+    ans = geo_engines.poll_engine("gemini", "q")
+    assert ans.via == "openrouter" and ans.error is None
+    assert len(calls) == 2                       # native tried first, then fallback
+
+
+def test_available_engines_lights_up_with_openrouter_only(monkeypatch):
+    monkeypatch.setattr(geo_engines, "engine_key", lambda e: "")
+    monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "or-key")
+    assert all(geo_engines.available_engines().values())
 
 
 def test_poll_engine_unknown_engine():

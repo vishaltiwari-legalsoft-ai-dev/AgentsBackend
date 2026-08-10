@@ -28,6 +28,9 @@ BRAND = {"id": "legalsoft", "name": "Legal Soft", "domain": "legalsoft.com",
 def _harness(monkeypatch, tmp_path):
     monkeypatch.setenv("SEO_OFFLINE", "1")
     monkeypatch.setenv("SEO_LOCAL_DIR", str(tmp_path / "geo_state"))
+    # a real OPENROUTER_API_KEY in local .env must never leak into offline
+    # tests — with the fallback live it would fire REAL paid engine polls
+    monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "")
     monkeypatch.setattr(insights, "list_brands", lambda: [dict(BRAND)])
     prev = fastapi_app.dependency_overrides.get(get_current_user)
     fastapi_app.dependency_overrides[get_current_user] = lambda: {

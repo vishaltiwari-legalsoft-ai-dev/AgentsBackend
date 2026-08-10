@@ -19,3 +19,7 @@ def _isolated_state(tmp_path, monkeypatch):
     monkeypatch.setenv("SEO_OFFLINE", "1")
     monkeypatch.setenv("SEO_LOCAL_DIR", str(tmp_path))
     monkeypatch.delenv("SEO_SERPER_API_KEY", raising=False)
+    # a real OPENROUTER_API_KEY in local .env must never fire paid polls here;
+    # tests that exercise the fallback stub httpx or patch this themselves
+    from final_geo_agent import geo_engines
+    monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "")
