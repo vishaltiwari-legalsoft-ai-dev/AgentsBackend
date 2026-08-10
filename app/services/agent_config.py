@@ -178,10 +178,10 @@ AGENTS: list[dict[str, str | bool | list[str]]] = [
         "role": "Web copilot in your Chrome",
         "category": "data",
         "live": True,
-        # One strong reasoning model per act-loop step, via
-        # browser_agent.brain.decide(agent_id="a11"). The Chrome extension is
-        # a thin sensor/actuator — every LLM call happens here.
-        "fields": ["openrouter_model"],
+        # Reasoning model decides each act-loop step (browser_agent.brain);
+        # the fast model writes the tab digests (browser_agent.digest, fast=True).
+        # The Chrome extension is a thin sensor/actuator — every LLM call is here.
+        "fields": ["openrouter_model", "openrouter_fast_model"],
     },
 ]
 

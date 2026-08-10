@@ -150,8 +150,8 @@ def test_agents_payload_lists_only_live_agents_with_their_fields(app_config):
     assert by_id["a9"]["fields"] == ["openrouter_model"]
     # GEO's LLM use is parsing-grade only (prompt universe, sentiment).
     assert by_id["a10"]["fields"] == ["openrouter_fast_model"]
-    # Browser Agent decides each act-loop step with the reasoning model.
-    assert by_id["a11"]["fields"] == ["openrouter_model"]
+    # Browser Agent: reasoning model per act-loop step, fast model for digests.
+    assert by_id["a11"]["fields"] == ["openrouter_model", "openrouter_fast_model"]
     # GD keeps its full set, planner included.
     assert set(by_id["a1"]["fields"]) == set(runtime_config.AGENT_OVERRIDE_FIELDS)
 

@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from app.security import get_current_user
 from app.services import run_tracking
 from browser_agent import actions as browser_actions
+from browser_agent import digest as browser_digest
 from browser_agent import runs as browser_runs
 
 router = APIRouter()
@@ -65,6 +66,22 @@ class RunIn(BaseModel):
     goal: str = Field(min_length=3, max_length=2000)
     mode: str = Field(default="act", pattern="^(act|monitor)$")
     start_url: str | None = None
+
+
+class WatchRule(BaseModel):
+    id: str | None = None
+    text: str = Field(min_length=2, max_length=200)
+    enabled: bool = True
+
+
+class ConfigIn(BaseModel):
+    # None = leave untouched (same convention as the GEO/admin config endpoints).
+    watch_rules: list[WatchRule] | None = None
+
+
+class DigestIn(BaseModel):
+    events: list[dict] = Field(default_factory=list)
+    tabs: list[dict] = Field(default_factory=list)
 
 
 class StepIn(BaseModel):
@@ -144,3 +161,49 @@ def get_run(run_id: str, user: dict = Depends(get_current_user)) -> dict:
     run = _run_or_404(run_id, user)
     # The full doc minus the replay cache — steps carry everything the UI shows.
     return {k: v for k, v in run.items() if k != "last_decision"}
+
+
+# ------------------------------ Tab monitoring ----------------------------- #
+# The extension buffers tab events locally and posts them only on demand, so
+# watching tabs all day costs nothing until someone asks what happened.
+
+
+@router.post("/browser/digest")
+def make_digest(body: DigestIn, user: dict = Depends(get_current_user)) -> dict:
+    _guard()
+    try:
+        result = browser_digest.build_digest(user, body.events, body.tabs)
+    except ValueError as exc:
+        # An unreadable model reply is reported as-is; we never ship a fake digest.
+        raise HTTPException(status_code=502, detail=f"Couldn't build the digest: {exc}") from exc
+    _track(user, "digest", result["headline"] or "Tab digest")
+    return result
+
+
+@router.get("/browser/digests")
+def list_digests(user: dict = Depends(get_current_user)) -> dict:
+    _guard()
+    user_id = None if user.get("is_admin") else str(user.get("id"))
+    return {"digests": browser_digest.list_digests(user_id=user_id)}
+
+
+@router.get("/browser/digests/{digest_id}")
+def get_digest(digest_id: str, user: dict = Depends(get_current_user)) -> dict:
+    _guard()
+    found = browser_digest.get_digest(digest_id)
+    if not found or (found.get("user_id") != str(user.get("id")) and not user.get("is_admin")):
+        raise HTTPException(status_code=404, detail="Unknown digest")
+    return found
+
+
+@router.get("/browser/config")
+def get_config(user: dict = Depends(get_current_user)) -> dict:
+    _guard()
+    return browser_digest.load_config()
+
+
+@router.put("/browser/config")
+def put_config(body: ConfigIn, user: dict = Depends(get_current_user)) -> dict:
+    _guard()
+    patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    return browser_digest.save_config(patch)
