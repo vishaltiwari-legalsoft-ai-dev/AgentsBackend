@@ -9,9 +9,14 @@ every endpoint into an honest 403 naming the flag.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import zipfile
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.security import get_current_user
@@ -25,6 +30,38 @@ logger = logging.getLogger("agentos.browser")
 
 BROWSER_AGENT_ID = "a11"
 BROWSER_AGENT_NAME = "Browser Agent"
+
+# The built extension ships inside the image (app/ is COPYd wholesale), so the
+# console can hand it out without anyone needing a GitHub account.
+EXTENSION_ZIP = Path(__file__).resolve().parents[1] / "static" / "agentos-browser-agent.zip"
+_DEFAULT_EXT_DOMAINS = "legalsoft.com"
+
+
+def _allowed_domains() -> set[str]:
+    raw = os.environ.get("BROWSER_EXT_DOMAINS", _DEFAULT_EXT_DOMAINS)
+    return {d.strip().lower().lstrip("@") for d in raw.split(",") if d.strip()}
+
+
+def _may_download(user: dict) -> bool:
+    """Company accounts get the extension; owners keep access whatever their domain.
+
+    NOTE: signing in to the console is NOT domain-restricted, so membership can't
+    be inferred from "is authenticated" — the email domain is checked here.
+    """
+    if user.get("is_creator") or user.get("is_admin"):
+        return True
+    email = str(user.get("email") or "").lower()
+    domain = email.rpartition("@")[2]
+    return bool(domain) and domain in _allowed_domains()
+
+
+def _extension_version() -> str:
+    """Version from the packaged manifest, so the panel can't advertise a stale build."""
+    try:
+        with zipfile.ZipFile(EXTENSION_ZIP) as bundle:
+            return str(json.loads(bundle.read("manifest.json")).get("version") or "")
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return ""
 
 
 def _guard() -> None:
@@ -104,8 +141,36 @@ def browser_status(user: dict = Depends(get_current_user)) -> dict:
         "ok": True,
         "email": user.get("email"),
         "protocol": browser_actions.PROTOCOL,
+        "can_download": _may_download(user),
+        "extension_version": _extension_version(),
         **pol,
     }
+
+
+@router.get("/browser/extension")
+def download_extension(user: dict = Depends(get_current_user)) -> FileResponse:
+    """Hand out the built extension to company accounts — no GitHub account needed."""
+    _guard()
+    if not _may_download(user):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "The Browser Agent extension is only available to "
+                f"{', '.join(sorted(_allowed_domains()))} accounts."
+            ),
+        )
+    if not EXTENSION_ZIP.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail="The extension bundle is missing from this deployment.",
+        )
+    _track(user, "extension_download",
+           f"Downloaded the extension ({_extension_version() or 'unknown version'})")
+    return FileResponse(
+        EXTENSION_ZIP,
+        media_type="application/zip",
+        filename="agentos-browser-agent.zip",
+    )
 
 
 @router.post("/browser/runs")

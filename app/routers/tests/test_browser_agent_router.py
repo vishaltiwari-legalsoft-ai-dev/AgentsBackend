@@ -126,6 +126,73 @@ def test_other_users_run_is_404(monkeypatch):
     assert client.get(f"/api/browser/runs/{run['run_id']}").status_code == 404
 
 
+# --------------------------------------------------------------------------- #
+# Extension download — company accounts only (console login is NOT domain-gated)
+# --------------------------------------------------------------------------- #
+
+def _as(email: str, *, creator: bool = False, admin: bool = False) -> None:
+    fastapi_app.dependency_overrides[get_current_user] = lambda: {
+        "id": "u9", "email": email, "is_admin": admin, "is_creator": creator,
+        "session_id": "", "timezone": "UTC",
+    }
+
+
+def test_company_account_downloads_the_extension():
+    r = client.get("/api/browser/extension")
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "application/zip"
+    assert len(r.content) > 1000
+
+
+def test_outside_account_is_refused_with_a_clear_reason():
+    _as("stranger@gmail.com")
+    r = client.get("/api/browser/extension")
+    assert r.status_code == 403
+    assert "legalsoft.com" in r.json()["detail"]
+
+
+def test_owner_on_another_domain_still_gets_it():
+    # CREATOR_EMAILS_DEFAULT includes a gmail.com owner — a blanket domain rule
+    # would lock them out of their own tool.
+    _as("owner@gmail.com", creator=True)
+    assert client.get("/api/browser/extension").status_code == 200
+
+
+def test_allowed_domains_are_configurable(monkeypatch):
+    monkeypatch.setenv("BROWSER_EXT_DOMAINS", "example.org")
+    _as("someone@example.org")
+    assert client.get("/api/browser/extension").status_code == 200
+    _as("someone@legalsoft.com")
+    assert client.get("/api/browser/extension").status_code == 403
+
+
+def test_status_reports_download_eligibility_and_version():
+    body = client.get("/api/browser/status").json()
+    assert body["can_download"] is True
+    assert body["extension_version"]
+
+    _as("stranger@gmail.com")
+    assert client.get("/api/browser/status").json()["can_download"] is False
+
+
+def test_download_needs_auth():
+    fastapi_app.dependency_overrides.pop(get_current_user, None)
+    try:
+        assert client.get("/api/browser/extension").status_code in (401, 403)
+    finally:
+        fastapi_app.dependency_overrides[get_current_user] = lambda: dict(USER)
+
+
+def test_missing_bundle_is_honest_503(monkeypatch):
+    from app.routers import browser_agent as router_mod
+    from pathlib import Path
+
+    monkeypatch.setattr(router_mod, "EXTENSION_ZIP", Path("nope.zip"))
+    r = client.get("/api/browser/extension")
+    assert r.status_code == 503
+    assert "missing" in r.json()["detail"]
+
+
 def test_get_run_hides_replay_cache(monkeypatch):
     _stub(monkeypatch, actions.Action(kind="wait", why="settle"))
     run = _create()
