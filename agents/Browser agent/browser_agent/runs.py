@@ -14,7 +14,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 
-from browser_agent import actions, brain, planner, state, tools
+from browser_agent import actions, brain, planner, skills, state, tools
 
 logger = logging.getLogger("agentos.browser")
 
@@ -78,13 +78,29 @@ def _now() -> str:
 
 def create_run(user: dict, goal: str, mode: str, start_url: str | None) -> dict:
     pol = policy()
-    # Plan before touching the browser: a bad first move costs every step after it.
-    plan = planner.build_plan(goal.strip(), start_url=start_url)
+    goal = goal.strip()
+
+    # A remembered route beats working one out: no model call per step, and a
+    # replayed step cannot invent anything. Planning still happens, so the
+    # fallback is ready the moment the recording stops matching the page.
+    skill = None
+    if mode != "monitor":
+        try:
+            skill = skills.find_match(goal, str(user.get("id") or ""), start_url=start_url)
+        except Exception:  # noqa: BLE001 — a broken skill store must not block a run
+            logger.exception("skill lookup failed")
+
+    plan = planner.build_plan(goal, start_url=start_url)
     run = {
         "id": uuid.uuid4().hex[:12],
         "protocol": actions.PROTOCOL,
-        "goal": goal.strip(),
+        "goal": goal,
         "plan": plan,
+        "skill": (
+            {"id": skill["id"], "name": skill["name"], "steps": skill["steps"],
+             "match_score": skill.get("match_score"), "cursor": 0, "status": "replaying"}
+            if skill else None
+        ),
         "mode": mode,
         "start_url": start_url,
         "status": "running",
@@ -162,6 +178,10 @@ def _response(
         "want_screenshot": want_screenshot,
         "subtask": (planner.current(run.get("plan") or {}) or {}).get("title"),
         "subtask_progress": list(planner.progress(run.get("plan") or {})),
+        "skill": (
+            {"name": run["skill"]["name"], "status": run["skill"]["status"]}
+            if run.get("skill") else None
+        ),
         "steps_remaining": max(0, int(run["step_cap"]) - int(run["steps_used"])),
         "summary": run.get("summary"),
         "fail_reason": run.get("fail_reason"),
@@ -242,6 +262,52 @@ def stuck_on(
             f"{canvas_note or ' Nothing I try changes this screen.'}"
         )
     return None
+
+
+def _abandon_skill(run: dict, why: str) -> None:
+    """Stop replaying and let the model take it from here.
+
+    A recording that no longer matches the page is worse than no recording, so
+    the moment one step doesn't fit we stop trusting the whole rest of it.
+    """
+    skill = run.get("skill") or {}
+    skill["status"] = "abandoned"
+    skill["abandoned_because"] = why
+    if skill.get("id"):
+        skills.record_use(skill["id"], ok=False)
+    logger.info("browser: dropped skill %s — %s", skill.get("name"), why)
+
+
+def _replay_step(run: dict, body: dict) -> actions.Action | None:
+    """The next remembered step, or None when we should think instead."""
+    skill = run.get("skill")
+    if not skill or skill.get("status") != "replaying":
+        return None
+
+    # The previous replayed step didn't work — the page has moved on from what
+    # was recorded, so stop replaying rather than push the rest of it blindly.
+    last = body.get("last_result")
+    if isinstance(last, dict) and last.get("ok") is False and skill.get("cursor", 0) > 0:
+        _abandon_skill(run, str(last.get("error") or "a remembered step didn't work"))
+        return None
+
+    steps = skill.get("steps") or []
+    cursor = int(skill.get("cursor", 0))
+    if cursor >= len(steps):
+        skill["status"] = "finished"
+        if skill.get("id"):
+            skills.record_use(skill["id"], ok=True)
+        # The recording is done; the model decides whether the goal is met.
+        return None
+
+    step = dict(steps[cursor])
+    skill["cursor"] = cursor + 1
+    step.setdefault("why", f"Replaying step {cursor + 1} of {len(steps)}")
+    try:
+        return actions.validate_action(step)
+    except ValueError as exc:
+        _abandon_skill(run, f"a saved step was unusable: {exc}")
+        return None
 
 
 def _run_tool(run: dict, action: actions.Action) -> dict:
@@ -330,7 +396,7 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
         _persist(run)
         return run, response
 
-    action = brain.decide(run, body)
+    action = _replay_step(run, body) or brain.decide(run, body)
 
     # Internal actions never leave the server, so the extension still receives
     # exactly one executable browser action per step: "next_subtask" marks a
@@ -379,7 +445,28 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
     canvas_app = bool((body.get("dom") or {}).get("canvas_app"))
     stuck = stuck_on(run, action, page_fp, canvas_app=canvas_app)
     if stuck:
-        action = actions.Action(kind="fail", reason=stuck, why="Going in circles.")
+        # A replayed route that stopped fitting is not a dead end — drop the
+        # recording and let the model try properly before giving up.
+        if (run.get("skill") or {}).get("status") == "replaying":
+            _abandon_skill(run, stuck)
+            action = brain.decide(run, body)
+        elif canvas_app or run.get("handed_over_at") == page_fp:
+            # Nothing a person can do about a canvas; and having already asked
+            # for help on THIS screen, asking again would just be nagging.
+            action = actions.Action(kind="fail", reason=stuck, why="Going in circles.")
+        else:
+            # Someone is sitting right there. Asking beats failing. A later
+            # stall on a different screen earns a fresh ask.
+            run["handed_over_at"] = page_fp
+            action = actions.Action(
+                kind="ask_user",
+                text=(
+                    f"I'm stuck — {stuck}. Could you do this bit yourself in the "
+                    "tab, then tell me to carry on? I'll pick up from whatever "
+                    "the page looks like then."
+                ),
+                why="Handing over rather than failing.",
+            )
 
     # Ask for a look once repetition starts, unless we already had one this step.
     want_screenshot = (

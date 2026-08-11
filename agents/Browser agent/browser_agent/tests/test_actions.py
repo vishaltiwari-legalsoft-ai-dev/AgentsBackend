@@ -35,11 +35,23 @@ def test_done_carries_summary_and_extracted():
     assert a.summary == "Found 3 stories" and a.extracted == [{"t": "x"}]
 
 
+def test_a_name_alone_is_enough_to_click():
+    """Skills and recordings carry names, never indexes — an index saved today
+    means nothing on tomorrow's page."""
+    a = actions.validate_action({"kind": "click", "expect": "Compose", "why": "open it"})
+    assert a.expect == "Compose" and a.index is None
+
+
+def test_an_action_with_neither_name_nor_index_is_refused():
+    with pytest.raises(ValueError, match="which element"):
+        actions.validate_action({"kind": "click", "why": "click something"})
+
+
 @pytest.mark.parametrize(
     "raw",
     [
         {"kind": "teleport"},                       # unknown kind
-        {"kind": "click"},                          # missing index
+        {"kind": "click"},                          # says nothing about what to click
         {"kind": "type", "index": 1},               # missing text
         {"kind": "navigate"},                       # missing url
         {"kind": "select", "index": 2},             # missing value

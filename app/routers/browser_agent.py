@@ -24,6 +24,7 @@ from app.services import run_tracking
 from browser_agent import actions as browser_actions
 from browser_agent import digest as browser_digest
 from browser_agent import runs as browser_runs
+from browser_agent import skills as browser_skills
 from browser_agent import tools as browser_tools
 
 router = APIRouter()
@@ -209,6 +210,13 @@ def create_run(body: RunIn, user: dict = Depends(get_current_user)) -> dict:
         "sensitive_confirm": run["sensitive_confirm"],
         "status": run["status"],
         "plan": run["plan"],
+        # Named up front so the panel can say "using what I learned last time"
+        # before the first step rather than after it.
+        "skill": (
+            {"name": run["skill"]["name"], "steps": len(run["skill"]["steps"]),
+             "match_score": run["skill"].get("match_score")}
+            if run.get("skill") else None
+        ),
     }
 
 
@@ -248,6 +256,70 @@ def get_run(run_id: str, user: dict = Depends(get_current_user)) -> dict:
     run = _run_or_404(run_id, user)
     # The full doc minus the replay cache — steps carry everything the UI shows.
     return {k: v for k, v in run.items() if k != "last_decision"}
+
+
+# --------------------------------- Skills ---------------------------------- #
+# Learned routes. Saving is always the user's decision — a run that limped to a
+# finish is exactly the one you don't want to repeat forever.
+
+
+class SkillIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    # Either learn from a finished run, or from a recording the user performed.
+    run_id: str | None = None
+    steps: list[dict] | None = None
+    goal: str | None = Field(default=None, max_length=300)
+    host: str | None = Field(default=None, max_length=120)
+
+
+@router.get("/browser/skills")
+def list_skills(user: dict = Depends(get_current_user)) -> dict:
+    _guard()
+    user_id = None if user.get("is_admin") else str(user.get("id"))
+    return {"skills": browser_skills.list_skills(user_id=user_id)}
+
+
+@router.post("/browser/skills")
+def save_skill(body: SkillIn, user: dict = Depends(get_current_user)) -> dict:
+    """Approve a flow so the agent can repeat it without thinking it out again."""
+    _guard()
+    goal, host, steps = body.goal or "", body.host or "", body.steps or []
+
+    if body.run_id:
+        run = _run_or_404(body.run_id, user)
+        steps = browser_skills.steps_from_run(run)
+        goal = goal or run.get("goal", "")
+        host = host or browser_skills.host_of(
+            next((s.get("action", {}).get("url") for s in run.get("steps") or []
+                  if (s.get("action") or {}).get("url")), "")
+        )
+    try:
+        skill = browser_skills.save_skill(user, body.name, goal, host, steps,
+                                          source="run" if body.run_id else "recording")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    _track(user, "skill_saved", f"Learned: {skill['name']} ({len(skill['steps'])} steps)")
+    return skill
+
+
+@router.get("/browser/skills/{skill_id}")
+def get_skill(skill_id: str, user: dict = Depends(get_current_user)) -> dict:
+    _guard()
+    found = browser_skills.get_skill(skill_id)
+    if not found or (found.get("user_id") != str(user.get("id")) and not user.get("is_admin")):
+        raise HTTPException(status_code=404, detail="Unknown skill")
+    return found
+
+
+@router.delete("/browser/skills/{skill_id}")
+def delete_skill(skill_id: str, user: dict = Depends(get_current_user)) -> dict:
+    _guard()
+    found = browser_skills.get_skill(skill_id)
+    if not found or (found.get("user_id") != str(user.get("id")) and not user.get("is_admin")):
+        raise HTTPException(status_code=404, detail="Unknown skill")
+    browser_skills.delete_skill(skill_id)
+    return {"deleted": skill_id}
 
 
 # ------------------------------ Tab monitoring ----------------------------- #

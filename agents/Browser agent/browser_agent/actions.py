@@ -74,11 +74,15 @@ class Action(BaseModel):
     query: str | None = None
 
 
+# Actions that must say WHICH element they mean. Either identifier will do:
+# the name is what actually resolves it, and a replayed or recorded step
+# carries only a name — a saved index would be meaningless on the next visit.
+_NEEDS_TARGET = frozenset({"click", "type", "select"})
+
 _REQUIRED: dict[str, tuple[str, ...]] = {
     "navigate": ("url",),
-    "click": ("index",),
-    "type": ("index", "text"),
-    "select": ("index", "value"),
+    "type": ("text",),
+    "select": ("value",),
     "key": ("text",),
     "open_tab": ("url",),
     "switch_tab": ("tab_id",),
@@ -101,6 +105,11 @@ def validate_action(raw: object) -> Action:
     for field in _REQUIRED.get(str(kind), ()):
         if getattr(action, field) in (None, ""):
             raise ValueError(f'action "{kind}" is missing required field "{field}"')
+    if kind in _NEEDS_TARGET and action.index is None and not action.expect:
+        raise ValueError(
+            f'action "{kind}" must say which element it means — give "expect" '
+            "(the element's name) and optionally its index"
+        )
     return action
 
 

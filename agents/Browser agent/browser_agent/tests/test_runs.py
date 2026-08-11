@@ -10,7 +10,7 @@ import json
 import app  # noqa: F401 - registers agent roots on sys.path
 import pytest
 
-from browser_agent import actions, brain, planner, runs, tools
+from browser_agent import actions, brain, planner, runs, skills, tools
 
 USER = {"id": "u1", "email": "owner@legalsoft.com"}
 
@@ -163,13 +163,14 @@ def _page(seq: int, *, url="https://mail.google.com/", labels=("To", "Subject"),
 def test_repeated_click_on_an_unchanged_page_gives_up(monkeypatch):
     """The real Gmail failure: the click 'succeeds' every time (CDP dispatched
     it) but the page never moves, so counting failures alone never fires."""
-    _stub_brain(monkeypatch, actions.Action(kind="click", index=0, why="focus the To field"))
+    _stub_brain(monkeypatch, actions.Action(kind="click", index=0, expect="To", why="focus"))
     run = runs.create_run(USER, "send an email", "act", None)
     resp = None
     for seq in range(1, runs._STUCK_AFTER + 1):
         run, resp = runs.step(run, _page(seq, last_result={"ok": True}))
-    assert resp["action"]["kind"] == "fail"
-    assert "never changed" in resp["action"]["reason"]
+    # Stopping is the point; with a person present we ask them rather than fail.
+    assert resp["action"]["kind"] == "ask_user"
+    assert "never changed" in resp["action"]["text"]
     assert run["steps_used"] < run["step_cap"]
 
 
@@ -207,10 +208,10 @@ def test_varied_flailing_on_one_screen_is_caught(monkeypatch):
     resp = None
     for seq in range(1, runs._NO_PROGRESS_AFTER + 2):
         run, resp = runs.step(run, _page(seq, last_result={"ok": True}))
-        if resp["done"]:
+        if resp["done"] or run["status"] == "awaiting_user":
             break
-    assert resp["action"]["kind"] == "fail"
-    assert "no progress" in resp["action"]["reason"]
+    assert resp["action"]["kind"] == "ask_user"
+    assert "no progress" in resp["action"]["text"]
     assert run["steps_used"] <= runs._NO_PROGRESS_AFTER + 1
 
 
@@ -451,6 +452,137 @@ def test_steps_record_the_rail(monkeypatch):
     run = runs.create_run(USER, "goal", "act", None)
     run, _ = runs.step(run, _step_body(1))
     assert run["steps"][-1]["rail"] == "browser"
+
+
+# --------------------------------------------------------------------------- #
+# Skills — replaying a route instead of working it out again
+# --------------------------------------------------------------------------- #
+
+_SKILL_STEPS = [
+    {"kind": "navigate", "url": "https://mail.google.com/"},
+    {"kind": "click", "expect": "Compose", "role": "button"},
+    {"kind": "type", "expect": "To recipients", "text": "a@b.com"},
+]
+
+
+def _with_skill(monkeypatch, steps=None):
+    monkeypatch.setattr(
+        skills, "find_match",
+        lambda goal, uid, start_url=None: {
+            "id": "sk1", "name": "Send a Gmail", "steps": steps or _SKILL_STEPS,
+            "match_score": 0.8,
+        },
+    )
+    monkeypatch.setattr(skills, "record_use", lambda sid, ok: None)
+
+
+def test_replay_costs_no_model_calls(monkeypatch):
+    """The whole point: a remembered step is returned without asking the model."""
+    _with_skill(monkeypatch)
+    calls = {"n": 0}
+
+    def counting(run, obs):
+        calls["n"] += 1
+        return actions.Action(kind="wait", why="thinking")
+
+    monkeypatch.setattr(brain, "decide", counting)
+
+    run = runs.create_run(USER, "send a hello email", "act", None)
+    run, first = runs.step(run, _step_body(1))
+    run, second = runs.step(run, _step_body(2, last_result={"ok": True}))
+
+    assert first["action"]["kind"] == "navigate"
+    assert second["action"]["expect"] == "Compose"
+    assert calls["n"] == 0          # never consulted while replaying
+    assert first["skill"] == {"name": "Send a Gmail", "status": "replaying"}
+
+
+def test_replay_hands_back_to_the_model_when_it_runs_out(monkeypatch):
+    _with_skill(monkeypatch, steps=[{"kind": "navigate", "url": "https://x.com/"}])
+    _stub_brain(monkeypatch, actions.Action(kind="done", summary="finished", why="all good"))
+
+    run = runs.create_run(USER, "send a hello email", "act", None)
+    run, _ = runs.step(run, _step_body(1))                          # the one saved step
+    run, resp = runs.step(run, _step_body(2, last_result={"ok": True}))
+    assert resp["action"]["kind"] == "done"                          # model took over
+    assert run["skill"]["status"] == "finished"
+
+
+def test_a_remembered_step_that_fails_abandons_the_whole_recording(monkeypatch):
+    """A route that no longer fits is worse than no route — stop trusting it."""
+    _with_skill(monkeypatch)
+    _stub_brain(monkeypatch, actions.Action(kind="scroll", why="look properly"))
+
+    run = runs.create_run(USER, "send a hello email", "act", None)
+    run, _ = runs.step(run, _step_body(1))
+    run, resp = runs.step(
+        run, _step_body(2, last_result={"ok": False, "error": 'nothing called "Compose"'})
+    )
+    assert run["skill"]["status"] == "abandoned"
+    assert "Compose" in run["skill"]["abandoned_because"]
+    assert resp["action"]["kind"] == "scroll"                        # thinking again
+
+
+def test_monitor_mode_never_replays(monkeypatch):
+    _with_skill(monkeypatch)
+    _stub_brain(monkeypatch, actions.Action(kind="extract", why="read it"))
+    run = runs.create_run(USER, "watch my email", "monitor", None)
+    assert run["skill"] is None
+
+
+def test_a_broken_skill_store_does_not_block_a_run(monkeypatch):
+    def boom(*_a, **_kw):
+        raise RuntimeError("firestore down")
+
+    monkeypatch.setattr(skills, "find_match", boom)
+    _stub_brain(monkeypatch, actions.Action(kind="wait", why="settle"))
+    run = runs.create_run(USER, "do a thing", "act", None)
+    assert run["skill"] is None and run["status"] == "running"
+
+
+# --------------------------------------------------------------------------- #
+# Takeover — ask the person rather than give up
+# --------------------------------------------------------------------------- #
+
+def test_being_stuck_asks_the_user_to_step_in(monkeypatch):
+    _stub_brain(monkeypatch, actions.Action(kind="click", index=0, expect="To", why="focus"))
+    run = runs.create_run(USER, "send an email", "act", None)
+    resp = None
+    for seq in range(1, runs._STUCK_AFTER + 1):
+        run, resp = runs.step(run, _page(seq, last_result={"ok": True}))
+    assert resp["action"]["kind"] == "ask_user"
+    assert "carry on" in resp["action"]["text"]
+    assert run["status"] == "awaiting_user"
+
+
+def test_a_canvas_page_fails_instead_of_asking(monkeypatch):
+    """No amount of human clicking makes canvas cells readable to the agent."""
+    _stub_brain(monkeypatch, actions.Action(kind="key", text="Escape", why="close overlays"))
+    run = runs.create_run(USER, "type into the sheet", "act", None)
+    resp = None
+    for seq in range(1, runs._STUCK_AFTER + 1):
+        body = _page(seq, last_result={"ok": True})
+        body["dom"]["canvas_app"] = True
+        run, resp = runs.step(run, body)
+    assert resp["action"]["kind"] == "fail"
+    assert "canvas" in resp["action"]["reason"]
+
+
+def test_it_does_not_ask_twice_about_the_same_screen(monkeypatch):
+    _stub_brain(monkeypatch, actions.Action(kind="click", index=0, expect="To", why="focus"))
+    run = runs.create_run(USER, "send an email", "act", None)
+    seq = 1
+    for _ in range(runs._STUCK_AFTER):
+        run, _ = runs.step(run, _page(seq, last_result={"ok": True}))
+        seq += 1
+    run["status"] = "running"  # the user replied and nothing changed
+    resp = None
+    for _ in range(runs._STUCK_AFTER):
+        run, resp = runs.step(run, _page(seq, last_result={"ok": True}))
+        seq += 1
+        if resp["done"]:
+            break
+    assert resp["action"]["kind"] == "fail"
 
 
 def test_extracted_result_becomes_a_finding(monkeypatch):
