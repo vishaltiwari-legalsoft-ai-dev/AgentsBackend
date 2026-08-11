@@ -171,3 +171,30 @@ def test_generate_universe_empty_llm_raises(monkeypatch):
     monkeypatch.setattr(geo_prompts, "llm_json", lambda *a, **k: {"prompts": []})
     with pytest.raises(ValueError):
         geo_prompts.generate_universe(BRAND)
+
+
+# ---------------------------------------------------------- custom prompts ----
+
+def test_add_custom_prompt_and_duplicate_rejected():
+    geo_prompts.add_custom_prompt(BRAND["id"], "Which intake service handles Spanish-speaking clients?")
+    universe = geo_prompts.load_universe(BRAND["id"])
+    assert universe["prompts"][-1]["source"] == "custom"
+    with pytest.raises(ValueError):
+        geo_prompts.add_custom_prompt(BRAND["id"], "which intake service handles spanish-speaking clients?")
+    with pytest.raises(ValueError):
+        geo_prompts.add_custom_prompt(BRAND["id"], "hey")          # too short
+
+
+def test_regenerate_preserves_custom_prompts(monkeypatch):
+    geo_prompts.add_custom_prompt(BRAND["id"], "Can a virtual receptionist do conflict checks?")
+    monkeypatch.setattr(geo_prompts, "llm_json", lambda *a, **k: {"prompts": [
+        {"text": "best legal intake service", "intent": "category", "stage": "consideration"},
+        {"text": "can a virtual receptionist do conflict checks?", "intent": "category", "stage": "purchase"},
+    ]})
+    universe = geo_prompts.generate_universe(BRAND)
+    texts = [p["text"] for p in universe["prompts"]]
+    sources = {p["text"]: p["source"] for p in universe["prompts"]}
+    assert "Can a virtual receptionist do conflict checks?" in texts     # custom survived
+    assert sources["Can a virtual receptionist do conflict checks?"] == "custom"
+    assert texts.count("can a virtual receptionist do conflict checks?") == 0  # AI dupe suppressed
+    assert sources["best legal intake service"] == "ai"

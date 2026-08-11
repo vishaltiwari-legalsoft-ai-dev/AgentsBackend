@@ -49,6 +49,13 @@ class PromptItem(BaseModel):
     intent: str = "category"
     stage: str = "consideration"
     enabled: bool = True
+    source: str = "ai"          # "ai" | "custom" — custom survives regeneration
+
+
+class CustomPromptIn(BaseModel):
+    text: str = Field(min_length=5, max_length=400)
+    intent: str = "category"
+    stage: str = "consideration"
 
 
 class PromptsIn(BaseModel):
@@ -121,6 +128,19 @@ def generate_prompts(brand_id: str, _creator: dict = Depends(require_creator)) -
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     _track(_creator, "prompts_generate",
            f"Generated prompt universe — {len(universe.get('prompts', []))} prompts", brand)
+    return universe
+
+
+@router.post("/geo/brands/{brand_id}/prompts/custom")
+def add_custom_prompt(
+    brand_id: str, body: CustomPromptIn, _creator: dict = Depends(require_creator)
+) -> dict:
+    brand = _brand_or_404(brand_id)
+    try:
+        universe = geo_prompts.add_custom_prompt(brand_id, body.text, body.intent, body.stage)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _track(_creator, "prompt_custom_add", f"Custom prompt added: {body.text[:60]}", brand)
     return universe
 
 

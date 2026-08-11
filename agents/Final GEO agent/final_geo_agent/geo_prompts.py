@@ -51,9 +51,9 @@ def save_universe(brand_id: str, prompts: list[dict]) -> dict:
     return doc
 
 
-def _clean(raw: list[dict], n: int) -> list[dict]:
+def _clean(raw: list[dict], n: int, taken: set[str] | None = None) -> list[dict]:
     prompts: list[dict] = []
-    seen: set[str] = set()
+    seen: set[str] = set(taken or ())
     for item in raw:
         text = str(item.get("text", "")).strip()
         if not text or text.lower() in seen:
@@ -68,6 +68,7 @@ def _clean(raw: list[dict], n: int) -> list[dict]:
                 "intent": intent,
                 "stage": stage,
                 "enabled": True,
+                "source": "ai",
             }
         )
         if len(prompts) >= n:
@@ -91,10 +92,38 @@ def generate_universe(brand: dict, n: int = DEFAULT_UNIVERSE_SIZE) -> dict:
         f"to this category (not generic marketing questions)."
     )
     data = llm_json(_SYSTEM, prompt, agent_id=GEO_AGENT_ID)
-    prompts = _clean(list(data.get("prompts") or []), n)
+    # the team's own questions are the most valuable panel members — a
+    # regenerate must NEVER wipe them, only refresh the AI-drafted ones
+    existing = load_universe(brand["id"]) or {}
+    custom = [p for p in existing.get("prompts", []) if p.get("source") == "custom"]
+    prompts = _clean(
+        list(data.get("prompts") or []), n,
+        taken={p["text"].lower() for p in custom},
+    )
     if not prompts:
         raise ValueError("LLM returned no usable prompts — try again")
-    return save_universe(brand["id"], prompts)
+    return save_universe(brand["id"], custom + prompts)
+
+
+def add_custom_prompt(
+    brand_id: str, text: str, intent: str = "category", stage: str = "consideration"
+) -> dict:
+    """Append one team-written question. Duplicates rejected honestly."""
+    text = text.strip()
+    if not (5 <= len(text) <= 400):
+        raise ValueError("Prompt must be 5-400 characters")
+    doc = load_universe(brand_id) or {"brand_id": brand_id, "prompts": []}
+    if any(p.get("text", "").lower() == text.lower() for p in doc.get("prompts", [])):
+        raise ValueError("That question is already in the universe")
+    doc.setdefault("prompts", []).append({
+        "id": uuid.uuid4().hex[:8],
+        "text": text,
+        "intent": intent if intent in INTENTS else "category",
+        "stage": stage if stage in STAGES else "consideration",
+        "enabled": True,
+        "source": "custom",
+    })
+    return save_universe(brand_id, doc["prompts"])
 
 
 def enabled_prompts(brand_id: str) -> list[dict]:
