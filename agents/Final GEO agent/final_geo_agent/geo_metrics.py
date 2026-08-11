@@ -16,7 +16,10 @@ from statistics import mean, pstdev
 
 
 def _ok(answers: list[dict]) -> list[dict]:
-    return [a for a in answers if not a.get("error")]
+    # no_aio = Google showed no AI Overview for that query — a completed
+    # observation, but a brand can't appear in an answer that doesn't exist,
+    # so it stays out of every rate denominator (like errors do)
+    return [a for a in answers if not a.get("error") and not a.get("no_aio")]
 
 
 def mention_stats(answers: list[dict], entity: str = "self") -> dict:

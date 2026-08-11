@@ -24,6 +24,9 @@ from seo_geo_agent.sources import CredentialMissing, llm_json
 DEFAULT_DAILY_CAP = 2000
 DEFAULT_RUNS = 3
 DEFAULT_BATCH = 10  # tasks (engine calls) per step
+# Google AIO runs on SerpAPI's free ~250 searches/month: one run per prompt
+# (SERP content, low variance) under a hard monthly credit guard.
+AIO_MONTHLY_CAP = 200
 
 
 def _now() -> str:
@@ -72,7 +75,7 @@ def ensure_config(brand: dict) -> dict:
 
 def save_config(brand_id: str, patch: dict) -> dict:
     doc = state.load(config_doc_id(brand_id)) or {}
-    for key in ("aliases", "competitors", "daily_cap"):
+    for key in ("aliases", "competitors", "daily_cap", "aio_monthly_cap"):
         if key in patch:
             doc[key] = patch[key]
     doc["brand_id"] = brand_id
@@ -150,13 +153,14 @@ def _pending_tasks(
     for engine, doc in docs.items():
         # only SUCCESSFUL answers complete a task — an errored run (quota,
         # outage) stays pending so the next poll retries it instead of
-        # writing the whole day off
+        # writing the whole day off. ("no AIO shown" counts as completed.)
         done = {
             (a["prompt_id"], a["run"])
             for a in doc.get("answers", []) if not a.get("error")
         }
+        engine_runs = 1 if engine == geo_engines.AIO_ENGINE else runs
         for prompt in prompts:
-            for run in range(1, runs + 1):
+            for run in range(1, engine_runs + 1):
                 if (prompt["id"], run) not in done:
                     tasks.append((engine, prompt, run))
     return tasks
@@ -164,6 +168,14 @@ def _pending_tasks(
 
 def used_today(cfg: dict) -> int:
     return int((cfg.get("counters") or {}).get(_today(), 0))
+
+
+def _month() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m")
+
+
+def aio_used_month(cfg: dict) -> int:
+    return int((cfg.get("counters_aio") or {}).get(_month(), 0))
 
 
 def poll_step(
@@ -187,10 +199,22 @@ def poll_step(
     if not prompts:
         raise ValueError("No enabled prompts — generate the prompt universe first")
 
+    # monthly credit guard for the SerpAPI free tier: when the month's AIO
+    # budget is spent, AIO simply leaves the panel until next month — honestly
+    # reported, never a surprise bill or a silent hole
+    aio_cap = int(cfg.get("aio_monthly_cap") or AIO_MONTHLY_CAP)
+    aio_capped = geo_engines.AIO_ENGINE in usable and aio_used_month(cfg) >= aio_cap
+    if aio_capped:
+        usable = [e for e in usable if e != geo_engines.AIO_ENGINE]
+        if not usable:
+            raise ValueError("AIO monthly credit budget is spent — resumes next month")
+
     day = _today()
     docs = _load_day_docs(brand["id"], usable, day)
     tasks = _pending_tasks(prompts, docs, runs)
-    total = len(prompts) * runs * len(usable)
+    total = sum(
+        len(prompts) * (1 if e == geo_engines.AIO_ENGINE else runs) for e in usable
+    )
     done_before = total - len(tasks)
 
     cap = int(cfg.get("daily_cap") or DEFAULT_DAILY_CAP)
@@ -205,9 +229,12 @@ def poll_step(
     batch = tasks[:budget]
     aliases = alias_map(cfg)
     calls = 0
+    aio_credits = 0
     for engine, prompt, run in batch:
         answer = geo_engines.poll_engine(engine, prompt["text"])
         calls += 1
+        if engine == geo_engines.AIO_ENGINE:
+            aio_credits += getattr(answer, "credits", 1)
         record = answer.to_dict() | {
             "prompt_id": prompt["id"],
             "prompt_text": prompt["text"],
@@ -252,12 +279,16 @@ def poll_step(
     cfg.setdefault("counters", {})[day] = used + calls
     # keep only the trailing 30 day-counters so the config doc never grows
     cfg["counters"] = dict(sorted(cfg["counters"].items())[-30:])
+    if aio_credits:
+        cfg.setdefault("counters_aio", {})[_month()] = aio_used_month(cfg) + aio_credits
+        cfg["counters_aio"] = dict(sorted(cfg["counters_aio"].items())[-3:])
     state.save(config_doc_id(brand["id"]), cfg)
 
     return {
         "done": done_before + len(batch), "total": total,
         "calls_used_today": used + calls, "daily_cap": cap, "capped": False,
-        "engines": usable, "date": day,
+        "engines": usable, "date": day, "aio_capped": aio_capped,
+        "aio_credits_month": aio_used_month(cfg),
     }
 
 

@@ -103,3 +103,13 @@ def test_prompt_rollup_appear_vs_missing():
     assert rollup["p2"]["rivals"][0] == {"key": "rival", "count": 2}
     assert rollup["p3"]["n"] == 1                       # error row excluded
     assert rollup["p1"]["engines_hit"] == ["perplexity"]
+
+
+def test_no_aio_rows_stay_out_of_rate_denominators():
+    answers = [
+        ans("p1", 1, mentions={"self": 1}),
+        dict(ans("p1", 2), no_aio=True),     # Google showed no AIO — not a miss
+    ]
+    stats = geo_metrics.mention_stats(answers)
+    assert stats["rate"] == 1.0
+    assert stats["n_answers"] == 1

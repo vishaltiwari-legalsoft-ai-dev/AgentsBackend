@@ -13,6 +13,7 @@ override, else env); a missing key just makes the engine unavailable.
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -20,6 +21,7 @@ import httpx
 
 from app.services import runtime_config
 
+from seo_geo_agent import state
 from seo_geo_agent.sources import domain_of
 
 # One place to change engine targets. Answer text AND citations are capped in
@@ -55,6 +57,13 @@ OPENROUTER_ENGINE_MODELS: dict[str, str] = {
 }
 _NEEDS_WEB_PLUGIN = {"gemini", "chatgpt"}  # sonar searches on its own
 
+# Google AI Overview via SerpAPI — the ONLY engine here measuring the real
+# consumer SERP surface. Free plan is ~250 searches/month, so AIO polls once
+# per prompt (SERP content, low variance) under a monthly credit guard in
+# geo_poll. "No AI Overview shown" is a completed observation, never an error.
+AIO_ENGINE = "aio"
+SERPAPI_URL = "https://serpapi.com/search.json"
+
 
 @dataclass
 class EngineAnswer:
@@ -64,7 +73,9 @@ class EngineAnswer:
     citations: list[dict] = field(default_factory=list)  # {url, domain, title}
     latency_ms: int = 0
     error: str | None = None
-    via: str = ""  # "native" | "openrouter" — the measurement surface
+    via: str = ""  # "native" | "openrouter" | "serpapi" — the measurement surface
+    no_aio: bool = False   # Google showed no AI Overview for this query (not an error)
+    credits: int = 1       # provider credits this answer cost (page_token AIO = 2)
 
     def to_dict(self) -> dict:
         return {
@@ -82,6 +93,7 @@ class EngineAnswer:
             "latency_ms": self.latency_ms,
             "error": self.error,
             "via": self.via,
+            "no_aio": self.no_aio,
         }
 
 
@@ -94,10 +106,27 @@ def openrouter_key() -> str:
     return runtime_config.get("openrouter_api_key")
 
 
+def serpapi_key() -> str:
+    """Env first; in cloud mode fall back to admin app config (same pattern
+    as the Serper key). Offline mode never touches Firestore."""
+    key = os.environ.get("SERPAPI_API_KEY", "")
+    if key or not state.use_cloud():
+        return key
+    try:
+        from app.services.firestore_repo import get_app_config
+
+        return str(get_app_config().get("serpapi_api_key") or "")
+    except Exception:  # noqa: BLE001 — config unreachable = no key, honestly
+        return ""
+
+
 def available_engines() -> dict[str, bool]:
-    """Which engines can answer right now: native key, or OpenRouter fallback."""
+    """Which engines can answer right now: native key, or OpenRouter fallback.
+    AIO is SERP data — SerpAPI key only, no chat fallback exists for it."""
     fallback = bool(openrouter_key())
-    return {engine: bool(engine_key(engine)) or fallback for engine in ENGINE_KEY_FIELDS}
+    engines = {engine: bool(engine_key(engine)) or fallback for engine in ENGINE_KEY_FIELDS}
+    engines[AIO_ENGINE] = bool(serpapi_key())
+    return engines
 
 
 def _citation(url: str, title: str = "") -> dict:
@@ -214,6 +243,67 @@ def poll_openai(prompt: str, key: str) -> EngineAnswer:
     return answer
 
 
+def _aio_flatten(blocks: list) -> list[str]:
+    """SerpAPI ai_overview text_blocks → plain lines (paragraphs, lists,
+    headings, nested blocks — coded defensively against shape drift)."""
+    lines: list[str] = []
+    for block in blocks or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("snippet"):
+            lines.append(str(block["snippet"]))
+        for item in block.get("list") or []:
+            if isinstance(item, dict):
+                text = " — ".join(filter(None, [item.get("title", ""), item.get("snippet", "")]))
+                if text:
+                    lines.append(f"- {text}")
+        if block.get("text_blocks"):
+            lines.extend(_aio_flatten(block["text_blocks"]))
+    return lines
+
+
+def poll_aio(prompt: str, key: str) -> EngineAnswer:
+    """One Google AI Overview snapshot via SerpAPI. Two-step when Google
+    defers the content behind a page_token (costs a second credit)."""
+    started = time.monotonic()
+    answer = EngineAnswer(engine=AIO_ENGINE, model="google-ai-overview", via="serpapi")
+    try:
+        resp = httpx.get(
+            SERPAPI_URL,
+            params={"engine": "google", "q": prompt, "hl": "en", "gl": "us", "api_key": key},
+            timeout=REQUEST_TIMEOUT,
+        )
+        answer.latency_ms = int((time.monotonic() - started) * 1000)
+        if resp.status_code != 200:
+            answer.error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            return answer
+        aio = resp.json().get("ai_overview") or {}
+        if aio.get("page_token") and not aio.get("text_blocks"):
+            resp2 = httpx.get(
+                SERPAPI_URL,
+                params={"engine": "google_ai_overview", "page_token": aio["page_token"], "api_key": key},
+                timeout=REQUEST_TIMEOUT,
+            )
+            answer.credits = 2
+            answer.latency_ms = int((time.monotonic() - started) * 1000)
+            if resp2.status_code != 200:
+                answer.error = f"HTTP {resp2.status_code} on AIO page fetch: {resp2.text[:150]}"
+                return answer
+            aio = resp2.json().get("ai_overview") or {}
+        lines = _aio_flatten(aio.get("text_blocks") or [])
+        if not lines:
+            answer.no_aio = True   # honest observation: the AIO slot is empty here
+            return answer
+        answer.text = "\n".join(lines)
+        for ref in aio.get("references") or []:
+            if ref.get("link"):
+                answer.citations.append(_citation(ref["link"], ref.get("title", "")))
+    except Exception as exc:  # noqa: BLE001 — adapters must degrade, never raise
+        answer.latency_ms = int((time.monotonic() - started) * 1000)
+        answer.error = f"{type(exc).__name__}: {exc}"
+    return answer
+
+
 def poll_openrouter(engine: str, prompt: str, key: str) -> EngineAnswer:
     """One engine-equivalent answer via OpenRouter — mainstream model + web
     search where the model has none of its own. Citations come back as
@@ -264,6 +354,11 @@ def poll_engine(engine: str, prompt: str) -> EngineAnswer:
     """Poll one engine once. Native API when its key exists; OpenRouter as
     fallback when there is no native key OR the native call fails (quota,
     outage). Missing everything → EngineAnswer(error=...), never a raise."""
+    if engine == AIO_ENGINE:
+        key = serpapi_key()
+        if not key:
+            return EngineAnswer(engine=engine, error="no API key configured")
+        return poll_aio(prompt, key)
     fn = ENGINES.get(engine)
     if fn is None:
         return EngineAnswer(engine=engine, error=f"unknown engine: {engine}")

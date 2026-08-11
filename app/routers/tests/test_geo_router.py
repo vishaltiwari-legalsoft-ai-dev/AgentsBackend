@@ -70,7 +70,7 @@ def test_geo_config_reports_engine_availability():
     resp = client.get("/api/geo/config")
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body["engines"]) == {"perplexity", "gemini", "chatgpt"}
+    assert set(body["engines"]) == {"perplexity", "gemini", "chatgpt", "aio"}
     # offline + keyless: nothing should claim to be available
     assert not any(body["engines"].values())
 
