@@ -298,7 +298,7 @@ def recent_answers(brand_id: str, days: int = 7) -> list[dict]:
     today = dt.datetime.now(dt.timezone.utc).date()
     for offset in range(days):
         day = (today - dt.timedelta(days=offset)).strftime("%Y%m%d")
-        for engine in geo_engines.ENGINE_KEY_FIELDS:
+        for engine in geo_engines.ALL_ENGINES:
             doc = state.load(poll_doc_id(brand_id, engine, day))
             if doc:
                 answers.extend(doc.get("answers", []))

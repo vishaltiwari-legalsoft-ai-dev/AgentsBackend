@@ -243,3 +243,11 @@ def test_aio_monthly_cap_drops_aio_not_the_poll(aio_engine):
     assert res["aio_capped"] is True
     assert "aio" not in res["engines"]                          # chat engines still polled
     assert (res["done"], res["total"]) == (2, 2)
+
+
+def test_recent_answers_includes_aio_docs(aio_engine):
+    seed_prompts(1)
+    geo_poll.poll_step(BRAND, runs=1, batch_size=10)
+    engines_seen = {a["engine"] for a in geo_poll.recent_answers(BRAND["id"], days=1)}
+    assert "aio" in engines_seen          # stored AIO answers must be readable everywhere
+    assert "perplexity" in engines_seen

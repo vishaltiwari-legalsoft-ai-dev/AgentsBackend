@@ -64,6 +64,11 @@ _NEEDS_WEB_PLUGIN = {"gemini", "chatgpt"}  # sonar searches on its own
 AIO_ENGINE = "aio"
 SERPAPI_URL = "https://serpapi.com/search.json"
 
+# every engine whose poll docs exist on disk — readers must scan THIS, not
+# ENGINE_KEY_FIELDS (aio has no chat key field; forgetting it made stored AIO
+# answers invisible to the whole product on 2026-08-11)
+ALL_ENGINES: tuple[str, ...] = (*ENGINE_KEY_FIELDS, AIO_ENGINE)
+
 
 @dataclass
 class EngineAnswer:
