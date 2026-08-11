@@ -10,17 +10,17 @@ import json
 import app  # noqa: F401 - registers agent roots on sys.path
 import pytest
 
-from browser_agent import actions, brain, planner, runs
+from browser_agent import actions, brain, planner, runs, tools
 
 USER = {"id": "u1", "email": "owner@legalsoft.com"}
 
 
 _PLAN = {
     "subtasks": [
-        {"id": "s1", "title": "Open compose", "goal": "open it", "steps": [],
-         "edge_cases": [], "done_when": "visible", "status": "pending"},
-        {"id": "s2", "title": "Fill recipient", "goal": "fill it", "steps": [],
-         "edge_cases": [], "done_when": "filled", "status": "pending"},
+        {"id": "s1", "title": "Open compose", "goal": "open it", "rail": "browser",
+         "steps": [], "edge_cases": [], "done_when": "visible", "status": "pending"},
+        {"id": "s2", "title": "Fill recipient", "goal": "fill it", "rail": "browser",
+         "steps": [], "edge_cases": [], "done_when": "filled", "status": "pending"},
     ],
     "notes": "", "planned": True, "goal": "send an email",
 }
@@ -348,6 +348,109 @@ def test_a_failed_plan_still_runs(monkeypatch):
     assert run["plan"]["planned"] is False
     run, resp = runs.step(run, _step_body(1))
     assert resp["action"]["kind"] == "wait"  # degraded, not dead
+
+
+# --------------------------------------------------------------------------- #
+# The tool rail — APIs instead of clicking
+# --------------------------------------------------------------------------- #
+
+def test_a_tool_call_never_reaches_the_extension(monkeypatch):
+    """The whole point of INTERNAL_KINDS: the browser gets one executable
+    action per step, whatever happened server-side to produce it."""
+    replies = iter([
+        actions.Action(kind="tool", tool="sheet_read", sheet="https://x/d/abc123", why="read it"),
+        actions.Action(kind="done", summary="Read the sheet", why="have the data"),
+    ])
+    monkeypatch.setattr(brain, "decide", lambda run, obs: next(replies))
+    monkeypatch.setattr(tools, "run_tool", lambda name, args: {"rows": [["a"]]})
+
+    run = runs.create_run(USER, "read my sheet", "act", None)
+    run, resp = runs.step(run, _step_body(1))
+
+    assert resp["action"]["kind"] == "done"          # never "tool"
+    assert run["tool_calls"][0]["tool"] == "sheet_read"
+    assert run["steps"][-1]["tools"] == [{"tool": "sheet_read", "ok": True, "error": None}]
+
+
+def test_tool_result_is_kept_as_a_finding(monkeypatch):
+    replies = iter([
+        actions.Action(kind="tool", tool="web_search", query="gyms", why="search"),
+        actions.Action(kind="wait", why="settle"),
+    ])
+    monkeypatch.setattr(brain, "decide", lambda run, obs: next(replies))
+    monkeypatch.setattr(tools, "run_tool", lambda n, a: {"results": [{"title": "Gold Gym"}]})
+
+    run = runs.create_run(USER, "find gyms", "act", None)
+    run, _ = runs.step(run, _step_body(1))
+    assert any("Gold Gym" in f for f in run["findings"])
+
+
+def test_a_failing_tool_does_not_end_the_run(monkeypatch):
+    """A missing share is a thing to report and work around, not a crash."""
+    replies = iter([
+        actions.Action(kind="tool", tool="sheet_append", sheet="https://x/d/abc123",
+                       rows=[["a"]], why="write it"),
+        actions.Action(kind="ask_user", text="Please share the sheet with me", why="blocked"),
+    ])
+    monkeypatch.setattr(brain, "decide", lambda run, obs: next(replies))
+
+    def denied(name, args):
+        raise tools.ToolError("I don't have Editor access to that sheet.")
+
+    monkeypatch.setattr(tools, "run_tool", denied)
+
+    run = runs.create_run(USER, "write to my sheet", "act", None)
+    run, resp = runs.step(run, _step_body(1))
+    assert run["status"] == "awaiting_user"
+    assert resp["action"]["kind"] == "ask_user"
+    assert run["tool_calls"][0]["ok"] is False
+    assert "Editor" in run["tool_calls"][0]["error"]
+
+
+def test_a_tool_that_explodes_is_contained(monkeypatch):
+    replies = iter([
+        actions.Action(kind="tool", tool="sheet_read", sheet="https://x/d/abc", why="read"),
+        actions.Action(kind="fail", reason="couldn't get the data", why="tool broke"),
+    ])
+    monkeypatch.setattr(brain, "decide", lambda run, obs: next(replies))
+
+    def explode(name, args):
+        raise ZeroDivisionError("boom")
+
+    monkeypatch.setattr(tools, "run_tool", explode)
+    run = runs.create_run(USER, "read", "act", None)
+    run, resp = runs.step(run, _step_body(1))
+    assert resp["action"]["kind"] == "fail"          # honest, not a 500
+    assert run["tool_calls"][0]["ok"] is False
+
+
+def test_tools_per_step_are_capped(monkeypatch):
+    """Bounds the latency of one HTTP step; the run continues next step."""
+    monkeypatch.setattr(
+        brain, "decide",
+        lambda run, obs: actions.Action(kind="tool", tool="web_search", query="x", why="again"),
+    )
+    monkeypatch.setattr(tools, "run_tool", lambda n, a: {"results": []})
+
+    run = runs.create_run(USER, "search a lot", "act", None)
+    run, resp = runs.step(run, _step_body(1))
+    assert len(run["tool_calls"]) == runs._MAX_TOOLS_PER_STEP
+    assert resp["action"]["kind"] == "wait"
+    assert run["status"] == "running"                # not failed — just next step
+
+
+def test_tool_calls_are_never_flagged_sensitive(monkeypatch):
+    """Appending to its own tab is not the irreversible kind of step."""
+    act = actions.Action(kind="tool", tool="sheet_append", sheet="https://x/d/a",
+                         rows=[["delete everything"]], why="write")
+    assert actions.is_sensitive(act, []) is False
+
+
+def test_steps_record_the_rail(monkeypatch):
+    _stub_brain(monkeypatch, actions.Action(kind="wait", why="settle"))
+    run = runs.create_run(USER, "goal", "act", None)
+    run, _ = runs.step(run, _step_body(1))
+    assert run["steps"][-1]["rail"] == "browser"
 
 
 def test_extracted_result_becomes_a_finding(monkeypatch):

@@ -25,23 +25,45 @@ logger = logging.getLogger("agentos.browser")
 
 AGENT_ID = "a11"
 
+RAILS = ("data", "browser", "think")
+
 MAX_SUBTASKS = 8
 MAX_STEPS_PER_SUBTASK = 8
 MAX_EDGE_CASES = 6
 _MAX_CHARS = 300
 
-_SYSTEM = """You plan browser work for an agent that controls a real, logged-in \
-Chrome browser. You do NOT browse — you only produce the plan the agent will \
-follow. Reply with ONE JSON object, no markdown fences.
+_SYSTEM = """You plan work for an agent that has BOTH a real logged-in Chrome \
+browser and a set of direct APIs. You do NOT do the work — you produce the plan \
+the agent follows. Reply with ONE JSON object, no markdown fences.
 
 {"subtasks": [
    {"title": "short name",
     "goal": "what this sub-task must achieve, in one sentence",
+    "rail": "data | browser | think",
     "steps": ["micro-step", "micro-step"],
     "edge_cases": [{"risk": "what might go wrong", "handle": "what to do then"}],
     "done_when": "the observable condition that proves this sub-task finished"}
  ],
  "notes": "anything the agent should know throughout, or empty"}
+
+CHOOSING THE RAIL — the most important judgement you make:
+- "data": the job can be done through an API. Reading or writing a Google
+  Sheet, searching the web, reading an article. ALWAYS prefer this. It takes
+  seconds, cannot get stuck, and does not break when a site is redesigned.
+- "browser": only the browser can do it — a logged-in app with no API, a
+  vendor portal, a site that blocks fetching, or a UI the user specifically
+  asked to be driven.
+- "think": no tool at all, just reasoning over what has already been gathered.
+
+Rules that follow from this:
+- **Google Sheets is ALWAYS "data", never "browser".** Sheets, Docs and Slides
+  paint their content onto a canvas; the agent physically cannot read cells or
+  type into the grid by clicking. Plan sheet work through the API or it will
+  fail every time.
+- Ordinary research is "data" too: search and read directly rather than
+  driving Google in a tab.
+- The agent can only ADD rows to a sheet, in its own tab. It cannot edit or
+  delete existing cells — never plan a step that depends on changing one.
 
 Rules for a good plan:
 - 2 to 6 sub-tasks. Each is a milestone with a visible result, not a single
@@ -92,11 +114,13 @@ def _clean(raw: dict, goal: str) -> dict:
         sub_goal = str(item.get("goal") or item.get("title") or "").strip()[:_MAX_CHARS]
         if not sub_goal:
             continue
+        rail = str(item.get("rail") or "browser").strip().lower()
         subtasks.append(
             {
                 "id": f"s{len(subtasks) + 1}",
                 "title": str(item.get("title") or sub_goal)[:80],
                 "goal": sub_goal,
+                "rail": rail if rail in RAILS else "browser",
                 "steps": [
                     str(s)[:_MAX_CHARS]
                     for s in (item.get("steps") or [])[:MAX_STEPS_PER_SUBTASK]
@@ -132,6 +156,7 @@ def fallback_plan(goal: str, reason: str) -> dict:
                 "id": "s1",
                 "title": "Complete the task",
                 "goal": goal,
+                "rail": "browser",
                 "steps": [],
                 "edge_cases": [],
                 "done_when": "the task is complete",
@@ -148,13 +173,22 @@ def fallback_plan(goal: str, reason: str) -> dict:
 def build_plan(goal: str, *, start_url: str | None = None) -> dict:
     """Decompose a task before any clicking. Never raises — a failed plan
     degrades to the raw goal, because a run without a plan still beats no run."""
+    from browser_agent import tools  # local import: keeps the module cycle-free
+
     model = runtime_config.get_for_agent(AGENT_ID, "browser_planner_model")
     where = f"\nThe agent starts on: {start_url}" if start_url else ""
+    ready = tools.availability()
+    offline = [name for name in tools.TOOLS if not ready.get(name)]
+    unavailable = (
+        f"\nNOT available right now, do not plan around them: {', '.join(offline)}."
+        if offline else ""
+    )
     prompt = (
         f"TASK: {goal}{where}\n\n"
-        f"The agent can only: {', '.join(actions.ACTION_KINDS)}. "
-        "It sees the page as a numbered list of interactive elements, and can "
-        "look at a screenshot when it gets stuck.\n\n"
+        f"In the browser it can: {', '.join(actions.ACTION_KINDS)}. It sees a page "
+        "as a numbered list of interactive elements and can look at a screenshot "
+        "when stuck.\n\n"
+        f"Its direct APIs (the 'data' rail):\n{tools.grammar()}{unavailable}\n\n"
         "Produce the plan JSON."
     )
     try:

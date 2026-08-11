@@ -24,6 +24,7 @@ from app.services import run_tracking
 from browser_agent import actions as browser_actions
 from browser_agent import digest as browser_digest
 from browser_agent import runs as browser_runs
+from browser_agent import tools as browser_tools
 
 router = APIRouter()
 logger = logging.getLogger("agentos.browser")
@@ -174,6 +175,23 @@ def download_extension(user: dict = Depends(get_current_user)) -> FileResponse:
         media_type="application/zip",
         filename="agentos-browser-agent.zip",
     )
+
+
+@router.get("/browser/tools")
+def list_tools(user: dict = Depends(get_current_user)) -> dict:
+    """Which APIs the agent can reach right now, and who to share sheets with."""
+    _guard()
+    ready = browser_tools.availability()
+    return {
+        "tools": [
+            {"name": name, "available": bool(ready.get(name)), "help": spec["help"]}
+            for name, spec in browser_tools.TOOLS.items()
+        ],
+        "service_account": ready["service_account"],
+        "default_tab": ready["default_tab"],
+        # Stated plainly because it is the whole safety story for sheet writes.
+        "write_policy": "append-only into its own tab; existing cells cannot be changed",
+    }
 
 
 @router.post("/browser/runs")

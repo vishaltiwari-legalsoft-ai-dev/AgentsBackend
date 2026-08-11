@@ -37,21 +37,26 @@ ACTION_KINDS = (
 # also never attaches the debugger on the extension side.
 MUTATING_KINDS = frozenset({"navigate", "click", "type", "select", "key", "open_tab"})
 
-# Handled entirely on the server: the model uses this to say a sub-task of the
-# plan is finished, and we immediately ask it for a real action on the next one.
+# Handled entirely on the server, never sent to the extension. "next_subtask"
+# marks a plan milestone done; "tool" reaches an API instead of the browser.
 # Deliberately NOT in ACTION_KINDS — the extension's wire contract is unchanged,
-# so adding planning did not need a protocol bump.
-INTERNAL_KINDS = ("next_subtask",)
+# so neither planning nor the toolbox needed a protocol bump.
+INTERNAL_KINDS = ("next_subtask", "tool")
 
 
 class Action(BaseModel):
     kind: str
     index: int | None = None  # distilled-DOM element index (click/type/select)
-    # What the model believes sits at that index. Indexes are re-assigned every
-    # step, so a dropdown opening renumbers the page underneath the model. The
-    # extension checks this label before acting and refuses on a mismatch —
-    # which turns "clicked the wrong thing" into "look again".
+    # The element's label, copied from the list. Indexes are re-assigned every
+    # step, so a dropdown opening renumbers the page underneath the model — the
+    # extension therefore finds the element BY THIS NAME and treats the index as
+    # a tie-break only. Without it, a click lands on whatever inherited the
+    # number, which is how "cancel" once resolved to "send".
     expect: str | None = None
+    role: str | None = None  # narrows the search when a label is ambiguous
+    # What should be observably true after this works. Checked on the next step
+    # against what actually happened — verification that costs no extra LLM call.
+    expect_after: str | None = None
     url: str | None = None  # navigate / open_tab
     text: str | None = None  # type: text · key: key combo · ask_user: question
     value: str | None = None  # select: option value or visible label
@@ -61,6 +66,12 @@ class Action(BaseModel):
     summary: str | None = None  # done: final answer for the user
     extracted: list | dict | None = None  # done: structured findings
     reason: str | None = None  # fail: honest reason
+    # tool: which API to reach for, and its arguments. Server-side only.
+    tool: str | None = None
+    sheet: str | None = None
+    tab: str | None = None
+    rows: list | None = None
+    query: str | None = None
 
 
 _REQUIRED: dict[str, tuple[str, ...]] = {
@@ -74,6 +85,7 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     "ask_user": ("text",),
     "done": ("summary",),
     "fail": ("reason",),
+    "tool": ("tool",),
 }
 
 
@@ -168,6 +180,11 @@ def _label_is_sensitive(label: str) -> bool:
 
 
 def is_sensitive(action: Action, elements: list[dict]) -> bool:
+    # Tool calls reach APIs, not the page. The only one that changes anything
+    # appends to its own tab and cannot overwrite, so none of them are the
+    # irreversible kind of step that needs a human in the loop.
+    if action.kind == "tool":
+        return False
     if action.kind in ("navigate", "open_tab"):
         url = (action.url or "").lower()
         return any(tok in url for tok in _SENSITIVE_URL_TOKENS)

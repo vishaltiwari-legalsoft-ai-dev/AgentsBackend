@@ -44,16 +44,25 @@ Actions (field "kind" plus the listed required fields):
 - {"kind":"ask_user","text":...}           ask the user a question and pause
 - {"kind":"next_subtask"}                  the current sub-task's done_when is
                                            satisfied — move to the next one
+- {"kind":"tool","tool":"<name>",...}      use a direct API instead of the page
 - {"kind":"done","summary":...,"extracted":...}  finish with your findings
 - {"kind":"fail","reason":...}             give up honestly — never fake success
 
 Every action also takes "why": one short plain-language line shown to the user.
 
 Any action with an "index" MUST also carry "expect": the text shown for that
-element in the list, copied exactly. Element numbers are re-assigned every step,
-so a dropdown opening or a panel closing renumbers everything. "expect" is how
-we catch that: if the element at your index no longer matches, the step is
-refused and you get to look again instead of clicking something at random.
+element in the list, copied exactly. The element is found BY THAT NAME — the
+number is only a tie-breaker, because numbers are re-assigned every step and a
+dropdown opening renumbers the whole page. Add "role" (button, link, textbox…)
+when several things share a name. If the name isn't found, or matches several
+things, the step is refused and you get to look again rather than acting on
+whatever inherited the number.
+
+Every action should also carry "expect_after": one short sentence saying what
+will be observably true once it works — "the To field shows the address", "the
+compose window is open". You will be shown, on the next step, whether it came
+true. This is how you notice a step that silently did nothing, instead of
+building on an assumption.
 
 When a screenshot is attached, it is the current viewport. Use it to work out
 why the text view isn't matching what you expect — an overlay or dialog covering
@@ -79,7 +88,11 @@ Rules:
    it. Try something else: a different element, scroll, wait, or say why you are
    stuck. Repeating an ineffective action is the single most common way these
    runs fail.
-7. Work ONLY on the current sub-task shown below. Its plan lists the micro-steps
+7. Prefer a tool over the browser whenever one fits. A tool answers in seconds
+   and cannot get stuck; clicking through a UI for something an API can do is
+   how these runs fail. Google Sheets in particular is ONLY reachable by tool —
+   its cells are painted pixels, so no click or keystroke will ever touch them.
+8. Work ONLY on the current sub-task shown below. Its plan lists the micro-steps
    and the edge cases someone already thought through — when the page matches a
    listed risk, apply that handling instead of improvising. When its "done_when"
    is visibly true, reply "next_subtask". Reply "done" only when the LAST
@@ -137,6 +150,32 @@ def _history_block(run: dict) -> str:
     return "\n".join(lines)
 
 
+def _last_claim(run: dict) -> str:
+    """Confront the model with the claim it made about its previous step.
+
+    The model asserts what should be true afterwards; here it is asked to check
+    that against the page it is now looking at. Verification for the price of a
+    few lines in a prompt we were already sending.
+    """
+    steps = run.get("steps") or []
+    if not steps:
+        return ""
+    last = steps[-1]
+    claim = (last.get("action") or {}).get("expect_after")
+    if not claim:
+        return ""
+    result = last.get("result") or {}
+    landed = "the step reported success" if result.get("ok") else (
+        f"the step FAILED: {result.get('error')}"
+    )
+    return (
+        f'\nYou expected after your last step: "{claim}"\n'
+        f"({landed}.) Check that against the page below BEFORE doing anything "
+        "else. If it did not come true, do not build on it — say so and change "
+        "approach.\n"
+    )
+
+
 def _tried_here(run: dict, page_fp: str) -> str:
     """Steps already attempted on THIS screen — the antidote to the retry loop."""
     tried: list[str] = []
@@ -185,6 +224,18 @@ def _plan_block(run: dict) -> str:
     if not active:
         return f"PLAN ({done}/{total} done):\n{outline}\n\nAll sub-tasks are done — reply \"done\".\n"
 
+    rail = active.get("rail", "browser")
+    rail_note = {
+        "data": (
+            "  RAIL: data — do this with a tool, NOT the browser. Reach for the "
+            "API; opening a tab for this is the wrong move."
+        ),
+        "think": (
+            "  RAIL: think — no tool needed. Reason over what you already have, "
+            'then reply "next_subtask" or "done".'
+        ),
+        "browser": "  RAIL: browser — only the browser can do this one.",
+    }.get(rail, "")
     steps = "\n".join(f"  - {s}" for s in active.get("steps") or []) or "  (none listed)"
     edges = (
         "\n".join(f'  - If {e["risk"]} → {e["handle"]}' for e in active.get("edge_cases") or [])
@@ -194,10 +245,30 @@ def _plan_block(run: dict) -> str:
     return (
         f"PLAN ({done}/{total} sub-tasks done):\n{outline}\n\n"
         f"CURRENT SUB-TASK: {active.get('title')}\n"
+        f"{rail_note}\n"
         f"  Goal: {active.get('goal')}\n"
         f"  Finished when: {active.get('done_when')}\n"
         f"  Micro-steps:\n{steps}\n"
         f"  Edge cases to watch for:\n{edges}{notes}\n"
+    )
+
+
+def _tools_block() -> str:
+    from browser_agent import tools  # local import: keeps the module cycle-free
+
+    ready = tools.availability()
+    usable = [n for n in tools.TOOLS if ready.get(n)]
+    if not usable:
+        return "\nTOOLS: none are available right now — the browser is all you have.\n"
+    lines = "\n".join(
+        f'- {n}: {tools.TOOLS[n]["help"]}' for n in usable
+    )
+    missing = [n for n in tools.TOOLS if not ready.get(n)]
+    note = f"\nUnavailable right now: {', '.join(missing)}." if missing else ""
+    return (
+        f"\nTOOLS (use with {{\"kind\":\"tool\", ...}} — faster and far more "
+        f"reliable than clicking):\n{lines}{note}\n"
+        f"Share sheets with {ready['service_account']} (Editor if I must write).\n"
     )
 
 
@@ -220,8 +291,10 @@ def _user_prompt(run: dict, observation: dict) -> str:
         f"GOAL: {run.get('goal', '')}\n"
         f"MODE: {run.get('mode', 'act')}\n"
         f"STEPS REMAINING: {remaining}\n\n"
-        f"{_plan_block(run)}\n"
+        f"{_plan_block(run)}"
+        f"{_tools_block()}\n"
         f"Recent steps:\n{_history_block(run)}\n"
+        f"{_last_claim(run)}"
         f"{_tried_here(run, _runs.page_fingerprint(observation))}\n"
         f"Collected findings:\n{_findings_block(run)}\n\n"
         f"Active tab: {str(tab.get('title') or '')[:80]} — {tab.get('url', '')}\n"

@@ -74,6 +74,59 @@ def test_decide_falls_back_to_honest_fail_on_garbage(monkeypatch):
     assert "unparseable" in (action.reason or "")
 
 
+def test_prompt_confronts_the_model_with_its_last_claim(monkeypatch):
+    """Free verification: the model said what would be true; ask it to check."""
+    captured: list = []
+
+    def fake_get_llm(*_a, **kw):
+        stub = _StubLLM('{"kind":"wait","why":"settle"}')
+        captured.append(stub)
+        return stub
+
+    monkeypatch.setattr(openrouter_service, "get_llm", fake_get_llm)
+
+    run = _run()
+    run["steps"] = [{
+        "seq": 1,
+        "action": {"kind": "click", "expect": "Compose",
+                   "expect_after": "the compose window is open"},
+        "result": {"ok": True, "error": None},
+    }]
+    brain.decide(run, _obs())
+    prompt = captured[0].prompts[0][1][1]
+    assert "the compose window is open" in prompt
+    assert "Check that against the page" in prompt
+
+
+def test_a_failed_step_is_reported_alongside_its_claim(monkeypatch):
+    captured: list = []
+    monkeypatch.setattr(
+        openrouter_service, "get_llm",
+        lambda *a, **kw: (captured.append(_StubLLM('{"kind":"wait","why":"x"}')) or captured[-1]),
+    )
+    run = _run()
+    run["steps"] = [{
+        "seq": 1,
+        "action": {"kind": "type", "expect_after": "the To field shows the address"},
+        "result": {"ok": False, "error": "the text did not land"},
+    }]
+    brain.decide(run, _obs())
+    prompt = captured[0].prompts[0][1][1]
+    assert "FAILED" in prompt and "did not land" in prompt
+
+
+def test_no_claim_means_no_confrontation(monkeypatch):
+    captured: list = []
+    monkeypatch.setattr(
+        openrouter_service, "get_llm",
+        lambda *a, **kw: (captured.append(_StubLLM('{"kind":"wait","why":"x"}')) or captured[-1]),
+    )
+    run = _run()
+    run["steps"] = [{"seq": 1, "action": {"kind": "wait"}, "result": {"ok": True}}]
+    brain.decide(run, _obs())
+    assert "You expected after your last step" not in captured[0].prompts[0][1][1]
+
+
 def test_prompt_includes_goal_and_dom_index(monkeypatch):
     captured: list = []
 

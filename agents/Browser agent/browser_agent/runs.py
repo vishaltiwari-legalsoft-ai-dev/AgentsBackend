@@ -8,11 +8,15 @@ worker mid-run), and anything else out of order is an honest 409.
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
 
-from browser_agent import actions, brain, planner, state
+from browser_agent import actions, brain, planner, state, tools
+
+logger = logging.getLogger("agentos.browser")
 
 TERMINAL = frozenset({"completed", "failed", "stopped"})
 
@@ -28,6 +32,10 @@ _STUCK_AFTER = 4
 # variety — Escape, click, reload, Escape — none of which move the page. Counting
 # steps-without-progress catches the cycle the repeat guard walks straight past.
 _NO_PROGRESS_AFTER = 8
+# Tool calls run inside one HTTP step, so the cap is a latency budget: each one
+# costs an API round-trip plus another LLM call to decide what comes next.
+_MAX_TOOLS_PER_STEP = 3
+_MAX_TOOL_RESULT_CHARS = 12_000
 # Repeats before we ask the extension for a screenshot. Text alone can't explain
 # why a click does nothing on an app like Gmail — an overlay, a control that only
 # looks focusable, an element the model is reading as the wrong thing. One repeat
@@ -236,6 +244,33 @@ def stuck_on(
     return None
 
 
+def _run_tool(run: dict, action: actions.Action) -> dict:
+    """Execute one tool and record what it returned as a finding.
+
+    A tool that fails is not a run-ending event: the message goes back to the
+    model, which can try another way or say honestly that it can't proceed.
+    """
+    args = action.model_dump(exclude_none=True)
+    name = str(action.tool or "")
+    try:
+        result = tools.run_tool(name, args)
+        record = {"tool": name, "ok": True, "result": result}
+    except tools.ToolError as exc:
+        record = {"tool": name, "ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 — a broken tool must not kill the run
+        logger.exception("browser tool %s blew up", name)
+        record = {"tool": name, "ok": False, "error": f"{name} failed: {str(exc)[:200]}"}
+
+    run.setdefault("tool_calls", []).append(
+        {"tool": name, "at": _now(), "ok": record["ok"],
+         "why": action.why, "error": record.get("error")}
+    )
+    if len(run.get("findings") or []) < _MAX_FINDINGS:
+        text = json.dumps(record, default=str)[:_MAX_TOOL_RESULT_CHARS]
+        run.setdefault("findings", []).append(f"[{name}] {text}")
+    return record
+
+
 def _veto(run: dict, action: actions.Action) -> str | None:
     """Policy check on a decided action; returns the honest refusal or None."""
     if run.get("mode") == "monitor" and action.kind in actions.MUTATING_KINDS:
@@ -297,23 +332,39 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
 
     action = brain.decide(run, body)
 
-    # "next_subtask" never leaves the server: mark the milestone done and ask
-    # again for a real action on the new sub-task, so the extension still gets
-    # exactly one executable action per step.
+    # Internal actions never leave the server, so the extension still receives
+    # exactly one executable browser action per step: "next_subtask" marks a
+    # milestone done, "tool" reaches an API instead of the page. Both resolve by
+    # asking the model again with the new state.
     advanced: list[str] = []
-    while action.kind == "next_subtask" and len(advanced) < len(
-        (run.get("plan") or {}).get("subtasks") or []
-    ):
-        finished = planner.current(run.get("plan") or {})
-        following = planner.advance(run.get("plan") or {})
-        advanced.append(str((finished or {}).get("title") or ""))
-        if not following:
-            action = actions.Action(
-                kind="done",
-                summary=f"Completed every step of the plan for: {run.get('goal', '')}",
-                why="The last sub-task is finished.",
-            )
-            break
+    used_tools: list[dict] = []
+    subtask_count = len((run.get("plan") or {}).get("subtasks") or [])
+
+    while action.kind in actions.INTERNAL_KINDS:
+        if action.kind == "next_subtask":
+            if len(advanced) >= subtask_count:
+                break
+            finished = planner.current(run.get("plan") or {})
+            following = planner.advance(run.get("plan") or {})
+            advanced.append(str((finished or {}).get("title") or ""))
+            if not following:
+                action = actions.Action(
+                    kind="done",
+                    summary=f"Completed every step of the plan for: {run.get('goal', '')}",
+                    why="The last sub-task is finished.",
+                )
+                break
+        else:  # tool
+            if len(used_tools) >= _MAX_TOOLS_PER_STEP:
+                # Not an error — just this step's budget. The next step
+                # continues with whatever the tools already returned.
+                action = actions.Action(
+                    kind="wait",
+                    why=f"Used {len(used_tools)} tools this step; carrying on.",
+                )
+                break
+            used_tools.append(_run_tool(run, action))
+
         action = brain.decide(run, body)
 
     veto = _veto(run, action)
@@ -348,7 +399,11 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
     run["steps"].append(
         {"seq": seq, "action": act_dict, "at": _now(), "sensitive": sensitive,
          "page_fp": page_fp, "saw_page": bool(body.get("screenshot")),
-         "subtask": (active or {}).get("title"), "completed": advanced, "result": None}
+         "subtask": (active or {}).get("title"), "completed": advanced,
+         "rail": (active or {}).get("rail", "browser"),
+         "tools": [{"tool": t["tool"], "ok": t["ok"], "error": t.get("error")}
+                   for t in used_tools],
+         "result": None}
     )
 
     if action.kind == "done":
