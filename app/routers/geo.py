@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from app.security import get_current_user, require_creator
 from app.services import run_tracking
-from final_geo_agent import geo_engines, geo_metrics, geo_poll, geo_prompts, opt_pipeline
+from final_geo_agent import geo_engines, geo_metrics, geo_poll, geo_prompts, geo_strategy, opt_pipeline
 from seo_geo_agent import insights
 from seo_geo_agent.sources import CredentialMissing
 
@@ -284,4 +284,49 @@ def optimizer_analysis(analysis_id: str, user: dict = Depends(get_current_user))
     doc = opt_pipeline.get_analysis(analysis_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Unknown analysis")
+    return doc
+
+
+# ------------------------------- Action Plan (strategy) -------------------------------
+
+
+class ActionStatusIn(BaseModel):
+    status: str = Field(pattern="^(todo|in_progress|done|skipped)$")
+
+
+@router.post("/geo/brands/{brand_id}/strategy/generate")
+def strategy_generate(brand_id: str, _creator: dict = Depends(require_creator)) -> dict:
+    """Full-model GEO strategy grounded in this week's measured numbers; the
+    plan stores its baseline so the panel can show baseline → current later."""
+    brand = _brand_or_404(brand_id)
+    try:
+        doc = geo_strategy.generate_strategy(brand)
+    except CredentialMissing as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    _track(_creator, "strategy_generate", "Action Plan generated from measured baseline", brand)
+    return doc
+
+
+@router.get("/geo/brands/{brand_id}/strategy")
+def strategy_get(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
+    _brand_or_404(brand_id)
+    return geo_strategy.load_strategy(brand_id) or {"brand_id": brand_id, "current": None}
+
+
+@router.put("/geo/brands/{brand_id}/strategy/actions/{action_id}")
+def strategy_action_status(
+    brand_id: str, action_id: str, body: ActionStatusIn,
+    user: dict = Depends(get_current_user),
+) -> dict:
+    brand = _brand_or_404(brand_id)
+    try:
+        doc = geo_strategy.set_action_status(brand_id, action_id, body.status)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _track(user, "strategy_action", f"Action {action_id} → {body.status}", brand,
+           usage_action="edit")
     return doc
