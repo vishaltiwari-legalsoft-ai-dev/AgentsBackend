@@ -83,12 +83,21 @@ def create_run(user: dict, goal: str, mode: str, start_url: str | None) -> dict:
     # A remembered route beats working one out: no model call per step, and a
     # replayed step cannot invent anything. Planning still happens, so the
     # fallback is ready the moment the recording stops matching the page.
-    skill = None
+    remembered = None
     if mode != "monitor":
         try:
-            skill = skills.find_match(goal, str(user.get("id") or ""), start_url=start_url)
+            found = skills.find_match(goal, str(user.get("id") or ""), start_url=start_url)
+            if found:
+                # Built inside the guard: one malformed stored doc must not make
+                # every new run fail with a KeyError.
+                remembered = {
+                    "id": found["id"], "name": found["name"], "steps": found["steps"],
+                    "match_score": found.get("match_score"), "cursor": 0,
+                    "status": "replaying",
+                }
         except Exception:  # noqa: BLE001 — a broken skill store must not block a run
             logger.exception("skill lookup failed")
+            remembered = None
 
     plan = planner.build_plan(goal, start_url=start_url)
     run = {
@@ -96,11 +105,7 @@ def create_run(user: dict, goal: str, mode: str, start_url: str | None) -> dict:
         "protocol": actions.PROTOCOL,
         "goal": goal,
         "plan": plan,
-        "skill": (
-            {"id": skill["id"], "name": skill["name"], "steps": skill["steps"],
-             "match_score": skill.get("match_score"), "cursor": 0, "status": "replaying"}
-            if skill else None
-        ),
+        "skill": remembered,
         "mode": mode,
         "start_url": start_url,
         "status": "running",
@@ -189,7 +194,16 @@ def _response(
 
 
 def _fingerprint(action: dict) -> str:
-    return f"{action.get('kind')}:{action.get('index')}:{action.get('url')}:{action.get('text')}"
+    """What makes two attempts "the same attempt".
+
+    The element's NAME belongs here: with indexes optional, four different
+    named clicks on one screen would otherwise collapse to the same string and
+    a perfectly healthy run would be declared stuck.
+    """
+    return (
+        f"{action.get('kind')}:{action.get('expect')}:{action.get('index')}:"
+        f"{action.get('url')}:{action.get('text')}"
+    )
 
 
 def page_fingerprint(body: dict) -> str:
@@ -227,10 +241,17 @@ def repeat_count(run: dict, action: actions.Action, page_fp: str) -> int:
 
 
 def steps_without_progress(run: dict, page_fp: str) -> int:
-    """Consecutive steps taken while the screen stayed exactly the same."""
+    """Consecutive steps taken while the screen stayed exactly the same.
+
+    Counting stops at the point the user last stepped in: after a hand-over the
+    agent gets a clean slate, otherwise the very first step back would re-trip
+    the same stall and fail — which would make the promise "I'll pick up from
+    here" untrue.
+    """
     count = 0
+    since = int(run.get("stall_reset_seq") or 0)
     for step in reversed(run.get("steps") or []):
-        if step.get("page_fp") != page_fp:
+        if step.get("page_fp") != page_fp or int(step.get("seq") or 0) <= since:
             break
         count += 1
     return count
@@ -273,9 +294,27 @@ def _abandon_skill(run: dict, why: str) -> None:
     skill = run.get("skill") or {}
     skill["status"] = "abandoned"
     skill["abandoned_because"] = why
-    if skill.get("id"):
-        skills.record_use(skill["id"], ok=False)
+    _note_skill_use(skill.get("id"), ok=False)
     logger.info("browser: dropped skill %s — %s", skill.get("name"), why)
+
+
+def _score_skill(run: dict, *, ok: bool) -> None:
+    """Judge a replayed route by how the RUN ended, not by whether it finished
+    playing. Already-abandoned routes were scored when they were dropped."""
+    skill = run.get("skill") or {}
+    if skill.get("status") in ("replaying", "finished"):
+        _note_skill_use(skill.get("id"), ok=ok)
+        skill["status"] = "worked" if ok else "did not work"
+
+
+def _note_skill_use(skill_id: str | None, *, ok: bool) -> None:
+    """Bookkeeping must never take a run down with it."""
+    if not skill_id:
+        return
+    try:
+        skills.record_use(skill_id, ok=ok)
+    except Exception:  # noqa: BLE001 — a store blip is not the user's problem
+        logger.exception("could not record skill use")
 
 
 def _replay_step(run: dict, body: dict) -> actions.Action | None:
@@ -294,20 +333,30 @@ def _replay_step(run: dict, body: dict) -> actions.Action | None:
     steps = skill.get("steps") or []
     cursor = int(skill.get("cursor", 0))
     if cursor >= len(steps):
+        # The recording played out. Whether it WORKED is a different question,
+        # answered when the run ends — a route can click every right name and
+        # still achieve nothing.
         skill["status"] = "finished"
-        if skill.get("id"):
-            skills.record_use(skill["id"], ok=True)
-        # The recording is done; the model decides whether the goal is met.
         return None
 
     step = dict(steps[cursor])
-    skill["cursor"] = cursor + 1
     step.setdefault("why", f"Replaying step {cursor + 1} of {len(steps)}")
     try:
-        return actions.validate_action(step)
+        action = actions.validate_action(step)
     except ValueError as exc:
         _abandon_skill(run, f"a saved step was unusable: {exc}")
         return None
+
+    # Only commit the cursor once the step is actually going to be used —
+    # advancing first would silently skip a vetoed step and leave the rest of
+    # the route describing a page that never happened.
+    veto = _veto(run, action)
+    if veto:
+        _abandon_skill(run, f"a saved step is not allowed here: {veto}")
+        return None
+
+    skill["cursor"] = cursor + 1
+    return action
 
 
 def _run_tool(run: dict, action: actions.Action) -> dict:
@@ -335,6 +384,24 @@ def _run_tool(run: dict, action: actions.Action) -> dict:
         text = json.dumps(record, default=str)[:_MAX_TOOL_RESULT_CHARS]
         run.setdefault("findings", []).append(f"[{name}] {text}")
     return record
+
+
+def _policed(run: dict, body: dict, action: actions.Action) -> actions.Action:
+    """Run an action past policy, giving the model one chance to correct itself.
+
+    Every action reaching the extension goes through here — including the one
+    decided after a skill is abandoned, which previously slipped past the
+    domain rules because the check happened earlier in the step.
+    """
+    veto = _veto(run, action)
+    if not veto:
+        return action
+    retry = dict(body, last_result={"ok": False, "error": veto})
+    action = brain.decide(run, retry)
+    veto = _veto(run, action)
+    if veto:
+        return actions.Action(kind="fail", reason=veto, why="Blocked by policy.")
+    return action
 
 
 def _veto(run: dict, action: actions.Action) -> str | None:
@@ -376,6 +443,12 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
 
     if seq != run["seq"] + 1:
         raise OutOfSync(f"expected seq {run['seq']} (replay) or {run['seq'] + 1}, got {seq}")
+
+    # The user just answered — most likely after doing a bit by hand. Give the
+    # stall detector a clean slate so the first step back doesn't re-trip it.
+    if body.get("user_reply"):
+        run["stall_reset_seq"] = int(run.get("seq") or 0)
+        run.pop("handed_over_at", None)
 
     # Attach the result of the previous action; harvest extracted page text.
     last = body.get("last_result")
@@ -433,13 +506,7 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
 
         action = brain.decide(run, body)
 
-    veto = _veto(run, action)
-    if veto:
-        retry = dict(body, last_result={"ok": False, "error": veto})
-        action = brain.decide(run, retry)
-        veto = _veto(run, action)
-        if veto:
-            action = actions.Action(kind="fail", reason=veto, why="Blocked by policy.")
+    action = _policed(run, body, action)
 
     page_fp = page_fingerprint(body)
     canvas_app = bool((body.get("dom") or {}).get("canvas_app"))
@@ -449,7 +516,7 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
         # recording and let the model try properly before giving up.
         if (run.get("skill") or {}).get("status") == "replaying":
             _abandon_skill(run, stuck)
-            action = brain.decide(run, body)
+            action = _policed(run, body, brain.decide(run, body))
         elif canvas_app or run.get("handed_over_at") == page_fp:
             # Nothing a person can do about a canvas; and having already asked
             # for help on THIS screen, asking again would just be nagging.
@@ -498,10 +565,12 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
         run["summary"] = action.summary
         if action.extracted is not None:
             run["extracted"] = action.extracted
+        _score_skill(run, ok=True)
         response = _response(run, act_dict)
     elif action.kind == "fail":
         run["status"] = "failed"
         run["fail_reason"] = action.reason
+        _score_skill(run, ok=False)
         response = _response(run, act_dict)
     elif sensitive and not body.get("confirmed"):
         run["status"] = "awaiting_confirmation"

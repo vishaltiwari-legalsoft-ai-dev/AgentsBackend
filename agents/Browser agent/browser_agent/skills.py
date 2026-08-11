@@ -24,12 +24,11 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import urlparse
 
-from browser_agent import state
+from browser_agent import actions, state
 
 _INDEX_DOC = "skills-index"
-MAX_SKILLS = 200
+MAX_SKILLS_PER_USER = 200
 MAX_STEPS = 40
 MIN_MATCH = 0.45
 
@@ -51,10 +50,9 @@ def _now() -> str:
 
 
 def host_of(url: str) -> str:
-    try:
-        return (urlparse(url or "").hostname or "").lower().replace("www.", "")
-    except ValueError:
-        return ""
+    """Site a route belongs to. Anchored strip — an unanchored replace would
+    turn "a.wwww.com" into "a.wcom" and quietly mismatch two real hosts."""
+    return re.sub(r"^www\.", "", actions.domain_of(url))
 
 
 def _tokens(text: str) -> set[str]:
@@ -86,8 +84,11 @@ def steps_from_run(run: dict) -> list[dict]:
         kind = action.get("kind")
         if kind not in REPLAYABLE:
             continue
-        result = step.get("result") or {}
-        if result.get("ok") is False:
+        # Only a step we SAW succeed. A step still carrying result=None was
+        # never confirmed — the run may have been stopped, or the worker died
+        # before the next step reported back. Enshrining it would repeat an
+        # action nobody ever verified.
+        if (step.get("result") or {}).get("ok") is not True:
             continue
         if kind in ("click", "type", "select") and not action.get("expect"):
             continue
@@ -111,7 +112,12 @@ def steps_from_run(run: dict) -> list[dict]:
 
 
 def _clean_steps(raw: list[dict]) -> list[dict]:
-    """Trim recorded or run-derived steps to the replayable shape."""
+    """Trim steps to the replayable shape, keeping only ones that can replay.
+
+    Validation is delegated to ``actions.validate_action`` rather than
+    re-checked here: a second, weaker copy of the rules is how you end up
+    saving a step that is guaranteed to abandon the route on first use.
+    """
     out: list[dict] = []
     for item in (raw or [])[:MAX_STEPS]:
         if not isinstance(item, dict):
@@ -119,15 +125,15 @@ def _clean_steps(raw: list[dict]) -> list[dict]:
         kind = str(item.get("kind") or "")
         if kind not in REPLAYABLE:
             continue
-        step = {"kind": kind}
+        step: dict = {"kind": kind}
         for field in ("expect", "role", "text", "value", "url", "why", "expect_after"):
             value = item.get(field)
-            if value not in (None, ""):
+            if value is not None:
                 step[field] = str(value)[:400]
-        if kind in ("click", "type", "select") and not step.get("expect"):
-            continue
-        if kind in ("navigate", "open_tab") and not step.get("url"):
-            continue
+        try:
+            actions.validate_action(step)
+        except ValueError:
+            continue  # unusable on replay, so not worth remembering
         out.append(step)
     return out
 
@@ -159,8 +165,23 @@ def save_skill(user: dict, name: str, goal: str, host: str, steps: list[dict],
     index = state.load(_INDEX_DOC) or {"skills": []}
     rows = [s for s in index.get("skills") or [] if s.get("id") != skill["id"]]
     rows.insert(0, _row(skill))
-    state.save(_INDEX_DOC, {"skills": rows[:MAX_SKILLS]})
+    state.save(_INDEX_DOC, {"skills": _capped(rows)})
     return skill
+
+
+def _capped(rows: list[dict]) -> list[dict]:
+    """Trim per owner, not globally — a busy colleague must not silently evict
+    everyone else's learned routes from the only list anything reads."""
+    kept_per_user: dict[str, int] = {}
+    out: list[dict] = []
+    for row in rows:
+        owner = str(row.get("user_id") or "")
+        seen = kept_per_user.get(owner, 0)
+        if seen >= MAX_SKILLS_PER_USER:
+            continue
+        kept_per_user[owner] = seen + 1
+        out.append(row)
+    return out
 
 
 def _row(skill: dict) -> dict:
@@ -213,6 +234,37 @@ def record_use(skill_id: str, *, ok: bool) -> None:
 # Finding one to use
 # --------------------------------------------------------------------------- #
 
+# Text that is clearly a specific value rather than a fixed part of the route:
+# an address, a number, a reference. Typing one of these from memory is how a
+# remembered route sends the right message to the wrong person.
+_LITERAL_RE = re.compile(r"[\w.+-]+@[\w.-]+|\b\d[\d,./-]{2,}\b")
+
+
+def literals(steps: list[dict]) -> list[str]:
+    """Specific values a saved route would type from memory."""
+    found: list[str] = []
+    for step in steps or []:
+        if step.get("kind") != "type":
+            continue
+        for match in _LITERAL_RE.findall(str(step.get("text") or "")):
+            if match not in found:
+                found.append(match)
+    return found
+
+
+def parameters_still_apply(goal: str, steps: list[dict]) -> bool:
+    """Would replaying this route type values the new task never mentioned?
+
+    The matcher is fuzzy on purpose — "send a hello email" and "please send
+    hello email to my friend" are the same job. But the saved steps are literal,
+    so the second task would silently reuse the first one's recipient. Any
+    specific value in the route must appear in the new goal, or the route is not
+    safe to replay as-is.
+    """
+    lowered = (goal or "").lower()
+    return all(value.lower() in lowered for value in literals(steps))
+
+
 def find_match(goal: str, user_id: str, *, start_url: str | None = None) -> dict | None:
     """The best saved skill for this task, or None.
 
@@ -226,16 +278,23 @@ def find_match(goal: str, user_id: str, *, start_url: str | None = None) -> dict
         if host and row.get("host") and row["host"] != host:
             continue
         score = max(similarity(goal, row.get("goal", "")), similarity(goal, row.get("name", "")))
-        if score < MIN_MATCH:
-            continue
-        # A skill that failed last time is a worse bet than one that worked.
+        # A skill that failed last time is a worse bet — weigh that BEFORE the
+        # threshold, or a known-broken route can still scrape in.
         if row.get("last_ok") is False:
             score -= 0.15
+        if score < MIN_MATCH:
+            continue
         if not best or score > best[0]:
             best = (score, row)
     if not best:
         return None
+
     full = get_skill(best[1]["id"])
-    if full:
-        full["match_score"] = round(best[0], 2)
+    if not full:
+        return None
+    if not parameters_still_apply(goal, full.get("steps") or []):
+        # Same shape of task, different details. Thinking it through is slower
+        # than replaying, and enormously better than acting on stale values.
+        return None
+    full["match_score"] = round(best[0], 2)
     return full

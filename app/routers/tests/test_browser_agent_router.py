@@ -193,6 +193,93 @@ def test_missing_bundle_is_honest_503(monkeypatch):
     assert "missing" in r.json()["detail"]
 
 
+# --------------------------------------------------------------------------- #
+# Skills — saved routes are private, and only saved on purpose
+# --------------------------------------------------------------------------- #
+
+_ROUTE = [
+    {"kind": "navigate", "url": "https://example.com/"},
+    {"kind": "click", "expect": "Learn more", "role": "a"},
+]
+
+
+def _save(name="Open the info page", **kw):
+    return client.post("/api/browser/skills", json={"name": name, "steps": _ROUTE,
+                                                    "goal": "open the info page",
+                                                    "host": "example.com", **kw})
+
+
+def test_save_then_list_a_skill():
+    r = _save()
+    assert r.status_code == 200, r.text
+    assert len(r.json()["steps"]) == 2
+    listed = client.get("/api/browser/skills").json()["skills"]
+    assert listed[0]["name"] == "Open the info page"
+
+
+def test_saving_something_unrepeatable_is_a_clear_422():
+    r = client.post("/api/browser/skills", json={"name": "Nothing", "steps": [{"kind": "wait"}]})
+    assert r.status_code == 422
+    assert "repeatable" in r.json()["detail"]
+
+
+def test_a_skill_learned_from_a_run_uses_the_runs_own_steps(monkeypatch):
+    from browser_agent import brain
+
+    monkeypatch.setattr(
+        brain, "decide",
+        lambda run, obs: actions.Action(kind="navigate", url="https://example.com/", why="go"),
+    )
+    run = _create()
+    _step(run["run_id"], 1)
+    _step(run["run_id"], 2, last_result={"ok": True})  # confirms step 1 worked
+
+    r = client.post("/api/browser/skills", json={"name": "From the run", "run_id": run["run_id"]})
+    assert r.status_code == 200, r.text
+    assert r.json()["steps"][0]["url"] == "https://example.com/"
+
+
+def test_another_users_skill_is_invisible_and_undeletable():
+    skill_id = _save().json()["id"]
+    _as("stranger@legalsoft.com")
+    assert client.get(f"/api/browser/skills/{skill_id}").status_code == 404
+    assert client.delete(f"/api/browser/skills/{skill_id}").status_code == 404
+    assert client.get("/api/browser/skills").json()["skills"] == []
+
+
+def test_an_admin_can_see_and_remove_any_skill():
+    skill_id = _save().json()["id"]
+    _as("boss@legalsoft.com", admin=True)
+    assert client.get(f"/api/browser/skills/{skill_id}").status_code == 200
+    assert client.delete(f"/api/browser/skills/{skill_id}").status_code == 200
+
+
+def test_deleting_removes_it_for_good():
+    skill_id = _save().json()["id"]
+    assert client.delete(f"/api/browser/skills/{skill_id}").status_code == 200
+    assert client.get(f"/api/browser/skills/{skill_id}").status_code == 404
+    assert client.get("/api/browser/skills").json()["skills"] == []
+
+
+def test_skills_need_auth():
+    fastapi_app.dependency_overrides.pop(get_current_user, None)
+    try:
+        assert client.get("/api/browser/skills").status_code in (401, 403)
+    finally:
+        fastapi_app.dependency_overrides[get_current_user] = lambda: dict(USER)
+
+
+def test_kill_switch_covers_skills(monkeypatch):
+    monkeypatch.setenv("BROWSER_AGENT_DISABLED", "1")
+    for call in (
+        lambda: client.get("/api/browser/skills"),
+        lambda: _save(),
+        lambda: client.get("/api/browser/skills/anything"),
+        lambda: client.delete("/api/browser/skills/anything"),
+    ):
+        assert call().status_code == 403
+
+
 def test_get_run_hides_replay_cache(monkeypatch):
     _stub(monkeypatch, actions.Action(kind="wait", why="settle"))
     run = _create()

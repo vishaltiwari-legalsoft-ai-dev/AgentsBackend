@@ -289,10 +289,13 @@ def save_skill(body: SkillIn, user: dict = Depends(get_current_user)) -> dict:
         run = _run_or_404(body.run_id, user)
         steps = browser_skills.steps_from_run(run)
         goal = goal or run.get("goal", "")
+        # Where the run actually happened. Falling back to start_url matters:
+        # a run on an already-open tab issues no navigate, and a host-less
+        # skill would then be offered on every site.
         host = host or browser_skills.host_of(
             next((s.get("action", {}).get("url") for s in run.get("steps") or []
                   if (s.get("action") or {}).get("url")), "")
-        )
+        ) or browser_skills.host_of(run.get("start_url") or "")
     try:
         skill = browser_skills.save_skill(user, body.name, goal, host, steps,
                                           source="run" if body.run_id else "recording")

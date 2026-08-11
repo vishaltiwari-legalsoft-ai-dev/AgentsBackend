@@ -199,9 +199,13 @@ def is_sensitive(action: Action, elements: list[dict]) -> bool:
         return any(tok in url for tok in _SENSITIVE_URL_TOKENS)
     presses_enter = action.kind == "key" and "enter" in (action.text or "").lower()
     if action.kind in ("click", "select") or presses_enter:
+        # The label may come from the action itself (a replayed skill step
+        # carries a name and no index) or from the element the index points at.
+        # Checking only the index used to mean an index-less "Send" click
+        # skipped confirmation entirely.
+        labels = [str(action.expect or "")]
         el = next((e for e in elements if e.get("i") == action.index), None)
-        if not el:
-            return False
-        label = " ".join(str(el.get(k) or "") for k in ("text", "name", "role")).lower()
-        return _label_is_sensitive(label)
+        if el:
+            labels += [str(el.get(k) or "") for k in ("text", "name", "role")]
+        return _label_is_sensitive(" ".join(labels).lower())
     return False

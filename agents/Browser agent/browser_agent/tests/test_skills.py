@@ -16,11 +16,16 @@ def _local(monkeypatch, tmp_path):
 
 
 def _steps():
+    """A route with no task-specific values — safe to reuse as-is."""
     return [
         {"kind": "navigate", "url": "https://mail.google.com/"},
         {"kind": "click", "expect": "Compose", "role": "button"},
-        {"kind": "type", "expect": "To recipients", "text": "someone@x.com"},
     ]
+
+
+def _steps_with_recipient(address="someone@x.com"):
+    """A route that types a specific address — only reusable for that address."""
+    return [*_steps(), {"kind": "type", "expect": "To recipients", "text": address}]
 
 
 # --------------------------------------------------------------------------- #
@@ -63,7 +68,7 @@ def test_save_then_list_and_fetch():
     assert skill["steps"][1]["expect"] == "Compose"
 
     rows = skills.list_skills(user_id="u1")
-    assert rows[0]["id"] == skill["id"] and rows[0]["steps"] == 3
+    assert rows[0]["id"] == skill["id"] and rows[0]["steps"] == 2
     assert skills.get_skill(skill["id"])["name"] == "Send a Gmail"
 
 
@@ -98,6 +103,37 @@ def test_matches_a_differently_worded_version_of_the_same_task():
     hit = skills.find_match("please send hello email to my friend", "u1",
                             start_url="https://mail.google.com/")
     assert hit and hit["name"] == "Gmail hello"
+
+
+def test_a_route_that_types_an_address_is_not_reused_for_someone_else():
+    """The dangerous case: the wording is close enough to match, but the saved
+    steps would type the OLD recipient. Better to think than to misfile mail."""
+    skills.save_skill(USER, "Gmail hello", "send a hello email to someone@x.com",
+                      "mail.google.com", _steps_with_recipient())
+    hit = skills.find_match("please send hello email to my friend", "u1",
+                            start_url="https://mail.google.com/")
+    assert hit is None
+
+
+def test_the_same_route_is_reused_when_the_address_matches():
+    skills.save_skill(USER, "Gmail hello", "send a hello email to someone@x.com",
+                      "mail.google.com", _steps_with_recipient())
+    hit = skills.find_match("send a hello email to someone@x.com again", "u1",
+                            start_url="https://mail.google.com/")
+    assert hit and hit["name"] == "Gmail hello"
+
+
+def test_amounts_and_reference_numbers_count_as_specific_too():
+    steps = [*_steps(), {"kind": "type", "expect": "Amount", "text": "4500.00"}]
+    skills.save_skill(USER, "Pay it", "pay invoice 4500.00", "x.com", steps)
+    assert skills.find_match("pay invoice 9900.00", "u1") is None
+    assert skills.find_match("pay invoice 4500.00 now", "u1") is not None
+
+
+def test_literals_only_looks_at_typed_text():
+    steps = [{"kind": "navigate", "url": "https://x.com/inbox/2024"},
+             {"kind": "type", "expect": "To", "text": "a@b.com"}]
+    assert skills.literals(steps) == ["a@b.com"]
 
 
 def test_does_not_match_an_unrelated_task():

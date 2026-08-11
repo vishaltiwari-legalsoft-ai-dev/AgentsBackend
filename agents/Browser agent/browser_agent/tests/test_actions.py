@@ -125,6 +125,17 @@ def test_plain_navigation_not_sensitive():
     assert not actions.is_sensitive(act, [])
 
 
+def test_a_named_click_is_judged_even_without_an_index():
+    """Regression: skills replay by name and carry no index. Keying the
+    confirmation gate on the index alone let a remembered "Send" through with
+    no human in the loop."""
+    act = actions.Action(kind="click", expect="Send message")
+    assert actions.is_sensitive(act, []) is True
+
+    safe = actions.Action(kind="click", expect="Read more")
+    assert actions.is_sensitive(safe, []) is False
+
+
 def test_enter_on_sensitive_button_counts():
     act = actions.Action(kind="key", text="Enter", index=1)
     assert actions.is_sensitive(act, _ELEMENTS)

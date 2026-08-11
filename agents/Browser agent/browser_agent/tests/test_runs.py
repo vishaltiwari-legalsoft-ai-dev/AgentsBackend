@@ -505,7 +505,23 @@ def test_replay_hands_back_to_the_model_when_it_runs_out(monkeypatch):
     run, _ = runs.step(run, _step_body(1))                          # the one saved step
     run, resp = runs.step(run, _step_body(2, last_result={"ok": True}))
     assert resp["action"]["kind"] == "done"                          # model took over
-    assert run["skill"]["status"] == "finished"
+    # Judged by how the RUN ended, not by having played to the end.
+    assert run["skill"]["status"] == "worked"
+
+
+def test_a_route_that_plays_out_but_fails_is_marked_as_not_working(monkeypatch):
+    """A route can click every right name and still achieve nothing; the honest
+    signal is the run's outcome, so the next match is penalised properly."""
+    _with_skill(monkeypatch, steps=[{"kind": "navigate", "url": "https://x.com/"}])
+    scored: list[bool] = []
+    monkeypatch.setattr(skills, "record_use", lambda sid, ok: scored.append(ok))
+    _stub_brain(monkeypatch, actions.Action(kind="fail", reason="nothing happened", why="stuck"))
+
+    run = runs.create_run(USER, "send a hello email", "act", None)
+    run, _ = runs.step(run, _step_body(1))
+    run, _ = runs.step(run, _step_body(2, last_result={"ok": True}))
+    assert scored == [False]
+    assert run["skill"]["status"] == "did not work"
 
 
 def test_a_remembered_step_that_fails_abandons_the_whole_recording(monkeypatch):
@@ -521,6 +537,68 @@ def test_a_remembered_step_that_fails_abandons_the_whole_recording(monkeypatch):
     assert run["skill"]["status"] == "abandoned"
     assert "Compose" in run["skill"]["abandoned_because"]
     assert resp["action"]["kind"] == "scroll"                        # thinking again
+
+
+def test_a_replayed_sensitive_step_still_needs_a_human(monkeypatch):
+    """Regression: a saved route carries a name and no index, and the gate used
+    to look only at the index — so a remembered "Send" fired unconfirmed."""
+    _with_skill(monkeypatch, steps=[{"kind": "click", "expect": "Send message", "role": "button"}])
+    _stub_brain(monkeypatch, actions.Action(kind="wait", why="settle"))
+
+    run = runs.create_run(USER, "send a hello email", "act", None)
+    run, resp = runs.step(run, _step_body(1))
+    assert resp["requires_confirmation"] is True
+    assert run["status"] == "awaiting_confirmation"
+
+
+def test_a_blocked_saved_step_abandons_the_route_instead_of_skipping_it(monkeypatch):
+    """Regression: the cursor moved before policy ran, so a vetoed step was
+    silently skipped and the rest of the route described a page that never was."""
+    _with_skill(monkeypatch, steps=[
+        {"kind": "navigate", "url": "https://paypal.com/pay"},
+        {"kind": "click", "expect": "Compose"},
+    ])
+    _stub_brain(monkeypatch, actions.Action(kind="scroll", why="look properly"))
+
+    run = runs.create_run(USER, "send a hello email", "act", None)
+    run, resp = runs.step(run, _step_body(1))
+    assert run["skill"]["status"] == "abandoned"
+    assert resp["action"]["kind"] == "scroll"          # not the route's step 2
+
+
+def test_four_different_named_clicks_are_not_mistaken_for_being_stuck(monkeypatch):
+    """Regression: with indexes optional, every index-less click hashed the
+    same, so ticking four boxes on one screen looked like one failing click."""
+    names = iter(["First", "Second", "Third", "Fourth", "Fifth"])
+    monkeypatch.setattr(
+        brain, "decide",
+        lambda run, obs: actions.Action(kind="click", expect=next(names, "Fifth"), why="tick"),
+    )
+    run = runs.create_run(USER, "tick the boxes", "act", None)
+    resp = None
+    for seq in range(1, runs._STUCK_AFTER + 1):
+        run, resp = runs.step(run, _page(seq, last_result={"ok": True}))
+    assert resp["action"]["kind"] == "click"
+    assert run["status"] == "running"
+
+
+def test_the_user_stepping_in_clears_the_stall(monkeypatch):
+    """Regression: the counter kept its history across a hand-over, so the very
+    first step after the user helped re-tripped it and failed the run."""
+    _stub_brain(monkeypatch, actions.Action(kind="click", index=0, expect="To", why="focus"))
+    run = runs.create_run(USER, "send an email", "act", None)
+    seq = 1
+    for _ in range(runs._STUCK_AFTER):
+        run, resp = runs.step(run, _page(seq, last_result={"ok": True}))
+        seq += 1
+    assert resp["action"]["kind"] == "ask_user"
+
+    # The user did the bit by hand and said carry on — even though the labels
+    # they changed don't alter the page fingerprint.
+    run["status"] = "running"
+    run, resp = runs.step(run, _page(seq, last_result={"ok": True}, user_reply="carry on"))
+    assert resp["action"]["kind"] == "click"           # working again, not failed
+    assert run["status"] == "running"
 
 
 def test_monitor_mode_never_replays(monkeypatch):
