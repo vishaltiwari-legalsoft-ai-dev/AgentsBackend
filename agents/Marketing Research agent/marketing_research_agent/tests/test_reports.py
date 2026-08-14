@@ -227,6 +227,19 @@ def test_bad_period_values_raise(monkeypatch, tmp_path):
             reports.build(kind, ds, user_id="u1", period=period)
 
 
+def test_default_window_also_drops_vendors_without_data(monkeypatch, tmp_path):
+    """Regression, 2026-08-15: the explicit-period path was honest, the DEFAULT
+    one was not — a vendor with nothing in the window was backfilled with its
+    latest earlier month and printed under the window's heading. Two live cards
+    showed June figures beneath "Aug 1-13, 2026"."""
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    aug, june = _pm(2026, 8, 1, 500.0), _pm(2026, 6, 1, 9999.0)
+    ds = {"metrics": [june, aug], "leads": [], "today": date(2026, 8, 15),
+          "vendor_metrics": {"Active Vendor": [aug], "Dormant Vendor": [june]}}
+    r = reports.build("daily_summary", ds, user_id="u1")
+    assert [v["vendor"] for v in r["structured"]["vendors"]] == ["Active Vendor"]
+
+
 def test_explicit_month_drops_vendors_without_data_in_month(monkeypatch, tmp_path):
     """A vendor with no July rows disappears from the July report — it must not
     fall back to its June numbers (per-vendor honesty)."""

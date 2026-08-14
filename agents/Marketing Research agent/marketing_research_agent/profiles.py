@@ -45,6 +45,11 @@ class TabProfile:
     summary: str = ""
     useful: bool = True
     hidden: bool = False
+    # Provenance — a heuristic profile and an LLM profile are the same shape, so
+    # these are the only tell. Appended last with defaults so existing positional
+    # callers and caches written before the fields existed both still load.
+    ai: bool = False
+    fallback_reason: str | None = None
 
 
 def _scan(grid: TabGrid, n_rows: int = 6) -> str:
@@ -125,6 +130,8 @@ def _heuristic_profile(grid: TabGrid, year: int) -> TabProfile:
         title=grid.title, gid=grid.gid, kind=kind, granularity=granularity,
         date_range=date_range, platforms=platforms, metrics=metrics[:8],
         summary=summary, useful=useful, hidden=grid.hidden,
+        ai=False,
+        fallback_reason="keyword heuristics — no LLM deep profiling was performed",
     )
 
 
@@ -146,12 +153,18 @@ Top rows:
 
 
 def _llm_profile(grid: TabGrid, year: int) -> TabProfile:
+    """Deep-profile one tab with the LLM.
+
+    When the model path fails the heuristic profile is returned — legitimately,
+    but flagged ``ai=False`` with the real cause, so a caller that asked for a
+    deep profile is never handed keyword heuristics dressed as one."""
     base = _heuristic_profile(grid, year)
-    payload = analysis.llm_json(_PROFILE_PROMPT.format(
+    payload, reason = analysis.llm_json_result(_PROFILE_PROMPT.format(
         title=grid.title, rows=grid.n_rows, cols=grid.n_cols,
         grid=json.dumps(compact_grid(grid.rows), default=str),
     ))
     if not isinstance(payload, dict):
+        base.fallback_reason = reason or "the model returned no usable tab profile"
         return base
     return TabProfile(
         title=grid.title, gid=grid.gid,
@@ -163,6 +176,7 @@ def _llm_profile(grid: TabGrid, year: int) -> TabProfile:
         summary=str(payload.get("summary") or base.summary),
         useful=bool(payload.get("useful", base.useful)),
         hidden=grid.hidden,
+        ai=True, fallback_reason=None,
     )
 
 

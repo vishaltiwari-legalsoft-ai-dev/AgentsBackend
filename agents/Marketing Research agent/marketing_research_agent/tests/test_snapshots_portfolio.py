@@ -17,6 +17,37 @@ def _snap(slug, d="2026-07-09", budget=10000.0, spend=4000.0, leads=10, q=2,
             "prev_month_raw": {"team_overall": [], "channels": {}}}
 
 
+def test_renamed_tab_is_not_counted_twice(monkeypatch, tmp_path):
+    """Regression: renaming a tab ("DrivGen LS Email" -> "… (Offboarded)") mints
+    a second slug. The old one stops being captured but its final snapshot never
+    expires, so the vendor was summed into every later bar for ever."""
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_SNAPSHOTS_DIR", str(tmp_path))
+    snapshots.save_snapshot(_snap("drivgen-ls-email", d="2026-07-21", spend=500.0))
+    snapshots.save_snapshot(_snap("drivgen-ls-email-offboarded", d="2026-07-27", spend=500.0))
+    snapshots.save_snapshot(_snap("meta-360-ra", d="2026-07-27", spend=1000.0))
+    p = snapshots.portfolio()
+    assert p["vendors"] == 2
+    assert p["computed_spend"] == 1500.0            # not 2000 — DrivGen once
+    assert p["vendors_excluded"] == ["drivgen-ls-email"]   # named, not silent
+
+
+def test_a_genuine_zero_in_the_rollup_is_not_replaced_by_the_vendor_sum(monkeypatch, tmp_path):
+    """Each official field used to fall back on any falsy value, so a month the
+    sheet honestly reports as 0 came back as the vendor sum — and the bar then
+    divided the roll-up's spend by the vendor sum's counts, printing a cost-per
+    figure that exists on no cell of the sheet."""
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_SNAPSHOTS_DIR", str(tmp_path))
+    snapshots.save_snapshot(_snap("meta-360-ra", leads=40, q=25, comp=9))
+    snapshots.save_snapshot(_snap("marketing-2026-overall-report", spend=9000.0,
+                                  budget=12000.0, leads=0, q=0, qdb=0, comp=0, sold=0))
+    p = snapshots.portfolio()
+    assert p["source"] == "sheet_overall"
+    assert (p["leads"], p["qualified_leads"], p["demos_completed"]) == (0, 0, 0)
+    assert p["cost_per_qualified_lead"] is None    # not 9000/25 across two bases
+
+
 def test_portfolio_overall_rollup_is_the_official_bar(monkeypatch, tmp_path):
     """Decision 2026-07-27: the Overall tab aggregates sources with no vendor
     tab, so when its snapshot exists ITS figures ARE the summary bar; the

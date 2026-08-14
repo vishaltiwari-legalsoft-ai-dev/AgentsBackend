@@ -3,6 +3,15 @@
 Online: calls the shared OpenRouter LLM with a prompt from ``prompts/``.
 Offline (``MR_OFFLINE=1``) or on any failure: a deterministic template summary,
 so the agent and its tests run with no network. ``narrate`` never raises.
+
+**The template summaries are legitimate — but they must never masquerade as
+model output.** They flow into ``report["markdown"]``/``["html"]`` and download
+as a client-facing PDF, so every degraded path here reports the honest pair
+``ai=False`` + a non-empty ``fallback_reason`` naming the actual cause (offline
+flag / missing credential / provider error / timeout / validation rejected).
+The ``*_result`` functions are the ones that carry it; the older plain
+``narrate``/``llm_json``/``llm_text`` wrappers stay for callers that only need
+the value.
 """
 
 from __future__ import annotations
@@ -98,11 +107,48 @@ def _offline_summary(kind: str, data: dict) -> str:
     return "\n".join(lines) or json.dumps(data, default=str)[:300]
 
 
-def llm_json(prompt: str):
-    """Call the LLM and parse a JSON object/array from the reply. Returns None
-    offline or on any failure (callers must provide a deterministic fallback)."""
+# --- honest-failure reasons -------------------------------------------------
+
+OFFLINE_REASON = (
+    "MR_OFFLINE=1 — deterministic offline template, not model output"
+)
+EMPTY_REPLY_REASON = "the model returned an empty reply"
+NO_JSON_REASON = "the model reply contained no parseable JSON"
+
+
+def failure_reason(exc: BaseException) -> str:
+    """Name the actual cause of an LLM failure for ``fallback_reason``.
+
+    Classifies into the categories the UI distinguishes — missing credential,
+    timeout, provider error — and always appends the concrete exception so the
+    reason is diagnosable. Never includes a secret value: the exception text
+    from ``runtime_config.require`` names the env var, not the key.
+    """
+    name = type(exc).__name__
+    msg = (str(exc) or "").strip()
+    low = f"{name} {msg}".lower()
+    if "timeout" in low or "timed out" in low or "deadline" in low:
+        kind = "the model call timed out"
+    elif any(k in low for k in (
+            "api key", "api_key", "apikey", "credential", "unauthorized",
+            "unauthenticated", "401", "403", "not configured", "missing key")):
+        kind = "the model provider credential is missing or was rejected"
+    elif name in ("ImportError", "ModuleNotFoundError"):
+        kind = "the model provider is unavailable in this runtime"
+    elif "rate limit" in low or "429" in low:
+        kind = "the model provider rate-limited the request"
+    else:
+        kind = "the model provider call failed"
+    return f"{kind} ({name}: {msg})"[:300] if msg else f"{kind} ({name})"
+
+
+# --- LLM calls (``*_result`` carry the honest pair) --------------------------
+
+def llm_json_result(prompt: str) -> tuple[object | None, str | None]:
+    """``(value, fallback_reason)``. ``fallback_reason`` is None only when the
+    model genuinely produced parseable JSON."""
     if is_offline():
-        return None
+        return None, OFFLINE_REASON
     try:
         import re
 
@@ -111,33 +157,70 @@ def llm_json(prompt: str):
         resp = get_llm(temperature=0.1, agent_id=MR_AGENT_ID).invoke(prompt)
         text = getattr(resp, "content", str(resp))
         m = re.search(r"(\{.*\}|\[.*\])", text, re.S)
-        return json.loads(m.group(1)) if m else None
-    except Exception:
-        return None
+        if not m:
+            return None, NO_JSON_REASON
+        return json.loads(m.group(1)), None
+    except Exception as exc:
+        return None, failure_reason(exc)
 
 
-def llm_text(prompt: str) -> str | None:
-    """Call the LLM for a free-text reply. Returns None offline / on failure."""
+def llm_text_result(prompt: str) -> tuple[str | None, str | None]:
+    """``(text, fallback_reason)``. ``fallback_reason`` is None only when the
+    model genuinely produced text."""
     if is_offline():
-        return None
+        return None, OFFLINE_REASON
     try:
         from app.services.openrouter import get_llm
 
         resp = get_llm(temperature=0.3, agent_id=MR_AGENT_ID).invoke(prompt)
-        return getattr(resp, "content", str(resp)) or None
-    except Exception:
-        return None
+        text = getattr(resp, "content", str(resp)) or None
+        return (text, None) if text else (None, EMPTY_REPLY_REASON)
+    except Exception as exc:
+        return None, failure_reason(exc)
 
 
-def narrate(kind: str, data: dict) -> str:
+def llm_json(prompt: str):
+    """Call the LLM and parse a JSON object/array from the reply. Returns None
+    offline or on any failure (callers must provide a deterministic fallback).
+
+    Value-only wrapper — prefer :func:`llm_json_result` on any path whose output
+    reaches a user, so the degraded case can be labelled."""
+    return llm_json_result(prompt)[0]
+
+
+def llm_text(prompt: str) -> str | None:
+    """Call the LLM for a free-text reply. Returns None offline / on failure.
+
+    Value-only wrapper — prefer :func:`llm_text_result` on user-facing paths."""
+    return llm_text_result(prompt)[0]
+
+
+def narrate_result(kind: str, data: dict) -> dict:
+    """Narrative plus its provenance: ``{"text", "ai", "fallback_reason"}``.
+
+    ``ai`` is True only when the text is genuinely model-written. Whenever it is
+    False the text is the deterministic ``_offline_summary`` template and
+    ``fallback_reason`` names why — never one without the other."""
     if is_offline():
-        return _offline_summary(kind, data)
+        return {"text": _offline_summary(kind, data), "ai": False,
+                "fallback_reason": OFFLINE_REASON}
     try:
         from app.services.openrouter import get_llm
 
         prompt = load_prompt(kind).replace("{data}", json.dumps(data, default=str))
         llm = get_llm(temperature=0.3, agent_id=MR_AGENT_ID)
         resp = llm.invoke(prompt)
-        return getattr(resp, "content", str(resp))
-    except Exception:
-        return _offline_summary(kind, data)
+        text = getattr(resp, "content", str(resp))
+    except Exception as exc:
+        return {"text": _offline_summary(kind, data), "ai": False,
+                "fallback_reason": failure_reason(exc)}
+    if not (text or "").strip():
+        return {"text": _offline_summary(kind, data), "ai": False,
+                "fallback_reason": EMPTY_REPLY_REASON}
+    return {"text": text, "ai": True, "fallback_reason": None}
+
+
+def narrate(kind: str, data: dict) -> str:
+    """Text-only wrapper — prefer :func:`narrate_result` on any path that
+    reaches a report, an answer card or a PDF."""
+    return narrate_result(kind, data)["text"]

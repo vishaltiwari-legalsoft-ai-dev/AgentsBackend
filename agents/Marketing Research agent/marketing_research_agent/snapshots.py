@@ -565,28 +565,52 @@ def portfolio(date_iso: str | None = None) -> dict | None:
     the sheet's "official" figures."""
     import calendar as _cal
 
-    latest: dict[str, dict] = {}
+    per_slug: dict[str, dict] = {}
     for s in list_snapshots():
         if "overall" in s["vendor_slug"]:
             continue
         if date_iso and s["date"] > date_iso:
             continue
-        latest[s["vendor_slug"]] = s  # list is date-sorted per vendor; last wins
+        per_slug[s["vendor_slug"]] = s  # list is date-sorted per vendor; last wins
+    if not per_slug:
+        return None
+
+    # The bar is stamped "<month> MTD · as of <date>", so only the tabs that
+    # were actually captured on that date may be in it. This used to take every
+    # slug's latest snapshot whenever it was taken, which broke twice over:
+    #
+    # 1. Renaming a tab ("DrivGen LS Email" -> "… (Offboarded)") mints a second
+    #    slug. The old one stops being captured but its final snapshot never
+    #    expires, so the vendor was summed twice — for ever.
+    # 2. A vendor last captured in July kept contributing July figures to a bar
+    #    headed August.
+    #
+    # Capture is one daily sweep over the live tabs, so "absent from the newest
+    # sweep" means offboarded, renamed, or failed — and none of those belong in
+    # today's total. Dropped slugs are counted, never silently discarded.
+    newest = max(s["date"] for s in per_slug.values())
+    latest = {slug: s for slug, s in per_slug.items() if s["date"] == newest}
+    excluded = sorted(set(per_slug) - set(latest))
     if not latest:
         return None
 
-    def val(node: dict, *path, pair: bool = False) -> float:
+    def raw(node: dict, *path, pair: bool = False) -> float | None:
+        """The cell as the sheet reports it — ``None`` when the ROW IS ABSENT,
+        ``0.0`` when the row says zero. Collapsing those two is what let a
+        genuine zero fall through to a different basis below."""
         cur = node
         for p in path:
             cur = (cur or {}).get(p)
         if pair and isinstance(cur, dict):
             v = cur.get("performance")
             cur = v if v is not None else cur.get("investment")
-        return float(cur or 0)
+        return None if cur is None or isinstance(cur, dict) else float(cur)
+
+    def val(node: dict, *path, pair: bool = False) -> float:
+        return raw(node, *path, pair=pair) or 0.0
 
     budget = spend = 0.0
     leads = qualified = qdb = completed = sold = 0
-    newest = max(s["date"] for s in latest.values())
     for s in latest.values():
         t = s["canonical"].get("team_overall", {})
         # Non-media vendors (Website) stay out of blended spend/budget — the
@@ -609,17 +633,36 @@ def portfolio(date_iso: str | None = None) -> dict | None:
     rollup = latest_rollup_snapshot(date_iso)
     if rollup and (rollup.get("date") or "")[:7] == newest[:7]:
         t = (rollup.get("canonical") or {}).get("team_overall", {})
-        o_spend = val(t, "spend", pair=True)
-        if o_spend:  # an empty parse must never blank the whole bar
+        o_spend = raw(t, "spend", pair=True)
+        if o_spend is not None:  # an empty parse must never blank the whole bar
+            # Take the roll-up's figures as a SET. Each field used to fall back
+            # to the vendor sum on a falsy value, so a month the sheet honestly
+            # reports as 0 came back as the vendor sum instead — and the bar then
+            # divided the roll-up's spend by the vendor sum's counts, printing a
+            # cost-per figure that exists nowhere on the sheet. A row that is
+            # genuinely absent (None) still falls back, and says so via `source`.
+            fell_back = False
+
+            def official(default: float, *path, pair: bool = False) -> float:
+                nonlocal fell_back
+                v = raw(t, *path, pair=pair)
+                if v is None:
+                    fell_back = True
+                    return default
+                return v
+
+            o_qdb = raw(t, "demos", "qualified_booked_all")
+            if not o_qdb:  # the roll-up reports 0/absent qualified — use all-demos
+                o_qdb = raw(t, "demos", "total_booked_all")
             spend = o_spend
-            budget = val(t, "budget", pair=True) or budget
-            leads = int(val(t, "leads", "total") or leads)
-            qualified = int(val(t, "leads", "qualified") or qualified)
-            b = val(t, "demos", "qualified_booked_all")
-            qdb = int(b if b else (val(t, "demos", "total_booked_all") or qdb))
-            completed = int(val(t, "demos", "completed_all") or completed)
-            sold = int(val(t, "actualized_revenue", "services_sold") or sold)
-            source = "sheet_overall"
+            budget = official(budget, "budget", pair=True)
+            leads = int(official(leads, "leads", "total"))
+            qualified = int(official(qualified, "leads", "qualified"))
+            qdb = int(qdb if o_qdb is None else o_qdb)
+            fell_back = fell_back or o_qdb is None
+            completed = int(official(completed, "demos", "completed_all"))
+            sold = int(official(sold, "actualized_revenue", "services_sold"))
+            source = "sheet_overall_partial" if fell_back else "sheet_overall"
 
     div = lambda n, d: round(n / d, 2) if d else None
     day = int(newest[8:10])
@@ -629,6 +672,9 @@ def portfolio(date_iso: str | None = None) -> dict | None:
         "date": newest,
         "month": newest[:7],
         "vendors": len(latest),
+        # Tabs with an older last snapshot — renamed, offboarded, or missed by
+        # the newest sweep. Named so a shrinking vendor count is explainable.
+        "vendors_excluded": excluded,
         "total_budget": round(budget, 2),
         "total_spend": round(spend, 2),
         "budget_utilized_pct": div(spend * 100, budget),

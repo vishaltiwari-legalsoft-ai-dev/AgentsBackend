@@ -283,15 +283,20 @@ def _fallback_vendor_insights(vendors: list[dict], red_map: dict[str, list[str]]
     return out
 
 
-def _vendor_insights(vendors: list[dict], red_flags: list[dict]) -> list[dict]:
+def _vendor_insights(vendors: list[dict], red_flags: list[dict]) -> tuple[list[dict], str | None]:
     """3 concise insights + 3 action points per vendor: LLM online, deterministic
-    fallback offline — output shape is identical either way."""
+    fallback offline — output shape is identical either way.
+
+    Returns ``(rows, fallback_reason)``. Because the shapes are identical, the
+    reason is the *only* thing that distinguishes a model read from the canned
+    one downstream, so it is never dropped: None means genuinely model-written.
+    """
     if not vendors:
-        return []
+        return [], None
     red_map = {r["vendor"]: r["reasons"] for r in red_flags}
     prompt = analysis.load_prompt("vendor_insights").replace(
         "{data}", json.dumps({"vendors": vendors, "red_flags": red_flags}, default=str))
-    raw = analysis.llm_json(prompt)
+    raw, reason = analysis.llm_json_result(prompt)
     if isinstance(raw, list):
         known = {v["vendor"] for v in vendors}
         rows = []
@@ -303,8 +308,11 @@ def _vendor_insights(vendors: list[dict], red_flags: list[dict]) -> list[dict]:
             if len(ins) == 3 and len(act) == 3:
                 rows.append({"vendor": r["vendor"], "insights": ins, "actions": act})
         if len(rows) == len(vendors):
-            return sorted(rows, key=lambda r: [v["vendor"] for v in vendors].index(r["vendor"]))
-    return _fallback_vendor_insights(vendors, red_map)
+            return sorted(rows, key=lambda r: [v["vendor"] for v in vendors].index(r["vendor"])), None
+        reason = (f"model output rejected by validation: {len(rows)} of "
+                  f"{len(vendors)} vendors came back with 3 insights + 3 actions")
+    return _fallback_vendor_insights(vendors, red_map), (
+        reason or "the model returned no usable vendor insights")
 
 
 # Official fields the headline strip may take from the sheet's Overall tab
@@ -421,7 +429,11 @@ def _campaign_structured(ds: dict) -> dict:
         structured["vendors"] = vendors
         structured["red_flag_vendors"] = red
         if ds.get("with_vendor_insights"):
-            structured["vendor_insights"] = _vendor_insights(vendors, red)
+            rows, vi_reason = _vendor_insights(vendors, red)
+            structured["vendor_insights"] = rows
+            # Identical shape either way — these two are the only tell.
+            structured["vendor_insights_ai"] = vi_reason is None
+            structured["vendor_insights_fallback_reason"] = vi_reason
     _apply_lead_quality(structured, ds)
     if previous is not None:
         structured["week_over_week"] = cr.week_over_week(
@@ -493,10 +505,13 @@ def _narration_input(kind: str, s: dict) -> dict:
     return s
 
 
-def _markdown(kind: str, structured: dict) -> str:
+def _markdown(kind: str, structured: dict) -> tuple[str, dict]:
+    """``(markdown, narration)`` where ``narration`` is the honest-failure pair
+    from :func:`analysis.narrate_result`. The markdown is what downloads as a
+    client-facing PDF, so the caller must stamp the pair onto the report."""
     title = kind.replace("_", " ").title()
-    narrative = analysis.narrate(kind, _narration_input(kind, structured))
-    return f"# {title}\n\n{narrative}"
+    narration = analysis.narrate_result(kind, _narration_input(kind, structured))
+    return f"# {title}\n\n{narration['text']}", narration
 
 
 def build(kind: str, dataset: dict, user_id: str, period: str | None = None) -> dict:
@@ -532,9 +547,16 @@ def build(kind: str, dataset: dict, user_id: str, period: str | None = None) -> 
         else:
             start, end = _period_window(kind, today)
             metrics = _clip_to_period(dataset.get("metrics", []), start, end)
+            # Per VENDOR the fallback is a lie, not a kindness: a vendor with no
+            # activity in the window was shown its latest earlier month under
+            # the window's heading. On 2026-08-15 two vendor cards printed June
+            # figures beneath "Aug 1–13, 2026". Absent from the window means
+            # absent from the table; the report-level fallback above still keeps
+            # the deliverable from coming out empty.
             vendor_metrics = {
-                v: _clip_to_period(ms, start, end)
+                v: kept
                 for v, ms in (dataset.get("vendor_metrics") or {}).items()
+                if (kept := _clip_to_period(ms, start, end, fallback=False))
             }
         dataset = {
             **dataset,
@@ -551,7 +573,14 @@ def build(kind: str, dataset: dict, user_id: str, period: str | None = None) -> 
         }
     else:
         structured = _structured(kind, dataset)
-    markdown = _markdown(kind, structured)
+    markdown, narration = _markdown(kind, structured)
+    # Provenance for the whole deliverable. The narrative and the vendor
+    # insights are both LLM paths that degrade to hand-written templates; if
+    # EITHER degraded the report is not AI-written, and the PDF/UI must say so.
+    reasons = [r for r in (
+        narration["fallback_reason"],
+        structured.get("vendor_insights_fallback_reason"),
+    ) if r]
     report = {
         "id": runs.new_run_id(),
         "kind": kind,
@@ -562,6 +591,10 @@ def build(kind: str, dataset: dict, user_id: str, period: str | None = None) -> 
         "structured": structured,
         "markdown": markdown,
         "html": _md_to_html(markdown),
+        "ai": not reasons,
+        "fallback_reason": "; ".join(reasons) or None,
+        "narrative_ai": narration["ai"],
+        "narrative_fallback_reason": narration["fallback_reason"],
     }
     runs.save_run(report)
     return report

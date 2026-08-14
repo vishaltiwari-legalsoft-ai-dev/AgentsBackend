@@ -273,7 +273,11 @@ def _offline_answer(question: str, timeframe: str | None, selected: list[str],
 
 def answer(question: str, profiles: list[TabProfile], grids: dict[str, list[list[str]]],
            *, timeframe: str | None = None, year: int = 2026) -> dict:
-    """Produce a grounded insight answer to a question."""
+    """Produce a grounded insight answer to a question.
+
+    Always carries ``ai`` and ``fallback_reason``: the offline read is a
+    legitimate deterministic answer but is not model output, and it renders the
+    same, so the payload has to say which one the caller is looking at."""
     want = infer_timeframe(question, timeframe)
     month = target_month(question)
     selected = select_tabs(question, want, profiles)
@@ -285,16 +289,22 @@ def answer(question: str, profiles: list[TabProfile], grids: dict[str, list[list
     counts = {t: max(len(rows) - 1, 0) for t, rows in data.items()}
     timeframe_label = month[0] if month else (want or "unspecified")
 
-    text = analysis.llm_text(_ANSWER_PROMPT.format(
+    text, reason = analysis.llm_text_result(_ANSWER_PROMPT.format(
         question=question, timeframe=timeframe_label,
         counts=json.dumps(counts),
         data=json.dumps(data, default=str)[:14000],
     ))
     if not text:
+        # _offline_answer is written in "the same shape the LLM is asked for", so
+        # it renders identically in the answer card. `ai`/`fallback_reason` are
+        # the only honest tell — never return the text without them.
         text = _offline_answer(question, timeframe_label, selected, data, by_title, year)
+        reason = reason or "the model returned no answer"
     return {
         "question": question,
         "timeframe": month[0] if month else want,
         "answer": text.strip(),
         "used_tabs": selected,
+        "ai": reason is None,
+        "fallback_reason": reason,
     }

@@ -13,9 +13,12 @@ import io
 import logging
 import os
 import tempfile
+import threading
 from datetime import date, datetime, timezone
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import (
+    APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile,
+)
 from fastapi.responses import StreamingResponse
 
 from app.security import get_current_user
@@ -42,6 +45,7 @@ from marketing_research_agent.sources.sheets_source import (
     fetch_official_totals,
     fetch_tab_values,
     is_rollup_platform,
+    reconcile_official_spend,
     workbook_meta,
 )
 
@@ -51,6 +55,39 @@ logger = logging.getLogger("agentos.mr")
 MR_AGENT_ID = "a6"  # "Market Researcher" slot in the frontend agent catalog
 MR_AGENT_NAME = "Marketing Research"
 _FULL_RANGE = DateRange(start=date(2000, 1, 1), end=date(2100, 1, 1))
+
+
+# ---------------------- sheet-pull failure contract ----------------------
+# ``mr_runs`` is the ONLY copy of parsed tracker state — there is no restore
+# path — so the pull must never destroy before it has a replacement in hand,
+# and a pull that destroyed nothing but produced nothing must not answer 200.
+
+class SheetPullError(RuntimeError):
+    """The pull could not produce new data. Nothing was swapped; the previous
+    runs are intact."""
+
+
+class SheetPullBusy(RuntimeError):
+    """A pull for this workspace is already in flight in this process."""
+
+
+# 207 (RFC 4918 Multi-Status) = some of it worked. Deliberately still 2xx: a
+# partially-degraded pull must not make Cloud Scheduler retry a permanently bad
+# tab forever, so it stays 2xx and shouts in the log instead. Total failure is a
+# 5xx (below), which the scheduler does retry and alert on.
+_PULL_HTTP_STATUS = {"ok": 200, "partial": 207}
+
+# Per-workspace overlap guard. Two pulls interleaving their write and delete
+# passes is a data-loss race; this is a single-process guard (Cloud Run runs
+# several instances), which closes the common case — cron firing while the user
+# hits "Pull" — but is not a distributed lease.
+_PULL_LOCKS: dict[str, threading.Lock] = {}
+_PULL_LOCKS_GUARD = threading.Lock()
+
+
+def _pull_lock(user_id: str) -> threading.Lock:
+    with _PULL_LOCKS_GUARD:
+        return _PULL_LOCKS.setdefault(user_id, threading.Lock())
 
 
 def _track(user: dict, action: str, task: str, *, usage_action: str = "generate") -> None:
@@ -160,18 +197,28 @@ def _tracker_rollups_by_month(user_id: str) -> dict[str, dict[str, dict]]:
     return out
 
 
-def _refresh_lead_analysis(user_id: str, year: int) -> dict | None:
+def _build_lead_analysis(user_id: str, year: int) -> tuple[dict, dict] | None:
     """Find the lead-analysis tab across every connected workbook (auto-detected
-    by its header row — nothing to configure), aggregate it, and persist the
-    summary as a run. Returns a result row, or None when no tab exists."""
+    by its header row — nothing to configure) and aggregate it into a run.
+
+    Builds only — the caller persists, so a failure here can never cost the
+    previous summary. Returns ``(run, result_row)``, or ``None`` when every
+    workbook was read cleanly and none of them holds a lead tab.
+
+    Raises ``SheetPullError`` when a workbook could not be read at all. An
+    unreadable sheet must never be mistaken for "this workspace has no lead
+    tab": that read is what decides whether the previous summary gets retired.
+    """
     workbooks = [{"id": mr_config.SHEETS_SPREADSHEET_ID, "label": "Primary marketing tracker"}]
     workbooks += [{"id": s["id"], "label": str(s.get("label") or s["id"][:8])}
                   for s in mr_sources_registry.extra_sources()]
     found: tuple[dict, str] | None = None
+    unreadable: list[str] = []
     for wb in workbooks:
         try:
             grids = mr_workbook.fetch_workbook(wb["id"], max_rows=20)  # header scan only
-        except Exception:
+        except Exception as exc:
+            unreadable.append(f"{wb['label']} ({exc})")
             continue  # an unreadable secondary never blocks the others
         for g in grids:
             if mr_leads.find_lead_tab(g.rows):
@@ -180,21 +227,23 @@ def _refresh_lead_analysis(user_id: str, year: int) -> dict | None:
         if found:
             break
     if not found:
+        if unreadable:
+            raise SheetPullError("could not read " + "; ".join(unreadable))
         return None
     wb, tab = found
     rows = fetch_tab_values(wb["id"], tab)  # full tab — lead sheets outgrow the grid cap
     records, gaps = mr_leads.parse_lead_rows(rows, year=year)
     summary = mr_leads.summarize(records, tracker_rollups=_tracker_rollups_by_month(user_id))
-    runs.save_run({
+    run = {
         "id": runs.new_run_id(), "kind": "lead_analysis", "user_id": user_id,
         "agent_id": MR_AGENT_ID, "platform": "sheets-leads",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_label": wb["label"], "tab": tab, "gaps": gaps,
         "summary": summary,
-    })
+    }
     flags = sum(b.get("flag_count", 0) for b in summary["months"].values())
-    return {"tab": f"Lead analysis ({tab})", "rows": len(records),
-            "months": len(summary["months"]), "lead_flags": flags}
+    return run, {"tab": f"Lead analysis ({tab})", "rows": len(records),
+                 "months": len(summary["months"]), "lead_flags": flags}
 
 
 def _load_dataset(user_id: str) -> dict:
@@ -268,6 +317,7 @@ async def ingest(
 
 @router.post("/mr/ingest-sheet")
 def ingest_sheet(
+    response: Response,
     body: dict | None = None,
     user=Depends(get_current_user),
 ):
@@ -277,7 +327,11 @@ def ingest_sheet(
     With a ``gid`` → that single tab is pulled (fast CSV export). With no gid →
     the whole workbook is scanned and every performance-tracker tab is ingested
     (auto-discovery; non-tracker tabs are skipped). Each tab becomes one dataset
-    run of channel-aggregate monthly metrics."""
+    run of channel-aggregate monthly metrics.
+
+    Status is honest: 200 clean, 207 some component degraded (details in
+    ``degraded``), 502 the pull failed and NOTHING was changed, 409 another
+    pull for this workspace is mid-flight."""
     body = body or {}
     year = int(body.get("year") or mr_config.SHEETS_YEAR)
 
@@ -287,15 +341,26 @@ def ingest_sheet(
         )
         try:
             metrics, gaps = src.fetch_campaign_metrics(_FULL_RANGE)
-            results = [_persist_sheet_dataset(user["id"], str(body["gid"]), metrics, gaps)]
-        except Exception as exc:  # auth/network/format — report, don't 500
-            results = [{"tab": str(body["gid"]), "error": str(exc)}]
+        except Exception as exc:  # auth/network/format — honest 502, nothing written
+            logger.warning("MR single-tab pull failed for gid %s: %s", body["gid"], exc)
+            raise HTTPException(502, f"Could not pull tab {body['gid']}: {exc}") from exc
+        result = {"tabs": [_persist_sheet_dataset(user["id"], str(body["gid"]), metrics, gaps)],
+                  "status": "ok", "ingested": 1, "failed": 0, "degraded": []}
     else:
-        results = _ingest_sheet_all(user["id"], year)
+        try:
+            result = _ingest_sheet_all(user["id"], year)
+        except SheetPullBusy as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except SheetPullError as exc:
+            raise HTTPException(
+                502, f"Sheet pull failed — your existing data was left untouched. {exc}"
+            ) from exc
 
-    ok = sum(1 for r in results if "error" not in r)
-    _track(user, "ingest_sheet", f"Sheet pull — {ok}/{len(results)} tabs ingested")
-    return {"spreadsheet_id": mr_config.SHEETS_SPREADSHEET_ID, "year": year, "tabs": results}
+    response.status_code = _PULL_HTTP_STATUS[result["status"]]
+    ok = len(result["tabs"]) - result["failed"]
+    _track(user, "ingest_sheet",
+           f"Sheet pull ({result['status']}) — {ok}/{len(result['tabs'])} tabs ingested")
+    return {"spreadsheet_id": mr_config.SHEETS_SPREADSHEET_ID, "year": year, **result}
 
 
 def _persist_sheet_dataset(user_id: str, label: str, metrics, gaps) -> dict:
@@ -314,51 +379,186 @@ def _persist_sheet_dataset(user_id: str, label: str, metrics, gaps) -> dict:
     return {"tab": label, "dataset_id": run["id"], "metrics": len(metrics), "gaps": run["gaps"]}
 
 
-def _ingest_sheet_all(user_id: str, year: int) -> list[dict]:
+def _ingest_sheet_all(user_id: str, year: int) -> dict:
     """Auto-discovery pull of every tracker tab for one user (UI and cron path).
 
-    Clears prior sheet datasets first so a re-pull is a clean refresh."""
-    for run in runs.list_runs(user_id):
-        is_sheet_ds = run.get("kind") == "dataset" and str(run.get("platform", "")).startswith("sheets:")
-        if is_sheet_ds or run.get("kind") in ("official_spend", "lead_analysis"):
-            runs.delete_run(run["id"])
-    results = []
+    Serialised per workspace, then handed to :func:`_pull_and_swap`. Returns
+    ``{"tabs", "status", "ingested", "failed", "degraded"}``; raises
+    ``SheetPullError`` (nothing touched) or ``SheetPullBusy``.
+    """
+    lock = _pull_lock(user_id)
+    if not lock.acquire(blocking=False):
+        raise SheetPullBusy(
+            "A sheet pull for this workspace is already running. Two overlapping "
+            "pulls interleave their writes and deletes — try again in a moment."
+        )
     try:
-        for found in fetch_all_trackers(mr_config.SHEETS_SPREADSHEET_ID, year):
-            results.append(_persist_sheet_dataset(user_id, found["tab"], found["metrics"], found["gaps"]))
+        return _pull_and_swap(user_id, year)
+    finally:
+        lock.release()
+
+
+def _pull_and_swap(user_id: str, year: int) -> dict:
+    """FETCH-THEN-SWAP the whole workspace.
+
+    Everything is read from Google FIRST; the previous runs are deleted only
+    once their replacements are written. The old order (delete every
+    ``sheets:*`` dataset plus the official and lead runs, then fetch) meant one
+    429 or one revoked share left the dashboard permanently blank — ``mr_runs``
+    is the only copy of parsed tracker state — and still answered 200.
+
+    Nothing is deleted for a component that could not be re-fetched, so a
+    Sheets blip now costs at most a stale figure, never a missing one.
+    """
+    sid = mr_config.SHEETS_SPREADSHEET_ID
+    degraded: list[str] = []
+
+    # ---- phase 1: fetch. No write and no delete happens while this runs. ----
+    try:
+        fetched = list(fetch_all_trackers(sid, year))
     except Exception as exc:
-        results.append({"tab": "*", "error": str(exc)})
+        logger.exception("MR sheet pull: tracker fetch failed for user %s", user_id)
+        raise SheetPullError(f"could not read the tracker tabs: {exc}") from exc
+
+    # Layout problems the parser worked around (a month repeated in a second
+    # column band) are the early warning that a tab was restructured. They are
+    # already on each dataset's gap list; promoting them to `degraded` is what
+    # puts them in front of a human before the figures drift.
+    degraded.extend(sorted({
+        g.message for f in fetched for g in (f.get("gaps") or [])
+        if "column band" in getattr(g, "message", "")
+    }))
+
     # The Overall tab's own team-level rows — the official headline figures the
     # console must match (the roll-up aggregates ledger/raw sources no vendor
-    # tab carries). "months" keeps the legacy spend-only shape for old readers.
-    official = fetch_official_totals(mr_config.SHEETS_SPREADSHEET_ID, year)
+    # tab carries). Contract C-4: a raise means the Sheets call failed and the
+    # previous official run must survive; ``{}`` means this workbook genuinely
+    # has no roll-up tab and the previous run is correctly retired. Those two
+    # used to be the same value, so a blip silently zeroed the headline.
+    official: dict | None
+    official_layout: list[str] = []
+    try:
+        official = fetch_official_totals(sid, year, warnings=official_layout)
+        degraded.extend(official_layout)
+    except Exception as exc:
+        official = None
+        degraded.append(f"official totals unavailable ({exc}) — kept the previous figures")
+        logger.warning("MR sheet pull: official totals unavailable for %s: %s", user_id, exc)
+
+    # Self-check before anything is believed: the roll-up cannot report less
+    # media spend than the vendor tabs it aggregates. When it does, the read is
+    # on the wrong cells, and publishing it as "the official figure" is exactly
+    # the silent-wrong-number failure this pull exists to avoid. Treated like a
+    # Sheets failure — previous figures survive and the reason is named.
+    if official and fetched:
+        mismatches = reconcile_official_spend(fetched, official, through=date.today())
+        if mismatches:
+            official = None
+            degraded.append(
+                "official totals rejected — they do not reconcile with the vendor "
+                "tabs, so the previous figures were kept. " + "; ".join(mismatches)
+            )
+            logger.error("MR sheet pull: official totals failed reconciliation for %s: %s",
+                         user_id, mismatches)
+
+    # ---- phase 2: swap. Replacements are written first and the superseded
+    # runs deleted after, so the workspace is never empty at any instant.
+    # (Same-tab runs share a "sheets:<tab>" platform key and the read path takes
+    # the newest per key, so the overlap can never double-count.) ----
+    swap_datasets = bool(fetched)
+    if not swap_datasets:
+        # A workbook that had eleven vendor tabs yesterday and none today is far
+        # more likely a permissions/format change than a real deletion. Keep
+        # what we have and say so rather than blanking on a maybe.
+        degraded.append("no tracker tabs matched — kept the previous datasets")
+    swap_kinds = {"official_spend"} if official is not None else set()
+    superseded = [
+        r["id"] for r in runs.list_runs(user_id)
+        if (swap_datasets and r.get("kind") == "dataset"
+            and str(r.get("platform", "")).startswith("sheets:"))
+        or r.get("kind") in swap_kinds
+    ]
+
+    results: list[dict] = [
+        _persist_sheet_dataset(user_id, f["tab"], f["metrics"], f["gaps"]) for f in fetched
+    ]
     if official:
         runs.save_run({
             "id": runs.new_run_id(), "kind": "official_spend", "user_id": user_id,
             "agent_id": MR_AGENT_ID, "platform": "sheets-official",
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            # "months" keeps the legacy spend-only shape for old readers.
             "months": {k: v["spend"] for k, v in official.items() if "spend" in v},
             "totals": official,
         })
         results.append({"tab": "Official totals (Overall Report)", "months": len(official)})
-    # Lead-analysis sheet (demo-level rows) — runs AFTER the tracker pull so the
-    # QL-ratio/booking-rate rule joins against fresh funnel counts.
+    elif official is None:
+        results.append({"tab": "Official totals (Overall Report)",
+                        "error": "Sheets read failed — previous figures kept"})
+    for run_id in superseded:
+        runs.delete_run(run_id)
+
+    # ---- phase 3: lead analysis. Runs AFTER the tracker swap so the
+    # QL-ratio/booking-rate rule joins against the fresh funnel counts. Its own
+    # fetch-then-swap: the previous summary only goes once a new one exists. ----
     try:
-        lead = _refresh_lead_analysis(user_id, year)
-        if lead:
-            results.append(lead)
+        built = _build_lead_analysis(user_id, year)
     except Exception as exc:
+        degraded.append(f"lead analysis unavailable ({exc}) — kept the previous summary")
         results.append({"tab": "Lead analysis", "error": str(exc)})
-    return results
+        logger.warning("MR sheet pull: lead analysis failed for %s: %s", user_id, exc)
+    else:
+        stale_leads = [r["id"] for r in runs.list_runs(user_id)
+                       if r.get("kind") == "lead_analysis"]
+        if built:
+            lead_run, row = built
+            runs.save_run(lead_run)
+            results.append(row)
+        for run_id in stale_leads:
+            runs.delete_run(run_id)
+
+    return {
+        "tabs": results,
+        "status": "partial" if degraded else "ok",
+        "ingested": len(fetched),
+        "failed": sum(1 for r in results if "error" in r),
+        "degraded": degraded,
+    }
+
+
+def _cron_status(response: Response, out: dict, failures: list[str], *, fatal: bool) -> dict:
+    """Stamp an honest HTTP status on a cron result.
+
+    Cloud Scheduler only ever looks at the status code, so a 200 carrying "every
+    item failed" in its body is a job that can be dead for weeks with nobody
+    paged. 502 = nothing worked (the scheduler retries and the failed-job alert
+    fires), 207 = some of it worked (kept 2xx on purpose so a permanently bad
+    item can't trigger an endless retry loop — it shouts in the log instead),
+    200 = clean."""
+    out["errors"] = failures
+    if fatal:
+        out["status"] = "failed"
+        response.status_code = 502
+        logger.error("MR cron refresh FAILED: %s", "; ".join(failures) or "unknown")
+    elif failures:
+        out["status"] = "partial"
+        response.status_code = 207
+        logger.warning("MR cron refresh degraded: %s", "; ".join(failures))
+    else:
+        out["status"] = "ok"
+    return out
 
 
 @router.post("/mr/cron/refresh")
-def cron_refresh(request: Request):
+def cron_refresh(request: Request, response: Response):
     """Scheduled full refresh: sheet pull + daily snapshot capture + GCS export.
 
     Authenticated by the MR_CRON_KEY shared secret (Cloud Scheduler can't hold a
     Firebase user session). The pull runs for MR_CRON_USER_ID's workspace; the
-    snapshot capture and exports are user-independent."""
+    snapshot capture and exports are user-independent.
+
+    Reports 200/207/502 per :func:`_cron_status` — a refresh where every stage
+    failed is never a 200."""
     key = os.environ.get("MR_CRON_KEY", "")
     if not key:
         raise HTTPException(503, "MR_CRON_KEY not configured on this deployment")
@@ -367,18 +567,47 @@ def cron_refresh(request: Request):
 
     today = date.today()
     out: dict = {"date": today.isoformat()}
+    failures: list[str] = []
+    fatal = False
+
     uid = os.environ.get("MR_CRON_USER_ID")
-    out["pull"] = _ingest_sheet_all(uid, mr_config.SHEETS_YEAR) if uid else "skipped (MR_CRON_USER_ID unset)"
+    if not uid:
+        out["pull"] = "skipped (MR_CRON_USER_ID unset)"
+        failures.append("sheet pull skipped: MR_CRON_USER_ID unset")
+    else:
+        try:
+            out["pull"] = _ingest_sheet_all(uid, mr_config.SHEETS_YEAR)
+        except SheetPullBusy as exc:
+            # Overlapping fire — the in-flight pull is doing the work. Not fatal.
+            out["pull"] = {"status": "busy", "error": str(exc)}
+            failures.append(f"sheet pull skipped: {exc}")
+        except SheetPullError as exc:
+            out["pull"] = {"status": "failed", "error": str(exc)}
+            failures.append(f"sheet pull failed: {exc}")
+            fatal = True  # the primary job of this cron did not happen
+        else:
+            failures.extend(out["pull"]["degraded"])
+
     try:
         grids = _workbook_grids()
     except Exception as exc:
         out["capture_error"] = str(exc)
-        return out
-    out["capture"] = mr_snapshots.capture_workbook(grids, year=mr_config.SHEETS_YEAR, today=today)
-    out["exported"] = mr_snapshots.export_all_to_gcs(today)
+        failures.append(f"snapshot capture failed: {exc}")
+        return _cron_status(response, out, failures, fatal=fatal or not uid)
+    try:
+        out["capture"] = mr_snapshots.capture_workbook(
+            grids, year=mr_config.SHEETS_YEAR, today=today)
+    except Exception as exc:
+        out["capture_error"] = str(exc)
+        failures.append(f"snapshot capture failed: {exc}")
+    try:
+        out["exported"] = mr_snapshots.export_all_to_gcs(today)
+    except Exception as exc:
+        out["export_error"] = str(exc)
+        failures.append(f"snapshot export failed: {exc}")
     _track(run_tracking.CRON_USER, "cron_refresh",
            f"Scheduled refresh for {today.isoformat()}", usage_action="session")
-    return out
+    return _cron_status(response, out, failures, fatal=fatal)
 
 
 @router.get("/mr/datasets")
