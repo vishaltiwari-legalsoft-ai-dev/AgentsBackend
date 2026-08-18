@@ -7,9 +7,11 @@ Creator-only; ``CredentialMissing`` surfaces as 503 with the real message
 """
 from __future__ import annotations
 
+import hmac
 import logging
+import os
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.security import get_current_user, require_creator
@@ -34,6 +36,17 @@ def _track(user: dict, action: str, task: str, brand: dict | None = None,
         brand=(brand or {}).get("name"), brand_id=(brand or {}).get("id"),
         usage_action=usage_action,
     )
+
+
+def _cron_budget_seconds() -> float:
+    """Wall clock one cron fire may spend per brand. Env-tunable because the
+    right value is a deploy fact (Cloud Run request timeout), not a code one."""
+    raw = os.environ.get("GEO_CRON_BUDGET_SECONDS", "")
+    try:
+        return max(10.0, min(float(raw), 1800.0)) if raw else geo_poll.DEFAULT_CRON_BUDGET_SECONDS
+    except ValueError:
+        logger.warning("GEO_CRON_BUDGET_SECONDS=%r is not a number — using default", raw)
+        return geo_poll.DEFAULT_CRON_BUDGET_SECONDS
 
 
 def _brand_or_404(brand_id: str) -> dict:
@@ -67,6 +80,10 @@ class ConfigIn(BaseModel):
     aliases: dict[str, list[str]] | None = None
     competitors: list[dict] | None = None
     daily_cap: int | None = Field(default=None, ge=10, le=20000)
+    # scheduled polling: how many days between sweeps, and whether the cron
+    # may run this brand at all
+    poll_interval_days: int | None = Field(default=None, ge=1, le=30)
+    auto_poll: bool | None = None
 
 
 class PollIn(BaseModel):
@@ -190,6 +207,17 @@ def poll_step(
     engines = ", ".join(body.engines) if body.engines else "all engines"
     _track(user, "poll_step", f"AI answer poll ({engines}, batch {body.batch_size})", brand)
     return result
+
+
+@router.get("/geo/brands/{brand_id}/poll/status")
+def poll_status(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
+    """Where today's sweep stands and when the next one is due — what the panel
+    shows instead of making someone sit through a progress bar."""
+    brand = _brand_or_404(brand_id)
+    try:
+        return geo_poll.poll_status(brand)
+    except CredentialMissing as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.get("/geo/brands/{brand_id}/report")
@@ -334,3 +362,72 @@ def strategy_action_status(
            usage_action="edit")
     return doc
 
+
+# ------------------------------- cron -------------------------------
+
+@router.post("/geo/cron/poll")
+def cron_poll(request: Request, response: Response) -> dict:
+    """Scheduled, unattended polling — the path that replaces a half-hour of
+    someone holding a browser tab open.
+
+    Fires DAILY; this decides per brand whether a sweep is actually due, from
+    ``poll_interval_days`` (default 2) counted off the last *completed* sweep.
+    A day-of-month cron step would double-fire across month boundaries and
+    would silently skip a brand whose previous sweep never finished.
+
+    One brand gets a bounded wall-clock slice. A sweep that does not finish in
+    it leaves its remaining tasks pending and stays due, so the next fire
+    resumes exactly where this one stopped — nothing is re-billed.
+
+    Status is honest, because Cloud Scheduler only reads the code: 200 every
+    due brand swept, 207 some failed, 502 every one failed.
+    """
+    expected = os.environ.get("GEO_CRON_KEY", "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="GEO_CRON_KEY not configured")
+    if not hmac.compare_digest(request.headers.get("x-cron-key", ""), expected):
+        raise HTTPException(status_code=403, detail="Bad cron key")
+
+    budget = _cron_budget_seconds()
+    results: dict[str, dict] = {}
+    skipped: dict[str, str] = {}
+    for brand in insights.list_brands():
+        if not brand.get("enabled", True):
+            continue
+        brand_id = brand["id"]
+        try:
+            cfg = geo_poll.ensure_config(brand)
+            due, reason = geo_poll.poll_due(cfg)
+            if not due:
+                skipped[brand_id] = reason
+                continue
+            results[brand_id] = geo_poll.poll_until_done(brand, budget_seconds=budget)
+        except CredentialMissing as exc:
+            # no engine key is a configuration fact, not a sweep failure — it
+            # must not put the scheduler into a retry loop
+            skipped[brand_id] = f"not configured: {exc}"
+        except Exception as exc:  # noqa: BLE001 — one bad brand must not kill the sweep
+            logger.exception("geo cron poll failed for %s", brand_id)
+            results[brand_id] = {"ok": False, "error": str(exc)}
+
+    ok = sum(1 for r in results.values() if r.get("ok", True))
+    failed = len(results) - ok
+    out: dict = {
+        "brands": results, "skipped": skipped, "ok": ok, "failed": failed,
+        "budget_seconds": budget, "status": "ok",
+    }
+    if results and ok == 0:
+        out["status"] = "failed"
+        response.status_code = 502
+        logger.error("GEO cron poll FAILED: all %d brands errored", failed)
+    elif failed:
+        out["status"] = "partial"
+        response.status_code = 207
+        logger.warning("GEO cron poll degraded: %d/%d brands failed", failed, len(results))
+
+    swept = ", ".join(f"{b}: {r.get('done')}/{r.get('total')}" for b, r in results.items())
+    _track(run_tracking.CRON_USER, "cron_poll",
+           f"Scheduled AI answer poll — {len(results)} due, {len(skipped)} not due"
+           + (f" ({swept})" if swept else ""),
+           usage_action="session")
+    return out

@@ -1,8 +1,14 @@
 """GEO polling + prompt universe — offline, engines faked at the adapter seam."""
+import datetime as dt
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from final_geo_agent import geo_engines, geo_poll, geo_prompts
 from final_geo_agent.geo_engines import EngineAnswer
+from seo_geo_agent import state
 from seo_geo_agent.sources import CredentialMissing
 
 BRAND = {"id": "legalsoft", "name": "Legal Soft", "domain": "legalsoft.com",
@@ -146,6 +152,181 @@ def test_poll_step_honors_daily_cap(fake_engine):
     assert len(fake_engine) == 4
 
 
+# ------------------------------------------------------- terminal signal ----
+# An errored run stays pending by design, so a dead key means `done` can never
+# reach `total` — the UI loop only ever stopped when the daily budget ran out.
+# These pin the exit: terminal + terminal_reason (a cross-agent contract with
+# the console poll loop — do not rename or reshape).
+
+def _engines(monkeypatch, **available):
+    monkeypatch.setattr(
+        geo_engines, "available_engines",
+        lambda: {"perplexity": False, "gemini": False, "chatgpt": False} | available,
+    )
+
+
+def test_healthy_poll_carries_the_terminal_contract_and_is_not_terminal(fake_engine):
+    seed_prompts(2)
+    res = geo_poll.poll_step(BRAND, runs=1, batch_size=10)
+    assert res["terminal"] is False
+    assert res["terminal_reason"] is None
+    # nothing left pending: still non-terminal, and the keys still exist
+    idle = geo_poll.poll_step(BRAND, runs=1, batch_size=10)
+    assert (idle["terminal"], idle["terminal_reason"]) == (False, None)
+
+
+def test_fully_errored_batch_is_terminal_and_names_the_failure(monkeypatch):
+    seed_prompts(3)
+    _engines(monkeypatch, perplexity=True)
+    monkeypatch.setattr(
+        geo_engines, "poll_engine",
+        lambda engine, prompt: EngineAnswer(
+            engine=engine, error="HTTP 401: invalid api key"),
+    )
+    res = geo_poll.poll_step(BRAND, runs=1, batch_size=10)
+    assert res["terminal"] is True
+    # the reason must be actionable: which engine, what actually failed
+    assert "perplexity" in res["terminal_reason"]
+    assert "HTTP 401: invalid api key" in res["terminal_reason"]
+
+
+def test_partial_failure_is_not_terminal(monkeypatch):
+    """One engine down while another answers is a degraded poll, not a dead
+    one — it still makes forward progress, so the loop keeps going."""
+    seed_prompts(2)
+    _engines(monkeypatch, perplexity=True, gemini=True)
+    monkeypatch.setattr(
+        geo_engines, "poll_engine",
+        lambda engine, prompt: EngineAnswer(engine=engine, error="HTTP 500: upstream")
+        if engine == "perplexity"
+        else EngineAnswer(engine=engine, model="fake", text="Legal Soft answers."),
+    )
+    res = geo_poll.poll_step(BRAND, runs=1, batch_size=3)
+    assert res["terminal"] is False
+    assert res["terminal_reason"] is None
+
+
+def test_consecutive_engine_failures_terminate(monkeypatch):
+    """A batch that keeps making SOME progress never trips the all-failed rule,
+    so a permanently dead engine needs the streak rule to stop the burn."""
+    seed_prompts(4)
+    _engines(monkeypatch, perplexity=True, gemini=True)
+    monkeypatch.setattr(
+        geo_engines, "poll_engine",
+        lambda engine, prompt: EngineAnswer(engine=engine, error="HTTP 503: engine down")
+        if engine == "perplexity"
+        else EngineAnswer(engine=engine, model="fake", text="Legal Soft answers."),
+    )
+    # 4 perplexity tasks (always fail, always pending) + 1 gemini task per step
+    results = [
+        geo_poll.poll_step(BRAND, runs=1, batch_size=5)
+        for _ in range(geo_poll.FAIL_STREAK_LIMIT)
+    ]
+    assert [r["terminal"] for r in results[:-1]] == [False] * (
+        geo_poll.FAIL_STREAK_LIMIT - 1
+    )
+    last = results[-1]
+    assert last["terminal"] is True
+    assert "perplexity" in last["terminal_reason"]
+    assert f"{geo_poll.FAIL_STREAK_LIMIT} consecutive" in last["terminal_reason"]
+    assert "gemini" not in last["terminal_reason"]   # the healthy engine is not blamed
+
+
+def test_a_success_clears_the_failure_streak(monkeypatch):
+    seed_prompts(2)
+    _engines(monkeypatch, perplexity=True)
+    behavior = {"fail": True}
+    monkeypatch.setattr(
+        geo_engines, "poll_engine",
+        lambda engine, prompt: EngineAnswer(engine=engine, error="HTTP 429: slow down")
+        if behavior["fail"]
+        else EngineAnswer(engine=engine, model="fake", text="Legal Soft answers."),
+    )
+    geo_poll.poll_step(BRAND, runs=1, batch_size=10)
+    behavior["fail"] = False
+    geo_poll.poll_step(BRAND, runs=1, batch_size=10)
+    cfg = geo_poll.ensure_config(BRAND)
+    assert cfg["poll_health"]["streaks"]["perplexity"] == 0
+
+
+def test_hitting_the_daily_cap_is_terminal(fake_engine):
+    seed_prompts(3)
+    geo_poll.ensure_config(BRAND)
+    geo_poll.save_config(BRAND["id"], {"daily_cap": 4})
+    geo_poll.poll_step(BRAND, runs=2, batch_size=10)
+    capped = geo_poll.poll_step(BRAND, runs=2, batch_size=10)
+    assert (capped["capped"], capped["terminal"]) == (True, True)
+    assert "4 of 4" in capped["terminal_reason"]
+
+
+# ------------------------------------------------------------- atomicity ----
+# The cap is the only thing between a signed-in user and the engine bill, and
+# it used to be a read-modify-write race: two overlapping steps both read 1990
+# against a 2000 cap, both fire ten paid calls, both write 2000.
+
+def test_concurrent_reservations_never_oversell_the_cap():
+    geo_poll.ensure_config(BRAND)
+    cfg = geo_poll.ensure_config(BRAND)
+    cfg["daily_cap"] = 2000
+    cfg.setdefault("counters", {})[geo_poll._today()] = 1990
+    state.save(geo_poll.config_doc_id(BRAND["id"]), cfg)
+
+    day = geo_poll._today()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        granted = [
+            f.result()[0] for f in [
+                pool.submit(geo_poll._reserve_calls, BRAND["id"], day, 10)
+                for _ in range(8)
+            ]
+        ]
+    assert sum(granted) == 10          # 10 head-room, 80 wanted, 10 handed out
+    after = geo_poll.ensure_config(BRAND)
+    assert after["counters"][day] == 2000
+
+
+def test_concurrent_poll_steps_stay_inside_the_daily_cap(monkeypatch):
+    seed_prompts(6)
+    calls = []
+    lock = threading.Lock()
+
+    def slow(engine, prompt):
+        with lock:
+            calls.append(prompt)
+        time.sleep(0.01)          # widen the window the old race needed
+        return EngineAnswer(engine=engine, model="fake", text="Legal Soft answers.")
+
+    _engines(monkeypatch, perplexity=True)
+    monkeypatch.setattr(geo_engines, "poll_engine", slow)
+    geo_poll.ensure_config(BRAND)
+    geo_poll.save_config(BRAND["id"], {"daily_cap": 5})
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for f in [
+            pool.submit(geo_poll.poll_step, BRAND, None, 1, 10) for _ in range(3)
+        ]:
+            f.result()
+    assert len(calls) == 5                                   # cap held exactly
+    cfg = geo_poll.ensure_config(BRAND)
+    assert cfg["counters"][geo_poll._today()] == 5           # and every call counted
+
+
+def test_concurrent_answer_writes_do_not_lose_records():
+    day = geo_poll._today()
+
+    def write(i):
+        geo_poll._merge_answers(BRAND["id"], "perplexity", day, [
+            {"prompt_id": f"p{i}", "run": 1, "engine": "perplexity",
+             "text": "answer", "error": None},
+        ])
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for f in [pool.submit(write, i) for i in range(20)]:
+            f.result()
+    doc = state.load(geo_poll.poll_doc_id(BRAND["id"], "perplexity", day))
+    assert len(doc["answers"]) == 20
+    assert {a["prompt_id"] for a in doc["answers"]} == {f"p{i}" for i in range(20)}
+
+
 # ---------------------------------------------------------------- prompts ----
 
 def test_generate_universe_cleans_and_persists(monkeypatch):
@@ -251,3 +432,166 @@ def test_recent_answers_includes_aio_docs(aio_engine):
     engines_seen = {a["engine"] for a in geo_poll.recent_answers(BRAND["id"], days=1)}
     assert "aio" in engines_seen          # stored AIO answers must be readable everywhere
     assert "perplexity" in engines_seen
+
+
+# ------------------------------------------------------- concurrency ----
+# ~400 sequential engine calls at ~5s each is the half hour that made polling
+# unusable. Overlapping them must not disturb the order the caller settles
+# budget and failure streaks in.
+
+
+def test_batch_polls_concurrently_but_returns_in_submission_order(monkeypatch):
+    seed_prompts(4)
+    started = threading.Barrier(geo_poll.POLL_CONCURRENCY, timeout=5)
+
+    def scripted(engine, prompt):
+        # deadlocks unless POLL_CONCURRENCY calls are genuinely in flight
+        started.wait()
+        return EngineAnswer(engine=engine, model="fake", text=f"Legal Soft: {prompt}")
+
+    monkeypatch.setattr(geo_engines, "available_engines",
+                        lambda: {"perplexity": True, "gemini": False, "chatgpt": False})
+    monkeypatch.setattr(geo_engines, "poll_engine", scripted)
+
+    result = geo_poll.poll_step(BRAND, runs=2, batch_size=geo_poll.POLL_CONCURRENCY)
+
+    assert result["done"] == geo_poll.POLL_CONCURRENCY
+
+
+def test_answers_come_back_in_submission_order_not_completion_order(monkeypatch):
+    # slowest task first: a completion-ordered result would reverse these, and
+    # per-engine failure streaks would then depend on provider latency
+    delays = {"slow": 0.05, "fast": 0.0}
+
+    def scripted(engine, prompt):
+        time.sleep(delays[prompt])
+        return EngineAnswer(engine=engine, model="fake", text=prompt)
+
+    monkeypatch.setattr(geo_engines, "poll_engine", scripted)
+    batch = [("perplexity", {"text": "slow"}, 1), ("perplexity", {"text": "fast"}, 1)]
+
+    assert [a.text for a in geo_poll._answers_for(batch)] == ["slow", "fast"]
+
+
+# ---------------------------------------------------------- schedule ----
+# The cron fires daily; being "due" is decided here, off the last COMPLETED
+# sweep, so a truncated run is resumed rather than skipped for two days.
+
+
+def test_brand_never_polled_is_due_immediately():
+    due, reason = geo_poll.poll_due({})
+    assert due is True
+    assert reason == "never polled"
+    assert geo_poll.next_due_at({}) is None
+
+
+def test_brand_is_not_due_before_its_interval_elapses():
+    cfg = {"last_poll_completed_at": "2026-08-18T02:00:00+00:00", "poll_interval_days": 2}
+    now = dt.datetime(2026, 8, 19, 12, 0, tzinfo=dt.timezone.utc)
+
+    due, reason = geo_poll.poll_due(cfg, now=now)
+
+    assert due is False
+    assert "2026-08-20" in reason
+
+
+def test_brand_is_due_once_the_interval_has_elapsed():
+    cfg = {"last_poll_completed_at": "2026-08-18T02:00:00+00:00", "poll_interval_days": 2}
+    now = dt.datetime(2026, 8, 20, 2, 0, tzinfo=dt.timezone.utc)
+
+    due, _ = geo_poll.poll_due(cfg, now=now)
+
+    assert due is True
+    assert geo_poll.next_due_at(cfg).startswith("2026-08-20")
+
+
+def test_month_boundary_keeps_a_true_two_day_gap():
+    # the reason this is an interval and not a `*/2` day-of-month cron step:
+    # that expression fires on the 31st and again on the 1st
+    cfg = {"last_poll_completed_at": "2026-08-31T02:00:00+00:00", "poll_interval_days": 2}
+
+    assert geo_poll.poll_due(cfg, now=dt.datetime(2026, 9, 1, 12, tzinfo=dt.timezone.utc))[0] is False
+    assert geo_poll.poll_due(cfg, now=dt.datetime(2026, 9, 2, 2, tzinfo=dt.timezone.utc))[0] is True
+
+
+def test_auto_poll_off_is_never_due():
+    cfg = {"auto_poll": False, "last_poll_completed_at": "2020-01-01T00:00:00+00:00"}
+
+    due, reason = geo_poll.poll_due(cfg)
+
+    assert due is False
+    assert "auto-poll is off" in reason
+
+
+def test_unparseable_timestamp_makes_the_brand_due_rather_than_stuck():
+    # a corrupt stamp must fail towards polling; failing the other way would
+    # silently stop a brand forever
+    assert geo_poll.poll_due({"last_poll_completed_at": "not-a-date"})[0] is True
+
+
+def test_interval_is_clamped_to_a_sane_range():
+    assert geo_poll._interval_days({"poll_interval_days": 0}) == 1
+    assert geo_poll._interval_days({"poll_interval_days": 999}) == 30
+    assert geo_poll._interval_days({"poll_interval_days": "junk"}) == geo_poll.DEFAULT_POLL_INTERVAL_DAYS
+    assert geo_poll._interval_days({}) == geo_poll.DEFAULT_POLL_INTERVAL_DAYS
+
+
+# ------------------------------------------------------ unattended run ----
+
+
+def test_poll_until_done_finishes_the_sweep_and_stamps_the_schedule(fake_engine):
+    seed_prompts(3)
+
+    result = geo_poll.poll_until_done(BRAND, runs=2, batch_size=4)
+
+    assert (result["done"], result["total"]) == (6, 6)
+    assert result["completed"] is True
+    assert result["steps"] == 2                      # 4 + 2, no browser involved
+    assert len(fake_engine) == 6                     # nothing polled twice
+    cfg = geo_poll.ensure_config(BRAND)
+    assert cfg["last_poll_completed_at"]
+    assert geo_poll.poll_due(cfg)[0] is False        # not due again immediately
+
+
+def test_poll_until_done_stops_on_budget_and_leaves_the_rest_pending(fake_engine):
+    seed_prompts(3)
+    ticks = iter([0.0, 0.0, 5.0, 5.0, 5.0])          # one step, then out of time
+
+    result = geo_poll.poll_until_done(
+        BRAND, runs=2, batch_size=2, budget_seconds=1.0, clock=lambda: next(ticks)
+    )
+
+    assert result["completed"] is False
+    assert result["done"] < result["total"]
+    assert "budget exhausted" in result["stopped_because"]
+    # a truncated sweep must stay due, or two days of data go missing
+    assert geo_poll.poll_due(geo_poll.ensure_config(BRAND))[0] is True
+
+
+def test_poll_until_done_stops_on_a_dead_engine_without_stamping(monkeypatch):
+    seed_prompts(2)
+
+    def dead(engine, prompt):
+        return EngineAnswer(engine=engine, model="fake", error="HTTP 401: bad key")
+
+    monkeypatch.setattr(geo_engines, "available_engines",
+                        lambda: {"perplexity": True, "gemini": False, "chatgpt": False})
+    monkeypatch.setattr(geo_engines, "poll_engine", dead)
+
+    result = geo_poll.poll_until_done(BRAND, runs=1, batch_size=2)
+
+    assert result["completed"] is False
+    assert result["terminal_reason"]
+    assert "last_poll_completed_at" not in geo_poll.ensure_config(BRAND)
+
+
+def test_poll_status_reports_progress_and_next_due(fake_engine):
+    seed_prompts(3)
+    geo_poll.poll_step(BRAND, runs=1, batch_size=2)
+
+    status = geo_poll.poll_status(BRAND, runs=1)
+
+    assert (status["done"], status["total"], status["pending"]) == (2, 3, 1)
+    assert status["due_now"] is True          # sweep unfinished, never completed
+    assert status["interval_days"] == geo_poll.DEFAULT_POLL_INTERVAL_DAYS
+    assert status["next_due_at"] is None
