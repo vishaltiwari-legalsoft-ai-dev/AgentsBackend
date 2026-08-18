@@ -10,6 +10,7 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
@@ -38,9 +39,17 @@ def _track(user: dict, action: str, task: str, brand: dict | None = None,
     )
 
 
+# Least wall clock worth handing a brand. Below this a step cannot finish even
+# one batch, so the brand is better left due than charged for a partial batch.
+MIN_BRAND_SECONDS = 20.0
+
+
 def _cron_budget_seconds() -> float:
-    """Wall clock one cron fire may spend per brand. Env-tunable because the
-    right value is a deploy fact (Cloud Run request timeout), not a code one."""
+    """Wall clock ONE CRON FIRE may spend in total, across every due brand.
+
+    Env-tunable because the ceiling is a deploy fact — it must stay under the
+    service's request timeout — not a code one.
+    """
     raw = os.environ.get("GEO_CRON_BUDGET_SECONDS", "")
     try:
         return max(10.0, min(float(raw), 1800.0)) if raw else geo_poll.DEFAULT_CRON_BUDGET_SECONDS
@@ -375,9 +384,15 @@ def cron_poll(request: Request, response: Response) -> dict:
     A day-of-month cron step would double-fire across month boundaries and
     would silently skip a brand whose previous sweep never finished.
 
-    One brand gets a bounded wall-clock slice. A sweep that does not finish in
-    it leaves its remaining tasks pending and stays due, so the next fire
-    resumes exactly where this one stopped — nothing is re-billed.
+    The budget is for the WHOLE request, not per brand: Cloud Run kills a
+    request at its configured timeout, so a per-brand slice multiplied by an
+    unknown number of brands is a config that breaks the day someone adds one.
+    Brands are swept stalest-first (never-polled before never-completed before
+    oldest-completed) and each takes what is left, so the brand with the oldest
+    data always gets the time. A sweep that does not finish leaves its tasks
+    pending and stays due, so the next fire resumes where this one stopped --
+    nothing is re-billed -- and brands that the clock never reached are
+    reported by name rather than silently skipped.
 
     Status is honest, because Cloud Scheduler only reads the code: 200 every
     due brand swept, 207 some failed, 502 every one failed.
@@ -389,33 +404,56 @@ def cron_poll(request: Request, response: Response) -> dict:
         raise HTTPException(status_code=403, detail="Bad cron key")
 
     budget = _cron_budget_seconds()
+    deadline = time.monotonic() + budget
     results: dict[str, dict] = {}
     skipped: dict[str, str] = {}
+    unreached: list[str] = []
+
+    due: list[tuple[float, dict]] = []
     for brand in insights.list_brands():
         if not brand.get("enabled", True):
             continue
-        brand_id = brand["id"]
         try:
             cfg = geo_poll.ensure_config(brand)
-            due, reason = geo_poll.poll_due(cfg)
-            if not due:
-                skipped[brand_id] = reason
-                continue
-            results[brand_id] = geo_poll.poll_until_done(brand, budget_seconds=budget)
+        except Exception as exc:  # noqa: BLE001 — unreadable config is not a sweep failure
+            skipped[brand["id"]] = f"config unreadable: {exc}"
+            continue
+        is_due, reason = geo_poll.poll_due(cfg)
+        if not is_due:
+            skipped[brand["id"]] = reason
+            continue
+        due.append((geo_poll.staleness_rank(cfg), brand))
+
+    # stalest first, so a tight budget starves the freshest brand, never the one
+    # whose data is already oldest
+    due.sort(key=lambda pair: pair[0], reverse=True)
+
+    for _, brand in due:
+        remaining = deadline - time.monotonic()
+        if remaining < MIN_BRAND_SECONDS:
+            unreached.append(brand["id"])
+            continue
+        try:
+            results[brand["id"]] = geo_poll.poll_until_done(brand, budget_seconds=remaining)
         except CredentialMissing as exc:
             # no engine key is a configuration fact, not a sweep failure — it
             # must not put the scheduler into a retry loop
-            skipped[brand_id] = f"not configured: {exc}"
+            skipped[brand["id"]] = f"not configured: {exc}"
         except Exception as exc:  # noqa: BLE001 — one bad brand must not kill the sweep
-            logger.exception("geo cron poll failed for %s", brand_id)
-            results[brand_id] = {"ok": False, "error": str(exc)}
+            logger.exception("geo cron poll failed for %s", brand["id"])
+            results[brand["id"]] = {"ok": False, "error": str(exc)}
 
     ok = sum(1 for r in results.values() if r.get("ok", True))
     failed = len(results) - ok
     out: dict = {
-        "brands": results, "skipped": skipped, "ok": ok, "failed": failed,
-        "budget_seconds": budget, "status": "ok",
+        "brands": results, "skipped": skipped, "unreached": unreached,
+        "ok": ok, "failed": failed, "budget_seconds": budget, "status": "ok",
     }
+    if unreached:
+        logger.warning(
+            "GEO cron ran out of budget before %d brand(s): %s — they stay due for the next fire",
+            len(unreached), ", ".join(unreached),
+        )
     if results and ok == 0:
         out["status"] = "failed"
         response.status_code = 502
@@ -427,7 +465,8 @@ def cron_poll(request: Request, response: Response) -> dict:
 
     swept = ", ".join(f"{b}: {r.get('done')}/{r.get('total')}" for b, r in results.items())
     _track(run_tracking.CRON_USER, "cron_poll",
-           f"Scheduled AI answer poll — {len(results)} due, {len(skipped)} not due"
+           f"Scheduled AI answer poll — {len(results)} swept, {len(skipped)} not due, "
+           f"{len(unreached)} out of time"
            + (f" ({swept})" if swept else ""),
            usage_action="session")
     return out

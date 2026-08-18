@@ -518,6 +518,19 @@ def next_due_at(cfg: dict) -> str | None:
     return (last + dt.timedelta(days=_interval_days(cfg))).isoformat(timespec="seconds")
 
 
+def staleness_rank(cfg: dict) -> float:
+    """How overdue this brand is, as a sortable number (higher = staler).
+
+    A cron fire has a finite budget, so when it cannot reach every due brand the
+    order decides whose data rots. Never-polled brands outrank everything, then
+    brands whose last sweep never completed, then oldest-completed first.
+    """
+    last = _parse_at(cfg.get("last_poll_completed_at"))
+    if last is None:
+        return float("inf")
+    return -last.timestamp()
+
+
 def poll_due(cfg: dict, *, now: dt.datetime | None = None) -> tuple[bool, str]:
     """Is a scheduled sweep due for this brand, and why (or why not).
 
