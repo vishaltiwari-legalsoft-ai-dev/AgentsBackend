@@ -309,6 +309,12 @@ def _clean_action(raw: dict, discovery: dict, dropped: list[dict]) -> dict | Non
             "examples": (venue.get("examples") or [])[:2],
         } if venue else None,
         "deliverable": str(raw.get("deliverable", "")).strip(),
+        # a list a team can tick off, not a paragraph they have to parse
+        "steps": [
+            step for step in
+            (str(x).strip() for x in (raw.get("steps") or [])[:4])
+            if step
+        ],
         "detail": str(raw.get("detail", "")).strip(),
         "owner_role": str(raw.get("owner_role", "ops")),
         "effort": raw.get("effort") if raw.get("effort") in ("low", "medium", "high") else "medium",
@@ -428,7 +434,7 @@ def _as_waves(current: dict) -> dict:
     waves = []
     for pillar in current.get("pillars") or []:
         actions = [
-            {"venue": None, "deliverable": "", "why_evidence": "", **action}
+            {"venue": None, "deliverable": "", "steps": [], "why_evidence": "", **action}
             for action in pillar.get("actions") or []
         ]
         span = max((int(a.get("timeframe_weeks") or 0) for a in actions), default=0)

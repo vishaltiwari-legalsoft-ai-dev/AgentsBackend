@@ -34,7 +34,9 @@ def _action(title, venue, **over):
     base = {
         "title": title, "venue": venue,
         "deliverable": "a 600-word expert answer post",
-        "detail": "Answer the intake question directly, no pitch.",
+        "steps": ["Open the three linked threads", "Draft a 600-word answer with two numbers",
+                  "Post it from the founder account", "", "fifth step should be dropped"],
+        "detail": "Self-promo is banned there.",
         "owner_role": "content", "effort": "medium", "impact": "high",
         "kpi": "mention_rate", "target": "30%",
         "why_evidence": "cited 14x where the brand was absent",
@@ -147,6 +149,10 @@ def test_actions_carry_the_resolved_venue_with_its_real_url(monkeypatch):
     assert reddit["venue"]["kind"] == "community"
     assert reddit["venue"]["cited_where_absent"] == 14
     assert reddit["deliverable"] == "a 600-word expert answer post"
+    # a list a team ticks off, capped and stripped of blanks — never a paragraph
+    assert reddit["steps"] == ["Open the three linked threads",
+                               "Draft a 600-word answer with two numbers",
+                               "Post it from the founder account"]
 
 
 def test_on_site_actions_have_no_venue_and_are_kept(monkeypatch):
@@ -328,6 +334,7 @@ def test_migrated_actions_gain_the_fields_the_panel_reads():
 
     assert action["venue"] is None          # no venue was ever recorded — not invented
     assert action["deliverable"] == ""
+    assert action["steps"] == []            # the panel finds the key, never undefined
     assert action["status"] == "done"       # the team's own progress survives
     assert action["id"] == "a2"
 
