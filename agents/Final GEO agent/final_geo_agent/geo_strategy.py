@@ -409,16 +409,55 @@ def generate_strategy(brand: dict) -> dict:
     return doc
 
 
+def _as_waves(current: dict) -> dict:
+    """Bring a stored plan up to the wave shape the panel reads.
+
+    Plans written before waves stored ``pillars``, and a panel that indexed
+    ``waves`` on one of those took the whole console down with a client-side
+    exception rather than showing the plan it already had. Converting on read
+    keeps every plan a team has already worked through visible and its action
+    statuses editable.
+
+    One pillar becomes one wave. Its ``weeks`` label comes from the longest
+    ``timeframe_weeks`` its actions carried, because that is the only calendar
+    information those plans ever held -- inventing a fortnight would be worse
+    than a wide one.
+    """
+    if current.get("waves") or not current.get("pillars"):
+        return current
+    waves = []
+    for pillar in current.get("pillars") or []:
+        actions = [
+            {"venue": None, "deliverable": "", "why_evidence": "", **action}
+            for action in pillar.get("actions") or []
+        ]
+        span = max((int(a.get("timeframe_weeks") or 0) for a in actions), default=0)
+        waves.append({
+            "weeks": f"1-{span}" if span else "1-4",
+            "title": pillar.get("title", "Workstream"),
+            "objective": pillar.get("objective", ""),
+            "why_evidence": pillar.get("why_evidence", ""),
+            "actions": actions,
+            "span": span,
+        })
+    waves.sort(key=lambda w: w.pop("span") or 99)
+    return {**current, "waves": waves, "shape": "migrated-from-pillars"}
+
+
 def load_strategy(brand_id: str) -> dict | None:
-    return state.load(strategy_doc_id(brand_id))
+    doc = state.load(strategy_doc_id(brand_id))
+    if doc and doc.get("current"):
+        doc = {**doc, "current": _as_waves(doc["current"])}
+    return doc
 
 
 def set_action_status(brand_id: str, action_id: str, status: str) -> dict:
     if status not in ACTION_STATUSES:
         raise ValueError(f"status must be one of {ACTION_STATUSES}")
-    doc = load_strategy(brand_id)
+    doc = load_strategy(brand_id)      # normalises an old pillars-shaped plan
     if not doc or not doc.get("current"):
         raise KeyError("No strategy generated yet")
+    doc["current"].pop("pillars", None)   # the write below persists the wave shape
     for wave in doc["current"].get("waves") or []:
         for action in wave["actions"]:
             if action["id"] == action_id:

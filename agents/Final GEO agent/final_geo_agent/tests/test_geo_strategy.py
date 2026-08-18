@@ -271,3 +271,85 @@ def test_action_status_updates_and_validates(monkeypatch):
         geo_strategy.set_action_status(BRAND["id"], action_id, "banana")
     with pytest.raises(KeyError):
         geo_strategy.set_action_status(BRAND["id"], "nope1234", "done")
+
+
+# ---------------------------------------------- plans saved before waves existed
+# A stored plan with `pillars` and no `waves` made the console throw a
+# client-side exception on the Action Plan tab, which blanked the whole panel --
+# Insights and Answers included -- for a plan the team had already worked through.
+
+LEGACY_PLAN = {
+    "summary": "Older plan, pillar shaped.",
+    "pillars": [
+        {"title": "Long arc", "objective": "o1", "why_evidence": "e1", "actions": [
+            {"id": "a1", "title": "Editorial placements", "detail": "d",
+             "owner_role": "outreach", "effort": "high", "impact": "high",
+             "timeframe_weeks": 8, "kpi": "mention_rate", "target": "30%", "status": "todo"},
+        ]},
+        {"title": "Quick wins", "objective": "o2", "why_evidence": "e2", "actions": [
+            {"id": "a2", "title": "Complete G2 profile", "detail": "d",
+             "owner_role": "ops", "effort": "low", "impact": "medium",
+             "timeframe_weeks": 2, "kpi": "citation_rate", "target": "12%", "status": "done"},
+        ]},
+    ],
+    "monitoring": {"cadence": "weekly", "review_ritual": "r", "leading_indicators": []},
+    "expectations": "e", "baseline": {"n_answers": 40}, "generated_at": "2026-08-11T00:00:00+00:00",
+}
+
+
+def _store_legacy():
+    from seo_geo_agent import state
+    state.save(geo_strategy.strategy_doc_id(BRAND["id"]),
+               {"brand_id": BRAND["id"], "current": LEGACY_PLAN, "history": []})
+
+
+def test_a_legacy_pillar_plan_loads_as_waves():
+    _store_legacy()
+
+    current = geo_strategy.load_strategy(BRAND["id"])["current"]
+
+    assert [w["title"] for w in current["waves"]] == ["Quick wins", "Long arc"]
+    assert current["shape"] == "migrated-from-pillars"
+
+
+def test_migrated_weeks_come_from_the_only_calendar_data_those_plans_had():
+    _store_legacy()
+
+    waves = geo_strategy.load_strategy(BRAND["id"])["current"]["waves"]
+
+    # timeframe_weeks was all those plans stored; a made-up fortnight would be worse
+    assert [w["weeks"] for w in waves] == ["1-2", "1-8"]
+
+
+def test_migrated_actions_gain_the_fields_the_panel_reads():
+    _store_legacy()
+
+    action = geo_strategy.load_strategy(BRAND["id"])["current"]["waves"][0]["actions"][0]
+
+    assert action["venue"] is None          # no venue was ever recorded — not invented
+    assert action["deliverable"] == ""
+    assert action["status"] == "done"       # the team's own progress survives
+    assert action["id"] == "a2"
+
+
+def test_status_edits_work_on_a_migrated_plan_and_persist_the_new_shape():
+    _store_legacy()
+
+    updated = geo_strategy.set_action_status(BRAND["id"], "a1", "in_progress")
+
+    assert updated["current"]["waves"][1]["actions"][0]["status"] == "in_progress"
+    # the write settles the migration, so the next read has nothing left to convert
+    reread = geo_strategy.load_strategy(BRAND["id"])["current"]
+    assert "pillars" not in reread
+    assert reread["waves"][1]["actions"][0]["status"] == "in_progress"
+
+
+def test_a_wave_shaped_plan_is_left_untouched(monkeypatch):
+    seed_measured_data(monkeypatch)
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: FAKE_PLAN)
+    geo_strategy.generate_strategy(BRAND)
+
+    current = geo_strategy.load_strategy(BRAND["id"])["current"]
+
+    assert "shape" not in current           # nothing was migrated
+    assert current["waves"][0]["weeks"] == "1-2"
