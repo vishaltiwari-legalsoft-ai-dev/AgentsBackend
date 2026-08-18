@@ -17,7 +17,7 @@ import uuid
 from seo_geo_agent import state
 from seo_geo_agent.sources import CredentialMissing
 
-from final_geo_agent import geo_engines, geo_metrics, geo_poll, geo_prompts
+from final_geo_agent import geo_engines, geo_metrics, geo_poll, geo_prompts, geo_venues
 
 GEO_AGENT_ID = "a10"
 HISTORY_CAP = 3
@@ -47,36 +47,55 @@ markup as a citation lever, keyword stuffing, hidden prompt injection, fake or i
 reviews, Reddit astroturfing, buying backlinks for GEO.
 
 RULES for the plan you write:
-1. EVERY action must be justified by a specific number or fact from the DATA section — name it \
+1. EVERY action must be justified by a specific number or fact from the DATA section - name it \
 in why_evidence ("cited 123x where brand absent", "named on 9/38 AIO"). No generic SEO advice.
-2. Actions must be executable by a small marketing team: concrete deliverable, owner role, \
-effort (low/medium/high), expected impact (low/medium/high), timeframe in weeks.
-3. Each action names the ONE kpi (from the allowed metric keys) it is meant to move.
-4. Be honest about sequencing and expectations: quick retrieval-rail wins first, parametric \
-mention-building as the long arc. If the data shows a strength, say how to defend it.
-5. Write in plain business English a non-specialist team member can execute from. No jargon \
-without a one-line explanation.
-6. 3 to 5 pillars, 2 to 4 actions each, 12 actions maximum across the whole plan.
+2. NAME THE PLACE. Every off-site action must set "venue" to a name copied EXACTLY from the \
+VENUES list. You may not invent, guess or "recall" a subreddit, forum, publication or channel \
+that is not in that list - a plan whose first step is a dead link is worse than no plan, and \
+anything you invent is dropped before the user ever sees it. On-site work uses venue "" and \
+names the URL path in the deliverable instead.
+3. Each action states a DELIVERABLE: the artefact that exists once it is done ("a 600-word \
+answer post", "the completed G2 profile", "an outreach email to the editor of X"), never an \
+activity ("engage with the community"). If a marketer cannot start it on Monday morning from \
+what you wrote, rewrite it.
+4. Actions must be executable by a small marketing team: owner role, effort (low/medium/high), \
+expected impact (low/medium/high).
+5. Each action names the ONE kpi (from the allowed metric keys) it is meant to move.
+6. Group the actions into 3-4 WAVES by calendar time: weeks 1-2 first, then 3-4, then 5-8, then \
+9-12 if needed. Cheap retrieval-rail wins (technical fixes, answer-shaped content, review \
+profiles) belong in the earliest waves; parametric mention-building (communities, editorial \
+placement, video) follows. A wave is what one small team can finish in that fortnight - 2 to 4 \
+actions, never more.
+7. Respect each venue's culture. Reddit and forums reject promotion: the deliverable there is a \
+genuinely useful expert answer that happens to come from us, never a pitch. Say so in the action \
+itself.
+8. Write in plain business English a non-specialist can execute from. No jargon without a \
+one-line explanation.
+9. 12 actions maximum across the whole plan.
 
 Return STRICT JSON only, no markdown fences, exactly this shape:
 {
   "summary": "5-8 sentences: where the brand stands (use the numbers), the core thesis of \
 this plan, and what success looks like in 90 days",
-  "pillars": [
+  "waves": [
     {
-      "title": "...",
+      "weeks": "1-2",
+      "title": "short name for what this fortnight is about",
       "objective": "one sentence, outcome-phrased",
-      "why_evidence": "the specific measured facts this pillar rests on",
+      "why_evidence": "the specific measured facts this wave rests on",
       "actions": [
         {
           "title": "...",
-          "detail": "2-4 sentences: exactly what to produce/do and how, specific to THIS brand",
+          "venue": "EXACT name from the VENUES list, or empty string for our own site",
+          "deliverable": "the artefact that exists once this is done",
+          "detail": "2-4 sentences: exactly how to produce it, specific to THIS brand \
+and THIS venue, including whatever the venue's rules require",
           "owner_role": "content|outreach|founder|ops",
           "effort": "low|medium|high",
           "impact": "low|medium|high",
-          "timeframe_weeks": 4,
           "kpi": "one of the allowed metric keys",
-          "target": "measurable 90-day target for that kpi, phrased as a number"
+          "target": "measurable 90-day target for that kpi, phrased as a number",
+          "why_evidence": "the measured fact that makes this worth doing"
         }
       ]
     }
@@ -168,13 +187,54 @@ def collect_baseline(brand: dict) -> dict:
     }
 
 
-def _evidence_prompt(brand: dict, baseline: dict) -> str:
+def _venue_brief(discovery: dict) -> str:
+    """The venue list, formatted for the model that must copy names out of it.
+
+    Deliberately verbose about provenance: a venue the engines already cite on
+    our own questions is a different quality of target from one that merely
+    turned up in a search, and the strategist should sequence accordingly.
+    """
+    venues = discovery.get("venues") or []
+    if not venues:
+        return (
+            "\nVENUES: none discovered (live search unavailable). Do NOT name any "
+            "specific subreddit, forum, publication or channel — you have no verified "
+            "list to copy from. Restrict this plan to work on our own site and to "
+            "actions that name no external venue.\n"
+        )
+    lines = []
+    for venue in venues[:30]:
+        bits = [f"- {venue['name']} [{venue['kind']}] {venue['url']}"]
+        if venue.get("cited_where_absent"):
+            bits.append(
+                f"cited {venue['cited_where_absent']}x by engines on our questions "
+                "in answers where we were ABSENT"
+            )
+        if venue.get("brand_present") is False:
+            bits.append("brand has NO profile here")
+        for example in (venue.get("examples") or [])[:2]:
+            bits.append(f"e.g. \"{example.get('title', '')}\" {example.get('url', '')}")
+        lines.append(" | ".join(bits))
+    caveat = "" if discovery.get("complete") else (
+        "\n(This list is PARTIAL — some discovery searches failed. Work with what is "
+        "here; do not fill the gaps from memory.)"
+    )
+    return (
+        f"\nVENUES — real places found for \"{discovery.get('category', '')}\", by live "
+        "search and by our own citation data. The \"venue\" field of every off-site "
+        "action MUST be one of these names, copied exactly:\n"
+        + "\n".join(lines) + caveat + "\n"
+    )
+
+
+def _evidence_prompt(brand: dict, baseline: dict, discovery: dict) -> str:
     return (
         f"BRAND: {brand.get('name')} ({brand.get('domain')})\n"
         f"Category seeds: {', '.join(brand.get('seeds') or []) or 'unknown'}\n\n"
         "DATA — everything below is measured this week from real sampled AI answers "
         "(not estimates). Build the plan from THIS:\n"
         + json.dumps(baseline, indent=1)
+        + _venue_brief(discovery)
         + "\n\nNotes on reading the data:\n"
         "- source_gaps = third-party domains engines cited on our tracked questions in answers "
         "where the brand was ABSENT (count = how often). These are the highest-ROI placement targets.\n"
@@ -209,39 +269,95 @@ def _llm_strategy(system: str, prompt: str) -> dict:
         raise CredentialMissing(f"Strategy model unavailable: {exc}") from exc
 
 
-def _clean(raw: dict, baseline: dict) -> dict:
-    pillars = []
-    for pillar in list(raw.get("pillars") or [])[:5]:
+ACTION_CAP = 12
+WAVE_CAP = 4
+ACTIONS_PER_WAVE = 4
+
+
+def _wave_order(weeks: str) -> int:
+    """Sort key from a "1-2" / "5-8" label. A wave whose label we cannot read
+    goes last rather than silently jumping the queue."""
+    digits = re.match(r"\s*(\d+)", str(weeks or ""))
+    return int(digits.group(1)) if digits else 999
+
+
+def _clean_action(raw: dict, discovery: dict, dropped: list[dict]) -> dict | None:
+    """One action, or None if it should never reach the user.
+
+    The venue check is the point of this function. The strategist is handed a
+    discovered venue list and told to copy names from it; a name outside that
+    list means the model produced a place from memory, and a plan whose first
+    step is a subreddit that does not exist destroys trust in the whole panel.
+    Those actions are dropped and recorded, never quietly rewritten.
+    """
+    title = str(raw.get("title", "")).strip()
+    if not title:
+        return None
+    venue_name = str(raw.get("venue", "")).strip()
+    venue = geo_venues.venue_by_name(discovery, venue_name) if venue_name else None
+    if venue_name and venue is None:
+        dropped.append({"title": title, "venue": venue_name, "reason": "venue not in discovered list"})
+        return None
+    return {
+        "id": uuid.uuid4().hex[:8],
+        "title": title,
+        # the venue is stored resolved, so the panel links the real URL rather
+        # than whatever the model typed
+        "venue": {
+            "name": venue["name"], "url": venue["url"], "kind": venue["kind"],
+            "cited_where_absent": venue.get("cited_where_absent", 0),
+            "examples": (venue.get("examples") or [])[:2],
+        } if venue else None,
+        "deliverable": str(raw.get("deliverable", "")).strip(),
+        "detail": str(raw.get("detail", "")).strip(),
+        "owner_role": str(raw.get("owner_role", "ops")),
+        "effort": raw.get("effort") if raw.get("effort") in ("low", "medium", "high") else "medium",
+        "impact": raw.get("impact") if raw.get("impact") in ("low", "medium", "high") else "medium",
+        "kpi": str(raw.get("kpi", "mention_rate")),
+        "target": str(raw.get("target", "")),
+        "why_evidence": str(raw.get("why_evidence", "")).strip(),
+        "status": "todo",
+    }
+
+
+def _clean(raw: dict, baseline: dict, discovery: dict) -> dict:
+    """Model output → the plan we are willing to show, with what we refused.
+
+    ``dropped_actions`` is kept and surfaced rather than swallowed: a plan that
+    silently shrank is indistinguishable from a plan the model wrote short, and
+    only one of those is worth investigating.
+    """
+    dropped: list[dict] = []
+    waves = []
+    budget = ACTION_CAP
+    for wave in sorted(list(raw.get("waves") or [])[:WAVE_CAP],
+                       key=lambda w: _wave_order(w.get("weeks"))):
         actions = []
-        for action in list(pillar.get("actions") or [])[:4]:
-            title = str(action.get("title", "")).strip()
-            if not title:
-                continue
-            actions.append({
-                "id": uuid.uuid4().hex[:8],
-                "title": title,
-                "detail": str(action.get("detail", "")).strip(),
-                "owner_role": str(action.get("owner_role", "ops")),
-                "effort": action.get("effort") if action.get("effort") in ("low", "medium", "high") else "medium",
-                "impact": action.get("impact") if action.get("impact") in ("low", "medium", "high") else "medium",
-                "timeframe_weeks": int(action.get("timeframe_weeks") or 4),
-                "kpi": str(action.get("kpi", "mention_rate")),
-                "target": str(action.get("target", "")),
-                "status": "todo",
-            })
+        for item in list(wave.get("actions") or [])[:ACTIONS_PER_WAVE]:
+            if budget <= 0:
+                break
+            action = _clean_action(item, discovery, dropped)
+            if action:
+                actions.append(action)
+                budget -= 1
         if actions:
-            pillars.append({
-                "title": str(pillar.get("title", "")).strip() or "Workstream",
-                "objective": str(pillar.get("objective", "")).strip(),
-                "why_evidence": str(pillar.get("why_evidence", "")).strip(),
+            waves.append({
+                "weeks": str(wave.get("weeks", "")).strip() or "1-2",
+                "title": str(wave.get("title", "")).strip() or "Workstream",
+                "objective": str(wave.get("objective", "")).strip(),
+                "why_evidence": str(wave.get("why_evidence", "")).strip(),
                 "actions": actions,
             })
-    if not pillars:
-        raise ValueError("Strategy model returned no usable pillars — try again")
+    if not waves:
+        raise ValueError(
+            "Strategy model returned no usable actions"
+            + (f" — {len(dropped)} named venues we could not verify" if dropped else "")
+            + " — try again"
+        )
     monitoring = raw.get("monitoring") or {}
     return {
         "summary": str(raw.get("summary", "")).strip(),
-        "pillars": pillars,
+        "waves": waves,
         "monitoring": {
             "cadence": str(monitoring.get("cadence", "")).strip(),
             "review_ritual": str(monitoring.get("review_ritual", "")).strip(),
@@ -249,6 +365,14 @@ def _clean(raw: dict, baseline: dict) -> dict:
         },
         "expectations": str(raw.get("expectations", "")).strip(),
         "baseline": baseline,
+        "venues": {
+            "category": discovery.get("category", ""),
+            "counts": discovery.get("counts", {}),
+            "searched": discovery.get("searched", 0),
+            "complete": discovery.get("complete", False),
+            "errors": discovery.get("errors", []),
+        },
+        "dropped_actions": dropped,
         "generated_at": _now(),
     }
 
@@ -261,8 +385,17 @@ def generate_strategy(brand: dict) -> dict:
             "Not enough measured answers yet — run a full poll first so the plan "
             "rests on real data, not guesses"
         )
-    raw = _llm_strategy(STRATEGIST_SYSTEM, _evidence_prompt(brand, baseline))
-    strategy = _clean(raw, baseline)
+    prompts = geo_prompts.enabled_prompts(brand["id"])
+    answers = geo_poll.recent_answers(brand["id"], days=7)
+    cfg = geo_poll.ensure_config(brand)
+    report = geo_metrics.engine_report(
+        answers, list(geo_poll.alias_map(cfg).keys()), brand.get("domain", "")
+    )
+    # real places, from live search plus the domains our own polls show the
+    # engines citing — never from the model's memory
+    discovery = geo_venues.discover(brand, prompts, report)
+    raw = _llm_strategy(STRATEGIST_SYSTEM, _evidence_prompt(brand, baseline, discovery))
+    strategy = _clean(raw, baseline, discovery)
 
     doc = state.load(strategy_doc_id(brand["id"])) or {"brand_id": brand["id"], "history": []}
     if doc.get("current"):
@@ -286,8 +419,8 @@ def set_action_status(brand_id: str, action_id: str, status: str) -> dict:
     doc = load_strategy(brand_id)
     if not doc or not doc.get("current"):
         raise KeyError("No strategy generated yet")
-    for pillar in doc["current"]["pillars"]:
-        for action in pillar["actions"]:
+    for wave in doc["current"].get("waves") or []:
+        for action in wave["actions"]:
             if action["id"] == action_id:
                 action["status"] = status
                 action["status_at"] = _now()

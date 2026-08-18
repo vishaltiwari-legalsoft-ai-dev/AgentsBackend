@@ -37,6 +37,13 @@ PERPLEXITY_MODEL = "sonar"
 GEMINI_MODEL = "gemini-flash-latest"  # alias survives model turnover; pinned 2.5 404s for new keys
 OPENAI_MODEL = "gpt-4o-mini"
 
+# engine id -> the model its NATIVE api runs (what a "native" chip promises)
+NATIVE_ENGINE_MODELS: dict[str, str] = {
+    "perplexity": PERPLEXITY_MODEL,
+    "gemini": GEMINI_MODEL,
+    "chatgpt": OPENAI_MODEL,
+}
+
 # engine id -> runtime_config/settings field holding its key
 ENGINE_KEY_FIELDS: dict[str, str] = {
     "perplexity": "perplexity_api_key",
@@ -132,6 +139,49 @@ def available_engines() -> dict[str, bool]:
     engines = {engine: bool(engine_key(engine)) or fallback for engine in ENGINE_KEY_FIELDS}
     engines[AIO_ENGINE] = bool(serpapi_key())
     return engines
+
+
+# what each mode actually measures — shown verbatim in the UI so a chip can
+# never imply "we asked the real product" when we asked a proxy of it
+MODE_MEANING: dict[str, str] = {
+    "native": "the engine's own API — this is the real product",
+    "proxy": "a stand-in model routed through OpenRouter, NOT the consumer product",
+    "serpapi": "Google's live SERP via SerpAPI — the real consumer surface",
+    "off": "no key configured — nothing is measured",
+}
+
+
+def engine_status() -> dict[str, dict]:
+    """Per-engine truth for the UI: connected AND *how*.
+
+    ``available_engines`` collapses native and proxy into one boolean, which
+    let a green "Perplexity" chip stand for an OpenRouter-routed stand-in.
+    This returns the mode and the exact model, so the panel can say which
+    surface a number was actually measured on.
+    """
+    or_key = bool(openrouter_key())
+    status: dict[str, dict] = {}
+    for engine in ENGINE_KEY_FIELDS:
+        if engine_key(engine):
+            mode, model = "native", NATIVE_ENGINE_MODELS[engine]
+        elif or_key:
+            mode, model = "proxy", OPENROUTER_ENGINE_MODELS[engine]
+        else:
+            mode, model = "off", ""
+        status[engine] = {
+            "connected": mode != "off",
+            "mode": mode,
+            "model": model,
+            "means": MODE_MEANING[mode],
+        }
+    aio_on = bool(serpapi_key())
+    status[AIO_ENGINE] = {
+        "connected": aio_on,
+        "mode": "serpapi" if aio_on else "off",
+        "model": "google_ai_overview" if aio_on else "",
+        "means": MODE_MEANING["serpapi" if aio_on else "off"],
+    }
+    return status
 
 
 def _citation(url: str, title: str = "") -> dict:

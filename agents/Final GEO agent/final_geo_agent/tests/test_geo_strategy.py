@@ -1,33 +1,81 @@
-"""Action Plan strategy — offline, LLM faked at the module seam."""
+"""Action Plan strategy — offline, LLM and venue search faked at their seams.
+
+The plan the panel shows is model output, so the tests that matter here are the
+ones that pin what we refuse to show: an action naming a venue nobody verified,
+and a plan whose venues came from the model's memory rather than a real search.
+"""
 import pytest
 
-from final_geo_agent import geo_engines, geo_poll, geo_prompts, geo_strategy
+from final_geo_agent import geo_engines, geo_poll, geo_prompts, geo_strategy, geo_venues
 from final_geo_agent.geo_engines import EngineAnswer
 
 BRAND = {"id": "legalsoft", "name": "Legal Soft", "domain": "legalsoft.com",
          "seeds": ["legal virtual assistant"], "enabled": True}
 
+# Venues the discovery step "found". Only these names may appear in a plan.
+FAKE_VENUES = {
+    "category": "legal virtual assistant",
+    "venues": [
+        {"kind": "community", "name": "r/LawFirm", "url": "https://reddit.com/r/LawFirm",
+         "cited_where_absent": 14, "found_via": ["live-search"],
+         "examples": [{"title": "Best intake service?", "url": "https://reddit.com/r/LawFirm/1"}]},
+        {"kind": "listicle", "name": "clio.com", "url": "https://clio.com",
+         "cited_where_absent": 9, "found_via": ["engine-citations"], "examples": []},
+        {"kind": "review", "name": "g2.com", "url": "https://g2.com",
+         "cited_where_absent": 0, "found_via": ["known-platform"],
+         "examples": [], "brand_present": False},
+    ],
+    "counts": {"community": 1, "listicle": 1, "review": 1},
+    "searched": 6, "errors": [], "complete": True,
+}
+
+
+def _action(title, venue, **over):
+    base = {
+        "title": title, "venue": venue,
+        "deliverable": "a 600-word expert answer post",
+        "detail": "Answer the intake question directly, no pitch.",
+        "owner_role": "content", "effort": "medium", "impact": "high",
+        "kpi": "mention_rate", "target": "30%",
+        "why_evidence": "cited 14x where the brand was absent",
+    }
+    base.update(over)
+    return base
+
+
 FAKE_PLAN = {
     "summary": "Strong citation base, weak naming on category questions.",
-    "pillars": [
+    "waves": [
         {
-            "title": "Win the category questions",
-            "objective": "Get named where rivals are named today",
-            "why_evidence": "brand absent on category prompts while cited 36x as a source",
+            "weeks": "3-4", "title": "Community presence",
+            "objective": "Be named where buyers already ask",
+            "why_evidence": "r/LawFirm cited 14x in answers that skipped us",
             "actions": [
-                {"title": "Pitch listicle inclusion on top gap domain",
-                 "detail": "Outreach to the roundup pages engines already cite.",
-                 "owner_role": "outreach", "effort": "medium", "impact": "high",
-                 "timeframe_weeks": 6, "kpi": "mention_rate", "target": "30%"},
-                {"title": "", "detail": "junk row dropped"},
+                _action("Answer the three open intake threads", "r/LawFirm"),
+                _action("", "r/LawFirm"),                       # junk row, dropped
             ],
         },
-        {"title": "Empty pillar dropped", "objective": "", "why_evidence": "", "actions": []},
+        {
+            "weeks": "1-2", "title": "Quick wins",
+            "objective": "Close the profile gaps engines read",
+            "why_evidence": "no G2 profile while g2.com is cited on our prompts",
+            "actions": [
+                _action("Complete the G2 profile", "g2.com", owner_role="ops", effort="low"),
+                _action("Add answer blocks to /intake-services", ""),   # on-site: no venue
+            ],
+        },
+        {"weeks": "5-8", "title": "Empty wave dropped", "actions": []},
     ],
     "monitoring": {"cadence": "weekly poll", "review_ritual": "open Insights, read 3 numbers",
                    "leading_indicators": ["gap domain replies", "AIO citations up"]},
     "expectations": "4-12 weeks for retrieval, quarters for memory.",
 }
+
+
+@pytest.fixture(autouse=True)
+def _fake_discovery(monkeypatch):
+    """Venue discovery is proven in test_geo_venues; here it is a fixed input."""
+    monkeypatch.setattr(geo_venues, "discover", lambda *a, **k: FAKE_VENUES)
 
 
 def seed_measured_data(monkeypatch, n_prompts=7):
@@ -65,16 +113,140 @@ def test_generate_persists_plan_with_baseline_and_ids(monkeypatch):
 
     current = doc["current"]
     assert current["summary"].startswith("Strong citation")
-    assert len(current["pillars"]) == 1                # empty pillar + junk action dropped
-    action = current["pillars"][0]["actions"][0]
+    assert len(current["waves"]) == 2                  # the empty wave is dropped
+    action = current["waves"][0]["actions"][0]
     assert action["id"] and action["status"] == "todo"
     assert current["baseline"]["n_answers"] == 21      # 7 prompts x 3 runs
     assert current["baseline"]["mention_rate"] == 1.0
-    # the strategist saw the measured numbers, not vibes
+    # the strategist saw the measured numbers and the real venue list, not vibes
     assert "source_gaps" in captured["prompt"] and "missing_questions" in captured["prompt"]
+    assert "r/LawFirm" in captured["prompt"] and "VENUES" in captured["prompt"]
     assert "FORBIDDEN" in captured["system"]           # debunked-tactics guardrail in the brief
     assert geo_strategy.load_strategy(BRAND["id"])["current"]["summary"] == current["summary"]
 
+
+def test_waves_are_ordered_by_calendar_not_by_model_output_order(monkeypatch):
+    seed_measured_data(monkeypatch)
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: FAKE_PLAN)
+
+    waves = geo_strategy.generate_strategy(BRAND)["current"]["waves"]
+
+    # the model listed 3-4 before 1-2; a team reads the plan top to bottom
+    assert [w["weeks"] for w in waves] == ["1-2", "3-4"]
+
+
+def test_actions_carry_the_resolved_venue_with_its_real_url(monkeypatch):
+    seed_measured_data(monkeypatch)
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: FAKE_PLAN)
+
+    waves = geo_strategy.generate_strategy(BRAND)["current"]["waves"]
+    reddit = next(a for w in waves for a in w["actions"] if a["title"].startswith("Answer the three"))
+
+    # resolved from the discovered list, not from whatever the model typed
+    assert reddit["venue"]["url"] == "https://reddit.com/r/LawFirm"
+    assert reddit["venue"]["kind"] == "community"
+    assert reddit["venue"]["cited_where_absent"] == 14
+    assert reddit["deliverable"] == "a 600-word expert answer post"
+
+
+def test_on_site_actions_have_no_venue_and_are_kept(monkeypatch):
+    seed_measured_data(monkeypatch)
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: FAKE_PLAN)
+
+    waves = geo_strategy.generate_strategy(BRAND)["current"]["waves"]
+    on_site = next(a for w in waves for a in w["actions"] if "intake-services" in a["title"])
+
+    assert on_site["venue"] is None
+
+
+# ------------------------------------------------- the anti-hallucination guard
+
+def test_an_action_naming_an_unverified_venue_is_dropped_and_recorded(monkeypatch):
+    seed_measured_data(monkeypatch)
+    plan = {
+        **FAKE_PLAN,
+        "waves": [{
+            "weeks": "1-2", "title": "Community", "objective": "", "why_evidence": "",
+            "actions": [
+                _action("Post in the paralegal community", "r/ParalegalLife"),  # invented
+                _action("Complete the G2 profile", "g2.com"),                   # verified
+            ],
+        }],
+    }
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: plan)
+
+    current = geo_strategy.generate_strategy(BRAND)["current"]
+
+    titles = [a["title"] for w in current["waves"] for a in w["actions"]]
+    assert titles == ["Complete the G2 profile"]
+    # dropped, not silently rewritten to something plausible
+    assert current["dropped_actions"][0]["venue"] == "r/ParalegalLife"
+    assert "not in discovered list" in current["dropped_actions"][0]["reason"]
+
+
+def test_a_plan_of_nothing_but_invented_venues_fails_loudly(monkeypatch):
+    seed_measured_data(monkeypatch)
+    plan = {
+        **FAKE_PLAN,
+        "waves": [{"weeks": "1-2", "title": "x", "actions": [
+            _action("Post here", "r/DoesNotExist"), _action("And here", "madeupforum.com"),
+        ]}],
+    }
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: plan)
+
+    # a fabricated plan must not degrade into a half-empty real one
+    with pytest.raises(ValueError, match="could not verify"):
+        geo_strategy.generate_strategy(BRAND)
+
+
+def test_venue_names_match_case_insensitively(monkeypatch):
+    # the model reproducing "r/lawfirm" is reproducing our own list, not inventing
+    seed_measured_data(monkeypatch)
+    plan = {**FAKE_PLAN, "waves": [{"weeks": "1-2", "title": "x", "actions": [
+        _action("Answer threads", "r/lawfirm"),
+    ]}]}
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: plan)
+
+    current = geo_strategy.generate_strategy(BRAND)["current"]
+
+    assert current["waves"][0]["actions"][0]["venue"]["name"] == "r/LawFirm"
+    assert current["dropped_actions"] == []
+
+
+def test_plan_records_whether_venue_discovery_was_complete(monkeypatch):
+    seed_measured_data(monkeypatch)
+    monkeypatch.setattr(geo_venues, "discover", lambda *a, **k: {
+        **FAKE_VENUES, "complete": False, "errors": ["community: search unavailable"],
+    })
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: FAKE_PLAN)
+
+    current = geo_strategy.generate_strategy(BRAND)["current"]
+
+    # the panel has to be able to say the venue list was partial
+    assert current["venues"]["complete"] is False
+    assert current["venues"]["errors"]
+
+
+def test_with_no_venues_the_brief_forbids_naming_any(monkeypatch):
+    seed_measured_data(monkeypatch)
+    empty = {"category": "x", "venues": [], "counts": {}, "searched": 0,
+             "errors": ["all searches failed"], "complete": False}
+    monkeypatch.setattr(geo_venues, "discover", lambda *a, **k: empty)
+    captured = {}
+
+    def fake_llm(system, prompt):
+        captured["prompt"] = prompt
+        return {**FAKE_PLAN, "waves": [{"weeks": "1-2", "title": "x", "actions": [
+            _action("Add answer blocks to /intake-services", ""),
+        ]}]}
+
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", fake_llm)
+    geo_strategy.generate_strategy(BRAND)
+
+    assert "Do NOT name any" in captured["prompt"]
+
+
+# ------------------------------------------------------------------ lifecycle
 
 def test_regenerate_archives_previous_to_history(monkeypatch):
     seed_measured_data(monkeypatch)
@@ -89,10 +261,10 @@ def test_action_status_updates_and_validates(monkeypatch):
     seed_measured_data(monkeypatch)
     monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: FAKE_PLAN)
     doc = geo_strategy.generate_strategy(BRAND)
-    action_id = doc["current"]["pillars"][0]["actions"][0]["id"]
+    action_id = doc["current"]["waves"][0]["actions"][0]["id"]
 
     updated = geo_strategy.set_action_status(BRAND["id"], action_id, "done")
-    saved_action = updated["current"]["pillars"][0]["actions"][0]
+    saved_action = updated["current"]["waves"][0]["actions"][0]
     assert saved_action["status"] == "done" and saved_action["status_at"]
 
     with pytest.raises(ValueError):

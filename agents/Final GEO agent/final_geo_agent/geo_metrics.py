@@ -179,6 +179,20 @@ def prompt_rollup(answers: list[dict]) -> list[dict]:
     return out
 
 
+def via_mix(answers: list[dict]) -> dict[str, int]:
+    """How many of these answers came off which measurement surface.
+
+    Every rate in the report is only as trustworthy as the surface it was
+    measured on: "native" is the engine's own API, "openrouter" is a stand-in
+    model, "serpapi" is Google's live SERP. Counted, never assumed — so the
+    panel can label a number instead of implying it came from the real product.
+    """
+    counts: dict[str, int] = defaultdict(int)
+    for a in _ok(answers):
+        counts[a.get("via") or "unknown"] += 1
+    return dict(counts)
+
+
 def engine_report(answers: list[dict], entities: list[str], own_domain: str) -> dict:
     """Full per-engine + blended report over one set of answer records."""
     by_engine: dict[str, list[dict]] = defaultdict(list)
@@ -194,6 +208,7 @@ def engine_report(answers: list[dict], entities: list[str], own_domain: str) -> 
             "source_mix": source_mix(subset),
             "n_answers": len(subset),
             "n_errors": len(errors),
+            "via_mix": via_mix(subset),
         }
 
     return {

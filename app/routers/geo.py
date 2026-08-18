@@ -79,6 +79,9 @@ class PollIn(BaseModel):
 def geo_config(user: dict = Depends(get_current_user)) -> dict:
     return {
         "engines": geo_engines.available_engines(),
+        # per-engine mode + model: a chip must never read "Perplexity" when the
+        # answer actually came from an OpenRouter stand-in
+        "engine_status": geo_engines.engine_status(),
         "default_runs": geo_poll.DEFAULT_RUNS,
         "default_daily_cap": geo_poll.DEFAULT_DAILY_CAP,
     }
@@ -330,3 +333,4 @@ def strategy_action_status(
     _track(user, "strategy_action", f"Action {action_id} → {body.status}", brand,
            usage_action="edit")
     return doc
+

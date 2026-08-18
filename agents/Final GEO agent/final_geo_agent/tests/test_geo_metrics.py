@@ -113,3 +113,55 @@ def test_no_aio_rows_stay_out_of_rate_denominators():
     stats = geo_metrics.mention_stats(answers)
     assert stats["rate"] == 1.0
     assert stats["n_answers"] == 1
+
+
+# ---------------------------------------------------------------- provenance
+# Each rate must carry the surface it was measured on, so the panel can label
+# "23% named" as native-measured or proxy-measured instead of implying the former.
+
+
+def _answer(engine: str, via: str, **extra) -> dict:
+    return {"engine": engine, "via": via, "prompt_id": extra.pop("pid", "p1"),
+            "run": 1, "mentions": {}, "citations": [], **extra}
+
+
+def test_via_mix_counts_each_measurement_surface():
+    answers = [
+        _answer("perplexity", "openrouter"),
+        _answer("perplexity", "openrouter", pid="p2"),
+        _answer("gemini", "native"),
+    ]
+
+    assert geo_metrics.via_mix(answers) == {"openrouter": 2, "native": 1}
+
+
+def test_via_mix_excludes_errored_and_missing_answers():
+    answers = [
+        _answer("gemini", "native"),
+        _answer("gemini", "native", error="HTTP 429", pid="p2"),
+        _answer("aio", "serpapi", no_aio=True, pid="p3"),
+    ]
+
+    # an errored run and a "no AI Overview shown" observation are already out of
+    # every rate denominator — provenance must use the same denominator
+    assert geo_metrics.via_mix(answers) == {"native": 1}
+
+
+def test_via_mix_labels_legacy_answers_unknown():
+    # answers polled before `via` was stored must read as unknown, never native
+    assert geo_metrics.via_mix([{"engine": "chatgpt", "prompt_id": "p1", "run": 1}]) == {
+        "unknown": 1
+    }
+
+
+def test_engine_report_blocks_carry_via_mix():
+    answers = [
+        _answer("perplexity", "openrouter", mentions={"self": 1}),
+        _answer("gemini", "native", pid="p2"),
+    ]
+
+    report = geo_metrics.engine_report(answers, ["self"], "example.com")
+
+    assert report["engines"]["perplexity"]["via_mix"] == {"openrouter": 1}
+    assert report["engines"]["gemini"]["via_mix"] == {"native": 1}
+    assert report["blended"]["via_mix"] == {"openrouter": 1, "native": 1}

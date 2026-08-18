@@ -235,3 +235,62 @@ def test_available_engines_includes_aio_with_serpapi_key(monkeypatch):
     engines = geo_engines.available_engines()
     assert engines["aio"] is True
     assert engines["perplexity"] is False
+
+
+# ---------------------------------------------------------------- provenance
+# A green chip that says "Perplexity" while an OpenRouter stand-in answered is
+# the single fastest way to lose a user's trust in every number on the panel.
+# available_engines() collapses that distinction; engine_status() must keep it.
+
+
+def test_engine_status_marks_openrouter_fallback_as_proxy(monkeypatch):
+    monkeypatch.setattr(geo_engines, "engine_key", lambda e: "")
+    monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "or-key")
+    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "")
+
+    status = geo_engines.engine_status()
+
+    assert status["perplexity"]["mode"] == "proxy"
+    assert status["perplexity"]["model"] == "perplexity/sonar"
+    assert "NOT the consumer product" in status["perplexity"]["means"]
+    # still usable — proxy is connected, it just isn't the real product
+    assert status["perplexity"]["connected"] is True
+    # and the old boolean would have said nothing but "true"
+    assert geo_engines.available_engines()["perplexity"] is True
+
+
+def test_engine_status_marks_native_key_as_native(monkeypatch):
+    monkeypatch.setattr(geo_engines, "engine_key", lambda e: "native-key")
+    monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "or-key")
+    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "")
+
+    status = geo_engines.engine_status()
+
+    assert status["gemini"]["mode"] == "native"
+    assert status["gemini"]["model"] == geo_engines.GEMINI_MODEL
+
+
+def test_engine_status_reports_off_when_no_key_at_all(monkeypatch):
+    monkeypatch.setattr(geo_engines, "engine_key", lambda e: "")
+    monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "")
+    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "")
+
+    status = geo_engines.engine_status()
+
+    assert status["chatgpt"] == {
+        "connected": False, "mode": "off", "model": "",
+        "means": geo_engines.MODE_MEANING["off"],
+    }
+    # AIO has no chat fallback — no SerpAPI key means genuinely nothing measured
+    assert status[geo_engines.AIO_ENGINE]["mode"] == "off"
+
+
+def test_engine_status_aio_rides_serpapi_only(monkeypatch):
+    monkeypatch.setattr(geo_engines, "engine_key", lambda e: "")
+    monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "or-key")
+    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "serp-key")
+
+    status = geo_engines.engine_status()
+
+    assert status[geo_engines.AIO_ENGINE]["mode"] == "serpapi"
+    assert status[geo_engines.AIO_ENGINE]["connected"] is True
