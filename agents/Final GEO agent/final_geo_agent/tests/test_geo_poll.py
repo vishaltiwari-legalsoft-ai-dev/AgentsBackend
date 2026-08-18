@@ -595,3 +595,43 @@ def test_poll_status_reports_progress_and_next_due(fake_engine):
     assert status["due_now"] is True          # sweep unfinished, never completed
     assert status["interval_days"] == geo_poll.DEFAULT_POLL_INTERVAL_DAYS
     assert status["next_due_at"] is None
+
+
+# ------------------------------------------------------- engine last seen
+# AIO runs once per prompt where chat engines run three times, so it ages out
+# of the report window first. Vanishing silently reads as "this engine is
+# broken"; the stamp lets the panel say when it was last measured instead.
+
+
+def test_a_successful_poll_stamps_when_each_engine_was_last_measured(fake_engine):
+    seed_prompts(2)
+
+    geo_poll.poll_step(BRAND, runs=1, batch_size=10)
+
+    seen = geo_poll.ensure_config(BRAND).get("engine_last_seen") or {}
+    assert "perplexity" in seen and seen["perplexity"]
+
+
+def test_an_engine_that_only_errored_is_not_stamped_as_measured(monkeypatch):
+    seed_prompts(2)
+    monkeypatch.setattr(geo_engines, "available_engines",
+                        lambda: {"perplexity": True, "gemini": False, "chatgpt": False})
+    monkeypatch.setattr(geo_engines, "poll_engine",
+                        lambda e, p: EngineAnswer(engine=e, model="fake", error="HTTP 401"))
+
+    geo_poll.poll_step(BRAND, runs=1, batch_size=4)
+
+    assert not (geo_poll.ensure_config(BRAND).get("engine_last_seen") or {})
+
+
+def test_no_aio_counts_as_measured_because_the_slot_was_genuinely_checked(monkeypatch):
+    seed_prompts(2)
+    monkeypatch.setattr(geo_engines, "available_engines",
+                        lambda: {"perplexity": False, "gemini": False, "chatgpt": False, "aio": True})
+    monkeypatch.setattr(geo_engines, "poll_engine",
+                        lambda e, p: EngineAnswer(engine=e, model="fake", no_aio=True))
+
+    geo_poll.poll_step(BRAND, runs=1, batch_size=4)
+
+    # Google showing no overview is an observation, not a failure to observe
+    assert "aio" in (geo_poll.ensure_config(BRAND).get("engine_last_seen") or {})

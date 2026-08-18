@@ -242,6 +242,9 @@ def report(
     result |= {
         "brand_id": brand_id,
         "days": days,
+        # so an engine whose last measurement fell outside the window can say
+        # when it was measured instead of disappearing from the panel
+        "engine_last_seen": cfg.get("engine_last_seen") or {},
         "competitor_names": {
             (c.get("key") or c.get("name", "")): c.get("name", "")
             for c in cfg.get("competitors") or []

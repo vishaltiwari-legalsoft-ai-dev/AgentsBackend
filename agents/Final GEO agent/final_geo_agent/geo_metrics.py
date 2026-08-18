@@ -201,13 +201,21 @@ def engine_report(answers: list[dict], entities: list[str], own_domain: str) -> 
 
     def block(subset: list[dict]) -> dict:
         errors = [a for a in subset if a.get("error")]
+        no_aio = [a for a in subset if a.get("no_aio")]
         return {
             "mention": mention_stats(subset),
             "sov": share_of_voice(subset, entities),
             "citation": citation_share(subset, own_domain),
             "source_mix": source_mix(subset),
             "n_answers": len(subset),
+            # rows a brand could actually have been named in. Every rate above
+            # uses THIS denominator, so a panel that prints n_answers beside a
+            # rate is describing two different populations -- which reads as
+            # "absent from 40 answers" when the truth is "Google published no
+            # AI Overview on 38 of those queries".
+            "n_measured": len(_ok(subset)),
             "n_errors": len(errors),
+            "n_no_aio": len(no_aio),
             "via_mix": via_mix(subset),
         }
 

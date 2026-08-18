@@ -294,6 +294,7 @@ def _settle_calls(
     spent: int,
     aio_credits: int,
     engine_failed: dict[str, bool],
+    engine_stored: dict[str, int] | None = None,
 ) -> dict:
     """Hand back the unspent reservation, bank AIO credits, update fail streaks.
 
@@ -316,6 +317,17 @@ def _settle_calls(
         for engine, failed in engine_failed.items():
             streaks[engine] = streaks.get(engine, 0) + 1 if failed else 0
         cfg["poll_health"] = {"day": day, "streaks": streaks}
+        # When an engine last produced a usable answer. The report window is
+        # short and AIO runs once per prompt where chat engines run three
+        # times, so AIO ages out first and used to vanish from the panel
+        # entirely -- which reads as "this engine is broken" rather than "this
+        # engine was last measured on the 11th".
+        seen = dict(cfg.get("engine_last_seen") or {})
+        for engine, stored in (engine_stored or {}).items():
+            if stored:
+                seen[engine] = _now()
+        if seen:
+            cfg["engine_last_seen"] = seen
         cfg = _trim_counters(cfg)
         return cfg, {
             "used": counters[day],
@@ -721,6 +733,9 @@ def poll_step(
         settled = _settle_calls(
             brand["id"], day, granted, spent, aio_credits,
             {e: len(failures.get(e, [])) == n for e, n in attempts.items()},
+            # "no AI Overview shown" is a successful observation, so it counts
+            # as the engine having been measured
+            {e: sum(1 for r in recs if not r.get("error")) for e, recs in records.items()},
         )
 
     terminal, terminal_reason = _terminal_signal(

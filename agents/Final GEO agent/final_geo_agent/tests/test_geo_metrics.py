@@ -165,3 +165,37 @@ def test_engine_report_blocks_carry_via_mix():
     assert report["engines"]["perplexity"]["via_mix"] == {"openrouter": 1}
     assert report["engines"]["gemini"]["via_mix"] == {"native": 1}
     assert report["blended"]["via_mix"] == {"openrouter": 1, "native": 1}
+
+
+# ------------------------------------------------- honest denominators
+# A rate and the count printed beside it must describe the same population.
+# "0% named in 40 answers" read as "absent from 40 AI Overviews" when Google
+# had published no AI Overview on 38 of those queries at all.
+
+
+def test_block_separates_answers_seen_from_answers_a_brand_could_appear_in():
+    answers = [
+        _answer("aio", "serpapi", mentions={"self": 1}),
+        _answer("aio", "serpapi", no_aio=True, pid="p2"),
+        _answer("aio", "serpapi", no_aio=True, pid="p3"),
+        _answer("aio", "serpapi", error="HTTP 429", pid="p4"),
+    ]
+
+    block = geo_metrics.engine_report(answers, ["self"], "example.com")["engines"]["aio"]
+
+    assert block["n_answers"] == 4      # rows we stored
+    assert block["n_measured"] == 1     # rows a mention could have appeared in
+    assert block["n_no_aio"] == 2       # Google published no overview here
+    assert block["n_errors"] == 1
+    # the rate is over n_measured, so a panel printing n_answers beside it lies
+    assert block["mention"]["rate"] == 1.0
+
+
+def test_an_engine_that_only_ever_showed_empty_slots_reports_no_rate():
+    answers = [_answer("aio", "serpapi", no_aio=True, pid=f"p{i}") for i in range(3)]
+
+    block = geo_metrics.engine_report(answers, ["self"], "example.com")["engines"]["aio"]
+
+    # None, not 0.0 — nobody was named because there was nothing to be named in
+    assert block["mention"]["rate"] is None
+    assert (block["n_answers"], block["n_measured"], block["n_no_aio"]) == (3, 0, 3)
