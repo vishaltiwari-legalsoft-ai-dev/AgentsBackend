@@ -425,6 +425,38 @@ def test_a_reconciling_rollup_is_accepted_as_the_headline(monkeypatch, tmp_path)
     assert mr_runs.get_run(ids["official"]) is None       # superseded, as designed
 
 
+def test_a_failed_cloud_write_keeps_the_superseded_runs(monkeypatch, tmp_path):
+    """The swap's success condition is DURABILITY, not "save_run returned".
+
+    Cloud Run's disk is ephemeral, so a replacement whose Firestore write failed
+    (oversized doc, quota, contention) lives only on this instance's /tmp. The
+    ordering fix put the writes before the deletes; this pins the other half —
+    a delete that goes ahead anyway still destroys the only durable copy."""
+    from app.routers import marketing_research as mrr
+    from marketing_research_agent import runs as mr_runs
+
+    ids = _seed_previous_pull()  # written while offline: disk is the durable store
+    monkeypatch.setenv("MR_SOURCES_FILE", str(tmp_path / "sources.json"))
+    monkeypatch.setattr(mrr, "fetch_all_trackers", lambda sid, year: _one_tracker_tab())
+    monkeypatch.setattr(mrr, "fetch_official_totals",
+                        lambda sid, year, **kw: {"2026-06": {"spend": 4200.0}})
+    monkeypatch.setattr(mrr.mr_workbook, "fetch_workbook", lambda sid, **kw: [])
+
+    # Cloud-configured, but every per-document write fails.
+    def _dead_collection():
+        raise RuntimeError("400 the document exceeds the maximum allowed size")
+
+    monkeypatch.setattr(mr_runs, "_use_cloud", lambda: True)
+    monkeypatch.setattr(mr_runs, "_collection", _dead_collection)
+
+    r = client.post("/api/mr/ingest-sheet", json={})
+    assert r.status_code == 207, r.text
+    degraded = r.json()["degraded"]
+    assert any("could not be stored durably" in d for d in degraded), degraded
+    assert mr_runs.get_run(ids["dataset"]) is not None, "durable dataset traded for a /tmp copy"
+    assert mr_runs.get_run(ids["official"]) is not None, "durable roll-up traded for a /tmp copy"
+
+
 def test_a_repeated_month_column_reaches_the_response(monkeypatch, tmp_path):
     """A tab restructured into two month bands is the early warning. The parser
     works around it (leftmost grid wins); the pull must still say so out loud."""

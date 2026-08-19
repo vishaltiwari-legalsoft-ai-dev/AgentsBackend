@@ -344,8 +344,8 @@ def ingest_sheet(
         except Exception as exc:  # auth/network/format — honest 502, nothing written
             logger.warning("MR single-tab pull failed for gid %s: %s", body["gid"], exc)
             raise HTTPException(502, f"Could not pull tab {body['gid']}: {exc}") from exc
-        result = {"tabs": [_persist_sheet_dataset(user["id"], str(body["gid"]), metrics, gaps)],
-                  "status": "ok", "ingested": 1, "failed": 0, "degraded": []}
+        row, _durable = _persist_sheet_dataset(user["id"], str(body["gid"]), metrics, gaps)
+        result = {"tabs": [row], "status": "ok", "ingested": 1, "failed": 0, "degraded": []}
     else:
         try:
             result = _ingest_sheet_all(user["id"], year)
@@ -363,7 +363,10 @@ def ingest_sheet(
     return {"spreadsheet_id": mr_config.SHEETS_SPREADSHEET_ID, "year": year, **result}
 
 
-def _persist_sheet_dataset(user_id: str, label: str, metrics, gaps) -> dict:
+def _persist_sheet_dataset(user_id: str, label: str, metrics, gaps) -> tuple[dict, bool]:
+    """Write one tab's dataset run. Returns ``(row, durable)`` — see
+    ``runs.save_run``: ``durable`` is False when only the ephemeral disk copy
+    was written, which is what gates the swap's delete pass."""
     run = {
         "id": runs.new_run_id(),
         "kind": "dataset",
@@ -375,8 +378,9 @@ def _persist_sheet_dataset(user_id: str, label: str, metrics, gaps) -> dict:
         "leads": [],
         "gaps": [g.__dict__ for g in gaps],
     }
-    runs.save_run(run)
-    return {"tab": label, "dataset_id": run["id"], "metrics": len(metrics), "gaps": run["gaps"]}
+    durable = runs.save_run(run)
+    return ({"tab": label, "dataset_id": run["id"], "metrics": len(metrics),
+             "gaps": run["gaps"]}, durable)
 
 
 def _ingest_sheet_all(user_id: str, year: int) -> dict:
@@ -472,18 +476,26 @@ def _pull_and_swap(user_id: str, year: int) -> dict:
         # what we have and say so rather than blanking on a maybe.
         degraded.append("no tracker tabs matched — kept the previous datasets")
     swap_kinds = {"official_spend"} if official is not None else set()
-    superseded = [
-        r["id"] for r in runs.list_runs(user_id)
-        if (swap_datasets and r.get("kind") == "dataset"
-            and str(r.get("platform", "")).startswith("sheets:"))
-        or r.get("kind") in swap_kinds
+    # Split per component: each half is retired only once ITS replacement is
+    # durably stored, so a per-document write failure can never take the
+    # originals with it.
+    previous = runs.list_runs(user_id)
+    superseded_datasets = [
+        r["id"] for r in previous
+        if swap_datasets and r.get("kind") == "dataset"
+        and str(r.get("platform", "")).startswith("sheets:")
     ]
+    superseded_official = [r["id"] for r in previous if r.get("kind") in swap_kinds]
 
-    results: list[dict] = [
-        _persist_sheet_dataset(user_id, f["tab"], f["metrics"], f["gaps"]) for f in fetched
-    ]
+    results: list[dict] = []
+    datasets_durable = True
+    for f in fetched:
+        row, durable = _persist_sheet_dataset(user_id, f["tab"], f["metrics"], f["gaps"])
+        results.append(row)
+        datasets_durable = datasets_durable and durable
+    official_durable = True  # an empty roll-up writes nothing, so nothing can fail
     if official:
-        runs.save_run({
+        official_durable = runs.save_run({
             "id": runs.new_run_id(), "kind": "official_spend", "user_id": user_id,
             "agent_id": MR_AGENT_ID, "platform": "sheets-official",
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -495,7 +507,19 @@ def _pull_and_swap(user_id: str, year: int) -> dict:
     elif official is None:
         results.append({"tab": "Official totals (Overall Report)",
                         "error": "Sheets read failed — previous figures kept"})
-    for run_id in superseded:
+
+    # A replacement that only reached this instance's ephemeral disk is not a
+    # replacement: the next deploy loses it, and deleting the superseded run
+    # would have destroyed the durable copy. Keep the originals and say why.
+    if not datasets_durable:
+        superseded_datasets = []
+        degraded.append("tracker datasets could not be stored durably — "
+                        "kept the previous datasets")
+    if not official_durable:
+        superseded_official = []
+        degraded.append("official totals could not be stored durably — "
+                        "kept the previous figures")
+    for run_id in superseded_datasets + superseded_official:
         runs.delete_run(run_id)
 
     # ---- phase 3: lead analysis. Runs AFTER the tracker swap so the
@@ -512,8 +536,11 @@ def _pull_and_swap(user_id: str, year: int) -> dict:
                        if r.get("kind") == "lead_analysis"]
         if built:
             lead_run, row = built
-            runs.save_run(lead_run)
             results.append(row)
+            if not runs.save_run(lead_run):
+                stale_leads = []
+                degraded.append("lead analysis could not be stored durably — "
+                                "kept the previous summary")
         for run_id in stale_leads:
             runs.delete_run(run_id)
 

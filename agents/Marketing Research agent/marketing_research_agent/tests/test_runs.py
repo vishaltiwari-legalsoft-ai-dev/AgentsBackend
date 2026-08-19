@@ -57,3 +57,25 @@ def test_list_runs_merges_cloud_disk_wins(tmp_path, monkeypatch):
     out = runs.list_runs("u1")
     assert [r["id"] for r in out] == ["local1", "cloud1"]
     assert out[0]["metrics"] == [1, 2]  # local copy wins
+
+
+def test_save_run_reports_whether_the_cloud_write_landed(tmp_path, monkeypatch):
+    """Callers that delete a superseded run need to know the replacement is
+    durable. Offline, disk IS durable (True); cloud-configured, a failed set()
+    means the run is only on this instance's ephemeral disk (False)."""
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    assert runs.save_run({"id": "off1", "kind": "dataset", "user_id": "u1"}) is True
+
+    class _Doc:
+        def set(self, payload):
+            raise RuntimeError("400 the document exceeds the maximum allowed size")
+
+    class _Coll:
+        def document(self, _id):
+            return _Doc()
+
+    monkeypatch.setattr(runs, "_use_cloud", lambda: True)
+    monkeypatch.setattr(runs, "_collection", lambda: _Coll())
+    assert runs.save_run({"id": "cloud1", "kind": "dataset", "user_id": "u1"}) is False
+    assert runs.get_run("cloud1") is not None  # local copy still written

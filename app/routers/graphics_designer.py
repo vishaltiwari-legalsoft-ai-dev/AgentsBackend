@@ -18,7 +18,14 @@ from pydantic import BaseModel, Field
 from app.security import get_current_user
 from app.services import firestore_repo, imaging, storage
 
-from graphics_designer_agent import pipeline, registry, stage2_element, suggestions, variants
+from graphics_designer_agent import (
+    pipeline,
+    providers,
+    registry,
+    stage2_element,
+    suggestions,
+    variants,
+)
 from graphics_designer_agent.pipeline import PipelineError
 from graphics_designer_agent.runs import (
     get_run,
@@ -269,6 +276,13 @@ def _guard(fn):
         return fn()
     except PipelineError as exc:
         raise HTTPException(409, str(exc)) from exc
+    except providers.ImageProviderUnavailable as exc:
+        # The agent refuses to pass a placeholder off as a generation, and the
+        # reason names the actual cause (no key / key unreadable). Unmapped it
+        # reached the catch-all handler, which outside development flattens every
+        # detail to "Internal server error" — so the one thing the user needed to
+        # read lived only in the server log.
+        raise HTTPException(503, exc.fallback_reason) from exc
 
 
 def _apply_element_styles(cfg: dict, incoming: dict, pack) -> None:

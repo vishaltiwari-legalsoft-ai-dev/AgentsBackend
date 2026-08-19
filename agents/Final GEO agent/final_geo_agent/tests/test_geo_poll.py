@@ -284,6 +284,58 @@ def test_concurrent_reservations_never_oversell_the_cap():
     assert after["counters"][day] == 2000
 
 
+def test_saving_config_cannot_roll_back_a_reserved_counter(monkeypatch):
+    """``geo-config-{brand}`` carries the settings AND the spend counters.
+
+    Saving the config used to be a plain read-modify-write of that whole
+    document, so a save whose read happened before a poll's reservation wrote
+    the pre-reservation ``counters`` map straight back — handing out the same
+    budget twice, against the only cap that stops a dead key burning 2,000
+    paid calls."""
+    geo_poll.ensure_config(BRAND)
+    day = geo_poll._today()
+    doc_id = geo_poll.config_doc_id(BRAND["id"])
+
+    entered, proceed, reserved = threading.Event(), threading.Event(), threading.Event()
+    real_load = state.load
+    widened = []
+
+    def load(doc_id_arg):
+        # Widen the config save's read->write window exactly once — the read
+        # happens first, so what the save later writes is a pre-reservation
+        # snapshot, which is precisely the shape of the bug.
+        if doc_id_arg == doc_id and not widened:
+            widened.append(True)
+            snapshot = real_load(doc_id_arg)
+            entered.set()
+            proceed.wait(5)
+            return snapshot
+        return real_load(doc_id_arg)
+
+    monkeypatch.setattr(state, "load", load)
+
+    def _save():
+        geo_poll.save_config(BRAND["id"], {"daily_cap": 500})
+
+    def _reserve():
+        geo_poll._reserve_calls(BRAND["id"], day, 12)
+        reserved.set()
+
+    saver = threading.Thread(target=_save)
+    saver.start()
+    assert entered.wait(5), "the config save never read the document"
+    reserver = threading.Thread(target=_reserve)
+    reserver.start()
+    reserved.wait(0.5)  # a transactional save makes the reservation wait its turn
+    proceed.set()
+    saver.join(5)
+    reserver.join(5)
+
+    after = real_load(doc_id)
+    assert (after.get("counters") or {}).get(day) == 12, "a config save gave back reserved calls"
+    assert after["daily_cap"] == 500  # ...and the save itself still landed
+
+
 def test_concurrent_poll_steps_stay_inside_the_daily_cap(monkeypatch):
     seed_prompts(6)
     calls = []

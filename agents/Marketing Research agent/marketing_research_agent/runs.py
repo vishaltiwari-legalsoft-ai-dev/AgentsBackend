@@ -55,16 +55,29 @@ def _path(run_id: str) -> Path:
     return _root() / f"{run_id}.json"
 
 
-def save_run(run: dict) -> None:
+def save_run(run: dict) -> bool:
+    """Write a run, returning True when it reached its DURABLE store.
+
+    Offline/local deployments have no cloud copy, so disk is the durable store
+    and the answer is always True. When the backend is cloud-configured the
+    Firestore document is the durable copy — Cloud Run's disk is ephemeral — so
+    a failed ``set()`` means this run exists only on one instance's ``/tmp``.
+    Callers that delete whatever this run supersedes MUST check the answer: a
+    swap that deletes the durable original after a failed replacement write
+    destroys the only copy that survives the next deploy.
+    """
     payload = json.dumps(run, default=str, indent=2)
     _path(run["id"]).write_text(payload, encoding="utf-8")
-    if _use_cloud():
-        try:
-            # Same serialization as disk: dataset runs embed datetime.date
-            # objects, which the Firestore client rejects.
-            _collection().document(run["id"]).set(json.loads(payload))
-        except Exception:  # cloud write is best-effort; disk is source of truth
-            logger.warning("MR cloud save failed for run %s", run.get("id"))
+    if not _use_cloud():
+        return True
+    try:
+        # Same serialization as disk: dataset runs embed datetime.date
+        # objects, which the Firestore client rejects.
+        _collection().document(run["id"]).set(json.loads(payload))
+    except Exception:  # disk still holds it; the caller decides what that is worth
+        logger.warning("MR cloud save failed for run %s", run.get("id"))
+        return False
+    return True
 
 
 def get_run(run_id: str) -> dict | None:

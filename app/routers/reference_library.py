@@ -99,7 +99,9 @@ def sync_drive(
     mirrors the bytes to Cloud Storage (when configured) so the index survives
     Cloud Run restarts, and writes the index. Admin/creator only.
     """
+    import os
     import shutil
+    import uuid
 
     from app.services import drive_source
 
@@ -108,19 +110,30 @@ def sync_drive(
         raise HTTPException(400, "No Drive folder configured (set GD_DRIVE_FOLDER_ID).")
 
     # Download into the durable reference dir (NOT a temp dir) so local/no-GCS
-    # deployments keep the files + a valid abs_path after the request ends. The
-    # brand's prior subtree is cleared first so a re-sync fully replaces it.
+    # deployments keep the files + a valid abs_path after the request ends.
+    #
+    # Staged, then swapped: on a no-GCS deployment the brand's tree on disk is
+    # the ONLY copy, and every way this call fails — Drive API disabled, folder
+    # unshared, a 429, the paging cap — surfaces after the download starts. The
+    # old tree therefore goes only once a complete new one exists beside it.
     base = _base_dir()
-    brand_dir = base / drive_source._safe_segment(settings.gd_drive_brand_name)
-    if brand_dir.exists():
-        shutil.rmtree(brand_dir, ignore_errors=True)
+    brand_seg = drive_source._safe_segment(settings.gd_drive_brand_name)
+    brand_dir = base / brand_seg
     base.mkdir(parents=True, exist_ok=True)
+    # Sibling of the brand dir so the swap is a same-filesystem rename. Sweep
+    # this brand's orphans from a killed process first: ingest_all reads every
+    # directory under base as a brand, and a half-downloaded one is not a brand.
+    # Scoped to this brand so a sync running for another one is left alone.
+    for orphan in base.glob(f".sync-{brand_seg}-*"):
+        shutil.rmtree(orphan, ignore_errors=True)
+    staging = base / f".sync-{brand_seg}-{uuid.uuid4().hex[:8]}"
 
     try:
         summary = drive_source.download_folder(
-            fid, base, brand_name=settings.gd_drive_brand_name
+            fid, staging, brand_name=settings.gd_drive_brand_name
         )
     except Exception as exc:  # noqa: BLE001 - surface Drive/auth errors to admin
+        shutil.rmtree(staging, ignore_errors=True)  # existing tree untouched
         raise HTTPException(
             502,
             f"Google Drive sync failed: {exc}. Check that the Drive API is "
@@ -128,11 +141,34 @@ def sync_drive(
         ) from exc
 
     if summary["downloaded"] == 0:
+        shutil.rmtree(staging, ignore_errors=True)  # existing tree untouched
         raise HTTPException(
             404,
             "No assets downloaded — is the folder shared with the service "
             f"account and laid out in mapped subfolders? Skipped: {summary['skipped_folders']}",
         )
+
+    # Swap. os.replace cannot overwrite a directory on Windows, so the old tree
+    # is moved aside first and put back if the second rename fails.
+    fresh = staging / brand_seg
+    retired = staging / "_retired"
+    try:
+        if brand_dir.exists():
+            os.replace(brand_dir, retired)
+        try:
+            os.replace(fresh, brand_dir)
+        except Exception:
+            if retired.exists():
+                os.replace(retired, brand_dir)
+            raise
+    except Exception as exc:  # noqa: BLE001 - the download worked; the swap did not
+        shutil.rmtree(staging, ignore_errors=True)
+        raise HTTPException(
+            500,
+            f"Drive sync downloaded {summary['downloaded']} files but could not "
+            f"replace the existing reference tree: {exc}. Nothing was removed.",
+        ) from exc
+    shutil.rmtree(staging, ignore_errors=True)
 
     records = rl.ingest_all(base, use_llm=use_llm)
     mirrored = rl.mirror_to_gcs(records)  # stamps gs_uri when GCS is configured

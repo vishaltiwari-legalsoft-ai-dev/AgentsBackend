@@ -141,3 +141,21 @@ def test_mini_research_appends_targeted_evidence():
     )
     assert added and added[0]["id"] == "ev-1"
     assert research.load_run(run["id"])["ledger"] == added
+
+
+def test_the_run_index_trims_to_the_newest_per_owner(monkeypatch):
+    """``runs-index`` is ONE Firestore document that every save appends to, and
+    ``state.save`` here is not best-effort: once the doc crosses 1 MiB the write
+    raises and the agent stops persisting runs permanently. The trim is per
+    owner so one busy user cannot evict a colleague's runs from the only list
+    ``list_runs`` reads."""
+    monkeypatch.setattr(research, "INDEX_CAP_PER_USER", 3)
+
+    colleague = research.new_run(BRAND, "colleague topic", user_id="u2")
+    mine = [research.new_run(BRAND, f"topic {i}", user_id="u1") for i in range(5)]
+
+    rows = state.load("runs-index")["runs"]
+    assert [r["id"] for r in rows] == [m["id"] for m in reversed(mine[-3:])] + [colleague["id"]]
+    assert sum(1 for r in rows if r["user_id"] == "u1") == 3  # oldest two dropped
+    assert colleague["id"] in {r["id"] for r in rows}, "a busy user evicted another owner's run"
+

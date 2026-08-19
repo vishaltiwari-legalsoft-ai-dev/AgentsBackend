@@ -91,34 +91,58 @@ def _default_aliases(brand: dict) -> list[str]:
 
 
 def ensure_config(brand: dict) -> dict:
-    """Load the brand's GEO config, creating a sensible default on first use."""
+    """Load the brand's GEO config, creating a sensible default on first use.
+
+    The create half goes through :func:`_mutate`: this document also holds the
+    spend counters, so a default written over a config an overlapping caller
+    just created would hand back budget that was already reserved. The common
+    read stays a plain read — no write, no transaction.
+    """
     doc = state.load(config_doc_id(brand["id"]))
     if doc:
         return doc
-    doc = {
-        "brand_id": brand["id"],
-        "aliases": {"self": _default_aliases(brand)},
-        "competitors": [],  # [{key, name, aliases: [...]}]
-        "daily_cap": DEFAULT_DAILY_CAP,
-        "poll_interval_days": DEFAULT_POLL_INTERVAL_DAYS,
-        "auto_poll": True,
-        "counters": {},
-        "updated_at": _now(),
-    }
-    state.save(config_doc_id(brand["id"]), doc)
-    return doc
+
+    def change(cfg: dict) -> tuple[dict, dict]:
+        if cfg:  # created between the read above and this transaction
+            return cfg, cfg
+        fresh = {
+            "brand_id": brand["id"],
+            "aliases": {"self": _default_aliases(brand)},
+            "competitors": [],  # [{key, name, aliases: [...]}]
+            "daily_cap": DEFAULT_DAILY_CAP,
+            "poll_interval_days": DEFAULT_POLL_INTERVAL_DAYS,
+            "auto_poll": True,
+            "counters": {},
+            "updated_at": _now(),
+        }
+        return fresh, fresh
+
+    return _mutate(config_doc_id(brand["id"]), change)
 
 
 def save_config(brand_id: str, patch: dict) -> dict:
-    doc = state.load(config_doc_id(brand_id)) or {}
-    for key in ("aliases", "competitors", "daily_cap", "aio_monthly_cap",
-                "poll_interval_days", "auto_poll"):
-        if key in patch:
-            doc[key] = patch[key]
-    doc["brand_id"] = brand_id
-    doc["updated_at"] = _now()
-    state.save(config_doc_id(brand_id), doc)
-    return doc
+    """Patch the brand's GEO config — transactionally, like every other write
+    to this document.
+
+    ``geo-config-{brand}`` carries the daily engine-call counters that
+    :func:`_reserve_calls` claims inside a real transaction. A plain
+    read-modify-write here silently restores the ``counters`` map to whatever it
+    was when this request loaded the doc, giving back calls a poll had already
+    reserved and spent — and that cap is the only thing between a dead provider
+    key and the whole daily budget.
+    """
+
+    def change(cfg: dict) -> tuple[dict, dict]:
+        doc = dict(cfg)
+        for key in ("aliases", "competitors", "daily_cap", "aio_monthly_cap",
+                    "poll_interval_days", "auto_poll"):
+            if key in patch:
+                doc[key] = patch[key]
+        doc["brand_id"] = brand_id
+        doc["updated_at"] = _now()
+        return doc, doc
+
+    return _mutate(config_doc_id(brand_id), change)
 
 
 def alias_map(cfg: dict) -> dict[str, list[str]]:

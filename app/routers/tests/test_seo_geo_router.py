@@ -262,3 +262,59 @@ def test_cron_partial_sweep_is_207(monkeypatch):
     assert r.status_code == 207, r.text
     body = r.json()
     assert body["status"] == "partial" and body["ok"] == 1 and body["failed"] == 1
+
+
+def test_the_oauth_callback_page_escapes_what_it_reflects():
+    """``?error=`` is attacker-controlled and lands in the one HTML page this
+    backend serves. Confirmed live in 2026-08: ``PROBE<i>`` came back as markup,
+    text/html, no CSP, no nosniff — arbitrary HTML from our own domain."""
+    r = client.get("/api/seo-geo/oauth/callback",
+                   params={"error": "PROBE<i>x</i>'\"onload=alert(1)"})
+
+    assert r.status_code == 400
+    assert "<i>" not in r.text and "</i>" not in r.text
+    assert "&lt;i&gt;" in r.text                      # reflected as text, not markup
+    assert "&quot;" in r.text and "&#x27;" in r.text  # quotes can't break an attribute
+    assert "default-src 'none'" in r.headers["content-security-policy"]
+    assert r.headers["x-content-type-options"] == "nosniff"
+
+
+def test_the_callback_keeps_its_own_inline_blocks_behind_a_per_response_nonce():
+    """The page auto-closes and is styled, and that costs nothing: only the two
+    blocks this backend authors carry the nonce, so a reflected <script> is
+    inert text under the same ``default-src 'none'`` policy. The nonce is
+    generated per response — a constant one would be ``unsafe-inline``."""
+    import re as _re
+
+    r = client.get("/api/seo-geo/oauth/callback", params={"error": "<script>alert(1)</script>"})
+    csp = r.headers["content-security-policy"]
+
+    assert "default-src 'none'" in csp
+    nonce = _re.search(r"script-src 'nonce-([A-Za-z0-9_-]+)'", csp).group(1)
+    assert f"style-src 'nonce-{nonce}'" in csp
+    assert r.headers["x-content-type-options"] == "nosniff"
+
+    # our own inline script + style are nonced, and nothing else is
+    assert f'<script nonce="{nonce}">' in r.text
+    assert f'<style nonce="{nonce}">' in r.text
+    assert r.text.count("nonce=") == 2
+
+    # the reflected script never executes: escaped text, and no nonce of its own
+    assert "<script>alert(1)</script>" not in r.text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in r.text
+
+    second = client.get("/api/seo-geo/oauth/callback", params={"error": "again"})
+    assert nonce not in second.headers["content-security-policy"], "nonce is reused"
+
+
+def test_the_connected_message_emphasises_the_property_without_trusting_it():
+    """The <b> is markup we author around an escaped value — the value itself
+    can never carry markup."""
+    from app.routers import seo_geo as router_mod
+
+    page = router_mod._close_page("Connected", "reading data from {strong}.",
+                                  strong="sc-domain:<evil>")
+    text = page.body.decode()
+    assert "<b>sc-domain:&lt;evil&gt;</b>" in text
+    assert "<evil>" not in text
+

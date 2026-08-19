@@ -29,6 +29,13 @@ ANGLES = [
     {"key": "competitors", "query_tpl": "{topic} blog article"},
 ]
 ROUND_CAP = 4          # UI offers "Go deeper" past this; the loop never auto-runs past it
+# The run index is ONE Firestore document every save appends to, and Firestore
+# hard-caps a document at 1 MiB. Uncapped it eventually refuses every write —
+# and ``state.save`` is not best-effort here, so ``save_run`` would raise and the
+# agent would stop persisting runs entirely, permanently. Per owner, not global:
+# a busy colleague must not evict everyone else's runs from the only list the UI
+# reads (``browser_agent.skills._capped`` solves the same problem the same way).
+INDEX_CAP_PER_USER = 200
 QUERIES_PER_ROUND = 6
 READS_PER_ROUND = 8
 MINI_READS = 3         # targeted reads for a single block revision
@@ -93,8 +100,23 @@ def save_run(run: dict) -> None:
         "status": run["status"],
     }
     runs = [r for r in index["runs"] if r["id"] != run["id"]]
-    index["runs"] = [entry] + runs
+    index["runs"] = _capped([entry] + runs)
     state.save("runs-index", index)
+
+
+def _capped(rows: list[dict]) -> list[dict]:
+    """Trim to the newest ``INDEX_CAP_PER_USER`` rows per owner (rows are
+    newest-first). Legacy runs carry no user_id and share one bucket."""
+    kept_per_user: dict[str, int] = {}
+    out: list[dict] = []
+    for row in rows:
+        owner = str(row.get("user_id") or "")
+        seen = kept_per_user.get(owner, 0)
+        if seen >= INDEX_CAP_PER_USER:
+            continue
+        kept_per_user[owner] = seen + 1
+        out.append(row)
+    return out
 
 
 def load_run(run_id: str) -> dict | None:

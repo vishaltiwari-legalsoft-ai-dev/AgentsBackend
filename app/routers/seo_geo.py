@@ -7,9 +7,11 @@ Creator edits the brand registry; the cron entry is gated by ``x-cron-key``
 from __future__ import annotations
 
 import hmac
+import html
 import logging
 import os
 import re
+import secrets
 
 from datetime import date, timedelta
 
@@ -431,12 +433,38 @@ def _oauth_redirect(request: Request) -> str:
     return f"{base}/api/seo-geo/oauth/callback"
 
 
-def _close_page(title: str, body: str, status: int = 200) -> HTMLResponse:
+def _close_page(title: str, body: str, status: int = 200, *, strong: str = "") -> HTMLResponse:
+    """The OAuth landing page — the ONE place this backend serves HTML.
+
+    Every caller value is attacker-reachable (``?error=`` comes straight off the
+    query string), so ``title``, ``body`` and ``strong`` are all escaped: markup
+    never comes from a value. ``body`` may carry one ``{strong}`` marker, which
+    is where the escaped ``strong`` text is emphasised — the tag is wrapped
+    around already-escaped text, so the value itself can never carry markup.
+
+    The CSP grants a fresh per-response nonce to the two inline blocks this
+    function authors and nothing else: injected script has no nonce, so
+    ``default-src 'none'`` still applies to it. Never a constant nonce — a
+    predictable one is the same as ``unsafe-inline``.
+    """
+    nonce = secrets.token_urlsafe(16)
+    safe_body = html.escape(body)
+    if strong:
+        safe_body = safe_body.replace("{strong}", f"<b>{html.escape(strong)}</b>")
     return HTMLResponse(
-        f"<html><body style='font-family:sans-serif;max-width:480px;margin:80px auto;text-align:center'>"
-        f"<h2>{title}</h2><p>{body}</p><p>You can close this tab.</p>"
-        f"<script>setTimeout(()=>window.close(),4000)</script></body></html>",
+        f"<html><head><style nonce=\"{nonce}\">"
+        "body{font-family:sans-serif;max-width:480px;margin:80px auto;text-align:center}"
+        f"</style></head><body><h2>{html.escape(title)}</h2>"
+        f"<p>{safe_body}</p><p>You can close this tab.</p>"
+        f"<script nonce=\"{nonce}\">setTimeout(()=>window.close(),4000)</script>"
+        "</body></html>",
         status_code=status,
+        headers={
+            "Content-Security-Policy": (
+                f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'"
+            ),
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -459,8 +487,9 @@ def oauth_callback(request: Request, code: str = "", state: str = "", error: str
         result = seo_oauth.complete(brand, code, _oauth_redirect(request))
         return _close_page(
             "Search Console connected ✓",
-            f"{brand['name']} is now reading data from <b>{result['property']}</b>. "
+            f"{brand['name']} is now reading data from {{strong}}. "
             "Go back to the dashboard and hit Refresh data.",
+            strong=result["property"],
         )
     except ValueError as exc:
         return _close_page("Not connected", str(exc), status=400)
