@@ -29,7 +29,11 @@ class Settings(BaseSettings):
     )
 
     # Server
-    app_env: str = "development"
+    # Defaults to production so an unset APP_ENV fails *secure*: the catch-all
+    # handler in app.main only echoes raw exception text (file paths, Firestore
+    # doc ids, provider error bodies) when this is explicitly "development".
+    # Local dev opts in via APP_ENV=development in .env.
+    app_env: str = "production"
     port: int = 8080
     # Comma-separated list of allowed browser origins (the Vercel frontend).
     cors_origins: str = "http://localhost:3000,http://localhost:3001,http://localhost:8000"
@@ -46,6 +50,17 @@ class Settings(BaseSettings):
     # integration management). The CREATOR_EMAILS_DEFAULT owners are always
     # Creators even when this is empty.
     creator_emails: str = ""
+
+    # --- Sign-in allowlist -------------------------------------------------
+    # Cloud Run runs --allow-unauthenticated, so /api/auth/google is the ONLY
+    # thing standing between the public internet and every endpoint (and the
+    # platform's LLM billing). A verified Google account may sign in only when
+    # its domain is listed here or its full address is in `allowed_emails`.
+    # Comma-separated; subdomains are NOT implied (list them explicitly).
+    allowed_email_domains: str = "legalsoft.com"
+    # Comma-separated individual addresses allowed regardless of domain — the
+    # exception list for contractors/clients. Fillable via env, no code change.
+    allowed_emails: str = ""
 
     # OpenRouter (agent LLM + image generation)
     openrouter_api_key: str = ""
@@ -125,6 +140,20 @@ class Settings(BaseSettings):
     def creator_email_set(self) -> set[str]:
         env = {e.strip().lower() for e in self.creator_emails.split(",") if e.strip()}
         return set(CREATOR_EMAILS_DEFAULT) | env
+
+    @property
+    def allowed_email_domain_set(self) -> set[str]:
+        """Domains permitted to sign in. Empty set = nobody (fail closed)."""
+        return {
+            d.strip().lower().lstrip("@")
+            for d in self.allowed_email_domains.split(",")
+            if d.strip()
+        }
+
+    @property
+    def allowed_email_set(self) -> set[str]:
+        """Individual addresses permitted to sign in regardless of domain."""
+        return {e.strip().lower() for e in self.allowed_emails.split(",") if e.strip()}
 
     def require(self, field: str) -> str:
         """Return a config value, raising a descriptive error if it is empty."""

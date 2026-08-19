@@ -1,4 +1,14 @@
-"""Integration tests for the SEO agent router (/api/seo-geo). Fully offline."""
+"""Integration tests for the SEO agent router (/api/seo-geo). Fully offline.
+
+The auth override is installed per-test by the ``_harness`` fixture and the
+previous value is *restored* on teardown. Restore, not ``pop``:
+``dependency_overrides`` lives on the one process-global FastAPI app shared by
+every test module, so an unconditional ``pop`` here deleted an override a
+sibling module was relying on. Paired with modules that installed theirs at
+import time, that made 29 router tests pass only in alphabetical order — this
+file sorts last today, and anything that reorders (``-k``, ``-m``, sharding,
+random order, or just a new file that sorts later) turned them into a 401 storm.
+"""
 
 import os
 
@@ -7,27 +17,33 @@ os.environ["SEO_OFFLINE"] = "1"
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import app as fastapi_app
 from app.security import get_current_user
 
 USER = {"id": "u1", "email": "t@legalsoft.com", "is_admin": False, "is_creator": False}
 CREATOR = {**USER, "is_creator": True}
 
-client = TestClient(app)
+client = TestClient(fastapi_app)
 
 
 @pytest.fixture(autouse=True)
-def _offline_state(tmp_path, monkeypatch):
+def _harness(tmp_path, monkeypatch):
     monkeypatch.setenv("SEO_OFFLINE", "1")
     monkeypatch.setenv("SEO_LOCAL_DIR", str(tmp_path))
     monkeypatch.delenv("SEO_CRON_KEY", raising=False)
-    app.dependency_overrides[get_current_user] = lambda: dict(USER)
+    prev = fastapi_app.dependency_overrides.get(get_current_user)
+    fastapi_app.dependency_overrides[get_current_user] = lambda: dict(USER)
     yield
-    app.dependency_overrides.pop(get_current_user, None)
+    if prev is None:
+        fastapi_app.dependency_overrides.pop(get_current_user, None)
+    else:
+        fastapi_app.dependency_overrides[get_current_user] = prev
 
 
 def as_creator():
-    app.dependency_overrides[get_current_user] = lambda: dict(CREATOR)
+    """Escalate the current test to a creator. Safe to call mid-test — the
+    ``_harness`` teardown restores whatever was in place before it ran."""
+    fastapi_app.dependency_overrides[get_current_user] = lambda: dict(CREATOR)
 
 
 def test_overview_lists_default_brand_and_sources():
@@ -198,5 +214,51 @@ def test_cron_inert_without_key_then_gated(monkeypatch):
     assert client.post("/api/seo-geo/cron/run").status_code == 503
     monkeypatch.setenv("SEO_CRON_KEY", "s3cret")
     assert client.post("/api/seo-geo/cron/run", headers={"x-cron-key": "wrong"}).status_code == 403
-    body = client.post("/api/seo-geo/cron/run", headers={"x-cron-key": "s3cret"}).json()
+    r = client.post("/api/seo-geo/cron/run", headers={"x-cron-key": "s3cret"})
+    assert r.status_code == 200, r.text  # every brand ran → clean 200
+    body = r.json()
     assert body["brands"]["legalsoft"]["ok"] is True
+    assert body["status"] == "ok" and body["ok"] == 1 and body["failed"] == 0
+
+
+def test_cron_all_brands_failed_is_not_200(monkeypatch):
+    """C9: the sweep answered 200 even when every brand errored, so Cloud
+    Scheduler recorded success, never retried, and the sweep could stay dead for
+    weeks with the only evidence inside a body nobody reads."""
+    from seo_geo_agent import insights
+
+    monkeypatch.setenv("SEO_CRON_KEY", "s3cret")
+
+    def _boom(brand, trigger=""):
+        raise RuntimeError("GSC token revoked")
+
+    monkeypatch.setattr(insights, "run_brand", _boom)
+    r = client.post("/api/seo-geo/cron/run", headers={"x-cron-key": "s3cret"})
+    assert r.status_code == 502, r.text
+    body = r.json()
+    assert body["status"] == "failed" and body["ok"] == 0 and body["failed"] == 1
+    assert body["brands"]["legalsoft"] == {"ok": False, "error": "GSC token revoked"}
+
+
+def test_cron_partial_sweep_is_207(monkeypatch):
+    """One broken brand out of two is neither success nor total failure: 207 so a
+    human can act, and still 2xx so a permanently bad brand can't put the job in
+    a retry loop."""
+    from seo_geo_agent import insights
+
+    as_creator()
+    assert client.post("/api/seo-geo/brands",
+                       json={"name": "Acme", "domain": "acme.com"}).status_code == 200
+    monkeypatch.setenv("SEO_CRON_KEY", "s3cret")
+    real = insights.run_brand
+
+    def _one_bad(brand, trigger=""):
+        if brand["id"] == "acme":
+            raise RuntimeError("GSC token revoked")
+        return real(brand, trigger=trigger)
+
+    monkeypatch.setattr(insights, "run_brand", _one_bad)
+    r = client.post("/api/seo-geo/cron/run", headers={"x-cron-key": "s3cret"})
+    assert r.status_code == 207, r.text
+    body = r.json()
+    assert body["status"] == "partial" and body["ok"] == 1 and body["failed"] == 1

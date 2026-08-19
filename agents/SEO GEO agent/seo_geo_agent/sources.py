@@ -6,12 +6,15 @@ plain-language degradation note or falls back to a heuristic.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
+import socket
 from dataclasses import dataclass, field
 from datetime import date
 from html.parser import HTMLParser
+from urllib.parse import urlparse
 
 import httpx
 
@@ -19,6 +22,40 @@ from . import state
 
 SERPER_ENDPOINT = "https://google.serper.dev/search"
 FETCH_UA = "Mozilla/5.0 (compatible; AgentOS-SEO/1.0)"
+
+# --- Deadlines -------------------------------------------------------------
+# These run in sync handlers, i.e. on one of anyio's 40 worker threads, so a
+# stalled report costs the service a slot rather than just this run.
+# googleapiclient applies an implicit 60s socket timeout of its own; 45s is
+# stated deliberately because a GSC query pulls up to 5000 rows and a GA
+# batchRunReports covers three reports — slow is normal, forever is not.
+GOOGLE_API_TIMEOUT_SECONDS = 45
+
+# Read-only scopes, named explicitly. Passing our own transport (the only way
+# to set a timeout) means googleapiclient no longer derives scopes from the
+# discovery document — which is an improvement: it was requesting the write
+# scopes (`analytics.edit`, `webmasters`) for a module that only ever reads.
+GA_READONLY_SCOPE = "https://www.googleapis.com/auth/analytics.readonly"
+GSC_READONLY_SCOPE = "https://www.googleapis.com/auth/webmasters.readonly"
+
+
+def _timed_google_client(api: str, version: str, scope: str):
+    """A Google API client whose transport carries an explicit socket deadline.
+
+    A fresh ``httplib2.Http`` per client is deliberate: httplib2 is not
+    thread-safe and these are used from FastAPI worker threads. ``build`` opens
+    no socket — the discovery document ships inside google-api-python-client.
+    """
+    import google.auth
+    import google_auth_httplib2
+    import httplib2
+    from googleapiclient.discovery import build
+
+    creds, _ = google.auth.default(scopes=[scope])
+    http = google_auth_httplib2.AuthorizedHttp(
+        creds, http=httplib2.Http(timeout=GOOGLE_API_TIMEOUT_SECONDS)
+    )
+    return build(api, version, http=http, cache_discovery=False)
 
 
 class CredentialMissing(Exception):
@@ -50,9 +87,7 @@ def _ga_service(api: str):
     if not state.use_cloud():
         raise CredentialMissing("offline mode")
     try:
-        from googleapiclient.discovery import build
-
-        return build(api, "v1beta", cache_discovery=False)
+        return _timed_google_client(api, "v1beta", GA_READONLY_SCOPE)
     except Exception as exc:  # noqa: BLE001
         raise CredentialMissing(f"Google Analytics auth unavailable: {exc}") from exc
 
@@ -218,9 +253,7 @@ def _gsc_service():
     if not state.use_cloud():
         raise CredentialMissing("offline mode")
     try:
-        from googleapiclient.discovery import build
-
-        return build("searchconsole", "v1", cache_discovery=False)
+        return _timed_google_client("searchconsole", "v1", GSC_READONLY_SCOPE)
     except Exception as exc:  # noqa: BLE001
         raise CredentialMissing(f"Search Console auth unavailable: {exc}") from exc
 
@@ -425,15 +458,90 @@ class _PageParser(HTMLParser):
                 self._text_len += len(text) + 1
 
 
+# --- Outbound fetch safety -------------------------------------------------
+# These fetchers take a URL from a brand config, a sitemap, a SERP result or —
+# via the browser agent's read_url tool — straight from a model, then hand the
+# body, the status and the final URL back to the caller. Unrestricted that is
+# an arbitrary GET from inside the VPC: 169.254.169.254 for metadata, a Redis
+# or admin port for a scan oracle, and the response reflected to whoever asked.
+# app/routers/canva.py::_fetch_bytes is the same idea with a fixed allowlist;
+# here the whole public web is legitimate, so the check is on the address the
+# name resolves to instead.
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+MAX_REDIRECT_HOPS = 4
+
+
+def _assert_public_address(url: str) -> None:
+    """Raise an ``httpx.HTTPError`` unless ``url`` is a public http(s) address.
+
+    An HTTPError specifically: every caller here already treats one as "that
+    page is unreachable", so a blocked host degrades exactly like a dead one
+    instead of becoming a new exception nobody catches.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise httpx.UnsupportedProtocol(
+            f"{url[:200]!r} is not an http(s) address"
+        )
+    host = parsed.hostname
+    if not host:
+        raise httpx.ConnectError(f"{url[:200]!r} has no host")
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except OSError as exc:
+        raise httpx.ConnectError(f"could not resolve {host}") from exc
+
+    for info in infos:
+        raw = str(info[4][0]).split("%", 1)[0]  # drop any IPv6 scope id
+        try:
+            addr = ipaddress.ip_address(raw)
+        except ValueError as exc:  # pragma: no cover - getaddrinfo shouldn't
+            raise httpx.ConnectError(f"could not resolve {host}") from exc
+        if (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_reserved
+            or addr.is_multicast
+            or addr.is_unspecified
+        ):
+            raise httpx.ConnectError(
+                f"{host} resolves to a non-public address ({addr}) — refusing"
+            )
+
+
+def _safe_get(cli: httpx.Client, url: str, *, max_hops: int = MAX_REDIRECT_HOPS):
+    """``cli.get(url)`` with the address check applied to every hop.
+
+    Redirects are followed here rather than by httpx because httpx would only
+    ever check what we asked for: a 302 to http://169.254.169.254/ walks past
+    any check made before the request. Hence ``follow_redirects=False`` on the
+    clients below — re-checking each Location is the entire point.
+    """
+    target = url
+    for _ in range(max_hops + 1):
+        _assert_public_address(target)
+        resp = cli.get(target)
+        if resp.status_code not in _REDIRECT_CODES:
+            return resp
+        location = resp.headers.get("location")
+        if not location:
+            return resp
+        target = str(resp.url.join(location))
+    raise httpx.TooManyRedirects(f"more than {max_hops} redirects from {url[:200]}")
+
+
 def fetch_page(url: str, client: httpx.Client | None = None) -> PageFacts:
     """Fetch one page and extract the on-page facts audits and briefs need."""
     if not state.use_cloud():
         raise CredentialMissing("offline mode")
     own = client is None
-    cli = client or httpx.Client(timeout=15, follow_redirects=True, headers={"User-Agent": FETCH_UA})
+    cli = client or httpx.Client(timeout=15, follow_redirects=False, headers={"User-Agent": FETCH_UA})
     facts = PageFacts(url=url)
     try:
-        resp = cli.get(url)
+        resp = _safe_get(cli, url)
         facts.status = resp.status_code
         if resp.status_code != 200 or len(resp.content) > 2_000_000:
             return facts
@@ -474,9 +582,9 @@ def fetch_text(url: str, client: httpx.Client | None = None) -> dict:
     if not state.use_cloud():
         raise CredentialMissing("offline mode")
     own = client is None
-    cli = client or httpx.Client(timeout=15, follow_redirects=True, headers={"User-Agent": FETCH_UA})
+    cli = client or httpx.Client(timeout=15, follow_redirects=False, headers={"User-Agent": FETCH_UA})
     try:
-        resp = cli.get(url)
+        resp = _safe_get(cli, url)
         return {"status": resp.status_code, "text": resp.text[:20_000], "final_url": str(resp.url)}
     except httpx.HTTPError:
         return {"status": 0, "text": "", "final_url": url}
@@ -490,11 +598,11 @@ def fetch_sitemap(domain: str, client: httpx.Client | None = None, cap: int = 50
     if not state.use_cloud():
         raise CredentialMissing("offline mode")
     own = client is None
-    cli = client or httpx.Client(timeout=15, follow_redirects=True, headers={"User-Agent": FETCH_UA})
+    cli = client or httpx.Client(timeout=15, follow_redirects=False, headers={"User-Agent": FETCH_UA})
 
     def locs(url: str) -> list[str]:
         try:
-            resp = cli.get(url)
+            resp = _safe_get(cli, url)
             if resp.status_code != 200:
                 return []
             return re.findall(r"<loc>\s*(.*?)\s*</loc>", resp.text)[:cap]

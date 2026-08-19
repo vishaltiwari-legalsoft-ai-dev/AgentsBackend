@@ -2,6 +2,14 @@
 
 Offline: fs run-storage via GD_RUNS_DIR tmp dir; auth dependency overridden —
 mirrors test_gd_elements_api.py.
+
+The auth override is installed per-test by the ``_harness`` fixture and the
+previous value is restored on teardown. It must never be applied at module
+import time: ``dependency_overrides`` lives on the one process-global FastAPI
+app shared by every test module, so an import-time write leaks into whatever
+runs next and a sibling module's teardown silently deletes it — which made this
+suite pass only in alphabetical order (a 401 storm under ``-k``, ``-m``,
+sharding or random ordering).
 """
 
 import io
@@ -9,16 +17,24 @@ import io
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import app as fastapi_app
 from app.security import get_current_user
 
-app.dependency_overrides[get_current_user] = lambda: {"id": "u1", "email": "t@legalsoft.com"}
-client = TestClient(app)
+client = TestClient(fastapi_app)
+
+USER = {"id": "u1", "email": "t@legalsoft.com"}
 
 
 @pytest.fixture(autouse=True)
-def _runs_dir(tmp_path, monkeypatch):
+def _harness(tmp_path, monkeypatch):
     monkeypatch.setenv("GD_RUNS_DIR", str(tmp_path))
+    prev = fastapi_app.dependency_overrides.get(get_current_user)
+    fastapi_app.dependency_overrides[get_current_user] = lambda: dict(USER)
+    yield
+    if prev is None:
+        fastapi_app.dependency_overrides.pop(get_current_user, None)
+    else:
+        fastapi_app.dependency_overrides[get_current_user] = prev
 
 
 @pytest.fixture()

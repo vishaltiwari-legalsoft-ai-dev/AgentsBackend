@@ -440,11 +440,42 @@ def test_tools_per_step_are_capped(monkeypatch):
     assert run["status"] == "running"                # not failed — just next step
 
 
-def test_tool_calls_are_never_flagged_sensitive(monkeypatch):
-    """Appending to its own tab is not the irreversible kind of step."""
-    act = actions.Action(kind="tool", tool="sheet_append", sheet="https://x/d/a",
-                         rows=[["delete everything"]], why="write")
-    assert actions.is_sensitive(act, []) is False
+def test_a_writing_tool_is_sensitive_but_a_reading_one_is_not(monkeypatch):
+    """Was: "tool calls are never flagged sensitive", on the grounds that the
+    append went to the agent's own tab and could not overwrite. Both halves of
+    that were false — the tab came from the model — so a write now counts as
+    the irreversible kind of step and the reads still do not."""
+    write = actions.Action(kind="tool", tool="sheet_append", sheet="https://x/d/a",
+                           rows=[["delete everything"]], why="write")
+    assert actions.is_sensitive(write, []) is True
+
+    read = actions.Action(kind="tool", tool="sheet_read", sheet="https://x/d/a", why="read")
+    assert actions.is_sensitive(read, []) is False
+
+
+def test_a_tool_call_is_vetoed_in_monitor_mode(monkeypatch):
+    """Regression: MUTATING_KINDS missed "tool", so a read-only run could
+    sheet_append. The veto has to land BEFORE the tool runs, not after."""
+    calls: list[str] = []
+
+    def _record(name, args):
+        calls.append(name)
+        return {"ok": True}
+
+    monkeypatch.setattr(tools, "run_tool", _record)
+    _stub_brain(
+        monkeypatch,
+        actions.Action(kind="tool", tool="sheet_append", sheet="https://x/d/a",
+                       rows=[["a"]], why="write"),
+    )
+
+    run = runs.create_run(USER, "watch my sheet", "monitor", None)
+    run, resp = runs.step(run, _step_body(1))
+
+    assert resp["action"]["kind"] == "fail"
+    assert "monitor" in resp["action"]["reason"]
+    assert calls == []                                # never executed
+    assert run.get("tool_calls") in (None, [])
 
 
 def test_steps_record_the_rail(monkeypatch):

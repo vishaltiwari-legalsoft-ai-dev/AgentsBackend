@@ -9,8 +9,15 @@ Two implementations ship:
 * ``OpenRouterProvider`` — delegates to the existing ``app.services.openrouter``
   image model used elsewhere in the backend.
 
-Provider is chosen by the ``GD_IMAGE_PROVIDER`` env var, defaulting to ``mock``
-unless an OpenRouter key is configured.
+Provider is chosen by the ``GD_IMAGE_PROVIDER`` env var. **The mock is reachable
+only when it is explicitly selected** (``GD_IMAGE_PROVIDER=mock``): its output is
+a brand gradient that travels the same ``(bytes, mime)`` return path as a real
+generation, so auto-selecting it would save a placeholder as the run's creative,
+upload it to GCS and log it as a completed run — a canned image badged as an AI
+result. In auto mode a missing (or undeterminable) key raises
+:class:`ImageProviderUnavailable` instead, carrying ``ai=False`` and a populated
+``fallback_reason`` — the same honest-failure contract ``suggestions`` and
+``text_optimizer`` already use.
 """
 
 from __future__ import annotations
@@ -27,6 +34,22 @@ _BDCFED = (189, 207, 237)
 _A2C0E6 = (162, 192, 230)
 _1746A2 = (23, 70, 162)
 _INK = (15, 15, 15)
+
+
+class ImageProviderUnavailable(RuntimeError):
+    """No real image provider could be resolved in auto mode.
+
+    Carries the honest-failure pair the rest of this agent already speaks
+    (``suggestions.py``, ``text_optimizer.py``): ``ai`` is ``False`` and
+    ``fallback_reason`` names the actual cause, so the HTTP layer can surface
+    *why* nothing was generated instead of shipping a placeholder.
+    """
+
+    ai = False
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.fallback_reason = reason
 
 
 class ImageProvider(Protocol):
@@ -155,22 +178,73 @@ class OpenRouterProvider:
         )
 
 
-def _openrouter_key_configured() -> bool:
-    """True if an OpenRouter key is available via env, the app's settings, OR an
-    admin-set override in Firestore.
+# Tri-state key resolution. "absent" and "unknown" are deliberately distinct:
+# reading the admin override goes through Firestore, and a one-second hiccup
+# there must never be reported as "no API key" when the key is set correctly.
+KEY_PRESENT = "present"
+KEY_ABSENT = "absent"
+KEY_UNKNOWN = "unknown"
+
+
+def _runtime_key() -> bool:
+    """Whether the admin-set key override resolves to a value. Module-level seam
+    so tests can drive the failure branch without a Firestore stub. Raises on any
+    read failure — the caller turns that into ``KEY_UNKNOWN``, never ``absent``."""
+    from app.services import runtime_config
+
+    return bool(runtime_config.get("openrouter_api_key"))
+
+
+def _openrouter_key_status() -> tuple[str, str | None]:
+    """Resolve whether an OpenRouter key is configured, distinguishing
+    "genuinely absent" from "could not determine".
 
     pydantic-settings loads ``.env`` into the settings object, not ``os.environ``,
     and the Super Admin may set the key from the UI (stored in Firestore), so we
     consult ``runtime_config`` which layers the override over the environment.
+    That read can fail transiently — which is *not* evidence the key is missing,
+    so it returns ``KEY_UNKNOWN`` plus the real cause rather than a bare False.
+
+    Returns ``(status, detail)``; ``detail`` is only set for ``KEY_UNKNOWN`` and
+    never contains a secret value — only env-var / setting names.
     """
     if os.environ.get("OPENROUTER_API_KEY"):
-        return True
+        return KEY_PRESENT, None
     try:
-        from app.services import runtime_config
+        configured = _runtime_key()
+    except Exception as exc:  # noqa: BLE001 - config/Firestore read failed
+        return KEY_UNKNOWN, (
+            "could not determine whether an image-model key is configured: the "
+            f"admin-override lookup failed ({type(exc).__name__}: {exc})"
+        )
+    return (KEY_PRESENT, None) if configured else (KEY_ABSENT, None)
 
-        return bool(runtime_config.get("openrouter_api_key"))
-    except Exception:
-        return False
+
+def _openrouter_key_configured() -> bool:
+    """Boolean view of :func:`_openrouter_key_status` for the *advisory* callers
+    (``placement_brain``, ``qa_brain``) that only ask "is the LLM worth trying?"
+    and degrade to a heuristic either way. Provider selection must NOT use this —
+    it collapses "absent" and "unknown" together; use ``_openrouter_key_status``.
+    """
+    return _openrouter_key_status()[0] == KEY_PRESENT
+
+
+def _require_real_provider() -> None:
+    """Gate for auto mode: return quietly when a real provider can be used, and
+    raise a named, honest failure otherwise. Never downgrades to the mock."""
+    status, detail = _openrouter_key_status()
+    if status == KEY_PRESENT:
+        return
+    if status == KEY_UNKNOWN:
+        raise ImageProviderUnavailable(
+            (detail or "could not determine whether an image-model API key is configured")
+            + " — refusing to substitute a placeholder image for a real generation"
+        )
+    raise ImageProviderUnavailable(
+        "no image-model API key configured (set OPENROUTER_API_KEY, or the admin "
+        "key override in the Secrets panel); to render brand-gradient placeholders "
+        "on purpose, select them explicitly with GD_IMAGE_PROVIDER=mock"
+    )
 
 
 def _agent_image_model(agent_id: str | None) -> str | None:
@@ -194,8 +268,9 @@ def get_provider(name: str | None = None, *, agent_id: str | None = None) -> Ima
     model = _agent_image_model(agent_id)
     if name == "openrouter":
         return OpenRouterProvider(model=model)
-    # Auto: use the real model when a key is configured, otherwise the mock.
-    return OpenRouterProvider(model=model) if _openrouter_key_configured() else MockImageProvider()
+    # Auto: the real model, or a loud failure. Never a silent placeholder.
+    _require_real_provider()
+    return OpenRouterProvider(model=model)
 
 
 # The Stage-3 polish pass runs a PREMIUM image-edit model by default: collision
@@ -229,6 +304,6 @@ def get_polish_provider(*, agent_id: str | None = None) -> ImageProvider:
     name = (os.environ.get("GD_IMAGE_PROVIDER") or "").strip().lower()
     if name == "mock":
         return MockImageProvider()
-    if name == "openrouter" or _openrouter_key_configured():
-        return OpenRouterProvider(model=_polish_model(agent_id))
-    return MockImageProvider()
+    if name != "openrouter":
+        _require_real_provider()
+    return OpenRouterProvider(model=_polish_model(agent_id))

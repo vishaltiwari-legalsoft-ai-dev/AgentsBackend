@@ -1,8 +1,11 @@
 # backend/conftest.py
 """Repo-root test guards — apply to EVERY test in this repo.
 
-Two protections, born from a real incident (see the MR suite's conftest: a
-targets test once wrote its fixture into the live ``mr_config/targets`` doc):
+Four protections, born from real incidents. The MR suite's conftest records the
+first one (a targets test wrote its fixture into the live ``mr_config/targets``
+doc); the GD suite supplied the second (``test_mirror_to_gcs_noop_without_gcs``
+asserts "no GCS in tests" but was uploading its fixtures to the live
+reference-library bucket, because nothing stopped it):
 
 1. The agent offline flags default ON for the whole suite, so suites without
    their own conftest (e.g. ``app/routers/tests``) can never talk to prod.
@@ -11,6 +14,15 @@ targets test once wrote its fixture into the live ``mr_config/targets`` doc):
    higher-level function) themselves — that override wins over this fixture.
    Best-effort writers (usage events, run tracking) swallow the error by
    design, exactly as they would offline.
+3. The OpenRouter key reads empty, so every LLM path takes the documented "no
+   key configured" fallback instead of spending real credits — and real network
+   latency — on whoever happens to run the suite.
+4. Cloud Storage reports itself unconfigured, so nothing mirrors to the live
+   bucket.
+
+3 and 4 follow the same rule as 2: a test that legitimately exercises those
+paths monkeypatches its own module-level seam (``suggestions._get_llm``,
+``qa_brain._analyze``, ``storage.is_configured``, …) and that override wins.
 """
 import os
 
@@ -20,6 +32,17 @@ os.environ.setdefault("MR_OFFLINE", "1")
 os.environ.setdefault("SEO_OFFLINE", "1")
 os.environ.setdefault("BLOG_OFFLINE", "1")
 os.environ.setdefault("BROWSER_OFFLINE", "1")
+
+# Which agent each test belongs to, derived from its path. Keep the fragments
+# lowercase — they are matched against a lowercased, forward-slashed path.
+_AGENT_MARKERS = (
+    ("agents/graphics designer agent", "gd"),
+    ("agents/marketing research agent", "mr"),
+    ("agents/browser agent", "browser"),
+    ("agents/seo geo agent", "seo"),
+    ("agents/final geo agent", "geo"),
+    ("agents/blog writer agent", "blog"),
+)
 
 
 @pytest.fixture(autouse=True)
@@ -38,3 +61,62 @@ def _no_prod_firestore(monkeypatch):
 
     monkeypatch.setattr(firestore_repo, "_db", _blocked)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_live_openrouter(monkeypatch):
+    """The OpenRouter key reads empty, which is the whole guard.
+
+    Every network entry point in ``app.services.openrouter`` resolves the key
+    through ``runtime_config.require`` first, so a blank key turns all of them
+    into the raise that callers already expect ("any raise means the LLM path is
+    unavailable" — ``suggestions._get_llm``). Callers that ask permission first
+    (``providers._openrouter_key_configured``) see False and take their curated
+    branch. One mechanism covers both shapes.
+
+    Deliberately *not* stubbing ``get_llm`` itself: building a client opens no
+    socket, and tests that pin per-agent model resolution supply their own key
+    via a mocked ``app_config`` — that override still wins, exactly as with the
+    Firestore guard above.
+    """
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    try:
+        from app.config import settings
+    except ImportError:
+        yield
+        return
+
+    monkeypatch.setattr(settings, "openrouter_api_key", "", raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_live_gcs(monkeypatch):
+    """Cloud Storage reports itself unconfigured, so the mirror/upload paths
+    take their documented no-op branch instead of writing to the real bucket."""
+    try:
+        from app.services import storage
+    except ImportError:
+        yield
+        return
+
+    monkeypatch.setattr(storage, "is_configured", lambda: False)
+    yield
+
+
+def pytest_collection_modifyitems(items):
+    """Tag every test with the agent it belongs to, derived from its path.
+
+    Lets a developer run only what they are working on — ``pytest -m browser``
+    — or skip the slowest suite while iterating — ``pytest -m "not gd"``.
+    Path-derived on purpose: new test files are tagged automatically, so there
+    is nothing for anyone to remember to add.
+    """
+    for item in items:
+        path = str(item.fspath).replace("\\", "/").lower()
+        for fragment, marker in _AGENT_MARKERS:
+            if fragment in path:
+                item.add_marker(getattr(pytest.mark, marker))
+                break
+        else:
+            item.add_marker(pytest.mark.core)

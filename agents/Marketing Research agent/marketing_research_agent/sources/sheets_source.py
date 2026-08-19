@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import re
 import threading
 from datetime import date
@@ -22,6 +23,7 @@ from typing import Callable, Sequence
 
 from .. import config
 from ..schemas import CampaignMetric, DataGap, DateRange, Lead
+from .base import CredentialMissingError
 
 _MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "june": 6,
@@ -437,10 +439,21 @@ def fetch_all_tab_values(spreadsheet_id: str, titles: list[str], *, service=None
     return out
 
 
+def _offline() -> bool:
+    """The MR agent's offline flag, read the same way as everywhere else."""
+    return os.environ.get("MR_OFFLINE") == "1"
+
+
 def _default_fetcher(spreadsheet_id: str, gid: str) -> str:
     # Credentials are resolved once per process and the token is reused until it
     # actually expires — this used to re-run ADC + mint a fresh token per tab.
     import httpx
+
+    # The offline flag has to be enforced HERE, not by every caller remembering
+    # to inject a fetcher: this is the export fallback, so stubbing the Sheets
+    # API seam left it wide open and a test run pulled the live workbook twice.
+    if _offline():
+        raise CredentialMissingError("offline mode")
 
     creds = cached_credentials([DRIVE_SCOPE])
     refresh_if_stale(creds)
@@ -455,6 +468,9 @@ def _default_fetcher(spreadsheet_id: str, gid: str) -> str:
 
 def _default_xlsx_fetcher(spreadsheet_id: str) -> bytes:
     import httpx
+
+    if _offline():
+        raise CredentialMissingError("offline mode")
 
     creds = cached_credentials([DRIVE_SCOPE])
     refresh_if_stale(creds)

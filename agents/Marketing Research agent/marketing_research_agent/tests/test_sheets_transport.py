@@ -117,6 +117,10 @@ def test_csv_export_fetcher_is_bounded(stub_adc, monkeypatch):
     import httpx
 
     monkeypatch.setattr(httpx, "get", fake_get)
+    # The fetcher now refuses outright while MR_OFFLINE=1, so reaching the
+    # transport at all means leaving offline mode — the documented override in
+    # this suite's conftest. httpx.get is stubbed above, so nothing goes out.
+    monkeypatch.delenv("MR_OFFLINE", raising=False)
     ss._default_fetcher("sheet1", "0")
     assert captured["timeout"] == ss.EXPORT_TIMEOUT_SECONDS
 

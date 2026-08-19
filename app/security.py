@@ -21,18 +21,60 @@ from app.config import settings
 logger = logging.getLogger("agentos.auth")
 _bearer = HTTPBearer(auto_error=False)
 
+# Deadline for fetching Google's signing certificates during ID-token
+# verification. This sits on the *sign-in path*, in a sync handler, i.e. on one
+# of anyio's 40 worker threads — and google-auth's transport defaults to a 120s
+# timeout it never overrides. The certs are a small static JSON from Google's
+# edge; 10s is already a generous outlier, and failing fast lets the user retry
+# instead of holding a thread for two minutes.
+GOOGLE_CERT_FETCH_TIMEOUT_SECONDS = 10
+
+
+class _TimedRequest(google_requests.Request):
+    """google-auth transport with our deadline instead of its 120s default.
+
+    ``verify_oauth2_token`` calls the transport without a timeout, so overriding
+    the default in ``__call__`` is the only seam that reaches the cert fetch.
+    """
+
+    def __call__(  # type: ignore[override]
+        self, url, method="GET", body=None, headers=None,
+        timeout=GOOGLE_CERT_FETCH_TIMEOUT_SECONDS, **kwargs,
+    ):
+        return super().__call__(
+            url, method=method, body=body, headers=headers, timeout=timeout, **kwargs
+        )
+
+
+def _require_config(field: str) -> str:
+    """``settings.require`` mapped to an honest HTTP status.
+
+    ``require`` raises ``RuntimeError``, which inside a dependency or handler
+    becomes a 500 — "the server crashed" — when the truth is "this deployment
+    is missing a setting". 503 says that without leaking which one to the
+    caller; the name goes to the log, where operators can act on it.
+    """
+    try:
+        return settings.require(field)
+    except RuntimeError as exc:
+        logger.error("auth is not configured: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication is not configured on this server.",
+        ) from exc
+
 
 def verify_google_id_token(credential: str) -> dict[str, str]:
     """Verify a Google ID token and return key profile claims.
 
     Raises HTTP 401 if the token is invalid or its audience does not match our
-    configured Google Web Client ID.
+    configured Google Web Client ID; 503 if this deployment has no client id.
     """
-    client_id = settings.require("google_client_id")
+    client_id = _require_config("google_client_id")
     try:
         claims = google_id_token.verify_oauth2_token(
             credential,
-            google_requests.Request(),
+            _TimedRequest(),
             client_id,
             clock_skew_in_seconds=60,  # tolerate minor server/Google clock drift
         )
@@ -84,7 +126,22 @@ def create_token(
         "iat": now,
         "exp": now + settings.jwt_expires_minutes * 60,
     }
-    return jwt.encode(payload, settings.require("jwt_secret"), algorithm="HS256")
+    return jwt.encode(payload, _require_config("jwt_secret"), algorithm="HS256")
+
+
+def _still_allowed(email: str) -> bool:
+    """Re-apply the sign-in allowlist to an already-issued token.
+
+    Deliberately delegates to ``app.routers.auth.is_allowed_email`` rather than
+    re-implementing the rule. Two copies of an access rule drift, and the copy
+    that drifts is the one that grants access it shouldn't. The import is local
+    because ``app.routers.auth`` imports *this* module at load time — by the
+    time any request runs, both are in ``sys.modules`` and this is a dict
+    lookup, not a re-import.
+    """
+    from app.routers.auth import is_allowed_email
+
+    return is_allowed_email(email)
 
 
 def get_current_user(
@@ -96,17 +153,65 @@ def get_current_user(
         )
     try:
         payload = jwt.decode(
-            credentials.credentials, settings.require("jwt_secret"), algorithms=["HS256"]
+            credentials.credentials, _require_config("jwt_secret"), algorithms=["HS256"]
         )
     except jwt.PyJWTError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token"
         ) from exc
+
+    # Gating sign-in only protects accounts that sign in *after* the gate: a
+    # token minted before it stays valid for the rest of its 7-day life, and
+    # revoking someone's access has no effect until it expires. So the
+    # allowlist is re-checked here, on every request, against the email claim
+    # already inside the token — a set-membership test, no database round trip.
+    email = str(payload.get("email") or "")
+    try:
+        allowed = _still_allowed(email)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — cannot evaluate the rule
+        # Fail closed and say so honestly: an authorisation check that cannot
+        # run must never be read as "authorised". 503, not 401 — the token may
+        # be perfectly good; it is the server that is broken.
+        logger.exception("could not evaluate the sign-in allowlist")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authorisation is temporarily unavailable.",
+        ) from exc
+    if not allowed:
+        # 401 (not 403) on purpose: the frontend's existing 401 handler clears
+        # the session and returns the user to sign-in, which is exactly the
+        # right outcome for a token that should no longer exist.
+        logger.warning("rejected token for non-allowlisted account: %s", email)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="This account is no longer authorised to use AgentOS.",
+        )
+
+    # Same reasoning one step further: the admin/creator claims were stamped at
+    # mint time, so dropping an address from CREATOR_EMAILS left that token
+    # holding Settings → Secrets for the rest of its 7-day life. Re-derive both
+    # from the email claim instead — the same helpers the minting path uses, and
+    # the same kind of set-membership lookup as the allowlist above, so there is
+    # no cost argument for trusting the stale copy. The claims stay in the
+    # payload; they simply stop being authoritative.
+    try:
+        admin, creator = is_admin(email), is_creator(email)
+    except Exception as exc:  # noqa: BLE001 — cannot evaluate the role config
+        # Fail closed, exactly as above: a role check that cannot run is not a
+        # grant. 503 because the token may be fine; the server is not.
+        logger.exception("could not evaluate the role configuration")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authorisation is temporarily unavailable.",
+        ) from exc
+
     return {
         "id": payload["sub"],
         "email": payload["email"],
-        "is_admin": bool(payload.get("admin", False)),
-        "is_creator": bool(payload.get("creator", False)),
+        "is_admin": admin,
+        "is_creator": creator,
         "session_id": payload.get("sid") or "",
         "timezone": payload.get("tz") or "UTC",
     }

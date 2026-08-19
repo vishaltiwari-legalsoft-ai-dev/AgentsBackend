@@ -34,8 +34,12 @@ ACTION_KINDS = (
 )
 
 # Kinds that drive the page — forbidden in monitor (read-only) mode, which
-# also never attaches the debugger on the extension side.
-MUTATING_KINDS = frozenset({"navigate", "click", "type", "select", "key", "open_tab"})
+# also never attaches the debugger on the extension side. "tool" is here even
+# though it never reaches the page: the toolbox can write (sheet_append), and a
+# read-only run that writes to a spreadsheet is still a read-only run breached.
+MUTATING_KINDS = frozenset(
+    {"navigate", "click", "type", "select", "key", "open_tab", "tool"}
+)
 
 # Handled entirely on the server, never sent to the extension. "next_subtask"
 # marks a plan milestone done; "tool" reaches an API instead of the browser.
@@ -188,12 +192,18 @@ def _label_is_sensitive(label: str) -> bool:
     return False
 
 
+#: Tools that change something on the other side of the API. Everything else in
+#: the toolbox only reads, and gating reads would bury an ordinary run in
+#: confirmation prompts.
+WRITING_TOOLS = frozenset({"sheet_append"})
+
+
 def is_sensitive(action: Action, elements: list[dict]) -> bool:
-    # Tool calls reach APIs, not the page. The only one that changes anything
-    # appends to its own tab and cannot overwrite, so none of them are the
-    # irreversible kind of step that needs a human in the loop.
+    # Tool calls reach APIs, not the page — but a write is a write. The append
+    # lands in a spreadsheet the model named, so a human belongs in front of it;
+    # the read-only tools stay quiet.
     if action.kind == "tool":
-        return False
+        return str(action.tool or "") in WRITING_TOOLS
     if action.kind in ("navigate", "open_tab"):
         url = (action.url or "").lower()
         return any(tok in url for tok in _SENSITIVE_URL_TOKENS)

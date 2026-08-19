@@ -13,7 +13,7 @@ import re
 
 from datetime import date, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -493,7 +493,15 @@ def ask_expert(brand_id: str, payload: AskIn, user=Depends(get_current_user)):
 # ------------------------------- cron -------------------------------
 
 @router.post("/seo-geo/cron/run")
-def cron_run(request: Request):
+def cron_run(request: Request, response: Response):
+    """Scheduled per-brand sweep.
+
+    Status is honest: 200 every brand ran, 207 some brands failed, 502 EVERY
+    brand failed. Cloud Scheduler only reads the status code, so the old
+    unconditional 200 meant a sweep could be dead for weeks with the reason
+    buried in a response body nobody reads. 207 stays 2xx on purpose — one
+    permanently broken brand must not put the job into an endless retry loop —
+    and the log line is what a human alerts on."""
     expected = os.environ.get("SEO_CRON_KEY", "")
     if not expected:
         raise HTTPException(status_code=503, detail="SEO_CRON_KEY not configured")
@@ -506,7 +514,8 @@ def cron_run(request: Request):
         try:
             run = insights.run_brand(brand, trigger="cron")
             entry = {"ok": True, "todo_count": len(run["todos"])}
-            # Tracking extras are best-effort: missing keys must not fail the sweep.
+            # Tracking extras are best-effort: missing keys must not fail the
+            # sweep, and they deliberately do NOT count toward the status below.
             try:
                 seo_competitors.rank_snapshot(brand)
                 entry["ranks"] = "updated"
@@ -521,6 +530,20 @@ def cron_run(request: Request):
         except Exception as exc:  # noqa: BLE001 — one bad brand must not kill the sweep
             logger.exception("seo cron failed for %s", brand["id"])
             results[brand["id"]] = {"ok": False, "error": str(exc)}
+    ok = sum(1 for r in results.values() if r.get("ok"))
+    failed = len(results) - ok
+    out = {"brands": results, "ok": ok, "failed": failed}
+    if results and ok == 0:
+        out["status"] = "failed"
+        response.status_code = 502
+        logger.error("SEO cron sweep FAILED: all %d brands errored", failed)
+    elif failed:
+        out["status"] = "partial"
+        response.status_code = 207
+        logger.warning("SEO cron sweep degraded: %d/%d brands failed", failed, len(results))
+    else:
+        out["status"] = "ok"
     _track(run_tracking.CRON_USER, "cron",
-           f"Scheduled sweep across {len(results)} brands", usage_action="session")
-    return {"brands": results}
+           f"Scheduled sweep across {len(results)} brands — {ok} ok, {failed} failed",
+           usage_action="session")
+    return out

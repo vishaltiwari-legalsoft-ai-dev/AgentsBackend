@@ -20,6 +20,31 @@ from app.config import settings
 _client: Optional[storage.Client] = None
 _signing_credentials = None
 
+# --- Deadlines -------------------------------------------------------------
+# These run in sync handlers on anyio's 40-slot worker threadpool, so a stalled
+# object call costs the whole service a slot. google-cloud-storage does default
+# to 60s per call (with a 120s retry deadline), so this is not an unbounded
+# hang — but the numbers are inherited and invisible. Stated here they can be
+# reviewed: metadata calls are small and should be quick, payload transfers get
+# the room they actually need.
+_METADATA_TIMEOUT_SECONDS = 15   # exists / delete / list — small round trips
+_TRANSFER_TIMEOUT_SECONDS = 60   # upload / download — real bytes on the wire
+# Token refresh for IAM-based URL signing on Cloud Run. google-auth's own
+# default is 120s for what is a metadata-server call.
+_AUTH_TIMEOUT_SECONDS = 10
+
+
+class _TimedRequest(google_auth_requests.Request):
+    """google-auth transport with our deadline instead of its 120s default."""
+
+    def __call__(  # type: ignore[override]
+        self, url, method="GET", body=None, headers=None,
+        timeout=_AUTH_TIMEOUT_SECONDS, **kwargs,
+    ):
+        return super().__call__(
+            url, method=method, body=body, headers=headers, timeout=timeout, **kwargs
+        )
+
 
 def _storage() -> storage.Client:
     global _client
@@ -43,7 +68,7 @@ def _signing_kwargs() -> dict:
     creds = _signing_credentials
     if isinstance(creds, compute_engine.Credentials):
         if not creds.valid:
-            creds.refresh(google_auth_requests.Request())
+            creds.refresh(_TimedRequest())
         return {
             "service_account_email": creds.service_account_email,
             "access_token": creds.token,
@@ -62,7 +87,12 @@ def download_bytes(gs_uri: str) -> bytes:
     bucket_name, _, object_path = gs_uri[len("gs://"):].partition("/")
     if not bucket_name or not object_path:
         raise ValueError(f"Malformed gs:// URI: {gs_uri}")
-    return _storage().bucket(bucket_name).blob(object_path).download_as_bytes()
+    return (
+        _storage()
+        .bucket(bucket_name)
+        .blob(object_path)
+        .download_as_bytes(timeout=_TRANSFER_TIMEOUT_SECONDS)
+    )
 
 
 def _safe_name(file_name: str) -> str:
@@ -74,7 +104,9 @@ def _upload(object_path: str, data: bytes, content_type: str) -> tuple[str, str]
     bucket_name = settings.require("gcs_bucket_name")
     try:
         blob = _storage().bucket(bucket_name).blob(object_path)
-        blob.upload_from_string(data, content_type=content_type)
+        blob.upload_from_string(
+            data, content_type=content_type, timeout=_TRANSFER_TIMEOUT_SECONDS
+        )
         signed_url = blob.generate_signed_url(
             version="v4", expiration=timedelta(hours=1), method="GET", **_signing_kwargs()
         )
@@ -91,13 +123,16 @@ def delete_all_brand_kit_blobs() -> int:
     bucket_name = settings.require("gcs_bucket_name")
     bucket = _storage().bucket(bucket_name)
     deleted = 0
-    for blob in bucket.list_blobs():
+    # No cap on the iteration on purpose: this must delete *everything* matching
+    # or its return count is a lie. The per-page/per-delete deadlines bound each
+    # round trip; the total is bounded by how much there is to delete.
+    for blob in bucket.list_blobs(timeout=_METADATA_TIMEOUT_SECONDS):
         parts = blob.name.split("/", 2)
         if len(parts) >= 2 and parts[1] == "creatives" and parts[0] not in (
             "generated",
             "references",
         ):
-            blob.delete()
+            blob.delete(timeout=_METADATA_TIMEOUT_SECONDS)
             deleted += 1
     return deleted
 
@@ -148,7 +183,9 @@ def upload_brand_asset(
     try:
         blob = _storage().bucket(bucket_name).blob(object_path)
         blob.upload_from_string(
-            data, content_type=content_type or "application/octet-stream"
+            data,
+            content_type=content_type or "application/octet-stream",
+            timeout=_TRANSFER_TIMEOUT_SECONDS,
         )
         return f"gs://{bucket_name}/{object_path}"
     except Exception as exc:  # noqa: BLE001 - surface storage errors with context
@@ -184,9 +221,9 @@ def read_reference_index() -> Optional[bytes]:
     """Read the reference index JSON from GCS, or ``None`` if it does not exist."""
     bucket_name = settings.require("gcs_bucket_name")
     blob = _storage().bucket(bucket_name).blob(REFERENCE_INDEX_OBJECT)
-    if not blob.exists():
+    if not blob.exists(timeout=_METADATA_TIMEOUT_SECONDS):
         return None
-    return blob.download_as_bytes()
+    return blob.download_as_bytes(timeout=_TRANSFER_TIMEOUT_SECONDS)
 
 
 def signed_url_for_gs_uri(gs_uri: str, expires_in_hours: int = 1) -> str:

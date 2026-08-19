@@ -502,6 +502,13 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
                     why=f"Used {len(used_tools)} tools this step; carrying on.",
                 )
                 break
+            # Policy runs BEFORE the tool does. This used to sit downstream of
+            # execution — the post-loop `_policed` call only saw whatever the
+            # model said NEXT — so a write reached the API and was vetoed
+            # afterwards, which is not a veto at all.
+            action = _policed(run, body, action)
+            if action.kind != "tool":
+                continue
             used_tools.append(_run_tool(run, action))
 
         action = brain.decide(run, body)

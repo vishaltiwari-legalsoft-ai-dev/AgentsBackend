@@ -451,8 +451,42 @@ def list_users(_admin: dict = Depends(require_admin)) -> dict:
 # --------------------------------------------------------------------------- #
 
 # Field names whose values must never be shown in full, wherever they appear
-# (top-level or nested). Secrets are masked to a recognisable hint instead.
-_SENSITIVE_FIELDS = {"openrouter_api_key", "api_key", "google_sub", "jwt_secret"}
+# (top-level or nested). Secrets are masked to a recognisable hint instead —
+# same treatment /admin/settings gives them, so this route can't be used as a
+# way around the Creator-only Secrets panel.
+#
+# Derived, not hand-listed: every runtime override field is sensitive EXCEPT the
+# per-agent model ids (AGENT_OVERRIDE_FIELDS), which are just model names and
+# are useful to see. A hand-written list is exactly how the GEO engine keys
+# ended up readable here after runtime_config grew them, so adding a key to
+# OVERRIDE_FIELDS now masks it automatically.
+_SENSITIVE_FIELDS = {
+    *(
+        f
+        for f in runtime_config.OVERRIDE_FIELDS
+        if f not in runtime_config.AGENT_OVERRIDE_FIELDS
+    ),
+    # Secrets that reach Firestore without going through runtime_config.
+    "api_key",
+    "google_sub",
+    "jwt_secret",
+}
+
+# Catch-all for secrets written by agent code straight into a document (e.g.
+# app_config/global.seo_serper_api_key, .serpapi_api_key, Canva OAuth tokens),
+# which no central list knows about.
+_SENSITIVE_SUFFIXES = (
+    "_api_key",
+    "_secret",
+    "_token",
+    "_password",
+    "_credential",
+)
+
+
+def _is_sensitive_key(key: str) -> bool:
+    lowered = key.lower()
+    return lowered in _SENSITIVE_FIELDS or lowered.endswith(_SENSITIVE_SUFFIXES)
 
 # Long text/blobs are truncated per cell so a single huge field (e.g. a base64
 # string) can't bloat the table; the truncation is signalled in the value.
@@ -472,7 +506,7 @@ _PREFERRED_COLUMNS = (
 
 def _sanitize(value, *, key: str = ""):
     """Make a Firestore value JSON-safe, redact secrets, and cap blob sizes."""
-    if value and key in _SENSITIVE_FIELDS and isinstance(value, str):
+    if value and isinstance(value, str) and _is_sensitive_key(key):
         return _mask(value)
     if isinstance(value, datetime):
         return value.isoformat()
