@@ -36,6 +36,9 @@ _NO_PROGRESS_AFTER = 8
 # costs an API round-trip plus another LLM call to decide what comes next.
 _MAX_TOOLS_PER_STEP = 3
 _MAX_TOOL_RESULT_CHARS = 12_000
+# Workbooks a run remembers having read, which is what makes them writable
+# (see _writable_sheets). Bounded so a long run can't grow the doc unchecked.
+_MAX_READ_SHEETS = 20
 # Repeats before we ask the extension for a screenshot. Text alone can't explain
 # why a click does nothing on an app like Gmail — an overlay, a control that only
 # looks focusable, an element the model is reading as the wrong thing. One repeat
@@ -380,28 +383,126 @@ def _run_tool(run: dict, action: actions.Action) -> dict:
         {"tool": name, "at": _now(), "ok": record["ok"],
          "why": action.why, "error": record.get("error")}
     )
+    if record["ok"] and name in actions.SHEET_READING_TOOLS:
+        _remember_workbook(run, record.get("result"), args.get("sheet"))
     if len(run.get("findings") or []) < _MAX_FINDINGS:
         text = json.dumps(record, default=str)[:_MAX_TOOL_RESULT_CHARS]
         run.setdefault("findings", []).append(f"[{name}] {text}")
     return record
 
 
-def _policed(run: dict, body: dict, action: actions.Action) -> actions.Action:
+def _remember_workbook(run: dict, result: object, requested: object) -> None:
+    """A workbook this run has read is one it may later be asked to append to.
+
+    The id comes from the RESULT where possible — that is the workbook the API
+    actually opened, not the string the model typed.
+    """
+    found = str(result.get("sheet_id") or "") if isinstance(result, dict) else ""
+    found = found or tools.workbook_id(str(requested or ""))
+    seen = run.setdefault("read_sheets", [])
+    if found and found not in seen and len(seen) < _MAX_READ_SHEETS:
+        seen.append(found)
+
+
+def _execute_tool(run: dict, action: actions.Action, elements: list[dict]) -> dict | None:
+    """Run one tool — or return None when a person has to say yes first.
+
+    The confirmation gate lives HERE, at the single place a tool can execute,
+    rather than at the end of the step. At the end of the step it was dead
+    code: the loop overwrote ``action`` with the model's next decision the
+    instant the tool returned, so nothing downstream could ever see kind
+    "tool", and the write had already landed by the time anyone looked. A
+    check that runs after the irreversible thing is not a check — the same
+    lesson ``_policed`` records twelve lines up.
+    """
+    if _needs_confirming(run, action, elements) and not _take_approval(run, action):
+        logger.info(
+            "browser: holding %s on run %s for the user's confirmation",
+            action.tool, run.get("id"),
+        )
+        return None
+    return _run_tool(run, action)
+
+
+def _needs_confirming(run: dict, action: actions.Action, elements: list[dict]) -> bool:
+    """Whether a person must see this action before it is allowed to happen."""
+    return bool(run.get("sensitive_confirm", True)) and actions.is_sensitive(action, elements)
+
+
+def _take_approval(run: dict, action: actions.Action) -> bool:
+    """Spend the user's approval, if it was for exactly THIS action.
+
+    One approval buys one action. Matching the whole action — not the kind, not
+    a flag on the request — is what stops an approved append being reused by a
+    second, different write the model decides on later in the same step.
+    """
+    if run.get("approved") == action.model_dump(exclude_none=True):
+        run["approved"] = None
+        return True
+    return False
+
+
+def _approved_action(run: dict) -> actions.Action | None:
+    """The action the user just approved, re-proposed verbatim.
+
+    Asking the model again would be a different question, and it may answer
+    differently — leaving the approval unspent and the user re-prompted for a
+    write they already agreed to. What was approved is what runs.
+    """
+    approved = run.get("approved")
+    if not approved:
+        return None
+    try:
+        return actions.validate_action(approved)
+    except ValueError:  # a stored action that no longer parses is not a mandate
+        run["approved"] = None
+        return None
+
+
+def _policed(
+    run: dict, body: dict, action: actions.Action, *, rail: list | None = None
+) -> actions.Action:
     """Run an action past policy, giving the model one chance to correct itself.
 
     Every action reaching the extension goes through here — including the one
     decided after a skill is abandoned, which previously slipped past the
-    domain rules because the check happened earlier in the step.
+    domain rules because the check happened earlier in the step. ``rail`` is
+    the step's tool list, so a refused tool call shows up there instead of
+    vanishing.
     """
     veto = _veto(run, action)
     if not veto:
         return action
+    _refused(run, action, veto, rail)
     retry = dict(body, last_result={"ok": False, "error": veto})
     action = brain.decide(run, retry)
     veto = _veto(run, action)
     if veto:
+        _refused(run, action, veto, rail)
         return actions.Action(kind="fail", reason=veto, why="Blocked by policy.")
     return action
+
+
+def _refused(run: dict, action: actions.Action, veto: str, rail: list | None) -> None:
+    """Record a refused TOOL call where the model and the user will both see it.
+
+    A read the policy stopped must never look like a page that said nothing:
+    silence is the one outcome the model would read as fact. So it lands in
+    findings as an explicit refusal, and on the step's tool rail as a failed
+    call. Browser-action refusals need none of this — they already surface as
+    the step's own fail reason.
+    """
+    if action.kind != "tool":
+        return
+    name = str(action.tool or "")
+    run.setdefault("tool_calls", []).append(
+        {"tool": name, "at": _now(), "ok": False, "why": action.why,
+         "error": veto, "refused": True}
+    )
+    if len(run.get("findings") or []) < _MAX_FINDINGS:
+        run.setdefault("findings", []).append(f"[{name}] refused by policy: {veto}")
+    if rail is not None:
+        rail.append({"tool": name, "ok": False, "error": veto})
 
 
 def _veto(run: dict, action: actions.Action) -> str | None:
@@ -412,7 +513,74 @@ def _veto(run: dict, action: actions.Action) -> str | None:
         return actions.check_url(
             action.url or "", set(run.get("allowed") or []), set(run.get("blocked") or [])
         )
+    if action.kind == "tool":
+        return _tool_veto(run, action)
     return None
+
+
+def _tool_veto(run: dict, action: actions.Action) -> str | None:
+    """The run's policy applies to the toolbox, not only to the browser.
+
+    Two ways round it, closed here. ``read_url`` fetches whatever host the
+    model names and the text is inlined into the next prompt, so a run that may
+    not NAVIGATE to a host must not be able to READ it either — otherwise the
+    allow/block lists cover only the slow half of the agent. And ``sheet_append``
+    takes its destination from the model, which means a page can propose one.
+    """
+    name = str(action.tool or "")
+    if name == "read_url":
+        return actions.check_url(
+            action.url or "", set(run.get("allowed") or []), set(run.get("blocked") or [])
+        )
+    if name in actions.WRITING_TOOLS:
+        return actions.check_sheet_target(
+            tools.workbook_id(action.sheet or ""), _writable_sheets(run)
+        )
+    return None
+
+
+def _writable_sheets(run: dict) -> set[str]:
+    """The workbooks this run is allowed to append to.
+
+    Both sources trace back to a person: the goal (and start URL) the user
+    typed, and the workbooks this run has actually read on their behalf. A
+    sheet id that arrived in PAGE TEXT is in neither set, which is the whole
+    point — a page naming somewhere to put your findings is describing an
+    exfiltration target, not a destination the user chose.
+    """
+    permitted = set(run.get("read_sheets") or [])
+    permitted |= tools.workbook_ids(run.get("goal") or "")
+    permitted |= tools.workbook_ids(run.get("start_url") or "")
+    return permitted
+
+
+def _pre_approved(body: dict, action: actions.Action) -> bool:
+    """Whether this request already carries the user's yes for this action.
+
+    A browser action can carry one: the extension replays the same seq with
+    ``confirmed`` when the panel's button is pressed, and the cached decision
+    is what then gets executed. A tool never can — it does not leave the
+    server, so the only way one reaches the end of a step is the gate having
+    stopped it, and a request-level flag must not be read as consent for it.
+    """
+    return bool(body.get("confirmed")) and action.kind not in actions.INTERNAL_KINDS
+
+
+def _carries_result(run: dict) -> bool:
+    """Whether the newest step is one the extension actually executed.
+
+    A tool held for confirmation never ran, so the next observation's
+    ``last_result`` belongs to the step BEFORE it. Recording it against the
+    held step would show the model a write that never happened as "ok" — which
+    is exactly the fake success this agent must never manufacture. A held
+    BROWSER action is different: the extension does execute it once approved.
+    """
+    steps = run.get("steps") or []
+    if not steps:
+        return False
+    newest = steps[-1]
+    kind = (newest.get("action") or {}).get("kind")
+    return not (newest.get("awaiting") and kind in actions.INTERNAL_KINDS)
 
 
 def step(run: dict, body: dict) -> tuple[dict, dict]:
@@ -433,8 +601,20 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
     if seq == run["seq"] and run.get("last_decision"):
         decision = run["last_decision"]
         if run.get("pending") and body.get("confirmed"):
+            pending = run["pending"]
             run["pending"] = None
             run["status"] = "running"
+            if str(pending.get("kind")) in actions.INTERNAL_KINDS:
+                # A confirmed tool has to be RUN, not handed back: tool actions
+                # never leave the server, so replaying the cached decision
+                # would send the extension something it cannot execute and the
+                # write would simply never happen. Re-drive this seq instead,
+                # carrying the approval for that one action — and deliberately
+                # NOT the request's `confirmed` flag, which must not wave
+                # through anything else the model decides on the way through.
+                run["approved"] = pending
+                run["seq"] = seq - 1
+                return step(run, dict(body, confirmed=False))
             decision = dict(decision, requires_confirmation=False, status="running")
             run["last_decision"] = decision
             run["updated_at"] = _now()
@@ -452,7 +632,7 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
 
     # Attach the result of the previous action; harvest extracted page text.
     last = body.get("last_result")
-    if isinstance(last, dict) and run["steps"]:
+    if isinstance(last, dict) and _carries_result(run):
         run["steps"][-1]["result"] = {"ok": bool(last.get("ok")), "error": last.get("error")}
         extracted = last.get("extracted")
         if extracted and len(run["findings"]) < _MAX_FINDINGS:
@@ -469,7 +649,9 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
         _persist(run)
         return run, response
 
-    action = _replay_step(run, body) or brain.decide(run, body)
+    # An approval the user just gave is re-proposed before anything is decided;
+    # otherwise this is an ordinary step.
+    action = _approved_action(run) or _replay_step(run, body) or brain.decide(run, body)
 
     # Internal actions never leave the server, so the extension still receives
     # exactly one executable browser action per step: "next_subtask" marks a
@@ -477,6 +659,7 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
     # asking the model again with the new state.
     advanced: list[str] = []
     used_tools: list[dict] = []
+    elements = (body.get("dom") or {}).get("elements") or []
     subtask_count = len((run.get("plan") or {}).get("subtasks") or [])
 
     while action.kind in actions.INTERNAL_KINDS:
@@ -506,10 +689,16 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
             # execution — the post-loop `_policed` call only saw whatever the
             # model said NEXT — so a write reached the API and was vetoed
             # afterwards, which is not a veto at all.
-            action = _policed(run, body, action)
+            action = _policed(run, body, action, rail=used_tools)
             if action.kind != "tool":
                 continue
-            used_tools.append(_run_tool(run, action))
+            # And so does confirmation, for exactly the same reason: the gate
+            # is inside _execute_tool, the one place a tool can run, so no
+            # future caller — or future internal kind — can execute around it.
+            record = _execute_tool(run, action, elements)
+            if record is None:
+                break  # nothing ran; the pause is built from this same action
+            used_tools.append(record)
 
         action = brain.decide(run, body)
 
@@ -549,9 +738,15 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
         and repeat_count(run, action, page_fp) >= _LOOK_AFTER
     )
 
-    elements = (body.get("dom") or {}).get("elements") or []
-    sensitive = bool(run.get("sensitive_confirm", True)) and actions.is_sensitive(
-        action, elements
+    sensitive = _needs_confirming(run, action, elements)
+    # Nothing sensitive happens this step unless the user has already said yes.
+    # A tool that reached here is one the gate inside the loop stopped, so it
+    # has NOT run — the step log records that rather than leaving it to look
+    # like something that executed.
+    holding = (
+        sensitive
+        and action.kind not in ("done", "fail")
+        and not _pre_approved(body, action)
     )
     act_dict = action.model_dump(exclude_none=True)
 
@@ -559,6 +754,7 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
     run["steps_used"] += 1
     run["steps"].append(
         {"seq": seq, "action": act_dict, "at": _now(), "sensitive": sensitive,
+         "awaiting": holding,
          "page_fp": page_fp, "saw_page": bool(body.get("screenshot")),
          "subtask": (active or {}).get("title"), "completed": advanced,
          "rail": (active or {}).get("rail", "browser"),
@@ -579,7 +775,7 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
         run["fail_reason"] = action.reason
         _score_skill(run, ok=False)
         response = _response(run, act_dict)
-    elif sensitive and not body.get("confirmed"):
+    elif holding:
         run["status"] = "awaiting_confirmation"
         run["pending"] = act_dict
         response = _response(run, act_dict, requires_confirmation=True)
@@ -590,6 +786,9 @@ def step(run: dict, body: dict) -> tuple[dict, dict]:
         run["status"] = "running"
         response = _response(run, act_dict, want_screenshot=want_screenshot)
 
+    # An approval is spent, or it expires with the step. It never carries into
+    # the next one, and never to a second action in this one.
+    run["approved"] = None
     run["last_decision"] = response
     run["updated_at"] = _now()
     _persist(run)

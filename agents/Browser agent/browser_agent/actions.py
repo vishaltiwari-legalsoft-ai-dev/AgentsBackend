@@ -197,6 +197,29 @@ def _label_is_sensitive(label: str) -> bool:
 #: confirmation prompts.
 WRITING_TOOLS = frozenset({"sheet_append"})
 
+#: Reading a workbook is how a run earns the right to append to it — see
+#: ``check_sheet_target``. These are the tools that count as having read one.
+SHEET_READING_TOOLS = frozenset({"sheet_read", "sheet_tabs"})
+
+
+def check_sheet_target(target_id: str, permitted: set[str]) -> str | None:
+    """None when this workbook may be appended to, else an honest refusal.
+
+    The DESTINATION of a write is the one argument an injected page most wants
+    control of: the append itself is safely built (own tab, RAW values, append
+    only), so the way to turn it into an exfiltration channel is to change
+    where it points. It is therefore not taken on trust — the caller supplies
+    the workbooks a person actually chose, and nothing else is writable.
+    """
+    if not target_id:
+        return "that doesn't look like a Google Sheet link, so I won't write to it"
+    if target_id in permitted:
+        return None
+    return (
+        "I only append to a workbook you named or one I have already read in "
+        f"this run — {target_id} is neither, so I am not writing to it"
+    )
+
 
 def is_sensitive(action: Action, elements: list[dict]) -> bool:
     # Tool calls reach APIs, not the page — but a write is a write. The append

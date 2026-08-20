@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 logger = logging.getLogger("agentos.browser")
@@ -74,6 +75,38 @@ def resolve_sheet(url_or_id: str) -> str:
             f"{url_or_id!r} doesn't look like a Google Sheet link or id."
         )
     return sheet_id
+
+
+# Punctuation that rides along when a link is pasted into a sentence.
+_TRIM = "\"'<>(),;.:!?"
+
+
+def workbook_id(url_or_id: str) -> str:
+    """The spreadsheet id inside a link, or ``""`` — never raises.
+
+    ``resolve_sheet`` is for doing work, so it refuses loudly. Policy has a
+    different job: it compares one target against a set of permitted ones, and
+    something it cannot parse is simply not a match.
+    """
+    try:
+        _, _, registry = _mr()
+        return str(registry.parse_spreadsheet_id(url_or_id or "") or "")
+    except Exception:  # noqa: BLE001 — an unparseable target is a non-match
+        return ""
+
+
+def workbook_ids(text: str) -> set[str]:
+    """Every spreadsheet id mentioned in a piece of text — a goal, a start URL.
+
+    Token by token, because a link pasted mid-sentence is the normal case and
+    the bare-id form only matches a whole string.
+    """
+    found: set[str] = set()
+    for token in re.split(r"\s+", str(text or "")):
+        one = workbook_id(token.strip(_TRIM))
+        if one:
+            found.add(one)
+    return found
 
 
 def _wrap_google_error(exc: Exception, sheet_id: str, *, writing: bool = False) -> ToolError:
