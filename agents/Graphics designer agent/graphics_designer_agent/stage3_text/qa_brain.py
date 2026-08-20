@@ -66,7 +66,10 @@ def _call_model(prompt: str, images_png: list[bytes]) -> str:
     from app.services import runtime_config  # lazy — works without app
     from app.services.openrouter import analyze_images
 
-    model = runtime_config.get("openrouter_vision_model")
+    from ..providers import GD_AGENT_ID
+
+    # get_for_agent, not get — see placement_brain._call_model.
+    model = runtime_config.get_for_agent(GD_AGENT_ID, "openrouter_vision_model")
     pairs = [(png, "image/png") for png in images_png]
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(analyze_images, prompt, pairs, model)

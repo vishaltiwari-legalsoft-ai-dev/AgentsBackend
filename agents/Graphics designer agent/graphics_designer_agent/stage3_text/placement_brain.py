@@ -93,7 +93,12 @@ def _call_model(prompt: str, image_png: bytes) -> str:
     from app.services import runtime_config  # lazy — works without app
     from app.services.openrouter import analyze_images
 
-    model = runtime_config.get("openrouter_vision_model")
+    from ..providers import GD_AGENT_ID
+
+    # get_for_agent, not get: this is one of GD's three vision paths, and the
+    # creator's per-agent vision model must reach all three or the Agent
+    # Configuration dropdown is a switch that changes one path in three.
+    model = runtime_config.get_for_agent(GD_AGENT_ID, "openrouter_vision_model")
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(analyze_images, prompt, [(image_png, "image/png")], model)
         return future.result(timeout=_VISION_TIMEOUT_S)

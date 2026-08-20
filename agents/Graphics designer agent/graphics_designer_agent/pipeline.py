@@ -12,6 +12,7 @@ from dataclasses import asdict
 from io import BytesIO
 
 from . import registry
+from .providers import GD_AGENT_ID as _GD_AGENT_ID
 from .providers import ImageProvider, get_provider
 from .runs import (
     STATE_FOR_STAGE_CONFIG,
@@ -71,7 +72,8 @@ MAX_RENDER_WIDTH = 4096
 # This pipeline IS the Graphic Designer agent ("a1" in the agent catalog). The id
 # lets the provider resolve this agent's per-agent image-model override set by the
 # creator in the Agent Configuration panel, falling back to the global default.
-GD_AGENT_ID = "a1"
+# Re-exported from providers so the whole package shares one definition.
+GD_AGENT_ID = _GD_AGENT_ID
 
 # The studio editor produces vertical social posts, so its reference precedent is
 # drawn from the social-story bucket of the Brand Reference Library.

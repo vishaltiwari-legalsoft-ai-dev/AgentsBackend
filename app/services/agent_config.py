@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.config import settings
+from app.services import runtime_config
 
 IMAGE_MODELS: list[dict[str, str | bool]] = [
     {
@@ -118,6 +118,8 @@ VISION_MODELS: list[dict[str, str | bool]] = [
 # Maps each runtime-config model field to the catalog the UI should offer for it.
 MODEL_CATALOG: dict[str, list[dict[str, str | bool]]] = {
     "openrouter_image_model": IMAGE_MODELS,
+    # Stage-3 polish fan-out (GD): an image-EDIT model, same catalog as above.
+    "gd_polish_image_model": IMAGE_MODELS,
     "openrouter_model": TEXT_MODELS,
     "openrouter_fast_model": TEXT_MODELS,
     "openrouter_vision_model": VISION_MODELS,
@@ -144,6 +146,9 @@ AGENTS: list[dict[str, str | bool | list[str]]] = [
             "openrouter_image_model",
             "openrouter_vision_model",
             "gd_planner_model",
+            # Stage-3 polish fan-out runs a separate (premium) image-edit
+            # model from Stages 1-2 — see providers._polish_model.
+            "gd_polish_image_model",
         ],
     },
     {
@@ -263,7 +268,14 @@ def default_enabled_abilities() -> list[str]:
 
 
 def default_image_model() -> str:
-    default = settings.openrouter_image_model
+    """The image model a new agent config starts from.
+
+    Resolves through :mod:`app.services.runtime_config` (global admin
+    override -> environment), NOT ``settings`` directly: reading the env
+    value here made an admin's panel-set image model invisible to every
+    default and to ``normalize_settings``.
+    """
+    default = runtime_config.get("openrouter_image_model")
     if default in IMAGE_MODEL_IDS:
         return default
     return str(IMAGE_MODELS[0]["id"])

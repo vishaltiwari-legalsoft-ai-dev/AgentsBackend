@@ -36,6 +36,12 @@ _1746A2 = (23, 70, 162)
 _INK = (15, 15, 15)
 
 
+# The Graphic Designer's agent id (matches app.services.agent_config.AGENTS).
+# Every model lookup this package makes must carry it, or the creator's
+# per-agent overrides in the Agent Configuration panel silently do nothing.
+GD_AGENT_ID = "a1"
+
+
 class ImageProviderUnavailable(RuntimeError):
     """No real image provider could be resolved in auto mode.
 
@@ -277,20 +283,28 @@ def get_provider(name: str | None = None, *, agent_id: str | None = None) -> Ima
 # fixes and text fidelity are exactly what Gemini 3 Pro Image (Nano Banana Pro)
 # is strongest at, and the polish pass is where placement quality is decided.
 # Stages 1–2 keep the cheaper default model — cost rises only where it pays.
+# Standalone fallback only: reached when the backend app (and therefore
+# Settings.gd_polish_image_model) is not importable. Keep the two in sync.
 _DEFAULT_POLISH_MODEL = "google/gemini-3-pro-image"
 
 
 def _polish_model(agent_id: str | None) -> str:
     """Model for the Text Optimizer polish fan-out:
     env ``GD_POLISH_IMAGE_MODEL`` → runtime config ``gd_polish_image_model``
-    (admin-settable) → the premium default."""
+    (per-agent override → global override → env) → the premium default.
+
+    ``gd_polish_image_model`` is a real ``Settings`` field and a member of both
+    ``runtime_config.OVERRIDE_FIELDS`` and ``AGENT_OVERRIDE_FIELDS``, so the
+    admin path this docstring advertises actually resolves. It used to be
+    neither, which made ``runtime_config.get`` return "" every time.
+    """
     env = (os.environ.get("GD_POLISH_IMAGE_MODEL") or "").strip()
     if env:
         return env
     try:
         from app.services import runtime_config
 
-        override = runtime_config.get("gd_polish_image_model")
+        override = runtime_config.get_for_agent(agent_id, "gd_polish_image_model")
         if override:
             return str(override)
     except Exception:
@@ -306,4 +320,4 @@ def get_polish_provider(*, agent_id: str | None = None) -> ImageProvider:
         return MockImageProvider()
     if name != "openrouter":
         _require_real_provider()
-    return OpenRouterProvider(model=_polish_model(agent_id))
+    return OpenRouterProvider(model=_polish_model(agent_id or GD_AGENT_ID))

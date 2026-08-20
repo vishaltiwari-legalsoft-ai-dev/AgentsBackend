@@ -19,6 +19,7 @@ import re
 logger = logging.getLogger("agentos.gd.suggestions")
 
 from .prompts import load_prompt
+from .providers import GD_AGENT_ID
 from .stage1_gradient import (
     SOURCE_NOTE_STAGE1,
     STAGE1_AR_ANCHOR,
@@ -372,7 +373,7 @@ def _enrich_direction_with_llm(brief: dict, curated: dict, pack) -> dict | None:
         'headline/copy approach"}'
     )
     try:
-        msg = get_llm(temperature=0.6, fast=True, agent_id="a1").invoke(prompt)
+        msg = get_llm(temperature=0.6, fast=True, agent_id=GD_AGENT_ID).invoke(prompt)
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
         match = re.search(r"\{.*\}", content, re.S)
         if not match:
@@ -529,7 +530,7 @@ def _converse_with_llm(history, brief, pack) -> dict | None:
     if not msgs:
         chat.append(("human", "Start the conversation."))
     try:
-        out = get_llm(temperature=0.6, agent_id="a1").invoke(chat)
+        out = get_llm(temperature=0.6, agent_id=GD_AGENT_ID).invoke(chat)
         content = out.content if isinstance(out.content, str) else str(out.content)
         match = re.search(r"\{.*\}", content, re.S)
         if not match:
@@ -660,7 +661,7 @@ def _enrich_explore_with_llm(answers: dict, curated: dict, pack) -> dict | None:
         'sentence on combining or pushing the elements"}'
     )
     try:
-        msg = get_llm(temperature=0.7, fast=True, agent_id="a1").invoke(prompt)
+        msg = get_llm(temperature=0.7, fast=True, agent_id=GD_AGENT_ID).invoke(prompt)
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
         match = re.search(r"\{.*\}", content, re.S)
         if not match:
@@ -901,7 +902,7 @@ def _get_llm(**kwargs):
     override applies to every GD suggestion call."""
     from app.services.openrouter import get_llm  # lazy — package works without the app
 
-    kwargs.setdefault("agent_id", "a1")
+    kwargs.setdefault("agent_id", GD_AGENT_ID)
     return get_llm(**kwargs)
 
 
@@ -1278,7 +1279,9 @@ def _enrich_element_with_llm(answers: dict, steer: str, curated: dict, pack) -> 
         'description, foreground only"}'
     )
     try:
-        llm = get_llm(temperature=0.8, fast=True)
+        # agent_id is REQUIRED here: without it get_for_agent short-circuits to
+        # the global model and GD's per-agent fast-model override is ignored.
+        llm = get_llm(temperature=0.8, fast=True, agent_id=GD_AGENT_ID)
         data = None
         # Two attempts: a description that mentions the background (common photo
         # phrasing) fails validation, so we retry once with a pointed correction
