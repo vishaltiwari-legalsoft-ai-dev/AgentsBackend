@@ -197,17 +197,34 @@ def _sentiment(prompt_text: str, answer_text: str, brand_name: str) -> str | Non
         return None
 
 
+# Every read path here is (days x engines) INDEPENDENT document fetches, and
+# each one is a network round trip. Done in sequence a 7-day report is 28
+# serial round trips -- measured at ~12s, during which the whole panel sits
+# empty. They are independent waits, so they overlap; the ceiling is the
+# datastore's, not ours.
+READ_CONCURRENCY = 12
+
+
+def _load_many(doc_ids: list[str]) -> dict[str, dict | None]:
+    """Fetch several state docs at once. Order of the result is irrelevant —
+    callers key by doc id."""
+    if len(doc_ids) < 2:
+        return {doc_id: state.load(doc_id) for doc_id in doc_ids}
+    with ThreadPoolExecutor(max_workers=min(READ_CONCURRENCY, len(doc_ids))) as pool:
+        return dict(zip(doc_ids, pool.map(state.load, doc_ids)))
+
+
 def _load_day_docs(brand_id: str, engines: list[str], day: str) -> dict[str, dict]:
-    docs = {}
-    for engine in engines:
-        doc = state.load(poll_doc_id(brand_id, engine, day)) or {
+    loaded = _load_many([poll_doc_id(brand_id, engine, day) for engine in engines])
+    return {
+        engine: loaded.get(poll_doc_id(brand_id, engine, day)) or {
             "brand_id": brand_id,
             "engine": engine,
             "date": day,
             "answers": [],
         }
-        docs[engine] = doc
-    return docs
+        for engine in engines
+    }
 
 
 def _pending_tasks(
@@ -789,14 +806,22 @@ def poll_step(
     )
 
 
-def recent_answers(brand_id: str, days: int = 7) -> list[dict]:
-    """All stored answers for the brand across engines over the last N days."""
-    answers: list[dict] = []
+def _recent_days(days: int) -> list[str]:
     today = dt.datetime.now(dt.timezone.utc).date()
-    for offset in range(days):
-        day = (today - dt.timedelta(days=offset)).strftime("%Y%m%d")
-        answers.extend(day_answers(brand_id, day))
-    return answers
+    return [
+        (today - dt.timedelta(days=offset)).strftime("%Y%m%d")
+        for offset in range(max(1, days))
+    ]
+
+
+def recent_answers(brand_id: str, days: int = 7) -> list[dict]:
+    """All stored answers for the brand across engines over the last N days.
+
+    One parallel fetch for the whole window rather than a fetch per day: the
+    report, the comparison and the raw-answer list all come through here, and
+    each was paying for the round trips one at a time.
+    """
+    return [a for rows in answers_by_day(brand_id, days=days).values() for a in rows]
 
 
 def day_answers(brand_id: str, day: str) -> list[dict]:
@@ -807,26 +832,31 @@ def day_answers(brand_id: str, day: str) -> list[dict]:
     next day rather than resuming yesterday's doc. That makes "one day" and
     "one sweep" the same window, which is what a trend point is measured over.
     """
-    answers: list[dict] = []
-    for engine in geo_engines.ALL_ENGINES:
-        doc = state.load(poll_doc_id(brand_id, engine, day))
-        if doc:
-            answers.extend(doc.get("answers", []))
-    return answers
+    loaded = _load_many(
+        [poll_doc_id(brand_id, engine, day) for engine in geo_engines.ALL_ENGINES]
+    )
+    return [a for doc in loaded.values() if doc for a in doc.get("answers", [])]
 
 
 def answers_by_day(brand_id: str, days: int = 30) -> dict[str, list[dict]]:
     """day (YYYYMMDD) -> that day's answers, for days that have any.
 
-    Only used to backfill the trend for a brand that was already polling
-    before the history document existed; the live path appends one point per
-    sweep instead of re-reading the whole window.
+    The whole window is fetched in ONE parallel batch — a day-by-day loop here
+    is what made a 30-day backfill 120 serial round trips.
     """
-    today = dt.datetime.now(dt.timezone.utc).date()
+    wanted = _recent_days(days)
+    loaded = _load_many([
+        poll_doc_id(brand_id, engine, day)
+        for day in wanted for engine in geo_engines.ALL_ENGINES
+    ])
     out: dict[str, list[dict]] = {}
-    for offset in range(max(1, days)):
-        day = (today - dt.timedelta(days=offset)).strftime("%Y%m%d")
-        rows = day_answers(brand_id, day)
+    for day in wanted:
+        rows = [
+            a
+            for engine in geo_engines.ALL_ENGINES
+            if (doc := loaded.get(poll_doc_id(brand_id, engine, day)))
+            for a in doc.get("answers", [])
+        ]
         if rows:
             out[day] = rows
     return out
