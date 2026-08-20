@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 from seo_geo_agent import state
-from final_geo_agent import geo_engines, geo_history, geo_prompts
+from final_geo_agent import geo_engines, geo_history, geo_prompts, geo_window
 from seo_geo_agent.sources import CredentialMissing, llm_json
 
 logger = logging.getLogger("agentos.geo.poll")
@@ -78,8 +78,11 @@ def config_doc_id(brand_id: str) -> str:
     return f"geo-config-{brand_id}"
 
 
-def poll_doc_id(brand_id: str, engine: str, day: str) -> str:
-    return f"geo-poll-{brand_id}-{engine}-{day}"
+# The day-doc id shape belongs to ``geo_window`` — it is the module every
+# reader goes through, and a second copy of the shape here is exactly how a
+# reader and a writer drift apart. Re-exported because this module writes those
+# documents and its callers already import the name from here.
+poll_doc_id = geo_window.poll_doc_id
 
 
 def _default_aliases(brand: dict) -> list[str]:
@@ -246,27 +249,24 @@ def _sentiment(prompt_text: str, answer_text: str, brand_name: str) -> str | Non
         return None
 
 
-# Every read path here is (days x engines) INDEPENDENT document fetches, and
-# each one is a network round trip. Done in sequence a 7-day report is 28
-# serial round trips -- measured at ~12s, during which the whole panel sits
-# empty. They are independent waits, so they overlap; the ceiling is the
-# datastore's, not ours.
-READ_CONCURRENCY = 12
-
-
-def _load_many(doc_ids: list[str]) -> dict[str, dict | None]:
-    """Fetch several state docs at once. Order of the result is irrelevant —
-    callers key by doc id."""
-    if len(doc_ids) < 2:
-        return {doc_id: state.load(doc_id) for doc_id in doc_ids}
-    with ThreadPoolExecutor(max_workers=min(READ_CONCURRENCY, len(doc_ids))) as pool:
-        return dict(zip(doc_ids, pool.map(state.load, doc_ids)))
-
-
 def _load_day_docs(brand_id: str, engines: list[str], day: str) -> dict[str, dict]:
-    loaded = _load_many([poll_doc_id(brand_id, engine, day) for engine in engines])
+    """One day's docs for the engines the POLL PLANNER may call — the one
+    legitimate exception to ``geo_window.ENGINES``.
+
+    Every *reader* must scan ``ALL_ENGINES`` or it loses stored AIO answers;
+    this is not a reader. It decides what to poll next, so it deliberately
+    iterates only the engines that have a key right now, and an unconfigured
+    engine's stored answers are none of its business. Stated here rather than
+    inferred, because the two lists diverging silently is the bug the window
+    module exists to prevent.
+
+    Missing docs are filled in with an empty shell: ``_pending_tasks`` walks
+    every engine it was asked about, so absence has to look like "no answers
+    yet" rather than a gap in the mapping.
+    """
+    docs = geo_window.load_docs(brand_id, [day], engines)
     return {
-        engine: loaded.get(poll_doc_id(brand_id, engine, day)) or {
+        engine: docs.get((day, engine)) or {
             "brand_id": brand_id,
             "engine": engine,
             "date": day,
@@ -358,6 +358,10 @@ def _trim_counters(cfg: dict) -> dict:
         cfg["counters"] = dict(sorted(cfg["counters"].items())[-30:])
     if cfg.get("counters_aio"):
         cfg["counters_aio"] = dict(sorted(cfg["counters_aio"].items())[-3:])
+    if cfg.get("answer_counts"):
+        cfg["answer_counts"] = dict(
+            sorted(cfg["answer_counts"].items())[-geo_window.MAX_DAYS:]
+        )
     return cfg
 
 
@@ -388,11 +392,18 @@ def _settle_calls(
     aio_credits: int,
     engine_failed: dict[str, bool],
     engine_stored: dict[str, int] | None = None,
+    engine_totals: dict[str, int] | None = None,
 ) -> dict:
     """Hand back the unspent reservation, bank AIO credits, update fail streaks.
 
     One atomic write closing out the step. Returns
     ``{"used": int, "aio_month": int, "streaks": {engine: consecutive_fails}}``.
+
+    ``engine_totals`` is ``{engine: answers now stored in today's day-doc}``,
+    straight out of the merge transactions that just ran. Banking it here costs
+    nothing — this write was happening anyway — and it is what lets the brand
+    listing answer "how many answers this week" without fetching a week of
+    answer text to take a ``len``.
     """
 
     def change(cfg: dict) -> tuple[dict, dict]:
@@ -421,6 +432,15 @@ def _settle_calls(
                 seen[engine] = _now()
         if seen:
             cfg["engine_last_seen"] = seen
+        if engine_totals:
+            # per-engine, because a step only ever touches the engines it
+            # polled: a day total could not be maintained without re-reading
+            # the engines this step left alone.
+            counts = dict(cfg.get("answer_counts") or {})
+            counts[day] = (counts.get(day) or {}) | {
+                engine: int(total) for engine, total in engine_totals.items()
+            }
+            cfg["answer_counts"] = counts
         cfg = _trim_counters(cfg)
         return cfg, {
             "used": counters[day],
@@ -431,14 +451,20 @@ def _settle_calls(
     return _mutate(config_doc_id(brand_id), change)
 
 
-def _merge_answers(brand_id: str, engine: str, day: str, records: list[dict]) -> None:
-    """Append this step's records to the engine's day-doc, atomically.
+def _merge_answers(brand_id: str, engine: str, day: str, records: list[dict]) -> int:
+    """Append this step's records to the engine's day-doc, atomically; return
+    how many answers the doc holds afterwards.
 
     Re-reads inside the transaction so a concurrent step's answers survive
     instead of being overwritten by our stale in-memory copy.
+
+    The returned count is the day-doc's true post-merge length — after retry
+    replacement and after overflow trimming — which is the only place that
+    number is known for free. ``_settle_calls`` banks it on the config so the
+    brand listing can report ``recent_answers`` without hydrating the corpus.
     """
 
-    def change(doc: dict) -> tuple[dict, None]:
+    def change(doc: dict) -> tuple[dict, int]:
         doc = dict(doc or {})
         doc.setdefault("brand_id", brand_id)
         doc.setdefault("engine", engine)
@@ -463,9 +489,9 @@ def _merge_answers(brand_id: str, engine: str, day: str, records: list[dict]) ->
         while len(json.dumps(doc["answers"])) > DOC_TRIM_BYTES and doc["answers"]:
             doc["answers"].pop(0)
             doc["overflow_trimmed"] = int(doc.get("overflow_trimmed", 0)) + 1
-        return doc, None
+        return doc, len(doc["answers"])
 
-    _mutate(poll_doc_id(brand_id, engine, day), change)
+    return _mutate(poll_doc_id(brand_id, engine, day), change)
 
 
 # ``geo_history`` stores its per-sweep points in a state doc of the same shape
@@ -599,6 +625,12 @@ def poll_status(brand: dict, *, engines: list[str] | None = None,
 
 
 def _interval_days(cfg: dict) -> int:
+    """Days between scheduled sweeps for this brand.
+
+    NOT ``geo_window.clamp_days``, despite sharing its 1..30 bounds — this is a
+    cadence, that is a measured window, and the day they need different ceilings
+    is the day a shared helper silently breaks one of them.
+    """
     # `or DEFAULT` would be wrong here: an explicit 0 is out of range and must
     # clamp to "every day", not silently become the two-day default
     raw = cfg.get("poll_interval_days")
@@ -828,14 +860,18 @@ def poll_step(
         # Whatever happened, store the answers we already paid for and hand
         # back the part of the reservation we never spent — an exception must
         # not leave the day's budget charged for calls that never went out.
+        stored_totals: dict[str, int] = {}
         for engine, engine_records in records.items():
-            _merge_answers(brand["id"], engine, day, engine_records)
+            stored_totals[engine] = _merge_answers(
+                brand["id"], engine, day, engine_records
+            )
         settled = _settle_calls(
             brand["id"], day, granted, spent, aio_credits,
             {e: len(failures.get(e, [])) == n for e, n in attempts.items()},
             # "no AI Overview shown" is a successful observation, so it counts
             # as the engine having been measured
             {e: sum(1 for r in recs if not r.get("error")) for e, recs in records.items()},
+            engine_totals=stored_totals,
         )
 
     terminal, terminal_reason = _terminal_signal(
@@ -855,60 +891,97 @@ def poll_step(
     )
 
 
-def _recent_days(days: int) -> list[str]:
-    today = dt.datetime.now(dt.timezone.utc).date()
-    return [
-        (today - dt.timedelta(days=offset)).strftime("%Y%m%d")
-        for offset in range(max(1, days))
-    ]
-
-
-def recent_answers(brand_id: str, days: int = 7) -> list[dict]:
-    """All stored answers for the brand across engines over the last N days.
-
-    One parallel fetch for the whole window rather than a fetch per day: the
-    report, the comparison and the raw-answer list all come through here, and
-    each was paying for the round trips one at a time.
-    """
-    return [a for rows in answers_by_day(brand_id, days=days).values() for a in rows]
+# The three brand-id-only readers below are thin adapters over
+# ``geo_window``: existing callers (and their tests) pass a brand id and want a
+# list back, while the window is keyed on the brand dict so it can also resolve
+# the config and the alias map. Anything that needs more than raw answers —
+# every read path in the router — should open the window itself and get the
+# report for free instead of re-assembling it.
+def recent_answers(brand_id: str, days: int = geo_window.DEFAULT_DAYS) -> list[dict]:
+    """All stored answers for the brand across engines over the last N days."""
+    return geo_window.open_window({"id": brand_id}, days).answers
 
 
 def day_answers(brand_id: str, day: str) -> list[dict]:
-    """Every stored answer for one UTC day, across every engine.
+    """Every stored answer for one UTC day, across every engine."""
+    return geo_window.open_day({"id": brand_id}, day).day(day)
 
-    A sweep lives entirely inside one day: ``_pending_tasks`` reads the day-doc
-    for ``_today()``, so a run truncated by the cron budget restarts on the
-    next day rather than resuming yesterday's doc. That makes "one day" and
-    "one sweep" the same window, which is what a trend point is measured over.
+
+def answers_by_day(
+    brand_id: str, days: int = geo_window.MAX_DAYS
+) -> dict[str, list[dict]]:
+    """day (YYYYMMDD) -> that day's answers, for days that have any."""
+    return geo_window.open_window({"id": brand_id}, days).by_day
+
+
+# ------------------------------------------------- stored-answer counter ----
+# The brand listing wants ONE integer per brand — "how many answers this week"
+# — and used to get it by hydrating the whole window and taking a ``len``: 28
+# day-doc fetches per brand, each up to DOC_TRIM_BYTES, megabytes deserialised
+# to produce a number. The count is now maintained on the config document (the
+# document the listing already reads) by the same ``_settle_calls`` transaction
+# that already maintains the spend counters, the failure streaks and
+# ``engine_last_seen`` — same kind of fact, same owner, no second document to
+# keep in sync.
+
+
+def _rebuild_answer_counts(brand: dict) -> dict[str, dict[str, int]]:
+    """One-time reconstruction of the counter from the day-docs themselves.
+
+    A brand that was already polling before the counter existed has no stored
+    counts, and the two dishonest ways out are both unacceptable: showing zero
+    would tell a brand with a month of data that it has never been polled, and
+    re-counting the window on every listing is the cost this exists to remove.
+
+    So it is reconstructed exactly once — the same move ``geo_history.backfill``
+    makes for the trend line, with the same stamp guarding it. One batched
+    window read, then the listing is cheap forever.
     """
-    loaded = _load_many(
-        [poll_doc_id(brand_id, engine, day) for engine in geo_engines.ALL_ENGINES]
+    fresh = geo_window.open_window(brand, geo_window.MAX_DAYS).answer_counts()
+
+    def change(cfg: dict) -> tuple[dict, dict]:
+        cfg = dict(cfg)
+        if cfg.get("answer_counts_at"):  # another request got there first
+            return cfg, dict(cfg.get("answer_counts") or {})
+        stored = dict(cfg.get("answer_counts") or {})
+        # A poll that landed while we were reading knows better than the
+        # reconstruction, so its per-engine entries win.
+        cfg["answer_counts"] = {
+            day: (fresh.get(day) or {}) | (stored.get(day) or {})
+            for day in sorted(set(fresh) | set(stored))
+        }
+        cfg["answer_counts_at"] = _now()
+        cfg = _trim_counters(cfg)
+        return cfg, dict(cfg["answer_counts"])
+
+    return _mutate(config_doc_id(brand["id"]), change)
+
+
+def recent_answer_count(
+    brand: dict, cfg: dict | None, days: int = geo_window.DEFAULT_DAYS
+) -> int:
+    """How many answers are stored for this brand over the last ``days`` days.
+
+    Exact, not an estimate: the counter holds the day-doc lengths themselves, so
+    this is the same integer ``len(recent_answers(...))`` returns — for the cost
+    of a document the caller already had.
+
+    ``cfg=None`` means the config could not be read at all. That is the one case
+    where the window is counted the expensive way, because the alternative is
+    inventing a number for a brand we currently know nothing about.
+    """
+    if cfg is None:
+        return len(geo_window.open_window(brand, days).answers)
+    counts = (
+        dict(cfg.get("answer_counts") or {})
+        if cfg.get("answer_counts_at")
+        else _rebuild_answer_counts(brand)
     )
-    return [a for doc in loaded.values() if doc for a in doc.get("answers", [])]
-
-
-def answers_by_day(brand_id: str, days: int = 30) -> dict[str, list[dict]]:
-    """day (YYYYMMDD) -> that day's answers, for days that have any.
-
-    The whole window is fetched in ONE parallel batch — a day-by-day loop here
-    is what made a 30-day backfill 120 serial round trips.
-    """
-    wanted = _recent_days(days)
-    loaded = _load_many([
-        poll_doc_id(brand_id, engine, day)
-        for day in wanted for engine in geo_engines.ALL_ENGINES
-    ])
-    out: dict[str, list[dict]] = {}
-    for day in wanted:
-        rows = [
-            a
-            for engine in geo_engines.ALL_ENGINES
-            if (doc := loaded.get(poll_doc_id(brand_id, engine, day)))
-            for a in doc.get("answers", [])
-        ]
-        if rows:
-            out[day] = rows
-    return out
+    return sum(
+        int(n)
+        for day in geo_window.day_ids(days)
+        for n in (counts.get(day) or {}).values()
+    )
 
 
 def _rescore_record(record: dict, aliases: dict[str, list[str]], own_domain: str) -> bool:
@@ -932,7 +1005,7 @@ def _rescore_record(record: dict, aliases: dict[str, list[str]], own_domain: str
     return before != (mentions, cited)
 
 
-def rescan_mentions(brand: dict, days: int = 7) -> dict:
+def rescan_mentions(brand: dict, days: int = geo_window.DEFAULT_DAYS) -> dict:
     """Re-read stored answers for a competitor tracked after they were polled.
 
     Mentions are detected when an answer is stored, so adding a rival normally
@@ -945,49 +1018,85 @@ def rescan_mentions(brand: dict, days: int = 7) -> dict:
     limit is the stored text cap (``geo_engines.ANSWER_TEXT_CAP``) — a name that
     only appeared past the cap in the original answer is not recoverable, and
     the next real sweep is what fixes that.
+
+    **Reads are one batch, writes are serial and only where something changed.**
+    This path used to be the odd one out: a nested ``day x engine`` loop doing
+    ``state.load`` then ``_mutate`` per pair — 120 serial probes and up to 120
+    serial transactions at 30 days — because the batching its three sibling
+    readers got was an idiom rather than a module. It now reads one window, and
+    then:
+
+    * a doc whose stored scoring already matches the current alias map is
+      **not written at all**. Re-running the transaction would rewrite it byte
+      for byte and spend a round trip proving nothing changed, and after adding
+      one competitor that is nearly every doc in the window.
+    * the docs that do change are written **one at a time, on this thread**.
+      Not for safety of the documents — each ``_mutate`` is an independent
+      transaction on a distinct doc — but because parallel writes buy nothing
+      here and cost something: offline, every ``_mutate`` serialises on one
+      process-global lock anyway; in cloud mode, firing N transactions at once
+      multiplies contention with the live poll writing today's doc, and a
+      contended transaction re-runs ``change`` rather than merely waiting. The
+      counters (``scanned``, ``changed``, ``touched``) also stay single-threaded,
+      which is the rule ``poll_step`` already follows for its budget bookkeeping.
+      With the no-op writes gone, writes are no longer the cost anyway.
     """
-    cfg = ensure_config(brand)
-    aliases = alias_map(cfg)
-    own_domain = (brand.get("domain") or "").lower().removeprefix("www.")
-    days = max(1, min(days, 30))
-    today = dt.datetime.now(dt.timezone.utc).date()
+    window = geo_window.open_window(brand, days)
+    cfg = window.cfg
+    aliases = window.aliases
+    own_domain = window.own_domain
 
     scanned = changed = 0
+    # day -> engine -> the answers as they now stand on disk, so the trend
+    # rebuild below does not re-fetch a window we are already holding
+    current: dict[str, dict[str, list[dict]]] = {}
     touched_days: list[str] = []
-    for offset in range(days):
-        day = (today - dt.timedelta(days=offset)).strftime("%Y%m%d")
-        day_changed = 0
-        for engine in geo_engines.ALL_ENGINES:
-            doc_id = poll_doc_id(brand["id"], engine, day)
-            if not state.load(doc_id):
-                continue
 
-            def change(doc: dict) -> tuple[dict, tuple[int, int]]:
-                doc = dict(doc or {})
-                answers = [dict(a) for a in doc.get("answers") or []]
-                hits = sum(
-                    1 for a in answers if _rescore_record(a, aliases, own_domain)
-                )
-                doc["answers"] = answers
-                if hits:
-                    doc["rescanned_at"] = _now()
-                return doc, (len(answers), hits)
+    for (day, engine), doc in window.docs.items():
+        rescored = [dict(a) for a in doc.get("answers") or []]
+        # Dry run against the copy first: this is the same pure function the
+        # transaction applies, so "would change nothing" is a fact, not a guess.
+        hits = sum(1 for a in rescored if _rescore_record(a, aliases, own_domain))
+        if not hits:
+            scanned += len(rescored)
+            current.setdefault(day, {})[engine] = rescored
+            continue
 
-            seen, hits = _mutate(doc_id, change)
-            scanned += seen
-            day_changed += hits
-        if day_changed:
-            changed += day_changed
-            touched_days.append(day)
+        def change(stored: dict) -> tuple[dict, tuple[int, int, list[dict]]]:
+            stored = dict(stored or {})
+            answers = [dict(a) for a in stored.get("answers") or []]
+            fresh = sum(
+                1 for a in answers if _rescore_record(a, aliases, own_domain)
+            )
+            stored["answers"] = answers
+            if fresh:
+                stored["rescanned_at"] = _now()
+            return stored, (len(answers), fresh, answers)
+
+        seen, applied, answers = _mutate(poll_doc_id(brand["id"], engine, day), change)
+        scanned += seen
+        current.setdefault(day, {})[engine] = answers
+        if applied:
+            changed += applied
+            if day not in touched_days:
+                touched_days.append(day)
 
     # The trend's rival lines are computed from the same answers, so leaving
-    # them alone would make the Dashboard contradict the Competitors tab.
-    for day in touched_days:
-        _record_history(brand, cfg, day, preserve_source=True)
+    # them alone would make the Dashboard contradict the Competitors tab. Fed
+    # from what we just wrote — re-reading the day here would put four fetches
+    # per touched day back on top of the batch we already paid for.
+    for day in sorted(touched_days):
+        by_engine = current.get(day) or {}
+        _record_history(
+            brand, cfg, day,
+            answers=[a for engine in geo_window.ENGINES
+                     for a in by_engine.get(engine, [])],
+            preserve_source=True,
+        )
 
     return {
         "brand_id": brand["id"],
-        "days": days,
+        "days": window.days,
         "answers_scanned": scanned,
         "answers_updated": changed,
         "days_updated": sorted(touched_days),
@@ -997,17 +1106,28 @@ def rescan_mentions(brand: dict, days: int = 7) -> dict:
 
 
 def _record_history(brand: dict, cfg: dict, day: str, *,
+                    answers: list[dict] | None = None,
                     preserve_source: bool = False) -> None:
     """Bank the trend point for a sweep that just completed.
 
     Best-effort by design: the answers are already paid for and stored, and a
     failure to derive a chart point must not turn a finished sweep into an
     error. It is logged with its traceback, never swallowed silently.
+
+    Pass ``answers`` when the day's records are already in hand (a rescan that
+    just wrote them) — otherwise the day is fetched, which is one round trip per
+    engine that the caller may already have paid for.
     """
     try:
+        # ``open_day`` fetches nothing on its own — it is here for the alias map
+        # and the normalised domain. The answers still come through
+        # ``day_answers`` (itself a one-batch window read) so the day remains a
+        # named, stubbable seam rather than an attribute lookup on an object.
+        window = geo_window.open_day(brand, day, cfg=cfg)
         geo_history.record_sweep(
-            brand["id"], day, day_answers(brand["id"], day),
-            list(alias_map(cfg).keys()), brand.get("domain", ""),
+            brand["id"], day,
+            day_answers(brand["id"], day) if answers is None else answers,
+            window.entities, window.own_domain,
             preserve_source=preserve_source,
         )
     except Exception:  # noqa: BLE001 — derived artifact, never fatal to a sweep

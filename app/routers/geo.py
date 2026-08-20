@@ -19,8 +19,8 @@ from pydantic import BaseModel, Field
 from app.security import get_current_user, require_creator
 from app.services import run_tracking
 from final_geo_agent import (
-    geo_compare, geo_engines, geo_history, geo_metrics, geo_poll, geo_prompts,
-    geo_strategy, opt_pipeline,
+    geo_compare, geo_engines, geo_history, geo_poll, geo_prompts, geo_strategy,
+    geo_window, opt_pipeline,
 )
 from seo_geo_agent import insights
 from seo_geo_agent.sources import CredentialMissing
@@ -62,11 +62,37 @@ def _cron_budget_seconds() -> float:
         return geo_poll.DEFAULT_CRON_BUDGET_SECONDS
 
 
+def _enabled_brands() -> list[dict]:
+    """The brands this agent will act on. Written once — the filter used to be
+    re-typed at three call sites, which is three chances to forget it and start
+    polling a brand somebody switched off."""
+    return [b for b in insights.list_brands() if b.get("enabled", True)]
+
+
 def _brand_or_404(brand_id: str) -> dict:
-    for brand in insights.list_brands():
-        if brand["id"] == brand_id and brand.get("enabled", True):
+    for brand in _enabled_brands():
+        if brand["id"] == brand_id:
             return brand
     raise HTTPException(status_code=404, detail="Unknown brand")
+
+
+def reader_brand(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
+    """The brand named in the path, for any signed-in caller.
+
+    A dependency rather than a call in the handler body so the four endpoints
+    that wanted only the 404 stop asking for a value they then threw away.
+
+    Auth is a SUB-dependency on purpose: it therefore resolves first no matter
+    where ``brand`` sits in the handler signature, so an unauthenticated request
+    still gets 401 and never learns from a 404 which brand ids exist.
+    """
+    return _brand_or_404(brand_id)
+
+
+def creator_brand(brand_id: str, _creator: dict = Depends(require_creator)) -> dict:
+    """The brand named in the path, for a Creator. Same ordering guarantee: 403
+    before 404."""
+    return _brand_or_404(brand_id)
 
 
 class PromptItem(BaseModel):
@@ -100,7 +126,13 @@ class ConfigIn(BaseModel):
 
 
 class RescanIn(BaseModel):
-    days: int = Field(default=7, ge=1, le=30)
+    # Bounds taken from the window module rather than re-typed: the schema and
+    # the clamp inside ``rescan_mentions`` were two independent statements of
+    # the same rule, which is one drift away from a 422 the panel cannot explain.
+    days: int = Field(
+        default=geo_window.DEFAULT_DAYS,
+        ge=geo_window.MIN_DAYS, le=geo_window.MAX_DAYS,
+    )
 
 
 class PollIn(BaseModel):
@@ -124,23 +156,24 @@ def geo_config(user: dict = Depends(get_current_user)) -> dict:
 @router.get("/geo/brands")
 def geo_brands(user: dict = Depends(get_current_user)) -> dict:
     brands = []
-    for brand in insights.list_brands():
-        if not brand.get("enabled", True):
-            continue
+    for brand in _enabled_brands():
         universe = geo_prompts.load_universe(brand["id"])
         cfg = None
         try:
             cfg = geo_poll.ensure_config(brand)
         except Exception:  # noqa: BLE001 — status listing must never 500
             logger.exception("geo: config load failed for %s", brand["id"])
-        recent = geo_poll.recent_answers(brand["id"], days=7)
         brands.append(
             {
                 "id": brand["id"],
                 "name": brand.get("name", brand["id"]),
                 "domain": brand.get("domain", ""),
                 "prompts": len(universe.get("prompts", [])) if universe else 0,
-                "recent_answers": len(recent),
+                # Exact, and read from the counter on the config document this
+                # loop already loaded. It used to be len() of the whole 7-day
+                # corpus: 28 day-doc fetches per brand, each up to 900 KB, to
+                # produce one integer per brand.
+                "recent_answers": geo_poll.recent_answer_count(brand, cfg),
                 "calls_used_today": geo_poll.used_today(cfg) if cfg else 0,
                 "competitors": len((cfg or {}).get("competitors") or []),
             }
@@ -149,14 +182,15 @@ def geo_brands(user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.get("/geo/brands/{brand_id}/prompts")
-def get_prompts(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
-    _brand_or_404(brand_id)
+def get_prompts(brand: dict = Depends(reader_brand)) -> dict:
+    brand_id = brand["id"]
     return geo_prompts.load_universe(brand_id) or {"brand_id": brand_id, "prompts": []}
 
 
 @router.post("/geo/brands/{brand_id}/prompts/generate")
-def generate_prompts(brand_id: str, _creator: dict = Depends(require_creator)) -> dict:
-    brand = _brand_or_404(brand_id)
+def generate_prompts(
+    brand: dict = Depends(creator_brand), _creator: dict = Depends(require_creator)
+) -> dict:
     try:
         universe = geo_prompts.generate_universe(brand)
     except CredentialMissing as exc:
@@ -170,11 +204,14 @@ def generate_prompts(brand_id: str, _creator: dict = Depends(require_creator)) -
 
 @router.post("/geo/brands/{brand_id}/prompts/custom")
 def add_custom_prompt(
-    brand_id: str, body: CustomPromptIn, _creator: dict = Depends(require_creator)
+    body: CustomPromptIn,
+    brand: dict = Depends(creator_brand),
+    _creator: dict = Depends(require_creator),
 ) -> dict:
-    brand = _brand_or_404(brand_id)
     try:
-        universe = geo_prompts.add_custom_prompt(brand_id, body.text, body.intent, body.stage)
+        universe = geo_prompts.add_custom_prompt(
+            brand["id"], body.text, body.intent, body.stage
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     _track(_creator, "prompt_custom_add", f"Custom prompt added: {body.text[:60]}", brand)
@@ -183,27 +220,24 @@ def add_custom_prompt(
 
 @router.put("/geo/brands/{brand_id}/prompts")
 def put_prompts(
-    brand_id: str, body: PromptsIn, _creator: dict = Depends(require_creator)
+    body: PromptsIn, brand: dict = Depends(creator_brand),
 ) -> dict:
-    _brand_or_404(brand_id)
     if not body.prompts:
         raise HTTPException(status_code=422, detail="At least one prompt is required")
     return geo_prompts.save_universe(
-        brand_id, [p.model_dump() for p in body.prompts]
+        brand["id"], [p.model_dump() for p in body.prompts]
     )
 
 
 @router.get("/geo/brands/{brand_id}/config")
-def get_geo_brand_config(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
-    brand = _brand_or_404(brand_id)
+def get_geo_brand_config(brand: dict = Depends(reader_brand)) -> dict:
     return geo_poll.ensure_config(brand)
 
 
 @router.put("/geo/brands/{brand_id}/config")
 def put_geo_brand_config(
-    brand_id: str, body: ConfigIn, _creator: dict = Depends(require_creator)
+    body: ConfigIn, brand: dict = Depends(creator_brand),
 ) -> dict:
-    brand = _brand_or_404(brand_id)
     # Seed the defaults first. ``save_config`` patches whatever document it
     # finds, so a config first written by this endpoint (tracking a competitor
     # before anything has read the config) would exist WITHOUT the brand's own
@@ -211,14 +245,15 @@ def put_geo_brand_config(
     # own answers.
     geo_poll.ensure_config(brand)
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
-    return geo_poll.save_config(brand_id, patch)
+    return geo_poll.save_config(brand["id"], patch)
 
 
 @router.post("/geo/brands/{brand_id}/poll/step")
 def poll_step(
-    brand_id: str, body: PollIn, user: dict = Depends(get_current_user)
+    body: PollIn,
+    brand: dict = Depends(reader_brand),
+    user: dict = Depends(get_current_user),
 ) -> dict:
-    brand = _brand_or_404(brand_id)
     try:
         result = geo_poll.poll_step(
             brand, engines=body.engines, runs=body.runs, batch_size=body.batch_size
@@ -233,10 +268,9 @@ def poll_step(
 
 
 @router.get("/geo/brands/{brand_id}/poll/status")
-def poll_status(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
+def poll_status(brand: dict = Depends(reader_brand)) -> dict:
     """Where today's sweep stands and when the next one is due — what the panel
     shows instead of making someone sit through a progress bar."""
-    brand = _brand_or_404(brand_id)
     try:
         return geo_poll.poll_status(brand)
     except CredentialMissing as exc:
@@ -245,17 +279,18 @@ def poll_status(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
 
 @router.get("/geo/brands/{brand_id}/report")
 def report(
-    brand_id: str, days: int = 7, user: dict = Depends(get_current_user)
+    days: int = geo_window.DEFAULT_DAYS, brand: dict = Depends(reader_brand),
 ) -> dict:
-    brand = _brand_or_404(brand_id)
-    days = max(1, min(days, 30))
-    cfg = geo_poll.ensure_config(brand)
-    answers = geo_poll.recent_answers(brand_id, days=days)
-    entities = list(geo_poll.alias_map(cfg).keys())
-    result = geo_metrics.engine_report(answers, entities, brand.get("domain", ""))
+    window = geo_window.open_window(brand, days)
+    cfg = window.cfg
+    # copy: the window computes its report once and hands the same dict to
+    # everyone who asks, so a caller that adds keys must not add them in place
+    result = dict(window.report)
     result |= {
-        "brand_id": brand_id,
-        "days": days,
+        "brand_id": window.brand_id,
+        # the CLAMPED window — the number in the response is the number that
+        # was actually measured, never the one the query string asked for
+        "days": window.days,
         # so an engine whose last measurement fell outside the window can say
         # when it was measured instead of disappearing from the panel
         "engine_last_seen": cfg.get("engine_last_seen") or {},
@@ -269,15 +304,13 @@ def report(
 
 @router.get("/geo/brands/{brand_id}/answers")
 def answers(
-    brand_id: str,
     prompt_id: str | None = None,
     engine: str | None = None,
-    days: int = 7,
-    user: dict = Depends(get_current_user),
+    days: int = geo_window.DEFAULT_DAYS,
+    brand: dict = Depends(reader_brand),
 ) -> dict:
-    _brand_or_404(brand_id)
-    days = max(1, min(days, 30))
-    rows = geo_poll.recent_answers(brand_id, days=days)
+    # the raw list needs no config, so this window never reads one
+    rows = list(geo_window.open_window(brand, days).answers)
     if prompt_id:
         rows = [a for a in rows if a.get("prompt_id") == prompt_id]
     if engine:
@@ -288,7 +321,7 @@ def answers(
 
 @router.get("/geo/brands/{brand_id}/comparison")
 def comparison(
-    brand_id: str, days: int = 7, user: dict = Depends(get_current_user)
+    days: int = geo_window.DEFAULT_DAYS, brand: dict = Depends(reader_brand),
 ) -> dict:
     """Head-to-head: every tracked rival scored on the same answers we are.
 
@@ -296,18 +329,17 @@ def comparison(
     answers as us". Same window, same denominators as ``/report``, so a number
     here and a number there can be read side by side without a footnote.
     """
-    brand = _brand_or_404(brand_id)
-    days = max(1, min(days, 30))
-    cfg = geo_poll.ensure_config(brand)
-    answers = geo_poll.recent_answers(brand_id, days=days)
+    window = geo_window.open_window(brand, days)
     return geo_compare.build(
-        answers, cfg, brand, aliases=geo_poll.alias_map(cfg),
-    ) | {"days": days}
+        window.answers, window.cfg, brand, aliases=window.aliases,
+    ) | {"days": window.days}
 
 
 @router.post("/geo/brands/{brand_id}/rescan")
 def rescan(
-    brand_id: str, body: RescanIn, _creator: dict = Depends(require_creator)
+    body: RescanIn,
+    brand: dict = Depends(creator_brand),
+    _creator: dict = Depends(require_creator),
 ) -> dict:
     """Re-read stored answers with the current competitor list.
 
@@ -316,7 +348,6 @@ def rescan(
     this finds their name in it now — zero engine calls, no new spend. Creator
     only, because it rewrites stored measurements.
     """
-    brand = _brand_or_404(brand_id)
     result = geo_poll.rescan_mentions(brand, days=body.days)
     _track(_creator, "rescan_mentions",
            f"Rescanned {result['answers_scanned']} stored answers "
@@ -326,9 +357,7 @@ def rescan(
 
 
 @router.get("/geo/brands/{brand_id}/history")
-def history(
-    brand_id: str, days: int = 90, user: dict = Depends(get_current_user)
-) -> dict:
+def history(days: int = 90, brand: dict = Depends(reader_brand)) -> dict:
     """The GEO score over time — one point per completed sweep.
 
     Points are banked when a sweep finishes, so this is a read of stored
@@ -337,16 +366,18 @@ def history(
     its remaining day-docs; the stamp on the document stops that from running
     again on every panel load.
     """
-    brand = _brand_or_404(brand_id)
-    days = max(7, min(days, 365))
-    cfg = geo_poll.ensure_config(brand)
+    brand_id = brand["id"]
+    # the SERIES window (how far back the chart is drawn), not the answer
+    # window below it — different quantity, different owner, different bounds
+    days = geo_history.clamp_series_days(days)
+    # Built but not fetched: the backfill branch is the only one that reads
+    # answers, so a brand whose points are already banked pays nothing here.
+    window = geo_window.open_window(brand, geo_history.BACKFILL_DAYS)
+    cfg = window.cfg
 
     if geo_history.needs_backfill(brand_id):
         points = geo_history.backfill(
-            brand_id,
-            geo_poll.answers_by_day(brand_id, days=geo_history.BACKFILL_DAYS),
-            list(geo_poll.alias_map(cfg).keys()),
-            brand.get("domain", ""),
+            brand_id, window.by_day, window.entities, window.own_domain,
         )
     else:
         points = geo_history.load_points(brand_id)
@@ -435,10 +466,11 @@ class ActionStatusIn(BaseModel):
 
 
 @router.post("/geo/brands/{brand_id}/strategy/generate")
-def strategy_generate(brand_id: str, _creator: dict = Depends(require_creator)) -> dict:
+def strategy_generate(
+    brand: dict = Depends(creator_brand), _creator: dict = Depends(require_creator)
+) -> dict:
     """Full-model GEO strategy grounded in this week's measured numbers; the
     plan stores its baseline so the panel can show baseline → current later."""
-    brand = _brand_or_404(brand_id)
     try:
         doc = geo_strategy.generate_strategy(brand)
     except CredentialMissing as exc:
@@ -450,19 +482,19 @@ def strategy_generate(brand_id: str, _creator: dict = Depends(require_creator)) 
 
 
 @router.get("/geo/brands/{brand_id}/strategy")
-def strategy_get(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
-    _brand_or_404(brand_id)
+def strategy_get(brand: dict = Depends(reader_brand)) -> dict:
+    brand_id = brand["id"]
     return geo_strategy.load_strategy(brand_id) or {"brand_id": brand_id, "current": None}
 
 
 @router.put("/geo/brands/{brand_id}/strategy/actions/{action_id}")
 def strategy_action_status(
-    brand_id: str, action_id: str, body: ActionStatusIn,
+    action_id: str, body: ActionStatusIn,
+    brand: dict = Depends(reader_brand),
     user: dict = Depends(get_current_user),
 ) -> dict:
-    brand = _brand_or_404(brand_id)
     try:
-        doc = geo_strategy.set_action_status(brand_id, action_id, body.status)
+        doc = geo_strategy.set_action_status(brand["id"], action_id, body.status)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -510,9 +542,7 @@ def cron_poll(request: Request, response: Response) -> dict:
     unreached: list[str] = []
 
     due: list[tuple[float, dict]] = []
-    for brand in insights.list_brands():
-        if not brand.get("enabled", True):
-            continue
+    for brand in _enabled_brands():
         try:
             cfg = geo_poll.ensure_config(brand)
         except Exception as exc:  # noqa: BLE001 — unreadable config is not a sweep failure

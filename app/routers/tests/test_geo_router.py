@@ -12,8 +12,8 @@ import app  # noqa: F401 - side effect: registers agent roots on sys.path
 import pytest
 
 from app.routers.tests.conftest import client
-from final_geo_agent import geo_engines
-from seo_geo_agent import insights
+from final_geo_agent import geo_engines, geo_window
+from seo_geo_agent import insights, state
 from final_geo_agent.geo_engines import EngineAnswer
 
 BRAND = {"id": "legalsoft", "name": "Legal Soft", "domain": "legalsoft.com",
@@ -60,6 +60,57 @@ def put_prompts(n=2):
     return prompts
 
 
+@pytest.fixture()
+def day_doc_reads(monkeypatch):
+    """Every day-doc this request pulls out of the datastore.
+
+    A read-COST fixture, deliberately: the values the listing shows are already
+    covered above, and the regression worth catching here produces exactly the
+    right numbers at 28 document fetches per brand.
+    """
+    seen: list[str] = []
+    real = state.load
+
+    def counting(doc_id):
+        if doc_id.startswith("geo-poll-"):
+            seen.append(doc_id)
+        return real(doc_id)
+
+    monkeypatch.setattr(state, "load", counting)
+    return seen
+
+
+def test_brand_listing_counts_answers_without_hydrating_them(fake_engines, day_doc_reads):
+    """``GET /geo/brands`` used to fetch a week of answers per brand to take a
+    ``len``: 7 days x 4 engines = 28 document fetches each, up to 900 KB apiece,
+    to produce one integer per brand.
+
+    The first listing after this shipped still reconstructs the counter once
+    (a brand polled before it existed must not read as "not polled yet"); every
+    listing after that reads no day-doc at all.
+    """
+    put_prompts(2)
+    client.post(f"/api/geo/brands/{BRAND['id']}/poll/step",
+                json={"runs": 1, "batch_size": 10})
+
+    day_doc_reads.clear()
+    first = client.get("/api/geo/brands").json()["brands"][0]
+    assert first["recent_answers"] == 2                  # honest, not zero
+    reconstruction = len(day_doc_reads)
+    assert reconstruction == geo_window.MAX_DAYS * len(geo_window.ENGINES)
+
+    day_doc_reads.clear()
+    second = client.get("/api/geo/brands").json()["brands"][0]
+    assert second["recent_answers"] == 2
+    assert day_doc_reads == [], "the listing is hydrating the corpus again"
+
+
+def test_brand_listing_says_not_polled_only_when_that_is_true(day_doc_reads):
+    """0 renders as "Not polled yet" in the console, so it must mean that."""
+    body = client.get("/api/geo/brands").json()["brands"][0]
+    assert body["recent_answers"] == 0
+
+
 def test_geo_config_reports_engine_availability():
     resp = client.get("/api/geo/config")
     assert resp.status_code == 200
@@ -72,6 +123,21 @@ def test_geo_config_reports_engine_availability():
 def test_unknown_brand_404():
     assert client.get("/api/geo/brands/nope/prompts").status_code == 404
     assert client.post("/api/geo/brands/nope/poll/step", json={}).status_code == 404
+
+
+def test_an_unknown_brand_never_answers_before_the_caller_is_checked(unauthenticated, as_caller):
+    """404 vs 401/403 on an unknown id is a brand-existence oracle.
+
+    Brand resolution is a dependency now, and a dependency's position in a
+    handler signature decides nothing here: auth is a SUB-dependency of it, so
+    it always resolves first.
+    """
+    unauthenticated()
+    assert client.get("/api/geo/brands/nope/report").status_code in (401, 403)
+
+    as_caller(VIEWER)   # signed in, not a creator
+    assert client.post("/api/geo/brands/nope/rescan", json={}).status_code == 403
+    assert client.get("/api/geo/brands/nope/report").status_code == 404
 
 
 def test_prompts_roundtrip_and_brand_listing():

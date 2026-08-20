@@ -17,11 +17,17 @@ import uuid
 from seo_geo_agent import state
 from seo_geo_agent.sources import CredentialMissing
 
-from final_geo_agent import geo_engines, geo_metrics, geo_poll, geo_prompts, geo_venues
+from final_geo_agent import (
+    geo_engines, geo_prompts, geo_venues, geo_window,
+)
 
 GEO_AGENT_ID = "a10"
 HISTORY_CAP = 3
 ACTION_STATUSES = ("todo", "in_progress", "done", "skipped")
+# The plan is grounded in "this week's" measured numbers, and the baseline it
+# stores is what the panel later compares against — so the window is a property
+# of the plan, not a caller's choice.
+BASELINE_DAYS = geo_window.DEFAULT_DAYS
 
 # ----------------------------------------------------------- the specialist
 
@@ -123,13 +129,20 @@ def strategy_doc_id(brand_id: str) -> str:
 
 # ------------------------------------------------------------- the evidence
 
-def collect_baseline(brand: dict) -> dict:
+def collect_baseline(window: geo_window.MeasuredWindow) -> dict:
     """Every measured fact the strategist sees — also stored with the plan so
-    the panel can show baseline → current for each KPI later."""
-    cfg = geo_poll.ensure_config(brand)
-    answers = geo_poll.recent_answers(brand["id"], days=7)
-    entities = list(geo_poll.alias_map(cfg).keys())
-    report = geo_metrics.engine_report(answers, entities, brand.get("domain", ""))
+    the panel can show baseline → current for each KPI later.
+
+    Takes the WINDOW, not the brand. It used to open its own, and its only
+    caller then opened a second one over the identical days and recomputed the
+    identical report: one ``POST /strategy/generate`` was 56 day-doc fetches and
+    two full ``engine_report`` runs over the same answers. Asking for the window
+    the caller already has makes paying twice unspellable.
+    """
+    brand = window.brand
+    cfg = window.cfg
+    answers = window.answers
+    report = window.report
 
     rollup = report.get("prompt_rollup", [])
     missing = [r for r in rollup if r["self_rate"] == 0]
@@ -384,22 +397,22 @@ def _clean(raw: dict, baseline: dict, discovery: dict) -> dict:
 
 
 def generate_strategy(brand: dict) -> dict:
-    """Measured data → executable plan, persisted with its baseline scoreboard."""
-    baseline = collect_baseline(brand)
+    """Measured data → executable plan, persisted with its baseline scoreboard.
+
+    ONE window per request: the baseline, the ``n_answers`` gate and the venue
+    discovery all read the same measured week, fetched and scored once.
+    """
+    window = geo_window.open_window(brand, BASELINE_DAYS)
+    baseline = collect_baseline(window)
     if baseline["n_answers"] < 20:
         raise ValueError(
             "Not enough measured answers yet — run a full poll first so the plan "
             "rests on real data, not guesses"
         )
     prompts = geo_prompts.enabled_prompts(brand["id"])
-    answers = geo_poll.recent_answers(brand["id"], days=7)
-    cfg = geo_poll.ensure_config(brand)
-    report = geo_metrics.engine_report(
-        answers, list(geo_poll.alias_map(cfg).keys()), brand.get("domain", "")
-    )
     # real places, from live search plus the domains our own polls show the
     # engines citing — never from the model's memory
-    discovery = geo_venues.discover(brand, prompts, report)
+    discovery = geo_venues.discover(brand, prompts, window.report)
     raw = _llm_strategy(STRATEGIST_SYSTEM, _evidence_prompt(brand, baseline, discovery))
     strategy = _clean(raw, baseline, discovery)
 

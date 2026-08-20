@@ -55,7 +55,26 @@ MAX_POINTS = 200
 # How far back a one-time backfill reads day-docs for a brand that was already
 # polling before this document existed. Deliberately bounded: each day costs
 # one state read per engine, and the answer docs do not live forever anyway.
+# Must stay <= geo_window.MAX_DAYS — a window wider than the readable window
+# would silently measure less than it claims (pinned by test_geo_window).
 BACKFILL_DAYS = 30
+
+# The SERIES window: how far back the chart is drawn. A different quantity from
+# the answer window (``geo_window`` — how far back day-docs are read) and from
+# the poll interval (``geo_poll``): points are banked per sweep and kept for
+# roughly a year, so the chart outlives the answers it was derived from. The
+# floor exists because a trend needs at least a week to be a trend.
+MIN_SERIES_DAYS = 7
+MAX_SERIES_DAYS = 365
+
+
+def clamp_series_days(days: object) -> int:
+    """The trend window, in days, forced into ``MIN..MAX_SERIES_DAYS``."""
+    try:
+        value = int(days)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 90
+    return max(MIN_SERIES_DAYS, min(value, MAX_SERIES_DAYS))
 
 
 def history_doc_id(brand_id: str) -> str:
