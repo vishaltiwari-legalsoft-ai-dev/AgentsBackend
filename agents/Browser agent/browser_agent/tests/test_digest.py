@@ -5,7 +5,7 @@ import app  # noqa: F401 - registers agent roots on sys.path
 import pytest
 
 from app.services import openrouter as openrouter_service
-from browser_agent import digest
+from browser_agent import digest, state
 
 USER = {"id": "u1", "email": "owner@legalsoft.com"}
 
@@ -126,9 +126,22 @@ def test_digest_is_listed_and_retrievable(monkeypatch):
 
 def test_alerts_ride_along_with_the_digest(monkeypatch):
     _bind(monkeypatch, _GOOD)
-    digest.save_config({"watch_rules": [{"id": "r1", "text": "billing"}]})
+    digest.save_config(USER["id"], {"watch_rules": [{"id": "r1", "text": "billing"}]})
     result = digest.build_digest(USER, EVENTS, TABS)
     assert result["alerts"][0]["rule"] == "billing"
+
+
+def test_a_digest_never_matches_another_tenants_watch_rules(monkeypatch):
+    """The digest is built for the poster, so it is their rules that run.
+
+    Someone else's rule matching this trail would put another tenant's phrasing
+    — "watch for the acme contract" — into this person's alert list, which is
+    both a leak and a lie about what they asked to be told.
+    """
+    _bind(monkeypatch, _GOOD)
+    digest.save_config("someone-else", {"watch_rules": [{"id": "r1", "text": "billing"}]})
+    result = digest.build_digest(USER, EVENTS, TABS)
+    assert result["alerts"] == []
 
 
 # --------------------------------------------------------------------------- #
@@ -136,7 +149,7 @@ def test_alerts_ride_along_with_the_digest(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 def test_save_config_trims_and_drops_blank_rules():
-    cfg = digest.save_config({"watch_rules": [
+    cfg = digest.save_config(USER["id"], {"watch_rules": [
         {"id": "r1", "text": "  billing  "},
         {"id": "r2", "text": "   "},
     ]})
@@ -146,5 +159,85 @@ def test_save_config_trims_and_drops_blank_rules():
 
 def test_save_config_caps_rule_count():
     many = [{"id": f"r{i}", "text": f"topic {i}"} for i in range(digest.MAX_RULES + 5)]
-    cfg = digest.save_config({"watch_rules": many})
+    cfg = digest.save_config(USER["id"], {"watch_rules": many})
     assert len(cfg["watch_rules"]) == digest.MAX_RULES
+
+
+# --------------------------------------------------------------------------- #
+# Tenancy + the one-time migration off the shared document
+# --------------------------------------------------------------------------- #
+# Watch rules were ONE document (``config-global``) for the whole deployment
+# until 2026-08-21. These pin both halves of the fix: the rules are per tenant
+# now, and the tenants who had rules in the shared document still have them.
+
+
+def test_two_tenants_keep_separate_watch_rules():
+    a = digest.save_config("tenant-a", {"watch_rules": [{"text": "acme contract"}]})
+    b = digest.save_config("tenant-b", {"watch_rules": [{"text": "b's own rule"}]})
+
+    assert [r["text"] for r in a["watch_rules"]] == ["acme contract"]
+    assert [r["text"] for r in b["watch_rules"]] == ["b's own rule"]
+    # A's save is intact after B's — the old store lost it here.
+    assert [r["text"] for r in digest.load_config("tenant-a")["watch_rules"]] == [
+        "acme contract"
+    ]
+
+
+def test_a_tenant_with_no_rules_and_no_legacy_doc_gets_the_empty_default():
+    assert digest.load_config("brand-new") == {"watch_rules": [], "updated_at": None}
+
+
+def test_the_legacy_shared_document_seeds_a_tenants_first_read():
+    state.save(digest.LEGACY_CONFIG_DOC,
+               {"watch_rules": [{"id": "r1", "text": "billing", "enabled": True}],
+                "updated_at": "2026-08-01T00:00:00+00:00"})
+
+    loaded = digest.load_config("tenant-a")
+    assert [r["text"] for r in loaded["watch_rules"]] == ["billing"]
+    assert loaded["seeded_from"] == digest.LEGACY_CONFIG_DOC
+    # The copy is the tenant's own document from now on.
+    assert state.load(digest.config_doc_id("tenant-a"))["watch_rules"]
+
+
+def test_the_seed_lands_once_and_never_reopens_a_tenants_own_edits():
+    """The property that makes the migration safe to run on every read."""
+    state.save(digest.LEGACY_CONFIG_DOC,
+               {"watch_rules": [{"id": "r1", "text": "billing"}]})
+
+    digest.load_config("tenant-a")  # seeds
+    digest.save_config("tenant-a", {"watch_rules": [{"text": "my own rule"}]})
+
+    assert [r["text"] for r in digest.load_config("tenant-a")["watch_rules"]] == [
+        "my own rule"
+    ]
+    # Even clearing every rule sticks: the empty document is what blocks a re-seed.
+    digest.save_config("tenant-a", {"watch_rules": []})
+    assert digest.load_config("tenant-a")["watch_rules"] == []
+
+
+def test_the_legacy_document_is_copied_not_shared():
+    """Two tenants seeded from the same legacy doc must not re-converge."""
+    state.save(digest.LEGACY_CONFIG_DOC,
+               {"watch_rules": [{"id": "r1", "text": "billing"}]})
+
+    digest.save_config("tenant-a", {"watch_rules": [{"text": "a only"}]})
+    b = digest.load_config("tenant-b")
+
+    assert [r["text"] for r in b["watch_rules"]] == ["billing"], (
+        "B inherited the shared rules, not A's edit"
+    )
+    assert [r["text"] for r in digest.load_config("tenant-a")["watch_rules"]] == ["a only"]
+    # And the legacy document itself is never rewritten.
+    assert [r["text"] for r in state.load(digest.LEGACY_CONFIG_DOC)["watch_rules"]] == [
+        "billing"
+    ]
+
+
+def test_the_seed_window_can_be_closed(monkeypatch):
+    """Once the fleet has migrated, a brand-new tenant must start empty."""
+    state.save(digest.LEGACY_CONFIG_DOC,
+               {"watch_rules": [{"id": "r1", "text": "billing"}]})
+    monkeypatch.setenv("BROWSER_WATCH_LEGACY_SEED", "0")
+
+    assert digest.load_config("tenant-a") == {"watch_rules": [], "updated_at": None}
+    assert state.load(digest.config_doc_id("tenant-a")) is None

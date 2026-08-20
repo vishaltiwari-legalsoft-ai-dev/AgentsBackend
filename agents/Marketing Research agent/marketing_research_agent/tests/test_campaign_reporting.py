@@ -1,5 +1,6 @@
 from datetime import date
 
+from marketing_research_agent import goals
 from marketing_research_agent.modules import campaign_reporting as cr
 from marketing_research_agent.schemas import CampaignMetric
 
@@ -32,5 +33,6 @@ def test_week_over_week_delta():
 
 
 def test_flag_all_collects_flags():
-    flags = cr.flag_all([_m("Google", 3500, 0)])  # spend, no demo -> red
+    flags = cr.flag_all([_m("Google", 3500, 0)], None,  # spend, no demo -> red
+                        goals.get_targets("u1"))
     assert any(f.metric == "spend_no_demo" for f in flags)

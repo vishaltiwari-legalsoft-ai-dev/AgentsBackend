@@ -7,7 +7,7 @@ primary report. ``check_alerts`` only fires when a threshold is breached.
 
 from __future__ import annotations
 
-from . import notify, reports
+from . import goals, notify, reports
 from .modules import campaign_reporting as cr
 
 
@@ -41,8 +41,14 @@ def run_monthly(dataset: dict, user_id: str) -> dict:
 
 
 def check_alerts(dataset: dict, user_id: str) -> dict | None:
-    """Triggered threshold alert — only emits a report if a flag is tripped."""
-    flags = cr.flag_all(dataset.get("metrics", []), dataset.get("prior"))
+    """Triggered threshold alert — only emits a report if a flag is tripped.
+
+    Judged against ``user_id``'s own targets: the alert is delivered to that
+    workspace, so firing it on somebody else's red lines would be an alert
+    nobody can act on.
+    """
+    flags = cr.flag_all(dataset.get("metrics", []), dataset.get("prior"),
+                        goals.get_targets(user_id))
     if not flags:
         return None
     return _run("threshold_alert", dataset, user_id)

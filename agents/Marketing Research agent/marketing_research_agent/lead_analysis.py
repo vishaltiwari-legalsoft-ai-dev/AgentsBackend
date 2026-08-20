@@ -267,8 +267,13 @@ def summarize(records: list[dict], *,
     demos_booked}) joins the tracker's same-month funnel counts in for the
     QL-ratio/booking-rate rule and for naming the matched vendor tab; campaigns
     with no tracker match are surfaced in ``unmatched_campaigns`` — never
-    silently dropped."""
-    t = dict(goals.thresholds())
+    silently dropped.
+
+    ``thresholds`` is the WORKSPACE's resolved threshold map (``goals.thresholds``
+    over that workspace's targets). Left out, the verbatim 2026 defaults apply:
+    this function does not reach the targets store, because reaching it would
+    mean choosing a workspace, and the caller is the only one who knows which."""
+    t = goals.default_thresholds()
     t.update(thresholds or {})
     rollups = tracker_rollups or {}
 

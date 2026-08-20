@@ -13,7 +13,7 @@ def _metric(month: int, channel: str = "Google", spend: float = 1200.0) -> Campa
 
 
 def test_overview_empty_dataset():
-    out = reports.overview({"metrics": [], "leads": []})
+    out = reports.overview({"metrics": [], "leads": []}, "u1")
     assert out["has_data"] is False
     assert out["month"] is None
     assert out["totals"] is None
@@ -22,14 +22,14 @@ def test_overview_empty_dataset():
 
 def test_overview_uses_latest_month_only():
     ds = {"metrics": [_metric(5, spend=999.0), _metric(6)], "leads": []}
-    out = reports.overview(ds)
+    out = reports.overview(ds, "u1")
     assert out["has_data"] is True
     assert out["month"] == "2026-06"
     assert out["totals"]["spend"] == 1200.0  # May's 999 excluded
 
 
 def test_overview_channels_carry_goal_and_status():
-    out = reports.overview({"metrics": [_metric(6)], "leads": []})
+    out = reports.overview({"metrics": [_metric(6)], "leads": []}, "u1")
     ch = out["channels"]["Google"]
     assert "goal" in ch and "status" in ch
     assert isinstance(out["flag_summary"], list)
@@ -37,7 +37,7 @@ def test_overview_channels_carry_goal_and_status():
 
 def test_overview_passes_sources_through():
     src = [{"platform": "sheets:123", "generated_at": "2026-07-07T00:00:00+00:00"}]
-    out = reports.overview({"metrics": [_metric(6)], "leads": [], "sources": src})
+    out = reports.overview({"metrics": [_metric(6)], "leads": [], "sources": src}, "u1")
     assert out["sources"] == src
 
 
@@ -46,18 +46,18 @@ def test_overview_ignores_future_months():
     The dashboard must anchor to the latest month <= today, not September."""
     ds = {"metrics": [_metric(6), _metric(9, spend=2200.0)], "leads": [],
           "today": date(2026, 7, 8)}
-    out = reports.overview(ds)
+    out = reports.overview(ds, "u1")
     assert out["month"] == "2026-06"
     assert out["totals"]["spend"] == 1200.0
 
 
 def test_overview_all_future_falls_back_to_earliest():
     ds = {"metrics": [_metric(9), _metric(8)], "leads": [], "today": date(2026, 7, 8)}
-    out = reports.overview(ds)
+    out = reports.overview(ds, "u1")
     assert out["month"] == "2026-08"
 
 
 def test_overview_persists_no_run(monkeypatch, tmp_path):
     monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
-    reports.overview({"metrics": [_metric(6)], "leads": []})
+    reports.overview({"metrics": [_metric(6)], "leads": []}, "u1")
     assert list(tmp_path.glob("*.json")) == []

@@ -372,8 +372,14 @@ def get_digest(digest_id: str, user: dict = Depends(get_current_user)) -> dict:
 
 @router.get("/browser/config")
 def get_config(user: dict = Depends(get_current_user)) -> dict:
+    """This caller's watch rules — private to them, no admin bypass.
+
+    Unlike runs/skills/digests there is no ``is_admin`` reach here: an admin
+    reading the whole deployment's rules through one un-keyed endpoint is the
+    defect this used to be, not a feature worth keeping.
+    """
     _guard()
-    return browser_digest.load_config()
+    return browser_digest.load_config(browser_digest.tenant_key(user))
 
 
 @router.put("/browser/config")
@@ -382,6 +388,6 @@ def put_config(body: ConfigIn, user: dict = Depends(get_current_user),
                                              unit=CHANGE)) -> dict:
     _guard()
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
-    saved = browser_digest.save_config(patch)
+    saved = browser_digest.save_config(browser_digest.tenant_key(user), patch)
     act.note(f"Watch rules saved — {len(saved.get('watch_rules') or [])} rules")
     return saved

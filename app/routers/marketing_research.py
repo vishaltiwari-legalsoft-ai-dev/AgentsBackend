@@ -235,7 +235,18 @@ def _build_lead_analysis(user_id: str, year: int) -> tuple[dict, dict] | None:
     wb, tab = found
     rows = fetch_tab_values(wb["id"], tab)  # full tab — lead sheets outgrow the grid cap
     records, gaps = mr_leads.parse_lead_rows(rows, year=year)
-    summary = mr_leads.summarize(records, tracker_rollups=_tracker_rollups_by_month(user_id))
+    # The lead-quality flags are frozen into the run, so they must be judged
+    # against the thresholds of the workspace this run is being written for —
+    # ``user["id"]`` from the UI, ``MR_CRON_USER_ID`` from the cron. Both reach
+    # here as ``user_id``, so the cron is just another caller and never a
+    # special case that could evaluate against somebody else's red lines.
+    from marketing_research_agent import goals as mr_goals
+
+    summary = mr_leads.summarize(
+        records,
+        tracker_rollups=_tracker_rollups_by_month(user_id),
+        thresholds=mr_goals.thresholds(mr_goals.get_targets(user_id)),
+    )
     run = {
         "id": runs.new_run_id(), "kind": "lead_analysis", "user_id": user_id,
         "agent_id": MR_AGENT_ID, "platform": "sheets-leads",
@@ -612,8 +623,14 @@ def cron_refresh(request: Request, response: Response,
     """Scheduled full refresh: sheet pull + daily snapshot capture + GCS export.
 
     Authenticated by the MR_CRON_KEY shared secret (Cloud Scheduler can't hold a
-    Firebase user session). The pull runs for MR_CRON_USER_ID's workspace; the
-    snapshot capture and exports are user-independent.
+    Firebase user session). The pull runs for MR_CRON_USER_ID's workspace — and
+    since 2026-08-21 that means it also evaluates red flags against THAT
+    workspace's targets, because the runs it writes are stamped with that
+    user_id and only that workspace ever reads them back. With MR_CRON_USER_ID
+    unset the pull is skipped outright (below) rather than run against a
+    deployment-wide default, so there is no path where the cron flags one desk's
+    data with another desk's red lines. The snapshot capture and exports are
+    user-independent.
 
     Reports 200/207/502 per :func:`_cron_status` — a refresh where every stage
     failed is never a 200."""
@@ -800,7 +817,7 @@ async def ingest_pdf(file: UploadFile = File(...), user=Depends(get_current_user
 @router.get("/mr/overview")
 def overview(user=Depends(get_current_user)):
     """Live dashboard state — latest-month KPIs vs 2026 goals. Persists nothing."""
-    return reports.overview(_load_dataset(user["id"]))
+    return reports.overview(_load_dataset(user["id"]), user["id"])
 
 
 @router.get("/mr/lead-analysis")
@@ -1044,26 +1061,30 @@ def connectors(user=Depends(get_current_user)):
 
 @router.get("/mr/targets")
 def get_targets(user=Depends(get_current_user)):
-    """Effective performance targets/thresholds (defaults merged with edits)."""
+    """This workspace's effective targets/thresholds (defaults merged with its
+    own edits). Another workspace's edits are not visible here and never were
+    meant to be — until 2026-08-21 they were, because this was one document for
+    the whole deployment."""
     from marketing_research_agent import goals as mr_goals
 
-    return mr_goals.get_targets()
+    return mr_goals.get_targets(user["id"])
 
 
 @router.post("/mr/targets")
 def save_targets(body: dict | None = None, user=Depends(get_current_user),
                  act: Activity = trail.records("targets_saved", "Edited the targets",
                                                unit=CHANGE)):
-    """Edit targets/figures. Body: {"thresholds": {...}, "channel_goals": {"Google": {...}}}.
-    Send {"reset": true} to return to the 2026 defaults."""
+    """Edit THIS workspace's targets/figures. Body:
+    {"thresholds": {...}, "channel_goals": {"Google": {...}}}.
+    Send {"reset": true} to return to the verbatim 2026 defaults."""
     from marketing_research_agent import goals as mr_goals
 
     body = body or {}
     if body.get("reset"):
         act.note("Targets reset to the defaults", action="targets_reset")
-        return mr_goals.reset_targets()
+        return mr_goals.reset_targets(user["id"])
     try:
-        saved = mr_goals.set_targets(body)
+        saved = mr_goals.set_targets(user["id"], body)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     act.note(f"Targets saved — {', '.join(sorted(body)) or 'no fields'}")
@@ -1075,7 +1096,7 @@ def get_config(user=Depends(get_current_user)):
     """Agent configuration: data source, report schedule, and thresholds."""
     from marketing_research_agent import goals as mr_goals
 
-    _thr = mr_goals.thresholds()
+    _thr = mr_goals.thresholds(mr_goals.get_targets(user["id"]))
     return {
         "spreadsheet_id": mr_config.SHEETS_SPREADSHEET_ID,
         "spreadsheet_url": f"https://docs.google.com/spreadsheets/d/{mr_config.SHEETS_SPREADSHEET_ID}/edit",

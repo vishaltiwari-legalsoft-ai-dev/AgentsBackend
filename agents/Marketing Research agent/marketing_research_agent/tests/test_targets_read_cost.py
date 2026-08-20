@@ -1,10 +1,15 @@
 """The targets document must be read once per report, not once per metric row.
 
-``mr_config/targets`` is ONE small document. ``goals.evaluate`` called
+``mr_config/targets__{user_id}`` is ONE small document. ``goals.evaluate`` called
 ``thresholds()`` and ``channel_goal()``, each of which resolved the whole
 targets object, so ``campaign_reporting.flag_all`` cost 2 store reads per metric
 row — ~120 reads of the same document to build one report. These tests count the
 reads directly, so a regression shows up as a number, not as latency.
+
+Since targets became per workspace (2026-08-21) the same numbers pin a second
+property: a helper that cannot reach the store cannot resolve a workspace, so it
+cannot judge one desk's campaigns against another desk's red lines. The
+threshold helpers now take the resolved dict, so most of these counts are zero.
 """
 from datetime import date
 
@@ -33,9 +38,9 @@ def _count_store_reads(monkeypatch) -> list[int]:
     calls = [0]
     real = goals._load_overrides
 
-    def _counted():
+    def _counted(user_id):
         calls[0] += 1
-        return real()
+        return real(user_id)
 
     monkeypatch.setattr(goals, "_load_overrides", _counted)
     return calls
@@ -52,9 +57,9 @@ def _count_resolves(monkeypatch) -> list[int]:
     calls = [0]
     real = goals.get_targets
 
-    def _counted(**kw):
+    def _counted(*a, **kw):
         calls[0] += 1
-        return real(**kw)
+        return real(*a, **kw)
 
     monkeypatch.setattr(goals, "get_targets", _counted)
     return calls
@@ -70,21 +75,26 @@ def _metrics(n: int) -> list[CampaignMetric]:
     ]
 
 
-def test_flag_all_resolves_the_targets_once_for_the_whole_dataset(monkeypatch):
+def test_flag_all_resolves_nothing_because_its_caller_hands_the_targets_in(
+    monkeypatch
+):
     """Was 2 resolves per metric row (``thresholds()`` + ``channel_goal()``
-    inside ``evaluate``); 40 rows cost 80."""
+    inside ``evaluate``); 40 rows cost 80. It is now zero: ``targets`` is a
+    required argument, so this loop cannot reach the store — which is both the
+    read-cost bar and the reason it cannot pick the wrong workspace."""
+    targets = goals.get_targets("u1")
     reads = _count_store_reads(monkeypatch)
     resolves = _count_resolves(monkeypatch)
-    flags = cr.flag_all(_metrics(40))
+    flags = cr.flag_all(_metrics(40), None, targets)
     assert flags, "the fixture must actually trip flags or this proves nothing"
-    assert resolves[0] == 1, (
-        f"{resolves[0]} targets resolves for 40 metric rows — one per dataset "
-        "is the bar (it was 2 per row)")
-    assert reads[0] == 1, f"{reads[0]} store reads for one dataset"
+    assert resolves[0] == 0, (
+        f"{resolves[0]} targets resolves for 40 metric rows that were handed "
+        "their targets")
+    assert reads[0] == 0, f"{reads[0]} store reads for one dataset"
 
 
 def test_evaluate_accepts_resolved_targets_and_resolves_nothing(monkeypatch):
-    targets = goals.get_targets()
+    targets = goals.get_targets("u1")
     reads = _count_store_reads(monkeypatch)
     resolves = _count_resolves(monkeypatch)
     for m in _metrics(25):
@@ -108,31 +118,52 @@ def test_a_whole_report_resolves_the_targets_once(monkeypatch):
 
 
 def test_repeat_calls_are_served_from_the_process_cache(monkeypatch):
-    goals.get_targets()  # prime
+    goals.get_targets("u1")  # prime
     calls = _count_store_reads(monkeypatch)
     for _ in range(50):
-        goals.thresholds()
-        goals.channel_goal("Google")
+        goals.thresholds(goals.get_targets("u1"))
+        goals.channel_goal("Google", goals.get_targets("u1"))
     assert calls[0] == 0, f"{calls[0]} store reads for 100 cached lookups"
+
+
+def test_the_cache_is_keyed_per_workspace(monkeypatch):
+    """One warm cache entry must not answer for a second workspace.
+
+    A process-wide cache over a now-per-workspace document is the exact shape
+    that would re-open the leak behind the API instead of in the store.
+    """
+    goals.set_targets("desk-a", {"thresholds": {"cac_red": 4242}})
+    assert goals.get_targets("desk-a")["thresholds"]["cac_red"] == 4242
+    assert goals.get_targets("desk-b")["thresholds"]["cac_red"] == goals.CAC_RED
+
+
+def test_an_edit_invalidates_only_the_editing_workspace(monkeypatch):
+    """…and the other way round: B's warm entry survives A's save."""
+    assert goals.get_targets("desk-b")["thresholds"]["cac_red"] == goals.CAC_RED
+    goals.set_targets("desk-a", {"thresholds": {"cac_red": 4242}})
+
+    calls = _count_store_reads(monkeypatch)
+    assert goals.get_targets("desk-b")["thresholds"]["cac_red"] == goals.CAC_RED
+    assert calls[0] == 0, "A's save blew away B's cache entry"
 
 
 def test_an_edit_is_visible_immediately_not_after_the_ttl(monkeypatch):
     """The cache must never serve a stale figure back to the desk that just
     edited it — writes invalidate."""
-    assert goals.thresholds()["cac_red"] == 3000.0
-    goals.set_targets({"thresholds": {"cac_red": 4321.0}})
-    assert goals.thresholds()["cac_red"] == 4321.0
-    goals.reset_targets()
-    assert goals.thresholds()["cac_red"] == 3000.0
+    assert goals.thresholds(goals.get_targets("u1"))["cac_red"] == 3000.0
+    goals.set_targets("u1", {"thresholds": {"cac_red": 4321.0}})
+    assert goals.thresholds(goals.get_targets("u1"))["cac_red"] == 4321.0
+    goals.reset_targets("u1")
+    assert goals.thresholds(goals.get_targets("u1"))["cac_red"] == 3000.0
 
 
 def test_the_cache_never_serves_another_store_s_values(monkeypatch, tmp_path):
     """Keyed on the store identity: moving MR_TARGETS_FILE must not hand back
     the previous file's edits."""
-    goals.set_targets({"thresholds": {"cac_red": 4321.0}})
-    assert goals.thresholds()["cac_red"] == 4321.0
+    goals.set_targets("u1", {"thresholds": {"cac_red": 4321.0}})
+    assert goals.thresholds(goals.get_targets("u1"))["cac_red"] == 4321.0
     monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "other.json"))
-    assert goals.thresholds()["cac_red"] == 3000.0
+    assert goals.thresholds(goals.get_targets("u1"))["cac_red"] == 3000.0
 
 
 def test_mr_config_endpoint_resolves_the_thresholds_once(monkeypatch):

@@ -9,11 +9,17 @@ Watch rules ("tell me when a Jira ticket about billing shows up") are evaluated
 inside the same call — matched by plain substring here, then handed to the model
 for the human sentence. A rule that matches nothing says so; we never invent an
 alert to look useful.
+
+Watch rules are PER TENANT. They were one document for the whole deployment
+until 2026-08-21, which meant every tenant read every other tenant's rules and
+any save wiped the rest; :func:`load_config` still seeds a tenant's first
+document from that legacy doc so nobody lost the rules they had.
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 
 from app.services import openrouter
@@ -23,7 +29,11 @@ from browser_agent import state
 logger = logging.getLogger("agentos.browser")
 
 AGENT_ID = "a11"
-CONFIG_DOC = "config-global"
+
+#: The pre-tenancy document every tenant shared. Read-only from here on: it is
+#: the seed source for the one-time migration in :func:`load_config` and is
+#: never written to and never deleted by this module.
+LEGACY_CONFIG_DOC = "config-global"
 
 MAX_EVENTS = 200
 MAX_RULES = 20
@@ -53,22 +63,91 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def load_config() -> dict:
-    return state.load(CONFIG_DOC) or {"watch_rules": [], "updated_at": None}
+def config_doc_id(user_id: str) -> str:
+    """One tenant's watch-rule document. The shape is written down HERE and
+    nowhere else — a second copy is how a reader ends up looking for documents
+    no writer makes. Same ``{prefix}-{id}`` form as this module's ``digest-{id}``
+    and ``geo-config-{brand_id}`` next door, so the offline JSON fallback maps
+    it 1:1 to a Windows-safe filename."""
+    return f"config-{user_id}"
 
 
-def save_config(patch: dict) -> dict:
-    cfg = load_config()
+def tenant_key(user: dict) -> str:
+    """The tenant a caller's watch rules belong to.
+
+    Deliberately ``str(user.get("id"))`` — the exact spelling ``_run_or_404``
+    compares runs with in the router — so one caller reaches exactly one config
+    document no matter which entry point got hold of them.
+    """
+    return str(user.get("id"))
+
+
+def _legacy_seed_enabled() -> bool:
+    """Whether a tenant with no document of their own may inherit the legacy one.
+
+    Set ``BROWSER_WATCH_LEGACY_SEED=0`` once the tenants who were using the
+    shared document have signed in; after that every new tenant starts from the
+    honest empty default instead of inheriting pre-tenancy rules.
+    """
+    return os.environ.get("BROWSER_WATCH_LEGACY_SEED", "1") != "0"
+
+
+def _clean_rules(rules: object) -> list[dict]:
+    """Validate/trim/cap a rule list. Anything blank is dropped, not stored."""
+    out: list[dict] = []
+    for rule in (rules or [])[:MAX_RULES]:  # type: ignore[index]
+        if not isinstance(rule, dict):
+            continue
+        text = str(rule.get("text") or "").strip()[:200]
+        if text:
+            out.append({"id": str(rule.get("id") or text[:24]), "text": text,
+                        "enabled": bool(rule.get("enabled", True))})
+    return out
+
+
+def _seed_from_legacy(user_id: str) -> dict:
+    """Copy the pre-tenancy shared rules into this tenant's own document, once.
+
+    A COPY, not an alias: from the moment it lands, this tenant's edits are
+    theirs alone and nobody else's reach them. Nothing is written when there is
+    nothing to inherit — a read must not create documents, and an empty answer
+    is the same answer next time, which is what makes this safe to repeat.
+    """
+    if not _legacy_seed_enabled():
+        return {"watch_rules": [], "updated_at": None}
+    legacy = state.load(LEGACY_CONFIG_DOC) or {}
+    rules = _clean_rules(legacy.get("watch_rules"))
+    if not rules:
+        return {"watch_rules": [], "updated_at": None}
+    seeded = {"watch_rules": rules, "updated_at": legacy.get("updated_at"),
+              "seeded_from": LEGACY_CONFIG_DOC, "seeded_at": _now()}
+    state.save(config_doc_id(user_id), seeded)
+    logger.info("browser: seeded %d watch rules for %s from %s",
+                len(rules), user_id, LEGACY_CONFIG_DOC)
+    return seeded
+
+
+def load_config(user_id: str) -> dict:
+    """This tenant's watch rules, seeding once from the legacy shared document.
+
+    The tenant's own document — even an empty one — is what stops the seed
+    running again, so a later edit (or a save that clears every rule) can never
+    be overwritten by the pre-tenancy values. A tenant with nothing to inherit
+    gets the honest empty default, never another tenant's rules.
+    """
+    own = state.load(config_doc_id(user_id))
+    if own is not None:
+        return own
+    return _seed_from_legacy(user_id)
+
+
+def save_config(user_id: str, patch: dict) -> dict:
+    """Patch this tenant's watch rules. Writes only their own document."""
+    cfg = load_config(user_id)
     if "watch_rules" in patch:
-        rules = []
-        for rule in (patch["watch_rules"] or [])[:MAX_RULES]:
-            text = str(rule.get("text") or "").strip()[:200]
-            if text:
-                rules.append({"id": str(rule.get("id") or text[:24]), "text": text,
-                              "enabled": bool(rule.get("enabled", True))})
-        cfg["watch_rules"] = rules
+        cfg["watch_rules"] = _clean_rules(patch["watch_rules"])
     cfg["updated_at"] = _now()
-    state.save(CONFIG_DOC, cfg)
+    state.save(config_doc_id(user_id), cfg)
     return cfg
 
 
@@ -157,7 +236,9 @@ def build_digest(user: dict, events: list[dict], tabs: list[dict]) -> dict:
     """One digest from a browsing trail. Raises ValueError if the model misbehaves."""
     cleaned = _clean_events(events or [])
     tabs = [t for t in (tabs or []) if str(t.get("url", "")).startswith("http")][:30]
-    cfg = load_config()
+    # The digest is built for whoever posted the trail, so the rules matched
+    # against it are that same person's — never the deployment's.
+    cfg = load_config(tenant_key(user))
     alerts = match_rules(cleaned, tabs, cfg.get("watch_rules") or [])
 
     if not cleaned and not tabs:

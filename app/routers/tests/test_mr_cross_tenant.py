@@ -22,10 +22,11 @@ through ``runs.list_runs(user_id, ...)``, which filters in Python. That is the
 read path behind ``/overview``, ``/trends``, ``/report-periods``,
 ``/lead-analysis`` and every report build, and it too was untested.
 
-Also here, deliberately: the MR endpoints that are **not** scoped by anything.
-``/mr/targets`` is one document for the whole deployment, so a second tenant
-reads and overwrites the first tenant's thresholds. That is pinned as a known
-leak, not endorsed — see the test's docstring.
+Also here: ``/mr/targets``, which was one document for the whole deployment
+until 2026-08-21 — a second tenant read and overwrote the first tenant's
+thresholds, and every report built from them. It is keyed on ``user["id"]`` now
+and the last section pins that, at the store and at the two places the figures
+are *applied* (report flags, overview traffic lights).
 """
 from __future__ import annotations
 
@@ -268,26 +269,22 @@ def test_two_tenants_ingesting_the_same_file_keep_separate_datasets(as_caller):
 
 
 # --------------------------------------------------------------------------- #
-# The MR endpoints with no tenant key at all
+# Targets — keyed per workspace since 2026-08-21
 # --------------------------------------------------------------------------- #
+# Until then ``GET``/``POST /mr/targets`` took the caller only to authenticate
+# them: ``get_targets()`` / ``set_targets(body)`` accepted no user id and
+# read/wrote a single document (``mr_config/targets``, or ``MR_TARGETS_FILE``
+# locally), so one desk's threshold edit re-flagged every other desk's dashboard
+# and ``GET /mr/config`` mirrored the changed figure back to everyone. Every
+# entry point now takes ``user["id"]``. The migration off the shared document is
+# covered where it lives, in ``marketing_research_agent/tests/test_goals.py``.
 
-def test_KNOWN_LEAK_targets_are_one_document_shared_by_every_tenant(
+
+def test_a_tenants_threshold_edit_does_not_move_another_tenants_red_line(
     owner_workspace, as_caller
 ):
-    """DOCUMENTS A LIVE CROSS-TENANT DEFECT. Do not read this as a spec.
-
-    ``GET``/``POST /mr/targets`` take the caller only to authenticate them:
-    ``mr_goals.get_targets()`` and ``set_targets(body)`` accept no user id and
-    read/write a single document (``mr_config/targets``, or ``MR_TARGETS_FILE``
-    locally). So one tenant's threshold edit re-flags every other tenant's
-    dashboard, and ``GET /mr/config`` mirrors the same values back to everyone.
-
-    Like the Browser Agent's watch rules, this is not a forgotten scoping line —
-    there is no per-tenant concept in this path at all. Pinned so the refactor
-    that introduces one has to come here and delete this test on purpose. Fix
-    belongs to ``senior-python-backend``; this suite only refuses to let it
-    change by accident.
-    """
+    """The read half. Both sides are asserted so this cannot pass by the
+    endpoint simply being broken for everyone."""
     baseline = client.get("/api/mr/targets").json()["thresholds"]["cac_red"]
 
     as_caller(STRANGER)
@@ -297,7 +294,88 @@ def test_KNOWN_LEAK_targets_are_one_document_shared_by_every_tenant(
 
     as_caller(OWNER)
     after = client.get("/api/mr/targets").json()["thresholds"]["cac_red"]
-    assert after == 4242 and after != baseline, (
-        "if this now fails, MR targets became per-tenant — good; delete this test"
+    assert after == baseline != 4242, "another tenant's edit moved this tenant's CAC line"
+    assert client.get("/api/mr/config").json()["thresholds"]["cac_red"] == baseline
+
+
+def test_each_tenants_own_edit_sticks(owner_workspace, as_caller):
+    """Two tenants edit the same threshold to different figures and both keep
+    theirs — the store is shared, the tenancy is not."""
+    assert client.post(
+        "/api/mr/targets", json={"thresholds": {"cac_red": 2600}}
+    ).status_code == 200
+
+    as_caller(STRANGER)
+    assert client.post(
+        "/api/mr/targets", json={"thresholds": {"cac_red": 4242}}
+    ).status_code == 200
+    assert client.get("/api/mr/targets").json()["thresholds"]["cac_red"] == 4242
+
+    as_caller(OWNER)
+    assert client.get("/api/mr/targets").json()["thresholds"]["cac_red"] == 2600
+    assert client.get("/api/mr/config").json()["thresholds"]["cac_red"] == 2600
+
+
+def test_a_tenants_reset_does_not_reset_another_tenants_targets(
+    owner_workspace, as_caller
+):
+    """``{"reset": true}`` is the destructive one: on the shared document it
+    wiped the whole deployment's edits."""
+    assert client.post(
+        "/api/mr/targets", json={"thresholds": {"cac_red": 2600}}
+    ).status_code == 200
+
+    as_caller(STRANGER)
+    assert client.post("/api/mr/targets", json={"reset": True}).json()["edited"] is False
+
+    as_caller(OWNER)
+    kept = client.get("/api/mr/targets").json()
+    assert kept["thresholds"]["cac_red"] == 2600 and kept["edited"] is True
+
+
+def test_a_report_is_flagged_against_its_own_tenants_thresholds(
+    owner_workspace, as_caller
+):
+    """Targets are not just stored per tenant — they are *applied* per tenant.
+
+    The fixture CSV spends $1,200 for 4 booked demos (cost/booking $300). The
+    owner drops their cost-per-booking line to $200 so their own report flags
+    it; the stranger, on the untouched $150 default… also flags it. So the
+    assertion runs the other way: the owner raises their line to $500, and the
+    stranger's report must still carry the flag the default produces.
+    """
+    assert client.post(
+        "/api/mr/targets", json={"thresholds": {"cost_per_booking_flag": 500}}
+    ).status_code == 200
+
+    mine = client.post("/api/mr/reports/daily_summary").json()["structured"]
+    assert not [f for f in mine["flags"] if f["metric"] == "cost_per_booking"], (
+        "the owner raised their own ceiling above $300 and is still flagged"
     )
-    assert client.get("/api/mr/config").json()["thresholds"]["cac_red"] == 4242
+
+    as_caller(STRANGER)
+    client.post("/api/mr/ingest", files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+                data={"platform": "google_ads"})
+    theirs = client.post("/api/mr/reports/daily_summary").json()["structured"]
+    assert [f for f in theirs["flags"] if f["metric"] == "cost_per_booking"], (
+        "the stranger's report was judged against the owner's raised ceiling"
+    )
+
+
+def test_the_overview_traffic_lights_use_the_readers_own_targets(
+    owner_workspace, as_caller
+):
+    """``/mr/overview`` resolves targets separately from the report path, so it
+    is a separate scoping site and gets its own test."""
+    assert client.post(
+        "/api/mr/targets", json={"thresholds": {"cost_per_booking_flag": 500}}
+    ).status_code == 200
+
+    mine = client.get("/api/mr/overview").json()
+    assert not [f for f in mine["flag_summary"] if f["metric"] == "cost_per_booking"]
+
+    as_caller(STRANGER)
+    client.post("/api/mr/ingest", files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+                data={"platform": "google_ads"})
+    theirs = client.get("/api/mr/overview").json()
+    assert [f for f in theirs["flag_summary"] if f["metric"] == "cost_per_booking"]

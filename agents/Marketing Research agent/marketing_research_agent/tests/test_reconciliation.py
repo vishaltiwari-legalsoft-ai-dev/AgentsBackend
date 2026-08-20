@@ -20,7 +20,7 @@ def _m(channel, spend, leads=10, q=5, b=4, c=2, month=7):
 def test_overview_totals_exclude_website_spend_keep_leads():
     ds = {"metrics": [_m("Google", 1000.0), _m("Websites", 700.0, leads=20, q=8)],
           "today": date(2026, 7, 8), "sources": []}
-    out = reports.overview(ds)
+    out = reports.overview(ds, "u1")
     assert out["totals"]["spend"] == 1000.0
     assert out["totals"]["leads"] == 30
     assert out["channels"]["Websites"]["spend"] == 700.0
@@ -44,7 +44,7 @@ def test_overview_headline_spend_is_the_sheet_official_total():
     ds = {"metrics": [_m("Google", 1000.0), _m("Websites", 700.0, leads=20, q=8)],
           "official_spend": {"2026-07": 45461.20},
           "today": date(2026, 7, 8), "sources": []}
-    t = reports.overview(ds)["totals"]
+    t = reports.overview(ds, "u1")["totals"]
     assert t["spend"] == 45461.20
     assert t["spend_source"] == "sheet_overall"
     assert t["spend_computed"] == 1000.0
@@ -58,7 +58,7 @@ def test_overview_falls_back_to_computed_when_official_month_missing():
     ds = {"metrics": [_m("Google", 1000.0)],
           "official_spend": {"2026-06": 99.0},
           "today": date(2026, 7, 8), "sources": []}
-    t = reports.overview(ds)["totals"]
+    t = reports.overview(ds, "u1")["totals"]
     assert t["spend"] == 1000.0
     assert "spend_source" not in t
 
@@ -70,7 +70,7 @@ def test_overview_official_totals_override_every_team_kpi():
               "demos_booked": 137, "demos_completed": 74,
           }},
           "today": date(2026, 7, 27), "sources": []}
-    t = reports.overview(ds)["totals"]
+    t = reports.overview(ds, "u1")["totals"]
     assert t["spend"] == 47166.58 and t["spend_source"] == "sheet_overall"
     assert t["leads"] == 331 and t["qualified_leads"] == 137
     assert t["demos_booked"] == 137 and t["demos_completed"] == 74

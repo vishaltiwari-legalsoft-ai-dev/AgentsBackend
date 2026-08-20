@@ -310,31 +310,24 @@ def test_a_creator_who_is_not_an_admin_gets_no_bypass(owned, as_caller):
 
 
 # --------------------------------------------------------------------------- #
-# Watch rules — a per-user-looking endpoint backed by one global document
+# Watch rules — keyed per tenant since 2026-08-21
 # --------------------------------------------------------------------------- #
+# Until then ``GET``/``PUT /browser/config`` took the caller only to authenticate
+# them: ``load_config()`` / ``save_config(patch)`` accepted no user id and
+# read/wrote the single document ``config-global``, so every tenant saw every
+# other tenant's rules and any save destroyed the rest. Both endpoints now key on
+# ``browser_digest.tenant_key(user)``. These two tests are what that fix has to
+# keep true; the migration off the shared document is covered where it lives, in
+# ``browser_agent/tests/test_digest.py``.
 
-def test_KNOWN_LEAK_watch_rules_are_one_global_document_shared_by_all_tenants(
-    owned, as_caller
-):
-    """DOCUMENTS A LIVE CROSS-TENANT DEFECT. Do not read this as a spec.
 
-    ``GET``/``PUT /browser/config`` take the caller only to authenticate them.
-    ``browser_digest.load_config()`` and ``save_config(patch)`` take no user id
-    at all and read/write the single document ``CONFIG_DOC``:
+def test_watch_rules_are_private_to_the_tenant_who_saved_them(owned, as_caller):
+    """A second tenant reads their own empty rule list, not the owner's.
 
-        @router.put("/browser/config")
-        def put_config(body, user=Depends(get_current_user), ...):
-            saved = browser_digest.save_config(patch)
-
-    So every tenant sees every other tenant's watch rules, and any tenant's save
-    silently destroys everyone else's. This is not a scoping line someone forgot
-    to type — there is no per-user concept in this path to forget.
-
-    Pinned as-is, and pinned loudly, for one reason: the refactor that gives
-    these endpoints a tenant key will turn this test red, and someone will have
-    to come here and delete it on purpose. That is the outcome we want. The fix
-    belongs to ``senior-python-backend``; this suite only refuses to let it
-    happen by accident.
+    The owner's rule text is asserted absent from the whole response body, not
+    just from the parsed list: a rule is a standing instruction about what
+    someone is working on ("watch for the acme contract"), and it must not come
+    back anywhere in another tenant's payload.
     """
     assert client.put(
         "/api/browser/config",
@@ -342,17 +335,74 @@ def test_KNOWN_LEAK_watch_rules_are_one_global_document_shared_by_all_tenants(
     ).status_code == 200
 
     as_caller(STRANGER)
-    leaked = client.get("/api/browser/config").json()["watch_rules"]
-    assert [r["text"] for r in leaked] == ["watch for the acme contract"], (
-        "if this now fails, watch rules became per-tenant — good; delete this test"
-    )
+    theirs = client.get("/api/browser/config")
+    assert theirs.status_code == 200
+    assert theirs.json()["watch_rules"] == []
+    assert "acme" not in theirs.text
 
+
+def test_a_tenants_save_cannot_overwrite_another_tenants_watch_rules(owned, as_caller):
+    """The destructive half. B saving is not refused — it is simply theirs.
+
+    ``PUT`` replaces the whole rule list, so on the shared document B's save
+    deleted A's rules outright. Both sides are read back so this proves
+    isolation, not that the endpoint broke for everyone.
+    """
+    assert client.put(
+        "/api/browser/config",
+        json={"watch_rules": [{"text": "watch for the acme contract"}]},
+    ).status_code == 200
+
+    as_caller(STRANGER)
     assert client.put(
         "/api/browser/config", json={"watch_rules": [{"text": "b's own rule"}]}
     ).status_code == 200
+    assert [r["text"] for r in client.get("/api/browser/config").json()["watch_rules"]] == [
+        "b's own rule"
+    ]
 
     as_caller(OWNER)
-    after = client.get("/api/browser/config").json()["watch_rules"]
-    assert [r["text"] for r in after] == ["b's own rule"], (
-        "the owner's watch rules survived another tenant's save — good; delete this test"
-    )
+    assert [r["text"] for r in client.get("/api/browser/config").json()["watch_rules"]] == [
+        "watch for the acme contract"
+    ], "another tenant's save wiped the owner's watch rules"
+
+
+def test_an_admin_gets_no_bypass_into_another_tenants_watch_rules(owned, as_caller):
+    """The seven admin bypasses in this router stop at the config endpoints.
+
+    Pinned deliberately: every other read path here widens for ``is_admin``, so
+    "the admin sees nothing" is a decision, not an oversight, and a future
+    unification of the four predicates has to keep it on purpose.
+    """
+    assert client.put(
+        "/api/browser/config",
+        json={"watch_rules": [{"text": "watch for the acme contract"}]},
+    ).status_code == 200
+
+    as_caller(ADMIN)
+    seen = client.get("/api/browser/config")
+    assert seen.json()["watch_rules"] == []
+    assert "acme" not in seen.text
+
+
+def test_a_digest_is_matched_against_the_posters_own_watch_rules(owned, as_caller):
+    """Rules are not just stored per tenant — they are *applied* per tenant.
+
+    A digest carries the alerts its rules produced, so a stranger's digest built
+    against the owner's rules would echo the owner's phrasing straight back at
+    them. The owner's side is asserted first so a rule that simply never matches
+    cannot pass this test.
+    """
+    assert client.put(
+        "/api/browser/config", json={"watch_rules": [{"text": "Q3 plan"}]}
+    ).status_code == 200
+
+    trail = {"events": [{"url": "https://example.com/private-doc", "title": "Q3 plan"}],
+             "tabs": []}
+    mine = client.post("/api/browser/digest", json=trail)
+    assert [a["rule"] for a in mine.json()["alerts"]] == ["Q3 plan"]
+
+    as_caller(STRANGER)
+    theirs = client.post("/api/browser/digest", json=trail)
+    assert theirs.status_code == 200, theirs.text
+    assert theirs.json()["alerts"] == []

@@ -72,7 +72,7 @@ def _totals(agg: dict[str, dict]) -> dict:
     }
 
 
-def _enrich(channel: str, agg: dict, targets: dict | None = None) -> dict:
+def _enrich(channel: str, agg: dict, targets: dict) -> dict:
     agg["goal"] = goals.goal_dict(channel, targets)
     agg["status"] = goals.status_for(channel, agg, targets)
     return agg
@@ -81,7 +81,7 @@ def _enrich(channel: str, agg: dict, targets: dict | None = None) -> dict:
 # Plain-language summary per flagged metric (so the report shows "14 campaigns
 # over the $600 ceiling", not 14 near-identical lines). Built per call because
 # every threshold figure is user-editable.
-def _flag_labels(targets: dict | None = None) -> dict[str, str]:
+def _flag_labels(targets: dict) -> dict[str, str]:
     t = goals.thresholds(targets)
     return {
         "cost_per_qualified_lead": f"over the ${t['cost_per_qualified_lead_red']:,.0f} cost-per-qualified-lead ceiling",
@@ -98,7 +98,7 @@ def _money_in(text: str) -> float:
     return max(nums) if nums else 0.0
 
 
-def _flag_summary(flags: list[dict], targets: dict | None = None) -> list[dict]:
+def _flag_summary(flags: list[dict], targets: dict) -> list[dict]:
     """Group raw flags by metric into one summarized line each."""
     groups: dict[tuple, dict] = {}
     for f in flags:
@@ -224,7 +224,7 @@ def _vendor_rollup(vendor_metrics: dict[str, list]) -> list[dict]:
     return out
 
 
-def _vendor_red_flags(vendors: list[dict], targets: dict | None = None) -> list[dict]:
+def _vendor_red_flags(vendors: list[dict], targets: dict) -> list[dict]:
     """Which vendors are on a red flag and exactly why (editable thresholds)."""
     t = goals.thresholds(targets)
     out = []
@@ -248,7 +248,7 @@ def _vendor_red_flags(vendors: list[dict], targets: dict | None = None) -> list[
 
 
 def _fallback_vendor_insights(vendors: list[dict], red_map: dict[str, list[str]],
-                              targets: dict | None = None) -> list[dict]:
+                              targets: dict) -> list[dict]:
     """Deterministic 3-insights / 3-actions per vendor (offline or LLM failure)."""
     t = goals.thresholds(targets)
     lo, hi = t["cost_per_qualified_lead_target_low"], t["cost_per_qualified_lead_target_high"]
@@ -285,7 +285,7 @@ def _fallback_vendor_insights(vendors: list[dict], red_map: dict[str, list[str]]
 
 
 def _vendor_insights(vendors: list[dict], red_flags: list[dict],
-                     targets: dict | None = None) -> tuple[list[dict], str | None]:
+                     targets: dict) -> tuple[list[dict], str | None]:
     """3 concise insights + 3 action points per vendor: LLM online, deterministic
     fallback offline — output shape is identical either way.
 
@@ -402,10 +402,11 @@ def _month_keys(start: date, end: date) -> list[str]:
     return keys
 
 
-def _campaign_structured(ds: dict) -> dict:
-    # Resolved ONCE for this report. Every threshold/goal read below takes it as
-    # an argument; each one used to re-read the mr_config/targets document.
-    targets = goals.get_targets()
+def _campaign_structured(ds: dict, targets: dict) -> dict:
+    # ``targets`` is resolved ONCE per report, by the caller, for the workspace
+    # the report belongs to. Every threshold/goal read below takes it as an
+    # argument; each one used to re-read the mr_config/targets document — and
+    # that document was the same one for every workspace.
     metrics = ds.get("metrics", [])
     previous = ds.get("previous_metrics")
     current_agg = cr.aggregate_by_channel(metrics)
@@ -447,9 +448,9 @@ def _campaign_structured(ds: dict) -> dict:
     return structured
 
 
-def _structured(kind: str, ds: dict) -> dict:
+def _structured(kind: str, ds: dict, targets: dict) -> dict:
     if kind in CAMPAIGN_KINDS:
-        return _campaign_structured(ds)
+        return _campaign_structured(ds, targets)
     if kind == "utm_attribution":
         leads = ds.get("leads", [])
         return {
@@ -525,9 +526,15 @@ def build(kind: str, dataset: dict, user_id: str, period: str | None = None) -> 
     ``period`` (monthly/quarterly only) pins the report to an explicit month
     ('2026-07') or quarter ('2026-Q2') instead of today's default window.
     Explicit periods never substitute another month's data — an empty window
-    raises :class:`PeriodError`."""
+    raises :class:`PeriodError`.
+
+    Every threshold in the report is judged against ``user_id``'s OWN targets,
+    resolved once here and handed down. The report is stamped with, persisted
+    under and only ever read back by that user, so anyone else's figures would
+    flag campaigns nobody can explain."""
     if kind not in KINDS:
         raise ValueError(f"unknown report kind: {kind}")
+    targets = goals.get_targets(user_id)
     if period is not None and kind not in ("monthly_summary", "quarterly_summary"):
         raise PeriodError(f"'{kind}' reports don't take a period.")
     if kind in CAMPAIGN_KINDS:
@@ -570,14 +577,14 @@ def build(kind: str, dataset: dict, user_id: str, period: str | None = None) -> 
             "with_vendor_insights": True,
             "lead_month_keys": _month_keys(start, end),
         }
-        structured = _structured(kind, dataset)
+        structured = _structured(kind, dataset, targets)
         structured["period"] = {
             "start": start.isoformat(), "end": end.isoformat(),
             "label": _period_label(start, end),
             "basis": "Tracker figures are month-to-date cumulatives; the report reads the months this window touches.",
         }
     else:
-        structured = _structured(kind, dataset)
+        structured = _structured(kind, dataset, targets)
     markdown, narration = _markdown(kind, structured)
     # Provenance for the whole deliverable. The narrative and the vendor
     # insights are both LLM paths that degrade to hand-written templates; if
@@ -605,13 +612,16 @@ def build(kind: str, dataset: dict, user_id: str, period: str | None = None) -> 
     return report
 
 
-def overview(ds: dict) -> dict:
+def overview(ds: dict, user_id: object) -> dict:
     """Live dashboard state for /mr/overview — latest-month KPIs vs goals.
 
     Anchored to the latest month NOT after today: vendor tabs pre-fill retainer
     fees into future months (spend, no activity), which would otherwise make the
     dashboard land on an empty September. Pure read: reuses the campaign
-    aggregation but never persists a run."""
+    aggregation but never persists a run.
+
+    ``user_id`` is the workspace whose targets the traffic lights and flag lines
+    are judged against — the same workspace ``ds`` was loaded for."""
     metrics = ds.get("metrics", [])
     sources = ds.get("sources", [])
     if not metrics:
@@ -625,7 +635,8 @@ def overview(ds: dict) -> dict:
     month_key = f"{latest[0]:04d}-{latest[1]:02d}"
     month_metrics = [m for m in metrics if (m.date.year, m.date.month) == latest]
     s = _campaign_structured({**ds, "metrics": month_metrics, "vendor_metrics": None,
-                              "lead_month_keys": [month_key]})
+                              "lead_month_keys": [month_key]},
+                             goals.get_targets(user_id))
     lead_block = ((s.get("lead_quality") or {}).get("months") or {}).get(month_key)
     flag_summary = s["flag_summary"]
     if lead_block:

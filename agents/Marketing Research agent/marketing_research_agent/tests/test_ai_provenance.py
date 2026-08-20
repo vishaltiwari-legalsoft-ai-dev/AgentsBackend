@@ -20,6 +20,7 @@ from datetime import date
 
 import pytest
 
+from marketing_research_agent import goals
 from marketing_research_agent import analysis, insight, profiles, reports
 from marketing_research_agent.schemas import CampaignMetric, Lead, MediaOpportunity
 from marketing_research_agent.workbook import TabGrid
@@ -188,7 +189,7 @@ def test_vendor_insight_fallback_is_flagged_and_reported(monkeypatch, tmp_path):
     vendors = [{"vendor": "V1", "spend": 100.0, "leads": 5, "qualified_leads": 2,
                 "demos_booked": 2, "demos_completed": 1,
                 "cost_per_qualified_lead": 50.0, "cost_per_demo_completed": 100.0}]
-    rows, reason = reports._vendor_insights(vendors, [])
+    rows, reason = reports._vendor_insights(vendors, [], goals.get_targets("u1"))
     assert len(rows) == 1 and len(rows[0]["insights"]) == 3
     assert reason, "canned vendor insights returned with no stated cause"
 
@@ -200,7 +201,7 @@ def test_vendor_insights_validation_rejection_says_so(online, monkeypatch):
     vendors = [{"vendor": "V1", "spend": 100.0, "leads": 5, "qualified_leads": 2,
                 "demos_booked": 2, "demos_completed": 1,
                 "cost_per_qualified_lead": 50.0, "cost_per_demo_completed": 100.0}]
-    rows, reason = reports._vendor_insights(vendors, [])
+    rows, reason = reports._vendor_insights(vendors, [], goals.get_targets("u1"))
     assert rows and "validation" in reason
 
 
@@ -210,7 +211,7 @@ def test_vendor_insights_accepted_model_output_has_no_reason(online, monkeypatch
     vendors = [{"vendor": "V1", "spend": 100.0, "leads": 5, "qualified_leads": 2,
                 "demos_booked": 2, "demos_completed": 1,
                 "cost_per_qualified_lead": 50.0, "cost_per_demo_completed": 100.0}]
-    rows, reason = reports._vendor_insights(vendors, [])
+    rows, reason = reports._vendor_insights(vendors, [], goals.get_targets("u1"))
     assert reason is None and rows[0]["insights"] == ["a", "b", "c"]
 
 

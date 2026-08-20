@@ -5,6 +5,7 @@ from datetime import date
 
 import pytest
 
+from marketing_research_agent import goals
 from marketing_research_agent import lead_analysis as la
 from marketing_research_agent import reports
 from marketing_research_agent.schemas import CampaignMetric
@@ -187,7 +188,8 @@ def _campaign_ds(lead_summary):
 
 def test_campaign_structured_merges_lead_flags_into_red_flag_vendors(monkeypatch):
     monkeypatch.setenv("MR_OFFLINE", "1")
-    s = reports._campaign_structured(_campaign_ds(_flagged_summary()))
+    s = reports._campaign_structured(_campaign_ds(_flagged_summary()),
+                                     goals.get_targets("u1"))
     assert "2026-08" in s["lead_quality"]["months"]
     meta = next(r for r in s["red_flag_vendors"] if r["vendor"] == "Meta 360 RA")
     assert any("Bad-lead rate" in reason for reason in meta["reasons"])
@@ -195,7 +197,7 @@ def test_campaign_structured_merges_lead_flags_into_red_flag_vendors(monkeypatch
 
 def test_overview_carries_lead_quality_and_flags(monkeypatch):
     monkeypatch.setenv("MR_OFFLINE", "1")
-    out = reports.overview(_campaign_ds(_flagged_summary()))
+    out = reports.overview(_campaign_ds(_flagged_summary()), "u1")
     assert out["lead_quality"]["vendors"][0]["campaign"] == "Meta 360 RA"
     assert any(f["metric"] == "bad_lead_rate" for f in out["flag_summary"])
 
@@ -203,6 +205,6 @@ def test_overview_carries_lead_quality_and_flags(monkeypatch):
 def test_overview_without_lead_summary_is_unchanged(monkeypatch):
     monkeypatch.setenv("MR_OFFLINE", "1")
     ds = _campaign_ds(None)
-    out = reports.overview(ds)
+    out = reports.overview(ds, "u1")
     assert out["lead_quality"] is None
     assert all(f["metric"] != "bad_lead_rate" for f in out["flag_summary"])
