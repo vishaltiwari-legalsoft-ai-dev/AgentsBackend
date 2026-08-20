@@ -321,6 +321,13 @@ def _usage_payload(user_id: str | None, days: int) -> dict:
         hour=0, minute=0, second=0, microsecond=0
     )
     events = firestore_repo.list_usage_events(user_id, start.isoformat())
+    if events is None:
+        # The read failed (Firestore unreachable, or the composite index this
+        # query needs does not exist). Rendering that as an all-zero dashboard
+        # tells the user they did nothing this week, which is a lie — say so.
+        raise HTTPException(
+            502, "Could not read your activity from the database. "
+                 "The figures below would be wrong, so nothing is shown.")
 
     agent_sessions: Counter[str] = Counter()   # per-agent tile count
     agent_creatives: Counter[str] = Counter()  # assets produced per agent
@@ -562,7 +569,15 @@ def list_db_collections(_admin: dict = Depends(require_admin)) -> dict:
     # table listed (0 rows until it logs), plus any table discovered in the
     # database whose agent has since left the catalog.
     known = {f"agent_runs__{aid}" for aid in agent_config.AGENT_LABELS}
-    for cname in sorted(known | set(firestore_repo.list_agent_run_collections())):
+    # ``None`` = the listing could not be read. Every count in this payload is
+    # then ``None`` too and ``connected`` below reports false, so the panel
+    # already says "couldn't reach the database" rather than "no tables".
+    discovered = firestore_repo.list_agent_run_collections()
+    if discovered is None:
+        logger.warning("DB viewer: agent-run collection discovery failed; "
+                       "listing only the catalogued agents")
+        discovered = []
+    for cname in sorted(known | set(discovered)):
         agent_id = cname[len("agent_runs__"):]
         collections.append({
             "name": cname,
@@ -696,8 +711,12 @@ def _gallery_view_url(item: dict) -> str:
 def image_library(limit: int = 200, _admin: dict = Depends(require_admin)) -> dict:
     """Super Admin: every completed GD run's final image, newest first."""
     limit = max(1, min(limit, 500))
+    entries = firestore_repo.list_gallery_images(limit=limit)
+    if entries is None:
+        raise HTTPException(
+            502, "Could not read the image library from the database.")
     items = []
-    for item in firestore_repo.list_gallery_images(limit=limit):
+    for item in entries:
         items.append({
             "run_id": item.get("run_id") or item.get("id"),
             "user_id": item.get("user_id", ""),

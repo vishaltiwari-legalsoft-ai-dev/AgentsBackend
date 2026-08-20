@@ -221,7 +221,7 @@ def test_degraded_vendor_insights_drag_the_whole_report_to_not_ai(online, monkey
     monkeypatch.setattr(analysis, "narrate_result", lambda k, d: {
         "text": "real narrative", "ai": True, "fallback_reason": None})
     monkeypatch.setattr(reports, "_vendor_insights",
-                        lambda v, r: ([], "the model provider call failed (X: y)"))
+                        lambda v, r, t=None: ([], "the model provider call failed (X: y)"))
     ds = {**_dataset(), "vendor_metrics": {"V1": _dataset()["metrics"]}}
     r = reports.build("weekly_summary", ds, user_id="u1")
     assert r["ai"] is False

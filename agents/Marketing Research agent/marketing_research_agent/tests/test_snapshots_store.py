@@ -74,7 +74,7 @@ def test_list_snapshots_merges_cloud_disk_wins(monkeypatch, tmp_path):
     monkeypatch.setenv("MR_SNAPSHOTS_DIR", str(tmp_path))
     snapshots.save_snapshot(_snap(d="2026-02-07", spend=250.0))  # disk copy
     monkeypatch.setattr(snapshots, "_use_cloud", lambda: True)
-    monkeypatch.setattr(snapshots, "_cloud_list", lambda: [
+    monkeypatch.setattr(snapshots, "_cloud_list", lambda *a, **kw: [
         _snap(d="2026-02-06", spend=100.0),          # cloud-only day
         _snap(d="2026-02-07", spend=999.0),          # stale cloud copy of a disk day
     ])
@@ -101,3 +101,38 @@ def test_capture_workbook_filters_and_reports(monkeypatch, tmp_path):
         "Meta 360 RA": True, "All Contacts": True}
     assert snapshots.get_snapshot("meta-360-ra", "2026-02-07") is not None
     assert snapshots.get_snapshot("all-contacts", "2026-02-07") is None
+
+
+# --- an unreadable store must never look like an empty one -------------------
+
+def _dead_db(*_a, **_kw):
+    raise RuntimeError("503 the datastore is unavailable")
+
+
+def test_list_snapshots_raises_when_the_cloud_read_fails(monkeypatch, tmp_path):
+    """``_cloud_list`` used to swallow its failure and return []. On Cloud Run
+    the disk is empty too, so a Firestore outage rendered as "no snapshots for
+    this vendor" — a 404/empty board instead of an outage."""
+    import pytest
+
+    monkeypatch.setenv("MR_SNAPSHOTS_DIR", str(tmp_path))
+    monkeypatch.setattr(snapshots, "_use_cloud", lambda: True)
+    monkeypatch.setattr(snapshots, "_cloud_list", lambda *a, **kw: None)
+    with pytest.raises(snapshots.SnapshotStoreError):
+        snapshots.list_snapshots(slug="meta-360-ra")
+    with pytest.raises(snapshots.SnapshotStoreError):
+        snapshots.latest_rollup_snapshot()
+
+
+def test_cloud_list_reports_none_not_empty_on_failure(monkeypatch):
+    from app.services import firestore_repo
+
+    monkeypatch.setattr(firestore_repo, "_db", _dead_db)
+    assert snapshots._cloud_list("meta-360-ra") is None
+
+
+def test_an_empty_cloud_is_still_an_empty_list(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_SNAPSHOTS_DIR", str(tmp_path))
+    monkeypatch.setattr(snapshots, "_use_cloud", lambda: True)
+    monkeypatch.setattr(snapshots, "_cloud_list", lambda *a, **kw: [])
+    assert snapshots.list_snapshots(slug="meta-360-ra") == []

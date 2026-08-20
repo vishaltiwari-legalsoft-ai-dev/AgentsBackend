@@ -1,0 +1,67 @@
+{
+  "_comment": [
+    "Firestore composite indexes for the AgentOS backend.",
+    "",
+    "Until now every composite index in production was created BY HAND, from the",
+    "one-click link Firestore prints the first time a query fails. Nothing in the",
+    "repo recorded which indexes the code depends on, so a fresh project (or a",
+    "restored database) came up subtly broken and nobody could tell which query",
+    "needed what. This file is that record.",
+    "",
+    "IMPORTANT: this file has NOT been applied to production. Applying it is a",
+    "deliberate, separate step:",
+    "    firebase deploy --only firestore:indexes --project <project>",
+    "or, per index, `gcloud firestore indexes composite create ...` against the",
+    "named database (the backend does NOT use '(default)' everywhere - see",
+    "settings.firestore_database).",
+    "",
+    "Single-field equality filters are served by Firestore's automatic",
+    "single-field indexes and need NO entry here. That covers every query the",
+    "MR read-path work added: mr_runs filtered by (user_id) and by",
+    "(user_id, kind) - two equality filters with no ordering - and mr_snapshots",
+    "filtered by (vendor_slug) and (month). They were written that way on",
+    "purpose, so the cost fix could ship without waiting on an index build.",
+    "",
+    "The two entries below are the composites the code ALREADY requires today."
+  ],
+  "indexes": [
+    {
+      "_why": "firestore_repo.list_usage_events - the per-user Home dashboard: where(user_id ==) + where(created_at >=). The inequality forces a composite.",
+      "collectionGroup": "creative_events",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "user_id", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "_why": "firestore_repo.delete_ingested_creatives - where(brand_id ==) + where(creative_metadata.author ==). Two equality filters, one of them a nested field path.",
+      "collectionGroup": "creatives",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "brand_id", "order": "ASCENDING" },
+        { "fieldPath": "creative_metadata.author", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "_why": "NOT REQUIRED TODAY - the follow-up. mr_runs currently sorts in Python because the disk copies merge in after the query. The day that ordering + a limit move server-side (where(user_id ==) + order_by(generated_at DESC) + limit), this is the index it needs. Listed so it can be built BEFORE that change ships, not discovered by an outage after.",
+      "collectionGroup": "mr_runs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "user_id", "order": "ASCENDING" },
+        { "fieldPath": "generated_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "_why": "NOT REQUIRED TODAY - same follow-up, for the kind-scoped reads (/mr/datasets, /mr/runs, _load_dataset).",
+      "collectionGroup": "mr_runs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "user_id", "order": "ASCENDING" },
+        { "fieldPath": "kind", "order": "ASCENDING" },
+        { "fieldPath": "generated_at", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

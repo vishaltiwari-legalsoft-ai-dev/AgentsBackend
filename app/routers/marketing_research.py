@@ -123,11 +123,15 @@ def _rehydrate_leads(rows: list[dict]) -> list[Lead]:
     return out
 
 
-def _latest_datasets(user_id: str) -> dict[str, dict]:
+def _latest_datasets(user_id: str, all_runs: list[dict] | None = None) -> dict[str, dict]:
     """Newest dataset run per ``platform`` so a re-pull supersedes the prior
-    copy rather than double-counting it."""
+    copy rather than double-counting it.
+
+    ``all_runs`` is a run list the caller has already fetched — pass it and this
+    costs nothing (see :func:`_load_dataset`); omit it and it runs its own
+    ``kind="dataset"`` query."""
     latest: dict[str, dict] = {}
-    for run in runs.list_runs(user_id):
+    for run in (runs.list_runs(user_id, kind="dataset") if all_runs is None else all_runs):
         if run.get("kind") != "dataset":
             continue
         plat = run.get("platform", run["id"])
@@ -150,12 +154,13 @@ def _vendor_label(platform: str) -> str:
     return plat
 
 
-def _latest_official_run(user_id: str) -> dict:
+def _latest_official_run(user_id: str, all_runs: list[dict] | None = None) -> dict:
     """Newest official-totals pull from the sheet's Overall tab; {} if never
     pulled. Carries both the full per-field map ("totals") and the legacy
     spend-only map ("months")."""
     newest: dict | None = None
-    for run in runs.list_runs(user_id):
+    for run in (runs.list_runs(user_id, kind="official_spend")
+                if all_runs is None else all_runs):
         if run.get("kind") != "official_spend":
             continue
         if newest is None or run.get("generated_at", "") > newest.get("generated_at", ""):
@@ -168,10 +173,11 @@ def _latest_official_spend(user_id: str) -> dict[str, float]:
     return dict(_latest_official_run(user_id).get("months") or {})
 
 
-def _latest_lead_run(user_id: str) -> dict | None:
+def _latest_lead_run(user_id: str, all_runs: list[dict] | None = None) -> dict | None:
     """Newest persisted lead-analysis summary run; None if never captured."""
     newest: dict | None = None
-    for run in runs.list_runs(user_id):
+    for run in (runs.list_runs(user_id, kind="lead_analysis")
+                if all_runs is None else all_runs):
         if run.get("kind") != "lead_analysis":
             continue
         if newest is None or run.get("generated_at", "") > newest.get("generated_at", ""):
@@ -246,10 +252,21 @@ def _build_lead_analysis(user_id: str, year: int) -> tuple[dict, dict] | None:
                  "months": len(summary["months"]), "lead_flags": flags}
 
 
+# The three kinds ``_load_dataset`` reassembles. Naming them keeps the report
+# runs — the only kinds that grow without bound — out of the query entirely.
+_DATASET_KINDS = ("dataset", "official_spend", "lead_analysis")
+
+
 def _load_dataset(user_id: str) -> dict:
     """Reassemble the user's ingested data into one dataset. Keeps a per-vendor
-    view (one entry per source tab/upload) so reports can name vendors."""
-    latest = _latest_datasets(user_id)
+    view (one entry per source tab/upload) so reports can name vendors.
+
+    ONE run query serves all three components. This used to call ``list_runs``
+    three times — and each of those was a full unfiltered scan of ``mr_runs``,
+    so ``/mr/overview`` alone read every other workspace's runs three times over.
+    """
+    all_runs = runs.list_runs(user_id, kind=_DATASET_KINDS)
+    latest = _latest_datasets(user_id, all_runs)
     metrics: list[CampaignMetric] = []
     leads: list[Lead] = []
     vendor_metrics: dict[str, list[CampaignMetric]] = {}
@@ -264,8 +281,8 @@ def _load_dataset(user_id: str) -> dict:
          "metrics": len(run.get("metrics", [])), "leads": len(run.get("leads", []))}
         for plat, run in sorted(latest.items())
     ]
-    official = _latest_official_run(user_id)
-    lead_run = _latest_lead_run(user_id)
+    official = _latest_official_run(user_id, all_runs)
+    lead_run = _latest_lead_run(user_id, all_runs)
     return {"metrics": metrics, "leads": leads, "vendor_metrics": vendor_metrics,
             "official_spend": dict(official.get("months") or {}),
             "official_totals": dict(official.get("totals") or {}),
@@ -479,7 +496,16 @@ def _pull_and_swap(user_id: str, year: int) -> dict:
     # Split per component: each half is retired only once ITS replacement is
     # durably stored, so a per-document write failure can never take the
     # originals with it.
-    previous = runs.list_runs(user_id)
+    # Read the superseded set BEFORE writing anything. A store failure here must
+    # abort the swap: proceeding would write replacements and then never retire
+    # what they replace, leaving the workspace double-counting for ever.
+    try:
+        # Only the two kinds this swap can supersede — report runs are never
+        # retired by a pull, so there is no reason to ship them here.
+        previous = runs.list_runs(user_id, kind=("dataset", "official_spend"))
+    except runs.RunStoreError as exc:
+        raise SheetPullError(
+            f"could not read the existing runs ({exc}) — nothing was changed") from exc
     superseded_datasets = [
         r["id"] for r in previous
         if swap_datasets and r.get("kind") == "dataset"
@@ -532,8 +558,13 @@ def _pull_and_swap(user_id: str, year: int) -> dict:
         results.append({"tab": "Lead analysis", "error": str(exc)})
         logger.warning("MR sheet pull: lead analysis failed for %s: %s", user_id, exc)
     else:
-        stale_leads = [r["id"] for r in runs.list_runs(user_id)
-                       if r.get("kind") == "lead_analysis"]
+        # After the tracker swap: a store failure here must not cost us the
+        # freshly built summary, so keep the previous one instead of retiring it.
+        try:
+            stale_leads = [r["id"] for r in runs.list_runs(user_id, kind="lead_analysis")]
+        except runs.RunStoreError as exc:
+            stale_leads = []
+            degraded.append(f"could not read the previous lead analysis ({exc}) — kept it")
         if built:
             lead_run, row = built
             results.append(row)
@@ -648,8 +679,7 @@ def datasets(user=Depends(get_current_user)):
             "leads": len(r.get("leads", [])),
             "gaps": r.get("gaps", []),
         }
-        for r in runs.list_runs(user["id"])
-        if r.get("kind") == "dataset"
+        for r in runs.list_runs(user["id"], kind="dataset")
     ]
 
 
@@ -1024,6 +1054,7 @@ def get_config(user=Depends(get_current_user)):
     """Agent configuration: data source, report schedule, and thresholds."""
     from marketing_research_agent import goals as mr_goals
 
+    _thr = mr_goals.thresholds()
     return {
         "spreadsheet_id": mr_config.SHEETS_SPREADSHEET_ID,
         "spreadsheet_url": f"https://docs.google.com/spreadsheets/d/{mr_config.SHEETS_SPREADSHEET_ID}/edit",
@@ -1040,13 +1071,12 @@ def get_config(user=Depends(get_current_user)):
             {"report": "UTM Attribution Summary", "cadence": "Weekly"},
             {"report": "ICP Audience Signal", "cadence": "Monthly"},
         ],
-        "thresholds": {
-            "cost_per_booking_flag": mr_goals.thresholds()["cost_per_booking_flag"],
-            "cac_red": mr_goals.thresholds()["cac_red"],
-            "cost_per_qualified_lead_red": mr_goals.thresholds()["cost_per_qualified_lead_red"],
-            "spend_no_demo_limit": mr_goals.thresholds()["spend_no_demo_limit"],
-            "conversion_drop_pct": int(mr_goals.thresholds()["conversion_drop_pct"] * 100),
-        },
+        # One resolve, five fields. This used to call ``thresholds()`` once per
+        # field — five reads of the same document to build one dict.
+        "thresholds": {k: (int(_thr[k] * 100) if k == "conversion_drop_pct" else _thr[k])
+                       for k in ("cost_per_booking_flag", "cac_red",
+                                 "cost_per_qualified_lead_red", "spend_no_demo_limit",
+                                 "conversion_drop_pct")},
     }
 
 
@@ -1084,8 +1114,7 @@ def list_report_runs(user=Depends(get_current_user)):
     return [
         {"id": r["id"], "kind": r.get("kind"), "generated_at": r.get("generated_at"),
          "period": ((r.get("structured") or {}).get("period") or {}).get("label")}
-        for r in runs.list_runs(user["id"])
-        if r.get("kind") in reports.KINDS
+        for r in runs.list_runs(user["id"], kind=tuple(reports.KINDS))
     ]
 
 

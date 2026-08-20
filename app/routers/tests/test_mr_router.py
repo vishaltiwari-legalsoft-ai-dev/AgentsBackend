@@ -442,12 +442,30 @@ def test_a_failed_cloud_write_keeps_the_superseded_runs(monkeypatch, tmp_path):
                         lambda sid, year, **kw: {"2026-06": {"spend": 4200.0}})
     monkeypatch.setattr(mrr.mr_workbook, "fetch_workbook", lambda sid, **kw: [])
 
-    # Cloud-configured, but every per-document write fails.
-    def _dead_collection():
-        raise RuntimeError("400 the document exceeds the maximum allowed size")
+    # Cloud-configured and READABLE (the cloud simply holds nothing yet), but
+    # every per-document write fails. Reads and writes are faulted separately on
+    # purpose: a failed read now aborts the pull outright (see
+    # test_an_unreadable_run_store_aborts_the_pull), which would mask the
+    # durability guard this test exists to pin.
+    class _WriteOnlyDeadDoc:
+        def set(self, _payload):
+            raise RuntimeError("400 the document exceeds the maximum allowed size")
+
+        def delete(self):
+            raise RuntimeError("400 the document exceeds the maximum allowed size")
+
+    class _ReadableCollection:
+        def document(self, _id):
+            return _WriteOnlyDeadDoc()
+
+        def where(self, **_kw):
+            return self
+
+        def stream(self):
+            return iter(())
 
     monkeypatch.setattr(mr_runs, "_use_cloud", lambda: True)
-    monkeypatch.setattr(mr_runs, "_collection", _dead_collection)
+    monkeypatch.setattr(mr_runs, "_collection", _ReadableCollection)
 
     r = client.post("/api/mr/ingest-sheet", json={})
     assert r.status_code == 207, r.text
@@ -614,3 +632,123 @@ def test_cron_refresh_unset_user_id_is_not_a_clean_200(monkeypatch, tmp_path):
     r = client.post("/api/mr/cron/refresh", headers={"x-cron-key": "s3cret"})
     assert r.status_code == 207, r.text
     assert r.json()["status"] == "partial"
+
+
+# --- an unreadable data store answers 502, never an empty dashboard ----------
+
+def _dead_runs_store(monkeypatch):
+    """Cloud-configured, but every mr_runs read fails."""
+    from marketing_research_agent import runs as mr_runs
+
+    def _dead(*_a, **_kw):
+        raise RuntimeError("503 the datastore is unavailable")
+
+    monkeypatch.setattr(mr_runs, "_use_cloud", lambda: True)
+    monkeypatch.setattr(mr_runs, "_collection", _dead)
+
+
+@pytest.mark.parametrize("path", ["/api/mr/overview", "/api/mr/datasets",
+                                  "/api/mr/runs", "/api/mr/trends",
+                                  "/api/mr/report-periods", "/api/mr/lead-analysis"])
+def test_unreadable_run_store_answers_502_not_an_empty_page(monkeypatch, path):
+    """Every MR read used to swallow a Firestore failure and render "no data
+    yet". The owner cannot tell an outage from an empty workspace that way."""
+    _dead_runs_store(monkeypatch)
+    r = client.get(path)
+    assert r.status_code == 502, f"{path} -> {r.status_code} {r.text}"
+    assert "Could not read" in r.json()["detail"]
+
+
+def test_an_unreadable_run_store_aborts_the_pull_without_deleting_anything(
+        monkeypatch, tmp_path):
+    """The superseded set is computed from a read. If that read fails and we
+    proceed, the replacements land and nothing is ever retired — the workspace
+    double-counts for ever. Abort instead, and touch nothing."""
+    from app.routers import marketing_research as mrr
+    from marketing_research_agent import runs as mr_runs
+
+    ids = _seed_previous_pull()
+    monkeypatch.setenv("MR_SOURCES_FILE", str(tmp_path / "sources.json"))
+    monkeypatch.setattr(mrr, "fetch_all_trackers", lambda sid, year: _one_tracker_tab())
+    monkeypatch.setattr(mrr, "fetch_official_totals", lambda sid, year, **kw: {})
+    monkeypatch.setattr(mrr.mr_workbook, "fetch_workbook", lambda sid, **kw: [])
+    _dead_runs_store(monkeypatch)
+
+    r = client.post("/api/mr/ingest-sheet", json={})
+    assert r.status_code == 502, r.text
+    monkeypatch.setattr(mr_runs, "_use_cloud", lambda: False)  # read back offline
+    for key in ("dataset", "official", "lead"):
+        assert mr_runs.get_run(ids[key]) is not None, f"{key} run was destroyed"
+
+
+def test_unreadable_snapshot_store_answers_502(monkeypatch):
+    from marketing_research_agent import snapshots as mr_snapshots
+
+    monkeypatch.setattr(mr_snapshots, "_use_cloud", lambda: True)
+    monkeypatch.setattr(mr_snapshots, "_cloud_list", lambda *a, **kw: None)
+    for path in ("/api/mr/snapshots", "/api/mr/snapshots/portfolio",
+                 "/api/mr/snapshots/deltas", "/api/mr/snapshots/vendor/meta-360-ra"):
+        r = client.get(path)
+        assert r.status_code == 502, f"{path} -> {r.status_code} {r.text}"
+
+
+# --- read cost: one scoped query per request, not three full scans ----------
+
+def _count_run_reads(monkeypatch):
+    """Count trips to the run store, and record how each one was scoped."""
+    from marketing_research_agent import runs as mr_runs
+
+    calls: list[tuple] = []
+    real = mr_runs.list_runs
+
+    def _counted(user_id=None, kind=None):
+        calls.append((user_id, kind))
+        return real(user_id, kind)
+
+    monkeypatch.setattr(mr_runs, "list_runs", _counted)
+    return calls
+
+
+def test_overview_reads_the_run_store_once(monkeypatch):
+    """``_load_dataset`` called ``list_runs`` three times — and each call was an
+    unfiltered scan of every workspace's runs. One scoped read now serves all
+    three components."""
+    _seed_previous_pull()
+    calls = _count_run_reads(monkeypatch)
+    r = client.get("/api/mr/overview")
+    assert r.status_code == 200, r.text
+    assert len(calls) == 1, f"{len(calls)} run-store reads for one page: {calls}"
+    user_id, kind = calls[0]
+    assert user_id == USER["id"], "the read was not scoped to the caller"
+    assert kind is not None, "the read did not name the kinds it needs"
+
+
+@pytest.mark.parametrize("path,kind", [
+    ("/api/mr/datasets", "dataset"),
+    ("/api/mr/lead-analysis", "lead_analysis"),
+])
+def test_single_kind_endpoints_ask_for_only_that_kind(monkeypatch, path, kind):
+    _seed_previous_pull()
+    calls = _count_run_reads(monkeypatch)
+    assert client.get(path).status_code == 200
+    assert calls == [(USER["id"], kind)], calls
+
+
+def test_the_runs_list_asks_for_report_kinds_only(monkeypatch):
+    _seed_previous_pull()
+    calls = _count_run_reads(monkeypatch)
+    assert client.get("/api/mr/runs").status_code == 200
+    assert len(calls) == 1 and calls[0][0] == USER["id"]
+    assert isinstance(calls[0][1], tuple) and "daily_summary" in calls[0][1], calls
+
+
+def test_the_dataset_read_still_returns_every_component(monkeypatch):
+    """Cheap is worthless if it is wrong: the one scoped read must still carry
+    the datasets, the official totals AND the lead summary."""
+    from app.routers import marketing_research as mrr
+
+    _seed_previous_pull()
+    ds = mrr._load_dataset(USER["id"])
+    assert ds["official_spend"] == {"2026-07": 8632.0}
+    assert ds["lead_summary"] is not None
+    assert ds["sources"], "the dataset runs went missing"

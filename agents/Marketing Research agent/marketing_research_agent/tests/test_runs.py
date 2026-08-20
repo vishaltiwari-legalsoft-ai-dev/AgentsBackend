@@ -49,7 +49,7 @@ def test_list_runs_merges_cloud_disk_wins(tmp_path, monkeypatch):
     runs.save_run({"id": "local1", "kind": "dataset", "user_id": "u1",
                    "generated_at": "2026-07-08T10:00:00", "metrics": [1, 2]})
     monkeypatch.setattr(runs, "_use_cloud", lambda: True)
-    monkeypatch.setattr(runs, "_cloud_list", lambda: [
+    monkeypatch.setattr(runs, "_cloud_list", lambda *a, **kw: [
         {"id": "cloud1", "kind": "dataset", "user_id": "u1", "generated_at": "2026-07-07T10:00:00"},
         {"id": "local1", "kind": "dataset", "user_id": "u1", "generated_at": "2026-07-08T09:00:00",
          "metrics": []},  # stale cloud copy of a disk run
@@ -79,3 +79,51 @@ def test_save_run_reports_whether_the_cloud_write_landed(tmp_path, monkeypatch):
     monkeypatch.setattr(runs, "_collection", lambda: _Coll())
     assert runs.save_run({"id": "cloud1", "kind": "dataset", "user_id": "u1"}) is False
     assert runs.get_run("cloud1") is not None  # local copy still written
+
+
+# --- an unreadable store must never look like an empty one -------------------
+
+def test_list_runs_raises_when_the_cloud_read_fails(tmp_path, monkeypatch):
+    """The defect this pins: ``_cloud_list`` swallowed its own failure and
+    returned []. On Cloud Run the disk is empty too, so a Firestore outage
+    reached the dashboard as "this workspace has no data" — and the sheet pull
+    computed its superseded set from a list missing every durable run."""
+    import pytest
+
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    runs.save_run({"id": "local1", "kind": "dataset", "user_id": "u1"})
+
+    def _dead(*_a, **_kw):
+        raise RuntimeError("503 the datastore is unavailable")
+
+    monkeypatch.setattr(runs, "_use_cloud", lambda: True)
+    monkeypatch.setattr(runs, "_collection", _dead)
+    with pytest.raises(runs.RunStoreError):
+        runs.list_runs("u1")
+
+
+def test_cloud_list_reports_none_not_empty_on_failure(monkeypatch):
+    """``[]`` = the workspace has no runs; ``None`` = we could not find out.
+    Same contract as ``firestore_repo.count_collection``."""
+    def _dead(*_a, **_kw):
+        raise RuntimeError("503 the datastore is unavailable")
+
+    monkeypatch.setattr(runs, "_collection", _dead)
+    assert runs._cloud_list("u1") is None
+
+
+def test_an_empty_cloud_is_still_an_empty_list(tmp_path, monkeypatch):
+    """The other half of the contract: a genuinely empty store must NOT raise."""
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+
+    class _Empty:
+        def where(self, **_kw):
+            return self
+
+        def stream(self):
+            return iter(())
+
+    monkeypatch.setattr(runs, "_use_cloud", lambda: True)
+    monkeypatch.setattr(runs, "_collection", _Empty)
+    assert runs.list_runs("u1") == []

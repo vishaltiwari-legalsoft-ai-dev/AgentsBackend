@@ -11,6 +11,7 @@ The client is created lazily so the server can boot before GCP is configured.
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from datetime import datetime, timezone
@@ -19,6 +20,8 @@ from typing import Any, Optional
 from google.cloud import firestore
 
 from app.config import settings
+
+logger = logging.getLogger("agentos.firestore")
 
 _client: Optional[firestore.Client] = None
 
@@ -419,12 +422,19 @@ def agent_runs_collection(agent_id: str) -> str:
     return f"agent_runs__{agent_id}"
 
 
-def list_agent_run_collections() -> list[str]:
-    """Discover the per-agent Table-1 collections that currently exist."""
+def list_agent_run_collections() -> list[str] | None:
+    """Discover the per-agent Table-1 collections that currently exist.
+
+    Returns ``[]`` when the database genuinely holds none, or ``None`` when the
+    listing could not be read (Firestore unreachable/unconfigured) — same
+    contract as :func:`count_collection`, so "couldn't connect" is never
+    disguised as "there are no agent tables".
+    """
     try:
         return sorted(c.id for c in _db().collections() if c.id.startswith("agent_runs__"))
     except Exception:
-        return []
+        logger.warning("could not list agent_runs__ collections", exc_info=True)
+        return None
 
 
 def start_run(
@@ -534,8 +544,11 @@ def upsert_gallery_image(item: dict[str, Any]) -> None:
         pass
 
 
-def list_gallery_images(limit: int = 200) -> list[dict[str, Any]]:
-    """Image-library entries, newest completion first."""
+def list_gallery_images(limit: int = 200) -> list[dict[str, Any]] | None:
+    """Image-library entries, newest completion first.
+
+    ``[]`` means the library is genuinely empty; ``None`` means the read failed
+    (see :func:`count_collection` for why the two are kept apart)."""
     try:
         docs = (
             _db()
@@ -546,7 +559,8 @@ def list_gallery_images(limit: int = 200) -> list[dict[str, Any]]:
         )
         return [doc.to_dict() | {"id": doc.id} for doc in docs]
     except Exception:
-        return []
+        logger.warning("could not read the image library", exc_info=True)
+        return None
 
 
 def get_gallery_image(run_id: str) -> Optional[dict[str, Any]]:
@@ -572,7 +586,7 @@ def purge_telemetry() -> dict[str, int]:
 
 def list_usage_events(
     user_id: Optional[str], since_iso: str, limit: int = 10000
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | None:
     """Usage events at/after ``since_iso``. Pass ``user_id`` for one user's data
     (the per-user dashboard) or ``None`` for everyone (creator all-users view).
 
@@ -591,7 +605,11 @@ def list_usage_events(
             ).where(filter=firestore.FieldFilter("created_at", ">=", since_iso))
         return [doc.to_dict() for doc in query.limit(limit).stream()]
     except Exception:
-        return []
+        # ``[]`` here rendered a Firestore outage (or a missing composite index)
+        # as "you did nothing this week". ``None`` = could not read; the caller
+        # answers honestly. Same contract as :func:`count_collection`.
+        logger.warning("could not read usage events", exc_info=True)
+        return None
 
 
 # --------------------------------------------------------------------------- #

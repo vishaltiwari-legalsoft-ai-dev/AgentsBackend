@@ -72,17 +72,17 @@ def _totals(agg: dict[str, dict]) -> dict:
     }
 
 
-def _enrich(channel: str, agg: dict) -> dict:
-    agg["goal"] = goals.goal_dict(channel)
-    agg["status"] = goals.status_for(channel, agg)
+def _enrich(channel: str, agg: dict, targets: dict | None = None) -> dict:
+    agg["goal"] = goals.goal_dict(channel, targets)
+    agg["status"] = goals.status_for(channel, agg, targets)
     return agg
 
 
 # Plain-language summary per flagged metric (so the report shows "14 campaigns
 # over the $600 ceiling", not 14 near-identical lines). Built per call because
 # every threshold figure is user-editable.
-def _flag_labels() -> dict[str, str]:
-    t = goals.thresholds()
+def _flag_labels(targets: dict | None = None) -> dict[str, str]:
+    t = goals.thresholds(targets)
     return {
         "cost_per_qualified_lead": f"over the ${t['cost_per_qualified_lead_red']:,.0f} cost-per-qualified-lead ceiling",
         "cac": f"over the ${t['cac_red']:,.0f} CAC ceiling",
@@ -98,7 +98,7 @@ def _money_in(text: str) -> float:
     return max(nums) if nums else 0.0
 
 
-def _flag_summary(flags: list[dict]) -> list[dict]:
+def _flag_summary(flags: list[dict], targets: dict | None = None) -> list[dict]:
     """Group raw flags by metric into one summarized line each."""
     groups: dict[tuple, dict] = {}
     for f in flags:
@@ -106,7 +106,7 @@ def _flag_summary(flags: list[dict]) -> list[dict]:
         g = groups.setdefault(key, {"metric": f.get("metric"), "level": f["level"], "count": 0, "worst": 0.0})
         g["count"] += 1
         g["worst"] = max(g["worst"], _money_in(f["message"]))
-    labels = _flag_labels()
+    labels = _flag_labels(targets)
     out = []
     for (metric, level), g in groups.items():
         label = labels.get(metric, (metric or "issue").replace("_", " "))
@@ -224,9 +224,9 @@ def _vendor_rollup(vendor_metrics: dict[str, list]) -> list[dict]:
     return out
 
 
-def _vendor_red_flags(vendors: list[dict]) -> list[dict]:
+def _vendor_red_flags(vendors: list[dict], targets: dict | None = None) -> list[dict]:
     """Which vendors are on a red flag and exactly why (editable thresholds)."""
-    t = goals.thresholds()
+    t = goals.thresholds(targets)
     out = []
     for v in vendors:
         reasons = []
@@ -247,9 +247,10 @@ def _vendor_red_flags(vendors: list[dict]) -> list[dict]:
     return out
 
 
-def _fallback_vendor_insights(vendors: list[dict], red_map: dict[str, list[str]]) -> list[dict]:
+def _fallback_vendor_insights(vendors: list[dict], red_map: dict[str, list[str]],
+                              targets: dict | None = None) -> list[dict]:
     """Deterministic 3-insights / 3-actions per vendor (offline or LLM failure)."""
-    t = goals.thresholds()
+    t = goals.thresholds(targets)
     lo, hi = t["cost_per_qualified_lead_target_low"], t["cost_per_qualified_lead_target_high"]
     out = []
     for v in vendors:
@@ -283,7 +284,8 @@ def _fallback_vendor_insights(vendors: list[dict], red_map: dict[str, list[str]]
     return out
 
 
-def _vendor_insights(vendors: list[dict], red_flags: list[dict]) -> tuple[list[dict], str | None]:
+def _vendor_insights(vendors: list[dict], red_flags: list[dict],
+                     targets: dict | None = None) -> tuple[list[dict], str | None]:
     """3 concise insights + 3 action points per vendor: LLM online, deterministic
     fallback offline — output shape is identical either way.
 
@@ -311,7 +313,7 @@ def _vendor_insights(vendors: list[dict], red_flags: list[dict]) -> tuple[list[d
             return sorted(rows, key=lambda r: [v["vendor"] for v in vendors].index(r["vendor"])), None
         reason = (f"model output rejected by validation: {len(rows)} of "
                   f"{len(vendors)} vendors came back with 3 insights + 3 actions")
-    return _fallback_vendor_insights(vendors, red_map), (
+    return _fallback_vendor_insights(vendors, red_map, targets), (
         reason or "the model returned no usable vendor insights")
 
 
@@ -401,6 +403,9 @@ def _month_keys(start: date, end: date) -> list[str]:
 
 
 def _campaign_structured(ds: dict) -> dict:
+    # Resolved ONCE for this report. Every threshold/goal read below takes it as
+    # an argument; each one used to re-read the mr_config/targets document.
+    targets = goals.get_targets()
     metrics = ds.get("metrics", [])
     previous = ds.get("previous_metrics")
     current_agg = cr.aggregate_by_channel(metrics)
@@ -408,28 +413,28 @@ def _campaign_structured(ds: dict) -> dict:
     # not a channel — pull it out so it isn't double-counted in the KPI strip.
     total_block = current_agg.pop("Total", None)
     for channel, agg in current_agg.items():
-        _enrich(channel, agg)
-    totals = _enrich("Total", total_block) if total_block is not None else _totals(current_agg)
+        _enrich(channel, agg, targets)
+    totals = _enrich("Total", total_block, targets) if total_block is not None else _totals(current_agg)
     official = _official_totals_for(ds, metrics)
     if official is not None:
         totals = _apply_official_totals(totals, official)
-    flags = [f.__dict__ for f in cr.flag_all(metrics, ds.get("prior"))]
+    flags = [f.__dict__ for f in cr.flag_all(metrics, ds.get("prior"), targets)]
     structured = {
         "channels": current_agg,
         "totals": totals,
         "top_utm": cr.top_utm_sources(metrics),
         "flags": flags,
-        "flag_summary": _flag_summary(flags),
+        "flag_summary": _flag_summary(flags, targets),
     }
     # Per-vendor layer (present when the dataset keeps vendor identity).
     vendor_metrics = ds.get("vendor_metrics")
     if vendor_metrics:
         vendors = _vendor_rollup(vendor_metrics)
-        red = _vendor_red_flags(vendors)
+        red = _vendor_red_flags(vendors, targets)
         structured["vendors"] = vendors
         structured["red_flag_vendors"] = red
         if ds.get("with_vendor_insights"):
-            rows, vi_reason = _vendor_insights(vendors, red)
+            rows, vi_reason = _vendor_insights(vendors, red, targets)
             structured["vendor_insights"] = rows
             # Identical shape either way — these two are the only tell.
             structured["vendor_insights_ai"] = vi_reason is None

@@ -322,13 +322,62 @@ def _cloud_get(doc_id: str) -> dict | None:
         return None
 
 
-def _cloud_list() -> list[dict]:
+class SnapshotStoreError(RuntimeError):
+    """The durable snapshot store could not be read.
+
+    Raised rather than returning the disk-only (on Cloud Run: empty) list, so a
+    Firestore outage cannot render as "this vendor has no snapshots". Same
+    contract as ``firestore_repo.count_collection``; the HTTP layer turns it
+    into a 502."""
+
+
+def _cloud_list(slug: str | None = None, month: str | None = None) -> list[dict] | None:
+    """Durable snapshots, or ``None`` when the read FAILED (``[]`` = none stored).
+
+    ``slug``/``month`` are pushed into the query so a per-vendor or per-month
+    read no longer bills and ships the whole collection. Both are equality
+    filters on stored fields, so Firestore serves them from the automatic
+    single-field indexes — no composite index is required, and the result is
+    identical to the Python filter that ``list_snapshots`` still applies to the
+    disk copies.
+
+    NOTE: ``mr_snapshots`` carries NO tenant key (its doc id is
+    ``{slug}_{date}``), so this query is still cross-workspace. Fixing that
+    needs a schema change + backfill — see docs/db-target-design.html.
+    """
     try:
+        from google.cloud import firestore as _fs
+
         from app.services import firestore_repo
-        return [d.to_dict() for d in firestore_repo._db().collection(_COLLECTION).stream()]
+        query = firestore_repo._db().collection(_COLLECTION)
+        if slug:
+            query = query.where(filter=_fs.FieldFilter("vendor_slug", "==", slug))
+        if month:
+            query = query.where(filter=_fs.FieldFilter("month", "==", month))
+        return [d.to_dict() for d in query.stream()]
     except Exception:
-        logger.warning("snapshot cloud list failed")
-        return []
+        logger.warning("snapshot cloud list failed", exc_info=True)
+        return None
+
+
+def _merged(slug: str | None = None, month: str | None = None) -> dict[str, dict]:
+    """Durable snapshots merged with the local copies, keyed by doc id (the
+    local copy of a same-day capture wins). Raises :class:`SnapshotStoreError`
+    when the durable store could not be read."""
+    by_id: dict[str, dict] = {}
+    if _use_cloud():  # durable history first; local same-day copies override
+        cloud = _cloud_list(slug, month)
+        if cloud is None:
+            raise SnapshotStoreError("the snapshot store could not be read")
+        for snap in cloud:
+            if isinstance(snap, dict) and snap.get("vendor_slug") and snap.get("date"):
+                by_id[_doc_id(snap["vendor_slug"], snap["date"])] = snap
+    for p in sorted(_root().glob("*.json")):
+        try:
+            by_id[p.stem] = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    return by_id
 
 
 def get_snapshot(slug: str, date_iso: str) -> dict | None:
@@ -341,17 +390,11 @@ def get_snapshot(slug: str, date_iso: str) -> dict | None:
 
 
 def list_snapshots(slug: str | None = None, month: str | None = None,
-                   meta_only: bool = False) -> list[dict]:
-    by_id: dict[str, dict] = {}
-    if _use_cloud():  # durable history first; local same-day copies override
-        for snap in _cloud_list():
-            if isinstance(snap, dict) and snap.get("vendor_slug") and snap.get("date"):
-                by_id[_doc_id(snap["vendor_slug"], snap["date"])] = snap
-    for p in sorted(_root().glob("*.json")):
-        try:
-            by_id[p.stem] = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            continue
+                   meta_only: bool = False, *,
+                   _store: dict[str, dict] | None = None) -> list[dict]:
+    """Vendor snapshots, date-sorted. ``_store`` lets one caller reuse a single
+    fetch across two listings (see :func:`portfolio`)."""
+    by_id = _merged(slug, month) if _store is None else _store
     out = []
     for snap in by_id.values():
         # Rollup-tab snapshots duplicate the vendor tabs — never list them.
@@ -368,20 +411,16 @@ def list_snapshots(slug: str | None = None, month: str | None = None,
     return out
 
 
-def latest_rollup_snapshot(date_iso: str | None = None) -> dict | None:
+def latest_rollup_snapshot(date_iso: str | None = None, *,
+                           _store: dict[str, dict] | None = None) -> dict | None:
     """Latest snapshot of the consolidated Overall tab — the sheet's own
     official team totals. Kept out of every vendor listing (it duplicates the
-    vendors), but the portfolio bar reads it as the source of truth."""
-    by_id: dict[str, dict] = {}
-    if _use_cloud():
-        for snap in _cloud_list():
-            if isinstance(snap, dict) and snap.get("vendor_slug") and snap.get("date"):
-                by_id[_doc_id(snap["vendor_slug"], snap["date"])] = snap
-    for p in sorted(_root().glob("*.json")):
-        try:
-            by_id[p.stem] = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            continue
+    vendors), but the portfolio bar reads it as the source of truth.
+
+    ``_store`` lets :func:`portfolio` reuse the fetch it already paid for — this
+    function used to scan the whole collection a SECOND time in the same
+    request."""
+    by_id = _merged() if _store is None else _store
     best = None
     for snap in by_id.values():
         if "overall" not in (snap.get("vendor_slug") or ""):
@@ -565,8 +604,9 @@ def portfolio(date_iso: str | None = None) -> dict | None:
     the sheet's "official" figures."""
     import calendar as _cal
 
+    store = _merged()  # ONE fetch, reused by the roll-up lookup below
     per_slug: dict[str, dict] = {}
-    for s in list_snapshots():
+    for s in list_snapshots(_store=store):
         if "overall" in s["vendor_slug"]:
             continue
         if date_iso and s["date"] > date_iso:
@@ -630,7 +670,7 @@ def portfolio(date_iso: str | None = None) -> dict | None:
     # above always undercounts. When its snapshot exists for this month, ITS
     # figures are the summary bar; the vendor sum stays as the audit trail.
     source, computed_spend, computed_budget = "vendor_sum", round(spend, 2), round(budget, 2)
-    rollup = latest_rollup_snapshot(date_iso)
+    rollup = latest_rollup_snapshot(date_iso, _store=store)
     if rollup and (rollup.get("date") or "")[:7] == newest[:7]:
         t = (rollup.get("canonical") or {}).get("team_overall", {})
         o_spend = raw(t, "spend", pair=True)

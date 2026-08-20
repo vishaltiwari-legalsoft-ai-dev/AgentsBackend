@@ -47,13 +47,20 @@ def top_utm_sources(metrics: list[CampaignMetric], limit: int = 5) -> list[dict]
     return rows[:limit]
 
 
-def flag_all(metrics: list[CampaignMetric], prior: dict[str, float] | None = None) -> list[Flag]:
+def flag_all(metrics: list[CampaignMetric], prior: dict[str, float] | None = None,
+             targets: dict | None = None) -> list[Flag]:
     """Run every metric through the 2026 threshold rules. ``prior`` maps a
-    channel to its prior 7-day conversion rate (for the >30% drop check)."""
+    channel to its prior 7-day conversion rate (for the >30% drop check).
+
+    The effective targets are resolved ONCE for the whole dataset. Each
+    ``evaluate`` used to resolve them itself, twice, so this loop alone was
+    2 × len(metrics) reads of one small Firestore document."""
     prior = prior or {}
+    targets = targets or goals.get_targets()
     flags: list[Flag] = []
     for m in metrics:
-        flags.extend(goals.evaluate(m, prior_conversion=prior.get(m.channel)))
+        flags.extend(goals.evaluate(m, prior_conversion=prior.get(m.channel),
+                                    targets=targets))
     return flags
 
 

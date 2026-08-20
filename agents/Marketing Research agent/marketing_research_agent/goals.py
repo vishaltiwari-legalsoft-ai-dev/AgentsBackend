@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -123,6 +124,27 @@ def _load_disk() -> dict:
         return {}
 
 
+# The overrides doc is ONE small document that every threshold check re-read.
+# ``evaluate`` alone called ``get_targets`` twice per metric row and
+# ``campaign_reporting.flag_all`` runs every row through it, so a single report
+# read the same document ~120 times. Cached exactly like
+# ``firestore_repo._app_config_cache``: a short process TTL, invalidated on every
+# write, keyed on the store the values came from so a test (or a redeploy that
+# moves MR_TARGETS_FILE) can never be served another store's values.
+_TARGETS_TTL_SECONDS = 30.0
+_targets_cache: tuple[float, str, dict] | None = None
+
+
+def _store_key() -> str:
+    """Identity of the store the current process/env reads targets from."""
+    return f"{'cloud' if _use_cloud() else 'disk'}:{_targets_path()}"
+
+
+def invalidate_targets_cache() -> None:
+    global _targets_cache
+    _targets_cache = None
+
+
 def _load_overrides() -> dict:
     """Firestore is the source of truth when configured; the file is the local
     copy (and the only store offline). A cloud read failure falls back to disk
@@ -143,8 +165,23 @@ _GOAL_FIELDS = ("cpd_booked_low", "cpd_booked_high",
                 "cpd_completed_low", "cpd_completed_high", "completed_demo_pct")
 
 
-def get_targets() -> dict:
-    """Effective targets: verbatim 2026 defaults merged with saved edits."""
+def get_targets(*, use_cache: bool = True) -> dict:
+    """Effective targets: verbatim 2026 defaults merged with saved edits.
+
+    Served from a short process cache (see ``_TARGETS_TTL_SECONDS``) so the
+    threshold checks stop paying a Firestore document read each. An edit made on
+    another Cloud Run instance is visible within the TTL; edits made here
+    invalidate immediately.
+    """
+    global _targets_cache
+    key = _store_key()
+    if (
+        use_cache
+        and _targets_cache
+        and _targets_cache[1] == key
+        and (time.monotonic() - _targets_cache[0]) < _TARGETS_TTL_SECONDS
+    ):
+        return _targets_cache[2]
     ov = _load_overrides()
     thresholds = dict(_DEFAULT_THRESHOLDS)
     for k, v in (ov.get("thresholds") or {}).items():
@@ -158,14 +195,17 @@ def get_targets() -> dict:
             if k in merged and isinstance(v, (int, float)):
                 merged[k] = float(v)
         channel_goals[name] = merged
-    return {"thresholds": thresholds, "channel_goals": channel_goals,
-            "edited": bool(ov.get("thresholds") or goal_ov)}
+    effective = {"thresholds": thresholds, "channel_goals": channel_goals,
+                 "edited": bool(ov.get("thresholds") or goal_ov)}
+    _targets_cache = (time.monotonic(), key, effective)
+    return effective
 
 
 def set_targets(update: dict) -> dict:
     """Merge an edit into the overrides file; returns the effective targets.
     Unknown keys and non-numeric values are rejected."""
     ov = _load_overrides()
+    invalidate_targets_cache()
     thr_in = update.get("thresholds") or {}
     goals_in = update.get("channel_goals") or {}
     for k, v in thr_in.items():
@@ -193,6 +233,7 @@ def set_targets(update: dict) -> dict:
     # gone. Let it raise and tell the desk the truth.
     if _use_cloud():
         _doc().set(ov)
+    invalidate_targets_cache()
     return get_targets()
 
 
@@ -202,15 +243,18 @@ def reset_targets() -> dict:
         p.unlink()
     if _use_cloud():
         _doc().delete()
+    invalidate_targets_cache()
     return get_targets()
 
 
-def thresholds() -> dict[str, float]:
-    return get_targets()["thresholds"]
+def thresholds(targets: dict | None = None) -> dict[str, float]:
+    """Effective thresholds. Pass ``targets`` (from one :func:`get_targets` call)
+    when you are inside a loop — every call without it is another store lookup."""
+    return (targets or get_targets())["thresholds"]
 
 
-def channel_goal(channel: str) -> ChannelGoal | None:
-    goals_map = get_targets()["channel_goals"]
+def channel_goal(channel: str, targets: dict | None = None) -> ChannelGoal | None:
+    goals_map = (targets or get_targets())["channel_goals"]
     for key, fields in goals_map.items():
         if key.lower() == (channel or "").lower():
             return ChannelGoal(key, **fields)
@@ -228,11 +272,12 @@ def _band(value: float | None, good_max: float, warn_max: float) -> str:
     return "bad"
 
 
-def status_for(channel: str, agg: dict) -> dict:
+def status_for(channel: str, agg: dict, targets: dict | None = None) -> dict:
     """Per-cost-metric traffic-light status for an aggregated channel row, judged
     against the effective goals/thresholds. Consumed by the report UI for coloring."""
-    g = channel_goal(channel)
-    t = thresholds()
+    targets = targets or get_targets()
+    g = channel_goal(channel, targets)
+    t = thresholds(targets)
     status = {
         # Target $200–400; red at $600+ (defaults — all editable).
         "cost_per_qualified_lead": _band(
@@ -251,8 +296,8 @@ def status_for(channel: str, agg: dict) -> dict:
     return status
 
 
-def goal_dict(channel: str) -> dict | None:
-    g = channel_goal(channel)
+def goal_dict(channel: str, targets: dict | None = None) -> dict | None:
+    g = channel_goal(channel, targets)
     if not g:
         return None
     return {
@@ -264,10 +309,16 @@ def goal_dict(channel: str) -> dict | None:
     }
 
 
-def evaluate(metric: CampaignMetric, prior_conversion: float | None = None) -> list[Flag]:
-    """Return every flag this metric trips against the effective thresholds."""
+def evaluate(metric: CampaignMetric, prior_conversion: float | None = None,
+             targets: dict | None = None) -> list[Flag]:
+    """Return every flag this metric trips against the effective thresholds.
+
+    ``targets`` is the resolved :func:`get_targets` dict. Callers running a whole
+    dataset through this (``campaign_reporting.flag_all``) resolve it ONCE and
+    pass it in; this used to do two store lookups per metric row."""
+    targets = targets or get_targets()
     flags: list[Flag] = []
-    t = thresholds()
+    t = thresholds(targets)
 
     if metric.spend >= t["spend_no_demo_limit"] and metric.demos_booked == 0:
         flags.append(Flag("red", f"${metric.spend:.0f} spend with no demo booked", "spend_no_demo"))
@@ -290,7 +341,7 @@ def evaluate(metric: CampaignMetric, prior_conversion: float | None = None) -> l
             drop = (prior_conversion - current) / prior_conversion
             flags.append(Flag("warn", f"Conversion dropped {drop * 100:.0f}% vs prior 7-day average", "conversion_drop"))
 
-    goal = channel_goal(metric.channel)
+    goal = channel_goal(metric.channel, targets)
     if goal and cpb is not None and cpb > goal.cpd_booked_high:
         flags.append(Flag("warn", f"{metric.channel} cost/demo booked ${cpb:.0f} over goal ${goal.cpd_booked_high:.0f}", "channel_goal"))
 

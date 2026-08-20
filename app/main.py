@@ -31,6 +31,10 @@ from app.routers import (
 )
 from app.services.gd_brand_source import firestore_spec_source
 from graphics_designer_agent import registry as gd_registry
+# Imported after the routers so the agent roots app/__init__ registers are
+# already on sys.path in exactly the order they were before.
+from marketing_research_agent import runs as mr_runs
+from marketing_research_agent import snapshots as mr_snapshots
 
 logging.basicConfig(level=logging.INFO)
 
@@ -45,6 +49,41 @@ app.add_middleware(
 )
 
 
+def _cors_headers(request: Request) -> dict[str, str]:
+    """Echo the allowed Origin so the browser can read the real error body.
+
+    Error responses are produced in Starlette's outer error middleware, outside
+    CORSMiddleware — without this the frontend sees "Failed to fetch" instead of
+    the message."""
+    headers: dict[str, str] = {}
+    origin = request.headers.get("origin")
+    if origin and origin in settings.cors_origin_list:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+        headers["Vary"] = "Origin"
+    return headers
+
+
+@app.exception_handler(mr_runs.RunStoreError)
+@app.exception_handler(mr_snapshots.SnapshotStoreError)
+async def datastore_unreadable_handler(request: Request, exc: Exception) -> JSONResponse:
+    """A read against the durable store FAILED — answer 502, never an empty page.
+
+    These two stores used to swallow their own failures and return ``[]``, so a
+    Firestore outage (or a query whose composite index does not exist) rendered
+    as "this workspace has no data". 502 is the honest answer: the gateway could
+    not reach its data, the client knows not to trust an empty screen, and Cloud
+    Scheduler retries instead of recording a clean run.
+    """
+    logging.getLogger("agentos").error("datastore unreadable: %s", exc)
+    return JSONResponse(
+        status_code=502,
+        content={"detail": f"Could not read the data store: {exc}. "
+                           "Nothing is shown rather than showing you an empty page."},
+        headers=_cors_headers(request),
+    )
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Return a 500 that still carries CORS headers.
@@ -55,12 +94,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     frontend can read the real message, and include the detail to aid debugging.
     """
     logging.getLogger("agentos").exception("unhandled error: %s", exc)
-    headers: dict[str, str] = {}
-    origin = request.headers.get("origin")
-    if origin and origin in settings.cors_origin_list:
-        headers["Access-Control-Allow-Origin"] = origin
-        headers["Access-Control-Allow-Credentials"] = "true"
-        headers["Vary"] = "Origin"
+    headers = _cors_headers(request)
     # Exception text can carry file paths / doc ids / model names — keep it in
     # the server log only outside local dev.
     detail = (

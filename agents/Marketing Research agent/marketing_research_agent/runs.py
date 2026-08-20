@@ -20,6 +20,18 @@ _DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "runs"
 _MR_COLLECTION = "mr_runs"
 
 
+class RunStoreError(RuntimeError):
+    """The durable run store could not be read.
+
+    Raised instead of returning the disk-only (usually empty) list. ``mr_runs``
+    is the only copy of parsed tracker state, so "Firestore is unreachable" and
+    "this workspace has no data" used to arrive at the caller as the same empty
+    list — the dashboard said "no data yet" during an outage, and the sheet-pull
+    swap computed its superseded set from a list that was missing every durable
+    run. Callers answer honestly (the HTTP layer turns this into a 502).
+    """
+
+
 def _root() -> Path:
     # Re-read env on each call so tests can monkeypatch MR_RUNS_DIR.
     root = Path(os.environ.get("MR_RUNS_DIR") or _DEFAULT_ROOT)
@@ -104,18 +116,54 @@ def delete_run(run_id: str) -> None:
             logger.warning("MR cloud delete failed for run %s", run_id)
 
 
-def _cloud_list() -> list[dict]:
+def _cloud_query(user_id: str | None = None, kind: str | tuple[str, ...] | None = None):
+    """The ``mr_runs`` query for one workspace, filtered SERVER-side.
+
+    ``mr_runs`` is shared by every workspace, so a bare ``.stream()`` billed and
+    shipped every other user's runs on every read. Both filters are equality
+    (``in`` is an equality set), so Firestore serves them from the automatic
+    single-field indexes — no composite index is required. Deliberately no
+    ``order_by``/``limit``: the disk copies merge in afterwards and the sort
+    happens over the union, and a server-side ``limit`` without a server-side
+    order would silently drop vendor datasets.
+    """
+    from google.cloud import firestore as _fs
+
+    query = _collection()
+    if user_id is not None:
+        query = query.where(filter=_fs.FieldFilter("user_id", "==", user_id))
+    if isinstance(kind, str):
+        query = query.where(filter=_fs.FieldFilter("kind", "==", kind))
+    elif kind:
+        query = query.where(filter=_fs.FieldFilter("kind", "in", list(kind)))
+    return query
+
+
+def _cloud_list(user_id: str | None = None,
+                kind: str | tuple[str, ...] | None = None) -> list[dict] | None:
+    """Durable runs for this workspace, or ``None`` when the read FAILED.
+
+    ``[]`` means the workspace genuinely has no runs. Same contract as
+    ``firestore_repo.count_collection``."""
     try:
-        return [d.to_dict() for d in _collection().stream()]
+        return [d.to_dict() for d in _cloud_query(user_id, kind).stream()]
     except Exception:
-        logger.warning("MR cloud list failed")
-        return []
+        logger.warning("MR cloud list failed", exc_info=True)
+        return None
 
 
-def list_runs(user_id: str | None = None) -> list[dict]:
+def list_runs(user_id: str | None = None,
+              kind: str | tuple[str, ...] | None = None) -> list[dict]:
+    """Every run for ``user_id`` (newest first), durable copies merged with the
+    local ones. Pass ``kind`` to have Firestore return only that kind.
+
+    Raises :class:`RunStoreError` when the durable store could not be read."""
     by_id: dict[str, dict] = {}
     if _use_cloud():  # durable history first; local same-id copies override
-        for run in _cloud_list():
+        cloud = _cloud_list(user_id, kind)
+        if cloud is None:
+            raise RunStoreError("the saved-runs store could not be read")
+        for run in cloud:
             if isinstance(run, dict) and run.get("id"):
                 by_id[run["id"]] = run
     for p in _root().glob("*.json"):
@@ -123,9 +171,14 @@ def list_runs(user_id: str | None = None) -> list[dict]:
             by_id[p.stem] = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             continue
+    kinds = (kind,) if isinstance(kind, str) else kind
     out = []
     for run in by_id.values():
-        if user_id is None or run.get("user_id") == user_id:
-            out.append(run)
+        if user_id is not None and run.get("user_id") != user_id:
+            continue
+        # Re-applied in Python because the disk copies above bypass the query.
+        if kinds is not None and run.get("kind") not in kinds:
+            continue
+        out.append(run)
     out.sort(key=lambda r: r.get("generated_at") or "", reverse=True)
     return out
