@@ -44,20 +44,34 @@ DEFAULT_BATCH = 10  # tasks (engine calls) per step
 # open, which is what made polling feel unusable. The calls are independent
 # network waits, so they overlap; only the bookkeeping stays serial.
 # Kept modest on purpose — provider rate limits, not CPU, are the ceiling here.
-POLL_CONCURRENCY = 6
+# Measured, not guessed: the stored answers give median 5.2s (perplexity),
+# 9.1s (gemini) and 32.8s (chatgpt via the OpenRouter stand-in). At 6 a single
+# brand's sweep needs ~1030s, which does not fit the service's 900s request
+# timeout -- so no sweep has ever completed, the poll interval has never taken
+# effect, and both brands were re-polled from scratch every day. At 10 one
+# brand finishes in ~620s, and with two brands swept stalest-first that lands
+# exactly on the intended every-other-day cadence.
+POLL_CONCURRENCY = 10
 # Scheduled polling: the cron fires daily and this decides whether a brand is
 # actually due. A day-of-month cron step (``*/2``) would silently double-fire
 # across month boundaries (31st -> 1st); an interval measured from the last
 # completed sweep does not.
 DEFAULT_POLL_INTERVAL_DAYS = 2
-# Wall clock one cron invocation may spend on a single brand. Cloud Run kills
-# long requests, so a sweep that does not finish leaves its remaining tasks
-# pending and the next fire resumes them — ``_pending_tasks`` already derives
-# what is left from what is stored.
-DEFAULT_CRON_BUDGET_SECONDS = 240
+# Wall clock one cron invocation may spend, across every brand it sweeps. Must
+# stay under the service's request timeout (900s in production) — Cloud Run
+# kills the request at that point, and because a day-doc is keyed by TODAY a
+# sweep cut short does not resume tomorrow, it restarts. So this number decides
+# whether a sweep can ever finish at all, not merely how fast it does.
+DEFAULT_CRON_BUDGET_SECONDS = 800
 # Google AIO runs on SerpAPI's free ~250 searches/month: one run per prompt
 # (SERP content, low variance) under a hard monthly credit guard.
 AIO_MONTHLY_CAP = 200
+# ...and that allowance is small enough that WHICH prompts get spent on it is a
+# real decision. Brand-intent prompts ("is Legal Soft good for personal injury
+# firms") are the weakest use of a credit: the buyer already has the name, and
+# the live panel shows AIO already answers those in our favour. Discovery
+# happens on category and problem questions, so the credits go there.
+AIO_INTENTS: tuple[str, ...] = ("category", "problem")
 # How many consecutive batches an engine may fail every single call in before
 # the poll is declared terminal. 1 batch = a blip worth retrying; 3 in a row on
 # the same engine is a dead key or an outage, and its tasks can never complete,
@@ -277,6 +291,15 @@ def _load_day_docs(brand_id: str, engines: list[str], day: str) -> dict[str, dic
     }
 
 
+def aio_prompts(prompts: list[dict]) -> list[dict]:
+    """The subset of the universe Google AI Overview is polled for."""
+    return [p for p in prompts if (p.get("intent") or "category") in AIO_INTENTS]
+
+
+def _engine_prompts(engine: str, prompts: list[dict]) -> list[dict]:
+    return aio_prompts(prompts) if engine == geo_engines.AIO_ENGINE else prompts
+
+
 def _pending_tasks(
     prompts: list[dict], docs: dict[str, dict], runs: int
 ) -> list[tuple[str, dict, int]]:
@@ -305,7 +328,7 @@ def _pending_tasks(
         engine_runs = 1 if engine == geo_engines.AIO_ENGINE else runs
         per_engine[engine] = [
             (engine, prompt, run)
-            for prompt in prompts
+            for prompt in _engine_prompts(engine, prompts)
             for run in range(1, engine_runs + 1)
             if (prompt["id"], run) not in done
         ]
@@ -594,10 +617,17 @@ def _usable_engines(engines: list[str] | None) -> list[str]:
 
 
 def _total_tasks(prompts: list[dict], usable: list[str], runs: int) -> int:
-    """Engine calls a complete sweep costs. AIO is SERP content with low
-    variance, so it runs once per prompt while chat engines run ``runs`` times."""
+    """Engine calls a complete sweep costs.
+
+    AIO is SERP content with low variance, so it runs once per prompt where the
+    chat engines run ``runs`` times — and only over the discovery prompts, so
+    the SerpAPI allowance is not spent on questions that already name us. This
+    MUST agree with :func:`_pending_tasks`, or a sweep can never report itself
+    finished.
+    """
     return sum(
-        len(prompts) * (1 if e == geo_engines.AIO_ENGINE else runs) for e in usable
+        len(_engine_prompts(e, prompts)) * (1 if e == geo_engines.AIO_ENGINE else runs)
+        for e in usable
     )
 
 

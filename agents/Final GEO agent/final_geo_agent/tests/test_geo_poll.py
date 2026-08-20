@@ -496,7 +496,10 @@ def test_recent_answers_includes_aio_docs(aio_engine):
 
 
 def test_batch_polls_concurrently_but_returns_in_submission_order(monkeypatch):
-    seed_prompts(4)
+    # enough prompts to FILL the pool whatever POLL_CONCURRENCY is tuned to —
+    # with fewer tasks than parties the barrier can never trip and the test
+    # fails for its own arithmetic rather than for the behaviour under test
+    seed_prompts(geo_poll.POLL_CONCURRENCY)
     started = threading.Barrier(geo_poll.POLL_CONCURRENCY, timeout=5)
 
     def scripted(engine, prompt):
@@ -796,3 +799,36 @@ def test_already_answered_tasks_are_still_skipped_when_interleaved():
     assert sorted((e, p["id"]) for e, p, _r in tasks) == [
         ("aio", "p0"), ("aio", "p1"), ("perplexity", "p1"),
     ]
+
+
+# ------------------------- AIO spends a small allowance -------------------------
+
+
+def test_aio_polls_only_the_discovery_prompts():
+    prompts = [
+        {"id": "b1", "intent": "brand"},
+        {"id": "c1", "intent": "category"},
+        {"id": "p1", "intent": "problem"},
+        {"id": "u1"},                       # no intent recorded -> category
+    ]
+    assert [p["id"] for p in geo_poll.aio_prompts(prompts)] == ["c1", "p1", "u1"]
+
+    docs = {e: {"answers": []} for e in ("perplexity", "aio")}
+    tasks = geo_poll._pending_tasks(prompts, docs, runs=1)
+    aio = sorted(p["id"] for e, p, _r in tasks if e == "aio")
+    chat = sorted(p["id"] for e, p, _r in tasks if e == "perplexity")
+
+    assert aio == ["c1", "p1", "u1"]        # brand prompt costs no credit
+    assert chat == ["b1", "c1", "p1", "u1"]  # chat engines still ask everything
+
+
+def test_total_tasks_agrees_with_the_queue_or_a_sweep_can_never_finish():
+    prompts = [{"id": f"b{i}", "intent": "brand"} for i in range(3)] + [
+        {"id": f"c{i}", "intent": "category"} for i in range(5)
+    ]
+    usable = ["perplexity", "gemini", "aio"]
+    docs = {e: {"answers": []} for e in usable}
+
+    assert geo_poll._total_tasks(prompts, usable, runs=3) == len(
+        geo_poll._pending_tasks(prompts, docs, runs=3)
+    )
