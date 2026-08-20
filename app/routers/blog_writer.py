@@ -65,11 +65,16 @@ def _run(run_id: str, user: dict | None = None) -> dict:
     run = research.load_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail=f"unknown run: {run_id}")
-    # Ownership: runs created before user stamping (no user_id) stay visible to
-    # everyone; stamped runs are owner + admin only.
+    # Ownership: owner + admin only. An unstamped run belongs to nobody, so it
+    # is visible to nobody — the `owner and ...` this used to carry made the
+    # whole condition false for an empty user_id and handed the run to any
+    # signed-in caller, which is the one predicate in the codebase that failed
+    # open. Every other router compares with a bare `!=`. Runs have been stamped
+    # since 2026-08-08; the two unstamped documents left are artefacts of a
+    # pre-fix smoke run and are reachable in the Firebase console if wanted.
     if user is not None:
         owner = run.get("user_id") or ""
-        if owner and owner != user.get("id") and not user.get("is_admin"):
+        if owner != user.get("id") and not user.get("is_admin"):
             raise HTTPException(status_code=404, detail=f"unknown run: {run_id}")
     return run
 
@@ -137,12 +142,13 @@ def scan_inventory(brand_id: str, user: dict = Depends(get_current_user),
 
 @router.get("/blog/runs")
 def list_runs(user: dict = Depends(get_current_user)) -> dict:
+    # `not r.get("user_id")` used to be the first clause, so this route
+    # published every unstamped run's id and topic to every caller — handing
+    # out exactly the ids that _run's fail-open branch then accepted.
     runs = [
         r
         for r in research.list_runs()
-        if not r.get("user_id")
-        or r["user_id"] == user.get("id")
-        or user.get("is_admin")
+        if r.get("user_id") == user.get("id") or user.get("is_admin")
     ]
     return {"runs": runs}
 

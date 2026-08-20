@@ -93,8 +93,11 @@ def save_run(run: dict) -> None:
         "brand_id": run["brand_id"],
         "brand_name": run["brand_name"],
         "topic": run["topic"],
-        # Legacy runs predate ownership — an absent/empty user_id means
-        # "visible to everyone", never invent one.
+        # Legacy runs predate ownership and carry no user_id. Never invent one
+        # — an unstamped run belongs to nobody, and since 2026-08-21 the router
+        # reads that as visible to nobody rather than to everyone. Inventing an
+        # owner here would silently hand two pre-2026-08-08 smoke runs to
+        # whoever happened to load the list first.
         "user_id": run.get("user_id", ""),
         "created": run["created"],
         "status": run["status"],
