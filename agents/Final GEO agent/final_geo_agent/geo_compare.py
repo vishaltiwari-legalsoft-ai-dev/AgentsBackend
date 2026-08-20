@@ -158,6 +158,7 @@ def comparison_rows(
     entities: list[str],
     names: dict[str, str],
     domains: dict[str, str],
+    aliases: dict[str, list[str]] | None = None,
 ) -> list[dict]:
     """One row per tracked entity — us first, then rivals by mention rate."""
     sov = geo_metrics.share_of_voice(answers, entities)
@@ -179,6 +180,9 @@ def comparison_rows(
             "sov_share": sov["share"].get(key),
             "sov_credit": sov["credit"].get(key),
             "avg_position": avg_position(answers, key),
+            # the exact strings this rate was matched on. A 0% next to the
+            # names we searched for is debuggable; a bare 0% is not.
+            "match_names": list((aliases or {}).get(key) or []),
             "per_engine": per_engine_rate(answers, key),
             "vs_self": None if is_self else head_to_head(answers, key),
         })
@@ -304,7 +308,10 @@ def entity_keys(cfg: dict) -> list[str]:
     return keys
 
 
-def build(answers: list[dict], cfg: dict, brand: dict) -> dict:
+def build(
+    answers: list[dict], cfg: dict, brand: dict,
+    aliases: dict[str, list[str]] | None = None,
+) -> dict:
     """The whole comparison payload for one brand over one window."""
     names = entity_names(cfg, brand)
     domains = entity_domains(cfg, brand)
@@ -315,7 +322,7 @@ def build(answers: list[dict], cfg: dict, brand: dict) -> dict:
         "entities": entities,
         "names": names,
         "domains": domains,
-        "rows": comparison_rows(answers, entities, names, domains),
+        "rows": comparison_rows(answers, entities, names, domains, aliases),
         "questions": question_matrix(answers, entities, names),
         "untracked_domains": untracked_domains(answers, list(domains.values())),
         "n_answers": len(answers),

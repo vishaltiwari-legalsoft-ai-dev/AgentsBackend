@@ -148,12 +148,61 @@ def save_config(brand_id: str, patch: dict) -> dict:
     return _mutate(config_doc_id(brand_id), change)
 
 
+def competitor_aliases(
+    name: str, domain: str = "", extra: list[str] | None = None
+) -> list[str]:
+    """Every written form of a competitor worth searching an answer for.
+
+    Mentions are matched on word boundaries against the exact string, so a
+    rival typed as "smith ai" is found in NONE of the answers that write it
+    "Smith.ai" — measured: 32 of 200 stored answers named them, 0 were
+    detected. The brand's own aliases have always been derived from name +
+    domain + stem (:func:`_default_aliases`); the competitor was the only
+    entity we expected to be typed exactly the way the engines write it.
+
+    Anything the team typed themselves comes first and is never dropped.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        value = (value or "").strip()
+        if not value or value.lower() in seen:
+            return
+        seen.add(value.lower())
+        out.append(value)
+
+    for value in extra or []:
+        add(value)
+    add(name)
+    host = (
+        (domain or "").strip().lower()
+        .removeprefix("https://").removeprefix("http://").removeprefix("www.")
+        .split("/")[0]
+    )
+    if host:
+        add(host)
+        stem = host.split(".")[0]
+        # same guard as the brand's own stem: below this it matches noise
+        if len(stem) > 3:
+            add(stem)
+    return out
+
+
 def alias_map(cfg: dict) -> dict[str, list[str]]:
+    """entity key -> the strings we search answers for.
+
+    Competitor aliases are derived on READ, not baked in at save time, so a
+    competitor tracked before this derivation existed is matched correctly on
+    the next rescan instead of needing a migration.
+    """
     aliases = {"self": list((cfg.get("aliases") or {}).get("self") or [])}
     for comp in cfg.get("competitors") or []:
         key = comp.get("key") or comp.get("name", "")
         if key:
-            aliases[key] = list(comp.get("aliases") or [comp.get("name", "")])
+            aliases[key] = competitor_aliases(
+                comp.get("name", ""), comp.get("domain", ""), comp.get("aliases"),
+            )
     return aliases
 
 

@@ -687,3 +687,61 @@ def test_no_aio_counts_as_measured_because_the_slot_was_genuinely_checked(monkey
 
     # Google showing no overview is an observation, not a failure to observe
     assert "aio" in (geo_poll.ensure_config(BRAND).get("engine_last_seen") or {})
+
+
+# ------------------------- competitor alias derivation -------------------------
+# Regression: a rival typed "smith ai" with domain smith.ai was detected in 0 of
+# 200 stored answers that write it "Smith.ai". Aliases came from the typed name
+# only, while the brand's own have always used name + domain + stem.
+
+
+def test_competitor_aliases_cover_the_domain_and_its_stem():
+    assert geo_poll.competitor_aliases("smith ai", "smith.ai") == [
+        "smith ai", "smith.ai", "smith",
+    ]
+
+
+def test_competitor_aliases_strip_scheme_and_www():
+    # the stem is already the name here, so it dedupes away rather than
+    # doubling the work of every mention scan
+    assert geo_poll.competitor_aliases("Clio", "https://www.Clio.com/pricing") == [
+        "Clio", "clio.com",
+    ]
+    assert geo_poll.competitor_aliases("Ruby", "http://ruby.com/") == ["Ruby", "ruby.com"]
+
+
+def test_competitor_aliases_keep_what_the_team_typed_first():
+    aliases = geo_poll.competitor_aliases(
+        "Smith.ai", "smith.ai", ["Smith dot AI", "smith.ai"],
+    )
+    assert aliases[0] == "Smith dot AI"
+    assert aliases.count("smith.ai") == 1   # deduped case-insensitively
+
+
+def test_competitor_aliases_skip_a_stem_too_short_to_mean_anything():
+    assert geo_poll.competitor_aliases("G2", "g2.com") == ["G2", "g2.com"]
+
+
+def test_competitor_with_no_domain_still_matches_its_name():
+    assert geo_poll.competitor_aliases("Smokeball", "") == ["Smokeball"]
+
+
+def test_alias_map_derives_on_read_so_old_configs_need_no_migration():
+    """The competitor was saved before the derivation existed — it carries only
+    the typed name, and must still be matched on its domain forms."""
+    cfg = {
+        "aliases": {"self": ["Legal Soft"]},
+        "competitors": [{"key": "smith-ai", "name": "smith ai",
+                         "domain": "smith.ai", "aliases": ["smith ai"]}],
+    }
+    assert geo_poll.alias_map(cfg)["smith-ai"] == ["smith ai", "smith.ai", "smith"]
+
+
+def test_derived_aliases_find_the_rival_the_typed_name_missed():
+    cfg = {
+        "aliases": {"self": ["Legal Soft"]},
+        "competitors": [{"key": "smith-ai", "name": "smith ai", "domain": "smith.ai"}],
+    }
+    text = "For law firm intake, Smith.ai and Legal Soft are the usual shortlist."
+    mentions = geo_poll.detect_mentions(text, geo_poll.alias_map(cfg))
+    assert mentions == {"self": 2, "smith-ai": 1}

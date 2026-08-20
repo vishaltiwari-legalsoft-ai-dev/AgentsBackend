@@ -300,7 +300,9 @@ def comparison(
     days = max(1, min(days, 30))
     cfg = geo_poll.ensure_config(brand)
     answers = geo_poll.recent_answers(brand_id, days=days)
-    return geo_compare.build(answers, cfg, brand) | {"days": days}
+    return geo_compare.build(
+        answers, cfg, brand, aliases=geo_poll.alias_map(cfg),
+    ) | {"days": days}
 
 
 @router.post("/geo/brands/{brand_id}/rescan")
