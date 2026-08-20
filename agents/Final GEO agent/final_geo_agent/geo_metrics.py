@@ -15,11 +15,19 @@ from statistics import mean, pstdev
 # never per-source-domain weights.
 
 
-def _ok(answers: list[dict]) -> list[dict]:
-    # no_aio = Google showed no AI Overview for that query — a completed
-    # observation, but a brand can't appear in an answer that doesn't exist,
-    # so it stays out of every rate denominator (like errors do)
+def measurable(answers: list[dict]) -> list[dict]:
+    """Answers a brand could actually have been named in.
+
+    no_aio = Google showed no AI Overview for that query — a completed
+    observation, but a brand can't appear in an answer that doesn't exist, so
+    it stays out of every rate denominator (like errors do). Public because
+    ``geo_compare`` and ``geo_history`` need the same denominator; two
+    definitions of "measured" would drift apart within a release.
+    """
     return [a for a in answers if not a.get("error") and not a.get("no_aio")]
+
+
+_ok = measurable
 
 
 def mention_stats(answers: list[dict], entity: str = "self") -> dict:
@@ -80,7 +88,12 @@ def citation_share(answers: list[dict], own_domain: str) -> dict:
     ok = [a for a in _ok(answers) if a.get("citations")]
     if not ok:
         return {"rate": None, "n_answers_with_citations": 0, "cited_answers": 0}
-    own = own_domain.lower().removeprefix("www.")
+    own = (own_domain or "").lower().removeprefix("www.")
+    # No domain on record = nothing to match. `endswith("")` is True for every
+    # string, so without this a domainless brand reads as cited in 100% of
+    # answers — the most flattering number in the panel, and pure fiction.
+    if not own:
+        return {"rate": None, "n_answers_with_citations": len(ok), "cited_answers": 0}
     cited = sum(
         1
         for a in ok

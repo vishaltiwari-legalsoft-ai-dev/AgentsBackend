@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import re
 import threading
 import time
@@ -29,8 +30,10 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 from seo_geo_agent import state
-from final_geo_agent import geo_engines, geo_prompts
+from final_geo_agent import geo_engines, geo_history, geo_prompts
 from seo_geo_agent.sources import CredentialMissing, llm_json
+
+logger = logging.getLogger("agentos.geo.poll")
 
 DEFAULT_DAILY_CAP = 2000
 DEFAULT_RUNS = 3
@@ -399,6 +402,13 @@ def _merge_answers(brand_id: str, engine: str, day: str, records: list[dict]) ->
     _mutate(poll_doc_id(brand_id, engine, day), change)
 
 
+# ``geo_history`` stores its per-sweep points in a state doc of the same shape
+# and needs the same atomic read-modify-write. Public alias rather than a
+# second copy of the helper — two implementations of "mutate a GEO doc" is how
+# one of them ends up non-transactional.
+mutate = _mutate
+
+
 # --------------------------------------------------------------- terminal ----
 
 def _failure_summary(failures: dict[str, list[str]]) -> str:
@@ -765,8 +775,14 @@ def poll_step(
     terminal, terminal_reason = _terminal_signal(
         len(batch), failures, settled["streaks"]
     )
+    done_now = done_before + len(batch)
+    # The batch that finishes the day is the one that banks the trend point —
+    # the same moment for a hand-run poll and for the cron, so the chart does
+    # not depend on which path collected the answers.
+    if done_now >= total and not terminal:
+        _record_history(brand, cfg, day)
     return _progress(
-        done=done_before + len(batch), total=total, used=settled["used"], cap=cap,
+        done=done_now, total=total, used=settled["used"], cap=cap,
         engines=usable, day=day, aio_capped=aio_capped,
         aio_credits_month=settled["aio_month"],
         terminal=terminal, terminal_reason=terminal_reason,
@@ -779,8 +795,142 @@ def recent_answers(brand_id: str, days: int = 7) -> list[dict]:
     today = dt.datetime.now(dt.timezone.utc).date()
     for offset in range(days):
         day = (today - dt.timedelta(days=offset)).strftime("%Y%m%d")
-        for engine in geo_engines.ALL_ENGINES:
-            doc = state.load(poll_doc_id(brand_id, engine, day))
-            if doc:
-                answers.extend(doc.get("answers", []))
+        answers.extend(day_answers(brand_id, day))
     return answers
+
+
+def day_answers(brand_id: str, day: str) -> list[dict]:
+    """Every stored answer for one UTC day, across every engine.
+
+    A sweep lives entirely inside one day: ``_pending_tasks`` reads the day-doc
+    for ``_today()``, so a run truncated by the cron budget restarts on the
+    next day rather than resuming yesterday's doc. That makes "one day" and
+    "one sweep" the same window, which is what a trend point is measured over.
+    """
+    answers: list[dict] = []
+    for engine in geo_engines.ALL_ENGINES:
+        doc = state.load(poll_doc_id(brand_id, engine, day))
+        if doc:
+            answers.extend(doc.get("answers", []))
+    return answers
+
+
+def answers_by_day(brand_id: str, days: int = 30) -> dict[str, list[dict]]:
+    """day (YYYYMMDD) -> that day's answers, for days that have any.
+
+    Only used to backfill the trend for a brand that was already polling
+    before the history document existed; the live path appends one point per
+    sweep instead of re-reading the whole window.
+    """
+    today = dt.datetime.now(dt.timezone.utc).date()
+    out: dict[str, list[dict]] = {}
+    for offset in range(max(1, days)):
+        day = (today - dt.timedelta(days=offset)).strftime("%Y%m%d")
+        rows = day_answers(brand_id, day)
+        if rows:
+            out[day] = rows
+    return out
+
+
+def _rescore_record(record: dict, aliases: dict[str, list[str]], own_domain: str) -> bool:
+    """Re-derive one stored answer's mentions from its stored text.
+
+    Returns whether anything changed. Errored answers have no text to read and
+    are left exactly as they are.
+    """
+    if record.get("error"):
+        return False
+    mentions = detect_mentions(record.get("text") or "", aliases)
+    cited = bool(own_domain) and any(
+        (c.get("domain") or "").endswith(own_domain)
+        for c in record.get("citations") or []
+    )
+    before = (record.get("mentions"), record.get("brand_cited"))
+    record["mentions"] = mentions
+    record["brand_mentioned"] = "self" in mentions
+    record["brand_position"] = mentions.get("self")
+    record["brand_cited"] = cited
+    return before != (mentions, cited)
+
+
+def rescan_mentions(brand: dict, days: int = 7) -> dict:
+    """Re-read stored answers for a competitor tracked after they were polled.
+
+    Mentions are detected when an answer is stored, so adding a rival normally
+    means waiting two days for the next sweep before a single number about them
+    exists — which makes "compare us to them" useless in the meeting where
+    somebody asks for it. The answer TEXT is already on disk, so their name can
+    be found in it now.
+
+    Costs zero engine calls: nothing is re-asked, only re-read. The one honest
+    limit is the stored text cap (``geo_engines.ANSWER_TEXT_CAP``) — a name that
+    only appeared past the cap in the original answer is not recoverable, and
+    the next real sweep is what fixes that.
+    """
+    cfg = ensure_config(brand)
+    aliases = alias_map(cfg)
+    own_domain = (brand.get("domain") or "").lower().removeprefix("www.")
+    days = max(1, min(days, 30))
+    today = dt.datetime.now(dt.timezone.utc).date()
+
+    scanned = changed = 0
+    touched_days: list[str] = []
+    for offset in range(days):
+        day = (today - dt.timedelta(days=offset)).strftime("%Y%m%d")
+        day_changed = 0
+        for engine in geo_engines.ALL_ENGINES:
+            doc_id = poll_doc_id(brand["id"], engine, day)
+            if not state.load(doc_id):
+                continue
+
+            def change(doc: dict) -> tuple[dict, tuple[int, int]]:
+                doc = dict(doc or {})
+                answers = [dict(a) for a in doc.get("answers") or []]
+                hits = sum(
+                    1 for a in answers if _rescore_record(a, aliases, own_domain)
+                )
+                doc["answers"] = answers
+                if hits:
+                    doc["rescanned_at"] = _now()
+                return doc, (len(answers), hits)
+
+            seen, hits = _mutate(doc_id, change)
+            scanned += seen
+            day_changed += hits
+        if day_changed:
+            changed += day_changed
+            touched_days.append(day)
+
+    # The trend's rival lines are computed from the same answers, so leaving
+    # them alone would make the Dashboard contradict the Competitors tab.
+    for day in touched_days:
+        _record_history(brand, cfg, day, preserve_source=True)
+
+    return {
+        "brand_id": brand["id"],
+        "days": days,
+        "answers_scanned": scanned,
+        "answers_updated": changed,
+        "days_updated": sorted(touched_days),
+        "entities": sorted(aliases),
+        "text_cap": geo_engines.ANSWER_TEXT_CAP,
+    }
+
+
+def _record_history(brand: dict, cfg: dict, day: str, *,
+                    preserve_source: bool = False) -> None:
+    """Bank the trend point for a sweep that just completed.
+
+    Best-effort by design: the answers are already paid for and stored, and a
+    failure to derive a chart point must not turn a finished sweep into an
+    error. It is logged with its traceback, never swallowed silently.
+    """
+    try:
+        geo_history.record_sweep(
+            brand["id"], day, day_answers(brand["id"], day),
+            list(alias_map(cfg).keys()), brand.get("domain", ""),
+            preserve_source=preserve_source,
+        )
+    except Exception:  # noqa: BLE001 — derived artifact, never fatal to a sweep
+        logger.exception("geo: could not record history point for %s on %s",
+                         brand.get("id"), day)

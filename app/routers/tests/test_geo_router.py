@@ -138,3 +138,148 @@ def test_brand_config_roundtrip():
     cfg = client.get(f"/api/geo/brands/{BRAND['id']}/config").json()
     assert cfg["daily_cap"] == 100
     assert cfg["competitors"][0]["key"] == "clio"
+
+
+# ----------------------- competitor comparison + score history ----------------
+
+
+def track_clio():
+    resp = client.put(
+        f"/api/geo/brands/{BRAND['id']}/config",
+        json={"competitors": [
+            {"key": "clio", "name": "Clio", "aliases": ["Clio"], "domain": "clio.com"},
+        ]},
+    )
+    assert resp.status_code == 200
+
+
+def test_comparison_scores_rivals_on_the_same_answers(fake_engines):
+    track_clio()
+    put_prompts(2)
+    client.post(f"/api/geo/brands/{BRAND['id']}/poll/step",
+                json={"runs": 1, "batch_size": 10})
+
+    doc = client.get(f"/api/geo/brands/{BRAND['id']}/comparison").json()
+    rows = {r["key"]: r for r in doc["rows"]}
+    assert doc["tracked_competitors"] == 1
+    # the stub answer names both of us, us first
+    assert rows["self"]["mention"]["rate"] == 1.0
+    assert rows["clio"]["mention"]["rate"] == 1.0
+    assert rows["self"]["avg_position"] == 1.0
+    assert rows["clio"]["avg_position"] == 2.0
+    # both have a domain on record and neither is cited — g2.com is
+    assert rows["self"]["citation"]["rate"] == 0.0
+    assert rows["clio"]["citation"]["rate"] == 0.0
+    assert rows["clio"]["vs_self"]["tied"] == 2   # named in every answer we are
+
+    # every question shows both of us, and g2 is the untracked co-citation
+    assert len(doc["questions"]) == 2
+    assert doc["questions"][0]["rates"]["clio"] == 1.0
+    assert [d["domain"] for d in doc["untracked_domains"]] == ["g2.com"]
+
+
+def test_comparison_with_nobody_tracked_says_so(fake_engines):
+    put_prompts(1)
+    client.post(f"/api/geo/brands/{BRAND['id']}/poll/step",
+                json={"runs": 1, "batch_size": 10})
+    doc = client.get(f"/api/geo/brands/{BRAND['id']}/comparison").json()
+    assert doc["tracked_competitors"] == 0
+    assert [r["key"] for r in doc["rows"]] == ["self"]
+
+
+def test_comparison_unknown_brand_404():
+    assert client.get("/api/geo/brands/nope/comparison").status_code == 404
+
+
+def test_history_banks_a_point_when_a_sweep_completes(fake_engines):
+    track_clio()
+    put_prompts(10)
+    progress = client.post(f"/api/geo/brands/{BRAND['id']}/poll/step",
+                           json={"runs": 1, "batch_size": 10}).json()
+    assert progress["done"] == progress["total"] == 10
+
+    body = client.get(f"/api/geo/brands/{BRAND['id']}/history").json()
+    assert len(body["points"]) == 1
+    point = body["points"][0]
+    assert point["source"] == "sweep"
+    assert point["n_measured"] == 10
+    assert point["mention_rate"] == 1.0
+    assert point["competitors"]["clio"] == 1.0
+    assert 0 < point["score"] <= 100
+    # first measurement: no move to report, and we say that rather than "0%"
+    assert body["trend"]["since_last"]["direction"] == "unknown"
+    assert body["names"]["clio"] == "Clio"
+
+
+def test_history_is_empty_and_honest_before_any_sweep():
+    body = client.get(f"/api/geo/brands/{BRAND['id']}/history").json()
+    assert body["points"] == []
+    assert body["trend"]["current"] is None
+    assert body["min_point_answers"] > 0
+
+
+def test_history_unknown_brand_404():
+    assert client.get("/api/geo/brands/nope/history").status_code == 404
+
+
+def test_tracking_a_competitor_first_does_not_erase_the_brand_aliases(fake_engines):
+    """Regression: PUT /config used to create the document, so a competitor
+    added before anything read the config produced a config with no `self`
+    aliases — and the brand then went unnamed in its own answers."""
+    track_clio()
+    cfg = client.get(f"/api/geo/brands/{BRAND['id']}/config").json()
+    assert cfg["aliases"]["self"]
+    put_prompts(1)
+    client.post(f"/api/geo/brands/{BRAND['id']}/poll/step",
+                json={"runs": 1, "batch_size": 10})
+    report = client.get(f"/api/geo/brands/{BRAND['id']}/report").json()
+    assert report["blended"]["mention"]["rate"] == 1.0
+
+
+def test_rescan_finds_a_competitor_tracked_after_the_poll(fake_engines):
+    """The whole point of the rescan: a rival added today is measurable today,
+    from answers already on disk, without re-billing a single engine call."""
+    put_prompts(2)
+    client.post(f"/api/geo/brands/{BRAND['id']}/poll/step",
+                json={"runs": 1, "batch_size": 10})
+
+    before = client.get(f"/api/geo/brands/{BRAND['id']}/comparison").json()
+    assert before["tracked_competitors"] == 0
+
+    track_clio()   # Clio is named in the stored answers, but nobody was looking
+    stale = client.get(f"/api/geo/brands/{BRAND['id']}/comparison").json()
+    assert next(r for r in stale["rows"] if r["key"] == "clio")["mention"]["rate"] == 0.0
+
+    result = client.post(f"/api/geo/brands/{BRAND['id']}/rescan", json={"days": 7}).json()
+    assert result["answers_scanned"] == 2
+    assert result["answers_updated"] == 2
+    assert "clio" in result["entities"]
+
+    after = client.get(f"/api/geo/brands/{BRAND['id']}/comparison").json()
+    assert next(r for r in after["rows"] if r["key"] == "clio")["mention"]["rate"] == 1.0
+    # and we are still measured exactly as before — a rescan is not a re-poll
+    assert next(r for r in after["rows"] if r["is_self"])["mention"]["rate"] == 1.0
+
+
+def test_rescan_is_creator_only():
+    prev = fastapi_app.dependency_overrides[get_current_user]
+    fastapi_app.dependency_overrides[get_current_user] = lambda: {
+        "id": "u2", "email": "viewer@legalsoft.com", "is_admin": False,
+        "is_creator": False, "session_id": "", "timezone": "UTC",
+    }
+    try:
+        assert client.post(f"/api/geo/brands/{BRAND['id']}/rescan", json={}).status_code == 403
+    finally:
+        fastapi_app.dependency_overrides[get_current_user] = prev
+
+
+def test_rescan_keeps_a_live_point_labelled_live(fake_engines):
+    track_clio()
+    put_prompts(10)
+    client.post(f"/api/geo/brands/{BRAND['id']}/poll/step",
+                json={"runs": 1, "batch_size": 10})
+    client.post(f"/api/geo/brands/{BRAND['id']}/rescan", json={"days": 7})
+
+    points = client.get(f"/api/geo/brands/{BRAND['id']}/history").json()["points"]
+    assert len(points) == 1
+    assert points[0]["source"] == "sweep"   # rebuilt, not relabelled

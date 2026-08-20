@@ -7,6 +7,7 @@ Creator-only; ``CredentialMissing`` surfaces as 503 with the real message
 """
 from __future__ import annotations
 
+import datetime as dt
 import hmac
 import logging
 import os
@@ -17,7 +18,10 @@ from pydantic import BaseModel, Field
 
 from app.security import get_current_user, require_creator
 from app.services import run_tracking
-from final_geo_agent import geo_engines, geo_metrics, geo_poll, geo_prompts, geo_strategy, opt_pipeline
+from final_geo_agent import (
+    geo_compare, geo_engines, geo_history, geo_metrics, geo_poll, geo_prompts,
+    geo_strategy, opt_pipeline,
+)
 from seo_geo_agent import insights
 from seo_geo_agent.sources import CredentialMissing
 
@@ -93,6 +97,10 @@ class ConfigIn(BaseModel):
     # may run this brand at all
     poll_interval_days: int | None = Field(default=None, ge=1, le=30)
     auto_poll: bool | None = None
+
+
+class RescanIn(BaseModel):
+    days: int = Field(default=7, ge=1, le=30)
 
 
 class PollIn(BaseModel):
@@ -195,7 +203,13 @@ def get_geo_brand_config(brand_id: str, user: dict = Depends(get_current_user)) 
 def put_geo_brand_config(
     brand_id: str, body: ConfigIn, _creator: dict = Depends(require_creator)
 ) -> dict:
-    _brand_or_404(brand_id)
+    brand = _brand_or_404(brand_id)
+    # Seed the defaults first. ``save_config`` patches whatever document it
+    # finds, so a config first written by this endpoint (tracking a competitor
+    # before anything has read the config) would exist WITHOUT the brand's own
+    # aliases — and a poll against it would then find the brand in none of its
+    # own answers.
+    geo_poll.ensure_config(brand)
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
     return geo_poll.save_config(brand_id, patch)
 
@@ -270,6 +284,87 @@ def answers(
         rows = [a for a in rows if a.get("engine") == engine]
     rows.sort(key=lambda a: a.get("at", ""), reverse=True)
     return {"answers": rows[:200], "total": len(rows)}
+
+
+@router.get("/geo/brands/{brand_id}/comparison")
+def comparison(
+    brand_id: str, days: int = 7, user: dict = Depends(get_current_user)
+) -> dict:
+    """Head-to-head: every tracked rival scored on the same answers we are.
+
+    Asked for in the 18 Aug review — "which companies are cited for the same
+    answers as us". Same window, same denominators as ``/report``, so a number
+    here and a number there can be read side by side without a footnote.
+    """
+    brand = _brand_or_404(brand_id)
+    days = max(1, min(days, 30))
+    cfg = geo_poll.ensure_config(brand)
+    answers = geo_poll.recent_answers(brand_id, days=days)
+    return geo_compare.build(answers, cfg, brand) | {"days": days}
+
+
+@router.post("/geo/brands/{brand_id}/rescan")
+def rescan(
+    brand_id: str, body: RescanIn, _creator: dict = Depends(require_creator)
+) -> dict:
+    """Re-read stored answers with the current competitor list.
+
+    A rival added today is invisible until the next sweep, because mentions are
+    detected when an answer is stored. The answer text is already on disk, so
+    this finds their name in it now — zero engine calls, no new spend. Creator
+    only, because it rewrites stored measurements.
+    """
+    brand = _brand_or_404(brand_id)
+    result = geo_poll.rescan_mentions(brand, days=body.days)
+    _track(_creator, "rescan_mentions",
+           f"Rescanned {result['answers_scanned']} stored answers "
+           f"({result['answers_updated']} updated) over {result['days']} days",
+           brand, usage_action="edit")
+    return result
+
+
+@router.get("/geo/brands/{brand_id}/history")
+def history(
+    brand_id: str, days: int = 90, user: dict = Depends(get_current_user)
+) -> dict:
+    """The GEO score over time — one point per completed sweep.
+
+    Points are banked when a sweep finishes, so this is a read of stored
+    history, not a re-derivation of a rolling window. A brand that was already
+    polling before the history document existed gets ONE reconstruction from
+    its remaining day-docs; the stamp on the document stops that from running
+    again on every panel load.
+    """
+    brand = _brand_or_404(brand_id)
+    days = max(7, min(days, 365))
+    cfg = geo_poll.ensure_config(brand)
+
+    if geo_history.needs_backfill(brand_id):
+        points = geo_history.backfill(
+            brand_id,
+            geo_poll.answers_by_day(brand_id, days=geo_history.BACKFILL_DAYS),
+            list(geo_poll.alias_map(cfg).keys()),
+            brand.get("domain", ""),
+        )
+    else:
+        points = geo_history.load_points(brand_id)
+
+    cutoff = (
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    ).strftime("%Y%m%d")
+    windowed = [p for p in points if (p.get("date") or "") >= cutoff]
+    return {
+        "brand_id": brand_id,
+        "days": days,
+        "points": windowed,
+        "trend": geo_history.trend(windowed),
+        "component_labels": geo_history.COMPONENT_LABELS,
+        "min_point_answers": geo_history.MIN_POINT_ANSWERS,
+        "names": geo_compare.entity_names(cfg, brand),
+        # every point older than this is gone for good, so the panel can say
+        # why the line starts where it does instead of implying nothing happened
+        "backfill_days": geo_history.BACKFILL_DAYS,
+    }
 
 
 # ------------------------- Content Optimizer (Layers 1-6) -------------------------
