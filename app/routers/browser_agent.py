@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.security import get_current_user
-from app.services import run_tracking
+from app.services.run_tracking import CHANGE, JOB, Activity, ActivityTrail
 from browser_agent import actions as browser_actions
 from browser_agent import digest as browser_digest
 from browser_agent import runs as browser_runs
@@ -73,14 +73,9 @@ def _guard() -> None:
         )
 
 
-def _track(user: dict, action: str, task: str, *, run_id: str | None = None,
-           status: str = "completed", usage_action: str = "generate") -> None:
-    """Mandatory usage trail → agent_runs__a11 + master runs (admin DB panel)."""
-    run_tracking.record_activity(
-        user, agent_id=BROWSER_AGENT_ID, agent_name=BROWSER_AGENT_NAME,
-        category="data", action=action, task=task, run_id=run_id,
-        status=status, usage_action=usage_action,
-    )
+#: Every unit of Browser Agent work lands here — see THE RULE in run_tracking.py.
+trail = ActivityTrail(agent_id=BROWSER_AGENT_ID, agent_name=BROWSER_AGENT_NAME,
+                      category="data")
 
 
 def _run_or_404(run_id: str, user: dict) -> dict:
@@ -91,14 +86,22 @@ def _run_or_404(run_id: str, user: dict) -> dict:
     return run
 
 
-def _track_end_once(run: dict, user: dict) -> None:
-    """Log the terminal event exactly once, even across replayed steps."""
+def _end_once(run: dict, act: Activity) -> None:
+    """Record the run's terminal event exactly once, even across replayed steps.
+
+    A run is one unit of work, not one per step: a thirty-step run records a
+    start and an end, and every step in between is deliberately silent (see THE
+    RULE in run_tracking.py). ``act.skip`` is how a step that did not end the
+    run says so out loud rather than by omission.
+    """
     if run["status"] in browser_runs.TERMINAL and not run.get("tracked_end"):
         run["tracked_end"] = True
         browser_runs._persist(run)
         task = run.get("summary") or run.get("fail_reason") or run.get("goal", "")
-        _track(user, f"run_{run['status']}", str(task), run_id=run["id"],
-               status=run["status"])
+        act.note(str(task), action=f"run_{run['status']}", run_id=run["id"],
+                 status=str(run["status"]))
+        return
+    act.skip("the run has not reached a terminal state on this request")
 
 
 class RunIn(BaseModel):
@@ -153,7 +156,9 @@ def browser_status(user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.get("/browser/extension")
-def download_extension(user: dict = Depends(get_current_user)) -> FileResponse:
+def download_extension(user: dict = Depends(get_current_user),
+                       act: Activity = trail.records("extension_download",
+                                                     "Downloaded the extension")) -> FileResponse:
     """Hand out the built extension to company accounts — no GitHub account needed."""
     _guard()
     if not _may_download(user):
@@ -169,8 +174,7 @@ def download_extension(user: dict = Depends(get_current_user)) -> FileResponse:
             status_code=503,
             detail="The extension bundle is missing from this deployment.",
         )
-    _track(user, "extension_download",
-           f"Downloaded the extension ({_extension_version() or 'unknown version'})")
+    act.note(f"Downloaded the extension ({_extension_version() or 'unknown version'})")
     return FileResponse(
         EXTENSION_ZIP,
         media_type="application/zip",
@@ -196,11 +200,12 @@ def list_tools(user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.post("/browser/runs")
-def create_run(body: RunIn, user: dict = Depends(get_current_user)) -> dict:
+def create_run(body: RunIn, user: dict = Depends(get_current_user),
+               act: Activity = trail.records("run_start", "Started a browser run",
+                                             unit=JOB)) -> dict:
     _guard()
     run = browser_runs.create_run(user, body.goal, body.mode, body.start_url)
-    _track(user, "run_start", f"{body.mode}: {body.goal}", run_id=run["id"],
-           usage_action="session")
+    act.note(f"{body.mode}: {body.goal}", run_id=run["id"])
     return {
         "run_id": run["id"],
         "protocol": browser_actions.PROTOCOL,
@@ -221,7 +226,8 @@ def create_run(body: RunIn, user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.post("/browser/runs/{run_id}/step")
-def run_step(run_id: str, body: StepIn, user: dict = Depends(get_current_user)) -> dict:
+def run_step(run_id: str, body: StepIn, user: dict = Depends(get_current_user),
+             act: Activity = trail.records("run_step", "Browser run step")) -> dict:
     _guard()
     run = _run_or_404(run_id, user)
     try:
@@ -230,16 +236,17 @@ def run_step(run_id: str, body: StepIn, user: dict = Depends(get_current_user)) 
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except browser_runs.OutOfSync as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    _track_end_once(run, user)
+    _end_once(run, act)
     return response
 
 
 @router.post("/browser/runs/{run_id}/stop")
-def stop_run(run_id: str, user: dict = Depends(get_current_user)) -> dict:
+def stop_run(run_id: str, user: dict = Depends(get_current_user),
+             act: Activity = trail.records("run_stop", "Stopped a browser run")) -> dict:
     _guard()
     run = _run_or_404(run_id, user)
     run = browser_runs.stop_run(run)
-    _track_end_once(run, user)
+    _end_once(run, act)
     return {"run_id": run["id"], "status": run["status"]}
 
 
@@ -280,7 +287,8 @@ def list_skills(user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.post("/browser/skills")
-def save_skill(body: SkillIn, user: dict = Depends(get_current_user)) -> dict:
+def save_skill(body: SkillIn, user: dict = Depends(get_current_user),
+               act: Activity = trail.records("skill_saved", "Saved a skill")) -> dict:
     """Approve a flow so the agent can repeat it without thinking it out again."""
     _guard()
     goal, host, steps = body.goal or "", body.host or "", body.steps or []
@@ -302,7 +310,7 @@ def save_skill(body: SkillIn, user: dict = Depends(get_current_user)) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    _track(user, "skill_saved", f"Learned: {skill['name']} ({len(skill['steps'])} steps)")
+    act.note(f"Learned: {skill['name']} ({len(skill['steps'])} steps)")
     return skill
 
 
@@ -316,12 +324,15 @@ def get_skill(skill_id: str, user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.delete("/browser/skills/{skill_id}")
-def delete_skill(skill_id: str, user: dict = Depends(get_current_user)) -> dict:
+def delete_skill(skill_id: str, user: dict = Depends(get_current_user),
+                 act: Activity = trail.records("skill_deleted", "Deleted a skill",
+                                               unit=CHANGE)) -> dict:
     _guard()
     found = browser_skills.get_skill(skill_id)
     if not found or (found.get("user_id") != str(user.get("id")) and not user.get("is_admin")):
         raise HTTPException(status_code=404, detail="Unknown skill")
     browser_skills.delete_skill(skill_id)
+    act.note(f"Deleted skill: {found.get('name') or skill_id}")
     return {"deleted": skill_id}
 
 
@@ -331,14 +342,15 @@ def delete_skill(skill_id: str, user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.post("/browser/digest")
-def make_digest(body: DigestIn, user: dict = Depends(get_current_user)) -> dict:
+def make_digest(body: DigestIn, user: dict = Depends(get_current_user),
+                act: Activity = trail.records("digest", "Built a tab digest")) -> dict:
     _guard()
     try:
         result = browser_digest.build_digest(user, body.events, body.tabs)
     except ValueError as exc:
         # An unreadable model reply is reported as-is; we never ship a fake digest.
         raise HTTPException(status_code=502, detail=f"Couldn't build the digest: {exc}") from exc
-    _track(user, "digest", result["headline"] or "Tab digest")
+    act.note(result["headline"] or "Tab digest")
     return result
 
 
@@ -365,7 +377,11 @@ def get_config(user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.put("/browser/config")
-def put_config(body: ConfigIn, user: dict = Depends(get_current_user)) -> dict:
+def put_config(body: ConfigIn, user: dict = Depends(get_current_user),
+               act: Activity = trail.records("config_saved", "Edited the watch rules",
+                                             unit=CHANGE)) -> dict:
     _guard()
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
-    return browser_digest.save_config(patch)
+    saved = browser_digest.save_config(patch)
+    act.note(f"Watch rules saved — {len(saved.get('watch_rules') or [])} rules")
+    return saved

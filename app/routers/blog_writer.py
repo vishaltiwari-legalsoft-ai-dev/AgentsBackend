@@ -16,7 +16,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from app.security import get_current_user
-from app.services import run_tracking
+from app.services.run_tracking import JOB, Activity, ActivityTrail
 from seo_geo_agent import insights
 from seo_geo_agent.sources import CredentialMissing
 
@@ -30,15 +30,10 @@ BLOG_AGENT_ID = "a9"  # "Blog Writer" slot in the frontend agent catalog
 BLOG_AGENT_NAME = "Blog Writer"
 
 
-def _track(user: dict, action: str, task: str, run: dict | None = None,
-           *, usage_action: str = "generate") -> None:
-    """Mandatory usage trail → agent_runs__a9 + master runs (admin DB panel)."""
-    run_tracking.record_activity(
-        user, agent_id=BLOG_AGENT_ID, agent_name=BLOG_AGENT_NAME, category="copy",
-        action=action, task=task,
-        brand_id=(run or {}).get("brand_id"), run_id=(run or {}).get("id"),
-        usage_action=usage_action,
-    )
+#: Every unit of Blog Writer work lands here — see THE RULE in run_tracking.py.
+#: A blog run has no recorded end (the draft and the export are its outputs), so
+#: each produced increment is its own unit rather than a step inside one.
+trail = ActivityTrail(agent_id=BLOG_AGENT_ID, agent_name=BLOG_AGENT_NAME, category="copy")
 
 _EXPORTS = {
     "md": (export.to_markdown, "text/markdown", "{slug}.md"),
@@ -109,7 +104,8 @@ def get_voice(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.post("/blog/brands/{brand_id}/voice")
-def study_voice(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
+def study_voice(brand_id: str, user: dict = Depends(get_current_user),
+                act: Activity = trail.records("voice_study", "Studied a brand voice")) -> dict:
     brand = _brand(brand_id)
     try:
         vc = bw_voice.study(brand, inventory.latest(brand_id))
@@ -117,8 +113,7 @@ def study_voice(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
         raise HTTPException(status_code=424, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    _track(user, "voice_study", f"Studied brand voice for {brand.get('name', brand_id)}",
-           {"brand_id": brand_id})
+    act.note(f"Studied brand voice for {brand.get('name', brand_id)}", brand_id=brand_id)
     return vc
 
 
@@ -132,10 +127,11 @@ def get_inventory(brand_id: str, user: dict = Depends(get_current_user)) -> dict
 
 
 @router.post("/blog/brands/{brand_id}/inventory")
-def scan_inventory(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
+def scan_inventory(brand_id: str, user: dict = Depends(get_current_user),
+                   act: Activity = trail.records("inventory_scan",
+                                                 "Scanned a content inventory")) -> dict:
     inv = inventory.scan(_brand(brand_id))
-    _track(user, "inventory_scan", f"Scanned content inventory for {brand_id}",
-           {"brand_id": brand_id})
+    act.note(f"Scanned content inventory for {brand_id}", brand_id=brand_id)
     return inv
 
 
@@ -157,30 +153,34 @@ def get_run(run_id: str, user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.post("/blog/runs")
-def create_run(body: RunIn, user: dict = Depends(get_current_user)) -> dict:
+def create_run(body: RunIn, user: dict = Depends(get_current_user),
+               act: Activity = trail.records("run_created", "New blog run", unit=JOB)) -> dict:
     topic = body.topic.strip()
     if not topic:
         raise HTTPException(status_code=422, detail="topic is required")
     run = research.new_run(
         _brand(body.brand_id), topic, body.notes.strip(), user_id=str(user.get("id") or "")
     )
-    _track(user, "run_created", f"New blog run: “{topic}”", run, usage_action="session")
+    act.note(f"New blog run: “{topic}”", brand_id=run.get("brand_id"), run_id=run.get("id"))
     return run
 
 
 @router.post("/blog/runs/{run_id}/research/step")
-def research_step(run_id: str, user: dict = Depends(get_current_user)) -> dict:
+def research_step(run_id: str, user: dict = Depends(get_current_user),
+                  act: Activity = trail.records("research_step", "Research step")) -> dict:
     run = _run(run_id, user)
     try:
         result = research.research_step(run)
     except CredentialMissing as exc:
         raise HTTPException(status_code=424, detail=str(exc)) from exc
-    _track(user, "research_step", f"Research step on “{run.get('topic', '')}”", run)
+    act.note(f"Research step on “{run.get('topic', '')}”",
+             brand_id=run.get("brand_id"), run_id=run.get("id"))
     return result
 
 
 @router.post("/blog/runs/{run_id}/draft")
-def build_draft(run_id: str, user: dict = Depends(get_current_user)) -> dict:
+def build_draft(run_id: str, user: dict = Depends(get_current_user),
+                act: Activity = trail.records("draft", "Built a draft")) -> dict:
     run = _run(run_id, user)
     if not run["ledger"]:
         raise HTTPException(status_code=409, detail="no evidence yet — run research first")
@@ -192,12 +192,15 @@ def build_draft(run_id: str, user: dict = Depends(get_current_user)) -> dict:
         raise HTTPException(status_code=424, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    _track(user, "draft", f"Drafted “{run.get('topic', '')}”", run)
+    act.note(f"Drafted “{run.get('topic', '')}”",
+             brand_id=run.get("brand_id"), run_id=run.get("id"))
     return result
 
 
 @router.post("/blog/runs/{run_id}/blocks/{block_id}/comment")
-def comment_block(run_id: str, block_id: str, body: CommentIn, user: dict = Depends(get_current_user)) -> dict:
+def comment_block(run_id: str, block_id: str, body: CommentIn,
+                  user: dict = Depends(get_current_user),
+                  act: Activity = trail.records("revise_block", "Revised a block")) -> dict:
     run = _run(run_id, user)
     comment = body.comment.strip()
     if not comment:
@@ -210,12 +213,13 @@ def comment_block(run_id: str, block_id: str, body: CommentIn, user: dict = Depe
         raise HTTPException(status_code=404, detail=f"unknown block: {block_id}") from exc
     except CredentialMissing as exc:
         raise HTTPException(status_code=424, detail=str(exc)) from exc
-    _track(user, "revise_block", f"Revision: {comment}", run)
+    act.note(f"Revision: {comment}", brand_id=run.get("brand_id"), run_id=run.get("id"))
     return result
 
 
 @router.post("/blog/runs/{run_id}/visuals")
-def plan_visuals(run_id: str, user: dict = Depends(get_current_user)) -> dict:
+def plan_visuals(run_id: str, user: dict = Depends(get_current_user),
+                 act: Activity = trail.records("visuals", "Planned visuals")) -> dict:
     run = _run(run_id, user)
     try:
         result = visuals.plan_visuals(run, _brand(run["brand_id"]))
@@ -223,12 +227,14 @@ def plan_visuals(run_id: str, user: dict = Depends(get_current_user)) -> dict:
         raise HTTPException(status_code=424, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    _track(user, "visuals", f"Planned visuals for “{run.get('topic', '')}”", run)
+    act.note(f"Planned visuals for “{run.get('topic', '')}”",
+             brand_id=run.get("brand_id"), run_id=run.get("id"))
     return result
 
 
 @router.get("/blog/runs/{run_id}/export")
-def export_run(run_id: str, format: str = "md", user: dict = Depends(get_current_user)) -> PlainTextResponse:
+def export_run(run_id: str, format: str = "md", user: dict = Depends(get_current_user),
+               act: Activity = trail.records("export", "Exported a draft")) -> PlainTextResponse:
     run = _run(run_id, user)
     if format not in _EXPORTS:
         raise HTTPException(status_code=422, detail=f"unknown format: {format}")
@@ -239,7 +245,8 @@ def export_run(run_id: str, format: str = "md", user: dict = Depends(get_current
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     slug = (run.get("draft") or {}).get("meta", {}).get("slug") or run["id"]
     filename = name_tpl.format(slug=slug)
-    _track(user, f"export:{format}", f"Exported “{slug}” as {format}", run)
+    act.note(f"Exported “{slug}” as {format}", action=f"export:{format}",
+             brand_id=run.get("brand_id"), run_id=run.get("id"))
     return PlainTextResponse(
         content,
         media_type=media_type,

@@ -22,7 +22,7 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 
 from app.security import get_current_user
-from app.services import run_tracking
+from app.services.run_tracking import CHANGE, CRON, JOB, Activity, ActivityTrail
 
 from dataclasses import asdict
 
@@ -90,12 +90,8 @@ def _pull_lock(user_id: str) -> threading.Lock:
         return _PULL_LOCKS.setdefault(user_id, threading.Lock())
 
 
-def _track(user: dict, action: str, task: str, *, usage_action: str = "generate") -> None:
-    """Mandatory usage trail → agent_runs__a6 + master runs (admin DB panel)."""
-    run_tracking.record_activity(
-        user, agent_id=MR_AGENT_ID, agent_name=MR_AGENT_NAME, category="data",
-        action=action, task=task, usage_action=usage_action,
-    )
+#: Every unit of Marketing Research work lands here — see THE RULE in run_tracking.py.
+trail = ActivityTrail(agent_id=MR_AGENT_ID, agent_name=MR_AGENT_NAME, category="data")
 
 
 def _save_csv_tmp(content: bytes) -> str:
@@ -295,6 +291,7 @@ async def ingest(
     file: UploadFile = File(...),
     platform: str = Form(...),
     user=Depends(get_current_user),
+    act: Activity = trail.records("ingest", "Uploaded a platform export"),
 ):
     if platform not in COLUMN_MAPS:
         raise HTTPException(400, f"unknown platform '{platform}' (expected one of {list(COLUMN_MAPS)})")
@@ -321,8 +318,8 @@ async def ingest(
         "gaps": [g.__dict__ for g in (m_gaps + l_gaps)],
     }
     runs.save_run(run)
-    _track(user, "ingest",
-           f"Uploaded {platform} export — {len(metrics)} metrics, {len(leads)} leads")
+    act.note(f"Uploaded {platform} export — {len(metrics)} metrics, {len(leads)} leads",
+             run_id=run["id"])
     return {
         "dataset_id": run["id"],
         "platform": platform,
@@ -337,6 +334,7 @@ def ingest_sheet(
     response: Response,
     body: dict | None = None,
     user=Depends(get_current_user),
+    act: Activity = trail.records("ingest_sheet", "Pulled the live sheet"),
 ):
     """Pull the live Google-Sheets performance tracker into datasets.
 
@@ -375,8 +373,8 @@ def ingest_sheet(
 
     response.status_code = _PULL_HTTP_STATUS[result["status"]]
     ok = len(result["tabs"]) - result["failed"]
-    _track(user, "ingest_sheet",
-           f"Sheet pull ({result['status']}) — {ok}/{len(result['tabs'])} tabs ingested")
+    act.note(f"Sheet pull ({result['status']}) — {ok}/{len(result['tabs'])} tabs ingested",
+             status=str(result["status"]))
     return {"spreadsheet_id": mr_config.SHEETS_SPREADSHEET_ID, "year": year, **result}
 
 
@@ -608,7 +606,9 @@ def _cron_status(response: Response, out: dict, failures: list[str], *, fatal: b
 
 
 @router.post("/mr/cron/refresh")
-def cron_refresh(request: Request, response: Response):
+def cron_refresh(request: Request, response: Response,
+                 act: Activity = trail.records("cron_refresh", "Scheduled MR refresh",
+                                               unit=JOB, actor=CRON)):
     """Scheduled full refresh: sheet pull + daily snapshot capture + GCS export.
 
     Authenticated by the MR_CRON_KEY shared secret (Cloud Scheduler can't hold a
@@ -651,6 +651,10 @@ def cron_refresh(request: Request, response: Response):
     except Exception as exc:
         out["capture_error"] = str(exc)
         failures.append(f"snapshot capture failed: {exc}")
+        # The fire still happened and still half-failed; recording it is how the
+        # next person finds out the workbook stopped being readable.
+        act.note(f"Scheduled refresh for {today.isoformat()} — workbook unreadable: {exc}",
+                 status="failed")
         return _cron_status(response, out, failures, fatal=fatal or not uid)
     try:
         out["capture"] = mr_snapshots.capture_workbook(
@@ -663,8 +667,9 @@ def cron_refresh(request: Request, response: Response):
     except Exception as exc:
         out["export_error"] = str(exc)
         failures.append(f"snapshot export failed: {exc}")
-    _track(run_tracking.CRON_USER, "cron_refresh",
-           f"Scheduled refresh for {today.isoformat()}", usage_action="session")
+    act.note(f"Scheduled refresh for {today.isoformat()}"
+             + (f" — {len(failures)} degraded" if failures else ""),
+             status="failed" if fatal else "completed")
     return _cron_status(response, out, failures, fatal=fatal)
 
 
@@ -684,13 +689,16 @@ def datasets(user=Depends(get_current_user)):
 
 
 @router.delete("/mr/datasets/{dataset_id}")
-def delete_dataset(dataset_id: str, user=Depends(get_current_user)):
+def delete_dataset(dataset_id: str, user=Depends(get_current_user),
+                   act: Activity = trail.records("dataset_deleted", "Deleted a dataset",
+                                                 unit=CHANGE)):
     """Remove one ingested file/pull from the workspace (its numbers leave the
     Overview and future reports immediately)."""
     run = runs.get_run(dataset_id)
     if not run or run.get("user_id") != user["id"] or run.get("kind") != "dataset":
         raise HTTPException(404, "dataset not found")
     runs.delete_run(dataset_id)
+    act.note(f"Dataset deleted — {run.get('platform') or dataset_id}", run_id=dataset_id)
     return {"deleted": dataset_id}
 
 
@@ -745,7 +753,8 @@ def _metrics_from_pdf(text: str, today: date) -> list[CampaignMetric]:
 
 
 @router.post("/mr/ingest-pdf")
-async def ingest_pdf(file: UploadFile = File(...), user=Depends(get_current_user)):
+async def ingest_pdf(file: UploadFile = File(...), user=Depends(get_current_user),
+                     act: Activity = trail.records("ingest_pdf", "Parsed an uploaded PDF")):
     """Upload a PDF report: text is extracted locally, metrics are parsed by the
     LLM into the canonical schema and saved as a dataset."""
     import io as _io
@@ -783,7 +792,7 @@ async def ingest_pdf(file: UploadFile = File(...), user=Depends(get_current_user
         "gaps": gaps,
     }
     runs.save_run(run)
-    _track(user, "ingest_pdf", f"Parsed PDF “{name}” — {len(metrics)} metrics")
+    act.note(f"Parsed PDF “{name}” — {len(metrics)} metrics", run_id=run["id"])
     return {"dataset_id": run["id"], "platform": run["platform"],
             "metrics": len(metrics), "leads": 0, "gaps": gaps}
 
@@ -827,7 +836,8 @@ def trends_endpoint(user=Depends(get_current_user)):
 
 
 @router.post("/mr/snapshots/capture")
-def snapshots_capture(user=Depends(get_current_user)):
+def snapshots_capture(user=Depends(get_current_user),
+                      act: Activity = trail.records("snapshot", "Captured tab snapshots")):
     """Freeze today's MTD state of every tracker tab + refresh the GCS export.
     The daily cron target AND the UI's 'Snapshot now' button."""
     today = date.today()
@@ -837,7 +847,7 @@ def snapshots_capture(user=Depends(get_current_user)):
         raise HTTPException(502, f"Could not read the spreadsheet: {exc}")
     results = mr_snapshots.capture_workbook(grids, year=mr_config.SHEETS_YEAR, today=today)
     exported = mr_snapshots.export_all_to_gcs(today)
-    _track(user, "snapshot", f"Captured {len(results)} tab snapshots for {today.isoformat()}")
+    act.note(f"Captured {len(results)} tab snapshots for {today.isoformat()}")
     return {"date": today.isoformat(), "tabs": results, "exported": exported}
 
 
@@ -912,18 +922,20 @@ def workbook_catalog(user=Depends(get_current_user)):
 
 
 @router.post("/mr/workbook/scan")
-def workbook_scan(user=Depends(get_current_user)):
+def workbook_scan(user=Depends(get_current_user),
+                  act: Activity = trail.records("workbook_scan", "Deep-profiled the workbook")):
     """Deep-profile every tab with the LLM and cache the result."""
     try:
         _, profs = _workbook_bundle(deep=True, use_cache=False)
     except Exception as exc:
         raise HTTPException(502, f"Could not read the spreadsheet: {exc}")
-    _track(user, "workbook_scan", f"Deep-profiled {len(profs)} workbook tabs")
+    act.note(f"Deep-profiled {len(profs)} workbook tabs")
     return {"tabs": [asdict(p) for p in profs], "count": len(profs)}
 
 
 @router.post("/mr/ask")
-def ask(body: dict | None = None, user=Depends(get_current_user)):
+def ask(body: dict | None = None, user=Depends(get_current_user),
+        act: Activity = trail.records("ask", "Asked the researcher a question")):
     """Answer a natural-language question with grounded insight from the right tab(s)."""
     body = body or {}
     question = str(body.get("question", "")).strip()
@@ -938,7 +950,7 @@ def ask(body: dict | None = None, user=Depends(get_current_user)):
         question, profs, grid_map,
         timeframe=body.get("timeframe"), year=mr_config.SHEETS_YEAR,
     )
-    _track(user, "ask", f"Asked: {question}")
+    act.note(f"Asked: {question}")
     return answer
 
 
@@ -953,7 +965,8 @@ def sheet_sources(user=Depends(get_current_user)):
 
 
 @router.post("/mr/sources")
-def add_sheet_source(body: dict | None = None, user=Depends(get_current_user)):
+def add_sheet_source(body: dict | None = None, user=Depends(get_current_user),
+                     act: Activity = trail.records("connect_sheet", "Connected a sheet")):
     """Connect another Google Sheet by pasted link. Access is validated up
     front; the response carries the agent's first-pass read of every tab."""
     if not mr_sources_registry.multi_sheet_enabled():
@@ -979,12 +992,14 @@ def add_sheet_source(body: dict | None = None, user=Depends(get_current_user)):
         tabs = [asdict(p) for p in profs]
     except Exception:
         tabs = []
-    _track(user, "connect_sheet", f"Connected sheet “{src.get('label', sid)}”")
+    act.note(f"Connected sheet “{src.get('label', sid)}”")
     return {"source": src, "tabs": tabs, "tab_count": len(meta.get("tabs") or [])}
 
 
 @router.delete("/mr/sources/{spreadsheet_id}")
-def remove_sheet_source(spreadsheet_id: str, user=Depends(get_current_user)):
+def remove_sheet_source(spreadsheet_id: str, user=Depends(get_current_user),
+                        act: Activity = trail.records("disconnect_sheet",
+                                                      "Disconnected a sheet", unit=CHANGE)):
     """Disconnect a secondary sheet — the agent stops reading it immediately."""
     if not mr_sources_registry.multi_sheet_enabled():
         raise HTTPException(403, "Multi-sheet support is disabled on this deployment (MR_MULTI_SHEET).")
@@ -994,6 +1009,7 @@ def remove_sheet_source(spreadsheet_id: str, user=Depends(get_current_user)):
         raise HTTPException(400, str(exc))
     if not removed:
         raise HTTPException(404, "source not found")
+    act.note(f"Disconnected sheet {spreadsheet_id}")
     return {"removed": spreadsheet_id}
 
 
@@ -1035,18 +1051,23 @@ def get_targets(user=Depends(get_current_user)):
 
 
 @router.post("/mr/targets")
-def save_targets(body: dict | None = None, user=Depends(get_current_user)):
+def save_targets(body: dict | None = None, user=Depends(get_current_user),
+                 act: Activity = trail.records("targets_saved", "Edited the targets",
+                                               unit=CHANGE)):
     """Edit targets/figures. Body: {"thresholds": {...}, "channel_goals": {"Google": {...}}}.
     Send {"reset": true} to return to the 2026 defaults."""
     from marketing_research_agent import goals as mr_goals
 
     body = body or {}
     if body.get("reset"):
+        act.note("Targets reset to the defaults", action="targets_reset")
         return mr_goals.reset_targets()
     try:
-        return mr_goals.set_targets(body)
+        saved = mr_goals.set_targets(body)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    act.note(f"Targets saved — {', '.join(sorted(body)) or 'no fields'}")
+    return saved
 
 
 @router.get("/mr/config")
@@ -1088,7 +1109,8 @@ def report_periods(user=Depends(get_current_user)):
 
 
 @router.post("/mr/reports/{kind}")
-def make_report(kind: str, body: dict | None = None, user=Depends(get_current_user)):
+def make_report(kind: str, body: dict | None = None, user=Depends(get_current_user),
+                act: Activity = trail.records("report", "Built a report")):
     """Build one report. Body (optional): ``{"period": "2026-07" | "2026-Q3"}`` —
     monthly/quarterly only. An explicit period never substitutes another month's
     data: an empty window is a 422, not a silent fallback."""
@@ -1104,8 +1126,8 @@ def make_report(kind: str, body: dict | None = None, user=Depends(get_current_us
             report = reports.build(kind, _load_dataset(user["id"]), user_id=user["id"], period=period)
         except reports.PeriodError as exc:
             raise HTTPException(422, str(exc))
-    _track(user, f"report:{kind}",
-           f"Built {kind} report" + (f" for {period}" if period else ""))
+    act.note(f"Built {kind} report" + (f" for {period}" if period else ""),
+             action=f"report:{kind}", run_id=str(report.get("id") or "") or None)
     return report
 
 
@@ -1137,18 +1159,23 @@ def _pdf_response(data: bytes, filename: str) -> StreamingResponse:
 
 
 @router.get("/mr/runs/{run_id}/pdf")
-def report_run_pdf(run_id: str, user=Depends(get_current_user)):
+def report_run_pdf(run_id: str, user=Depends(get_current_user),
+                   act: Activity = trail.records("export:report_pdf",
+                                                 "Downloaded a report PDF")):
     """The Reports panel document as a PDF — same sections, same order, same
     figures the user is looking at on screen."""
     run = runs.get_run(run_id)
     if not run or run.get("user_id") != user["id"] or run.get("kind") not in reports.KINDS:
         raise HTTPException(404, "run not found")
     stamp = str(run.get("generated_at", ""))[:10] or date.today().isoformat()
+    act.note(f"Downloaded the {run['kind']} report as PDF ({stamp})", run_id=run_id)
     return _pdf_response(mr_pdf.report_pdf(run), f"mr-{run['kind']}-{stamp}.pdf")
 
 
 @router.get("/mr/lead-analysis/pdf")
-def lead_analysis_pdf(month: str | None = None, user=Depends(get_current_user)):
+def lead_analysis_pdf(month: str | None = None, user=Depends(get_current_user),
+                      act: Activity = trail.records("export:leads_pdf",
+                                                    "Downloaded the leads PDF")):
     """The Leads panel as a PDF — same story line, red-flag card and vendor
     table the user is looking at. ``month`` (YYYY-MM) defaults to the latest;
     an unknown month is a 422, never a silently substituted one."""
@@ -1160,12 +1187,15 @@ def lead_analysis_pdf(month: str | None = None, user=Depends(get_current_user)):
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     label = month or (run.get("summary") or {}).get("latest_month") or "latest"
+    act.note(f"Downloaded the lead analysis for {label} as PDF")
     return _pdf_response(data, f"mr-leads-{label}.pdf")
 
 
 @router.get("/mr/snapshots/vendor/{slug}/pdf")
 def snapshots_vendor_pdf(slug: str, date_iso: str | None = None,
-                         user=Depends(get_current_user)):
+                         user=Depends(get_current_user),
+                         act: Activity = trail.records("export:vendor_pdf",
+                                                       "Downloaded a vendor dossier")):
     """The Vendors panel dossier as a PDF — official summary, day movement and
     the full section dossier exactly as rendered on screen."""
     detail = mr_snapshots.vendor_detail(slug, date_iso)
@@ -1177,12 +1207,14 @@ def snapshots_vendor_pdf(slug: str, date_iso: str | None = None,
     except Exception:  # benchmarks only tint cells; the dossier must still export
         pass
     snap_date = (detail.get("snapshot") or {}).get("date") or date.today().isoformat()
+    act.note(f"Downloaded the {slug} dossier for {snap_date} as PDF")
     return _pdf_response(mr_pdf.vendor_pdf(detail, benchmarks),
                          f"mr-vendor-{slug}-{snap_date}.pdf")
 
 
 @router.post("/mr/schedule/{period}")
-def trigger_schedule(period: str, user=Depends(get_current_user)):
+def trigger_schedule(period: str, user=Depends(get_current_user),
+                     act: Activity = trail.records("schedule", "Ran a schedule")):
     fn = {
         "daily": schedule.run_daily,
         "weekly": schedule.run_weekly,
@@ -1192,5 +1224,5 @@ def trigger_schedule(period: str, user=Depends(get_current_user)):
     if not fn:
         raise HTTPException(404, f"unknown period '{period}'")
     result = fn(_load_dataset(user["id"]), user_id=user["id"])
-    _track(user, f"schedule:{period}", f"Ran the {period} schedule")
+    act.note(f"Ran the {period} schedule", action=f"schedule:{period}")
     return result

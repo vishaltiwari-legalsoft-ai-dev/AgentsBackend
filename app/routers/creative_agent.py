@@ -33,7 +33,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from app.security import get_current_user
-from app.services import run_tracking
+from app.services.run_tracking import JOB, Activity, ActivityTrail, silent
 
 # On sys.path via app.__init__ (agent root registered there).
 from graphics_designer_agent import reference_library as rl
@@ -50,15 +50,12 @@ CREATIVE_AGENT_ID = "a1"
 CREATIVE_AGENT_NAME = "Graphics Designer"
 
 
-def _track(user: dict, action: str, task: str, run: dict | None = None,
-           *, usage_action: str = "generate") -> None:
-    """Mandatory usage trail → agent_runs__a1 + master runs (admin DB panel)."""
-    run_tracking.record_activity(
-        user, agent_id=CREATIVE_AGENT_ID, agent_name=CREATIVE_AGENT_NAME,
-        category="design", action=action, task=task,
-        brand_id=(run or {}).get("brand_id"), run_id=(run or {}).get("id"),
-        usage_action=usage_action,
-    )
+#: Every unit of Creative Agent work lands here — see THE RULE in run_tracking.py.
+#: The steps between "run created" and "artifacts produced" (intent, plan, plan
+#: edits, approval, manual override) are deliberately outside it: the run is the
+#: unit of work, not each click inside it.
+trail = ActivityTrail(agent_id=CREATIVE_AGENT_ID, agent_name=CREATIVE_AGENT_NAME,
+                      category="design")
 
 
 # --------------------------------------------------------------------------- #
@@ -116,7 +113,9 @@ class CreateBody(BaseModel):
 
 
 @router.post("/creative/runs")
-def create(body: CreateBody, user: dict = Depends(get_current_user)) -> dict:
+def create(body: CreateBody, user: dict = Depends(get_current_user),
+           act: Activity = trail.records("creative_run", "Started a creative run",
+                                         unit=JOB)) -> dict:
     if not rl.is_known_type(body.creative_type):
         raise HTTPException(400, f"Unknown creative type: {body.creative_type}")
     if not rl.routes_to_creative_agent(body.creative_type):
@@ -130,9 +129,8 @@ def create(body: CreateBody, user: dict = Depends(get_current_user)) -> dict:
         brand_id=body.brand_id, brief=body.brief, autonomous=body.autonomous,
         text_mode=body.text_mode,
     )
-    _track(user, "creative_run",
-           f"{body.creative_type} — “{body.brief[:160]}”" if body.brief else body.creative_type,
-           run, usage_action="session")
+    act.note(f"{body.creative_type} — “{body.brief[:160]}”" if body.brief else body.creative_type,
+             brand_id=run.get("brand_id"), run_id=run.get("id"))
     return _to_client(run)
 
 
@@ -147,12 +145,14 @@ class IntentBody(BaseModel):
 
 
 @router.post("/creative/runs/{run_id}/intent")
+@silent("gathers the brief inside an open run — the run is the recorded unit")
 def intent(run_id: str, body: IntentBody, user: dict = Depends(get_current_user)) -> dict:
     run = _owned(run_id, user)
     return _to_client(pipeline.gather_intent(run, brief=body.brief, answers=body.answers))
 
 
 @router.post("/creative/runs/{run_id}/acknowledge")
+@silent("records the autonomy warning inside an open run — no spend, no output")
 def acknowledge(run_id: str, user: dict = Depends(get_current_user)) -> dict:
     run = _owned(run_id, user)
     return _to_client(pipeline.acknowledge(run))
@@ -164,6 +164,8 @@ class PlanBody(BaseModel):
 
 
 @router.post("/creative/runs/{run_id}/plan")
+@silent("in-run planning the user re-runs freely while iterating; the run row "
+        "and the generate that follows are the recorded units")
 def plan(run_id: str, body: PlanBody = Body(default=PlanBody()),
          user: dict = Depends(get_current_user)) -> dict:
     run = _owned(run_id, user)
@@ -179,6 +181,7 @@ class PlanTextBody(BaseModel):
 
 
 @router.post("/creative/runs/{run_id}/plan/text")
+@silent("per-slide copy editing inside an open run — the generate records the result")
 def plan_text(run_id: str, body: PlanTextBody,
               user: dict = Depends(get_current_user)) -> dict:
     """Apply the user's exact per-slide headline/sub-text to a carousel plan before
@@ -191,6 +194,7 @@ def plan_text(run_id: str, body: PlanTextBody,
 
 
 @router.post("/creative/runs/{run_id}/plan/approve")
+@silent("a gate inside an open run, not a unit of work on its own")
 def approve(run_id: str, user: dict = Depends(get_current_user)) -> dict:
     run = _owned(run_id, user)
     try:
@@ -200,7 +204,9 @@ def approve(run_id: str, user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.post("/creative/runs/{run_id}/generate")
-def generate(run_id: str, user: dict = Depends(get_current_user)) -> dict:
+def generate(run_id: str, user: dict = Depends(get_current_user),
+             act: Activity = trail.records("creative_generate",
+                                           "Rendered a creative")) -> dict:
     run = _owned(run_id, user)
     try:
         result = pipeline.produce(run)
@@ -208,9 +214,9 @@ def generate(run_id: str, user: dict = Depends(get_current_user)) -> dict:
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:  # engine missing (reportlab/python-pptx)
         raise HTTPException(503, str(exc)) from exc
-    _track(user, "creative_generate",
-           f"Rendered {result.get('creative_type', '')} — {len(result.get('artifacts', []))} artifacts",
-           result)
+    act.note(f"Rendered {result.get('creative_type', '')} — "
+             f"{len(result.get('artifacts', []))} artifacts",
+             brand_id=result.get("brand_id"), run_id=result.get("id"))
     return _to_client(result)
 
 
@@ -221,7 +227,9 @@ class AutoBody(BaseModel):
 
 @router.post("/creative/runs/{run_id}/autonomous")
 def autonomous(run_id: str, body: AutoBody = Body(default=AutoBody()),
-               user: dict = Depends(get_current_user)) -> dict:
+               user: dict = Depends(get_current_user),
+               act: Activity = trail.records("creative_autonomous",
+                                             "Autonomous creative run")) -> dict:
     run = _owned(run_id, user)
     try:
         result = pipeline.run_autonomous(run, count=body.count, use_llm=body.use_llm)
@@ -232,13 +240,14 @@ def autonomous(run_id: str, body: AutoBody = Body(default=AutoBody()),
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
-    _track(user, "creative_autonomous",
-           f"Autonomous {result.get('creative_type', '')} run — "
-           f"{len(result.get('artifacts', []))} artifacts", result)
+    act.note(f"Autonomous {result.get('creative_type', '')} run — "
+             f"{len(result.get('artifacts', []))} artifacts",
+             brand_id=result.get("brand_id"), run_id=result.get("id"))
     return _to_client(result)
 
 
 @router.post("/creative/runs/{run_id}/override")
+@silent("hands control of an open run back to the user — nothing produced")
 def override(run_id: str, user: dict = Depends(get_current_user)) -> dict:
     run = _owned(run_id, user)
     return _to_client(pipeline.take_manual_control(run))

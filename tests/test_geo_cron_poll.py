@@ -35,8 +35,11 @@ def _offline(monkeypatch, tmp_path):
     monkeypatch.delenv("GEO_CRON_BUDGET_SECONDS", raising=False)
     monkeypatch.setattr(insights, "list_brands", lambda: list(BRANDS))
     # the sweep itself is proven in the agent's own tests; here we care about
-    # who gets swept, and what the scheduler is told
-    monkeypatch.setattr("app.routers.geo.run_tracking.record_activity",
+    # who gets swept, and what the scheduler is told. The trail is stubbed at
+    # its writer (routers reach it through the shared ActivityTrail now, so
+    # there is no per-router seam left to patch) — what the cron records is
+    # asserted in tests/test_agent_run_logging.py instead.
+    monkeypatch.setattr("app.services.run_tracking.record_activity",
                         lambda *a, **k: None)
 
 

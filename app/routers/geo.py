@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.security import get_current_user, require_creator
-from app.services import run_tracking
+from app.services.run_tracking import CHANGE, CRON, JOB, Activity, ActivityTrail
 from final_geo_agent import (
     geo_compare, geo_engines, geo_history, geo_poll, geo_prompts, geo_strategy,
     geo_window, opt_pipeline,
@@ -32,15 +32,13 @@ GEO_AGENT_ID = "a10"
 GEO_AGENT_NAME = "GEO"
 
 
-def _track(user: dict, action: str, task: str, brand: dict | None = None,
-           *, usage_action: str = "generate") -> None:
-    """Mandatory usage trail → agent_runs__a10 + master runs (admin DB panel)."""
-    run_tracking.record_activity(
-        user, agent_id=GEO_AGENT_ID, agent_name=GEO_AGENT_NAME, category="seo",
-        action=action, task=task,
-        brand=(brand or {}).get("name"), brand_id=(brand or {}).get("id"),
-        usage_action=usage_action,
-    )
+#: Every unit of GEO work lands here — see THE RULE in run_tracking.py.
+trail = ActivityTrail(agent_id=GEO_AGENT_ID, agent_name=GEO_AGENT_NAME, category="seo")
+
+
+def _for(act: Activity, brand: dict) -> None:
+    """Stamp the brand this unit of work was about onto its trail row."""
+    act.note(brand=brand.get("name"), brand_id=brand.get("id"))
 
 
 # Least wall clock worth handing a brand. Below this a step cannot finish even
@@ -189,16 +187,17 @@ def get_prompts(brand: dict = Depends(reader_brand)) -> dict:
 
 @router.post("/geo/brands/{brand_id}/prompts/generate")
 def generate_prompts(
-    brand: dict = Depends(creator_brand), _creator: dict = Depends(require_creator)
+    brand: dict = Depends(creator_brand),
+    act: Activity = trail.records("prompts_generate", "Generated a prompt universe"),
 ) -> dict:
+    _for(act, brand)
     try:
         universe = geo_prompts.generate_universe(brand)
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    _track(_creator, "prompts_generate",
-           f"Generated prompt universe — {len(universe.get('prompts', []))} prompts", brand)
+    act.note(f"Generated prompt universe — {len(universe.get('prompts', []))} prompts")
     return universe
 
 
@@ -206,24 +205,28 @@ def generate_prompts(
 def add_custom_prompt(
     body: CustomPromptIn,
     brand: dict = Depends(creator_brand),
-    _creator: dict = Depends(require_creator),
+    act: Activity = trail.records("prompt_custom_add", "Added a custom prompt"),
 ) -> dict:
+    _for(act, brand)
     try:
         universe = geo_prompts.add_custom_prompt(
             brand["id"], body.text, body.intent, body.stage
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    _track(_creator, "prompt_custom_add", f"Custom prompt added: {body.text[:60]}", brand)
+    act.note(f"Custom prompt added: {body.text[:60]}")
     return universe
 
 
 @router.put("/geo/brands/{brand_id}/prompts")
 def put_prompts(
     body: PromptsIn, brand: dict = Depends(creator_brand),
+    act: Activity = trail.records("prompts_saved", "Edited the prompt universe", unit=CHANGE),
 ) -> dict:
     if not body.prompts:
         raise HTTPException(status_code=422, detail="At least one prompt is required")
+    _for(act, brand)
+    act.note(f"Prompt universe saved — {len(body.prompts)} prompts")
     return geo_prompts.save_universe(
         brand["id"], [p.model_dump() for p in body.prompts]
     )
@@ -237,6 +240,7 @@ def get_geo_brand_config(brand: dict = Depends(reader_brand)) -> dict:
 @router.put("/geo/brands/{brand_id}/config")
 def put_geo_brand_config(
     body: ConfigIn, brand: dict = Depends(creator_brand),
+    act: Activity = trail.records("config_saved", "Edited the GEO brand config", unit=CHANGE),
 ) -> dict:
     # Seed the defaults first. ``save_config`` patches whatever document it
     # finds, so a config first written by this endpoint (tracking a competitor
@@ -245,6 +249,8 @@ def put_geo_brand_config(
     # own answers.
     geo_poll.ensure_config(brand)
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    _for(act, brand)
+    act.note(f"GEO config saved — {', '.join(sorted(patch)) or 'no fields'}")
     return geo_poll.save_config(brand["id"], patch)
 
 
@@ -252,8 +258,9 @@ def put_geo_brand_config(
 def poll_step(
     body: PollIn,
     brand: dict = Depends(reader_brand),
-    user: dict = Depends(get_current_user),
+    act: Activity = trail.records("poll_step", "AI answer poll"),
 ) -> dict:
+    _for(act, brand)
     try:
         result = geo_poll.poll_step(
             brand, engines=body.engines, runs=body.runs, batch_size=body.batch_size
@@ -263,7 +270,7 @@ def poll_step(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     engines = ", ".join(body.engines) if body.engines else "all engines"
-    _track(user, "poll_step", f"AI answer poll ({engines}, batch {body.batch_size})", brand)
+    act.note(f"AI answer poll ({engines}, batch {body.batch_size})")
     return result
 
 
@@ -339,7 +346,7 @@ def comparison(
 def rescan(
     body: RescanIn,
     brand: dict = Depends(creator_brand),
-    _creator: dict = Depends(require_creator),
+    act: Activity = trail.records("rescan_mentions", "Rescanned stored answers", unit=CHANGE),
 ) -> dict:
     """Re-read stored answers with the current competitor list.
 
@@ -348,11 +355,10 @@ def rescan(
     this finds their name in it now — zero engine calls, no new spend. Creator
     only, because it rewrites stored measurements.
     """
+    _for(act, brand)
     result = geo_poll.rescan_mentions(brand, days=body.days)
-    _track(_creator, "rescan_mentions",
-           f"Rescanned {result['answers_scanned']} stored answers "
-           f"({result['answers_updated']} updated) over {result['days']} days",
-           brand, usage_action="edit")
+    act.note(f"Rescanned {result['answers_scanned']} stored answers "
+             f"({result['answers_updated']} updated) over {result['days']} days")
     return result
 
 
@@ -417,10 +423,12 @@ class OptimizerRescoreIn(BaseModel):
 
 
 @router.post("/geo/optimizer/analyze")
-def optimizer_analyze(body: OptimizerAnalyzeIn, user: dict = Depends(get_current_user)) -> dict:
+def optimizer_analyze(body: OptimizerAnalyzeIn,
+                      act: Activity = trail.records("optimizer_analyze",
+                                                    "Content Optimizer analysis")) -> dict:
     """Fresh SERP snapshot + profiles (+ draft score when a draft is sent).
     Costs one Serper call + ~20 page fetches + embeddings; snapshot is pinned."""
-    _track(user, "optimizer_analyze", f"Content Optimizer: {body.keyword}")
+    act.note(f"Content Optimizer: {body.keyword}")
     try:
         return opt_pipeline.analyze(
             body.keyword, body.locale, body.draft,
@@ -433,10 +441,12 @@ def optimizer_analyze(body: OptimizerAnalyzeIn, user: dict = Depends(get_current
 
 
 @router.post("/geo/optimizer/rescore")
-def optimizer_rescore(body: OptimizerRescoreIn, user: dict = Depends(get_current_user)) -> dict:
+def optimizer_rescore(body: OptimizerRescoreIn,
+                      act: Activity = trail.records("optimizer_rescore",
+                                                    "Content Optimizer re-score")) -> dict:
     """Re-score an edited draft against the PINNED snapshot — deterministic,
     no new SERP call. Refresh = run analyze again explicitly."""
-    _track(user, "optimizer_rescore", f"Re-score draft vs {body.analysis_id}")
+    act.note(f"Re-score draft vs {body.analysis_id}")
     try:
         return opt_pipeline.rescore(body.analysis_id, body.draft)
     except KeyError as exc:
@@ -467,17 +477,19 @@ class ActionStatusIn(BaseModel):
 
 @router.post("/geo/brands/{brand_id}/strategy/generate")
 def strategy_generate(
-    brand: dict = Depends(creator_brand), _creator: dict = Depends(require_creator)
+    brand: dict = Depends(creator_brand),
+    act: Activity = trail.records("strategy_generate", "Generated an Action Plan"),
 ) -> dict:
     """Full-model GEO strategy grounded in this week's measured numbers; the
     plan stores its baseline so the panel can show baseline → current later."""
+    _for(act, brand)
     try:
         doc = geo_strategy.generate_strategy(brand)
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    _track(_creator, "strategy_generate", "Action Plan generated from measured baseline", brand)
+    act.note("Action Plan generated from measured baseline")
     return doc
 
 
@@ -491,23 +503,25 @@ def strategy_get(brand: dict = Depends(reader_brand)) -> dict:
 def strategy_action_status(
     action_id: str, body: ActionStatusIn,
     brand: dict = Depends(reader_brand),
-    user: dict = Depends(get_current_user),
+    act: Activity = trail.records("strategy_action", "Moved an Action Plan item", unit=CHANGE),
 ) -> dict:
+    _for(act, brand)
     try:
         doc = geo_strategy.set_action_status(brand["id"], action_id, body.status)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    _track(user, "strategy_action", f"Action {action_id} → {body.status}", brand,
-           usage_action="edit")
+    act.note(f"Action {action_id} → {body.status}")
     return doc
 
 
 # ------------------------------- cron -------------------------------
 
 @router.post("/geo/cron/poll")
-def cron_poll(request: Request, response: Response) -> dict:
+def cron_poll(request: Request, response: Response,
+              act: Activity = trail.records("cron_poll", "Scheduled AI answer poll",
+                                            unit=JOB, actor=CRON)) -> dict:
     """Scheduled, unattended polling — the path that replaces a half-hour of
     someone holding a browser tab open.
 
@@ -594,9 +608,7 @@ def cron_poll(request: Request, response: Response) -> dict:
         logger.warning("GEO cron poll degraded: %d/%d brands failed", failed, len(results))
 
     swept = ", ".join(f"{b}: {r.get('done')}/{r.get('total')}" for b, r in results.items())
-    _track(run_tracking.CRON_USER, "cron_poll",
-           f"Scheduled AI answer poll — {len(results)} swept, {len(skipped)} not due, "
-           f"{len(unreached)} out of time"
-           + (f" ({swept})" if swept else ""),
-           usage_action="session")
+    act.note(f"Scheduled AI answer poll — {len(results)} swept, {len(skipped)} not due, "
+             f"{len(unreached)} out of time" + (f" ({swept})" if swept else ""),
+             status=out["status"])
     return out

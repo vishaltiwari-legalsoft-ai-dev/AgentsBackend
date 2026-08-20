@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from app.security import get_current_user, require_creator
-from app.services import run_tracking
+from app.services.run_tracking import CHANGE, CRON, JOB, Activity, ActivityTrail
 from seo_geo_agent import advisor as seo_advisor
 from seo_geo_agent import gsc_oauth as seo_oauth
 from seo_geo_agent import site_brain as seo_site
@@ -40,15 +40,13 @@ SEO_AGENT_NAME = "SEO Analyst"
 TODO_STATUSES = {"todo", "assigned", "done"}
 
 
-def _track(user: dict, action: str, task: str, brand: dict | None = None,
-           *, usage_action: str = "generate") -> None:
-    """Mandatory usage trail → agent_runs__a2 + master runs (admin DB panel)."""
-    run_tracking.record_activity(
-        user, agent_id=SEO_AGENT_ID, agent_name=SEO_AGENT_NAME, category="seo",
-        action=action, task=task,
-        brand=(brand or {}).get("name"), brand_id=(brand or {}).get("id"),
-        usage_action=usage_action,
-    )
+#: Every unit of SEO Analyst work lands here — see THE RULE in run_tracking.py.
+trail = ActivityTrail(agent_id=SEO_AGENT_ID, agent_name=SEO_AGENT_NAME, category="seo")
+
+
+def _for(act: Activity, brand: dict) -> None:
+    """Stamp the brand this unit of work was about onto its trail row."""
+    act.note(brand=brand.get("name"), brand_id=brand.get("id"))
 
 
 class BrandIn(BaseModel):
@@ -143,7 +141,8 @@ def overview(user=Depends(get_current_user)):
 
 
 @router.post("/seo-geo/brands")
-def save_brand(payload: BrandIn, user=Depends(require_creator)):
+def save_brand(payload: BrandIn, user=Depends(require_creator),
+               act: Activity = trail.records("brand_saved", "Saved a brand", unit=CHANGE)):
     slug = re.sub(r"[^a-z0-9]+", "-", (payload.id or payload.name).lower()).strip("-")
     if not slug:
         raise HTTPException(status_code=422, detail="Brand needs a name")
@@ -158,21 +157,26 @@ def save_brand(payload: BrandIn, user=Depends(require_creator)):
         "seeds": [s.strip() for s in payload.seeds if s.strip()][:10],
         "enabled": payload.enabled,
     }
+    _for(act, brand)
+    act.note(f"Brand saved — {brand['name']} ({domain})")
     return {"brands": insights.upsert_brand(brand)}
 
 
 @router.delete("/seo-geo/brands/{brand_id}")
-def remove_brand(brand_id: str, user=Depends(require_creator)):
-    _brand_or_404(brand_id)
+def remove_brand(brand_id: str, user=Depends(require_creator),
+                 act: Activity = trail.records("brand_deleted", "Deleted a brand", unit=CHANGE)):
+    _for(act, _brand_or_404(brand_id))
+    act.note(f"Brand deleted — {brand_id}")
     return {"brands": insights.delete_brand(brand_id)}
 
 
 @router.post("/seo-geo/run/{brand_id}")
-def run_brand(brand_id: str, user=Depends(get_current_user)):
+def run_brand(brand_id: str, user=Depends(get_current_user),
+              act: Activity = trail.records("run", "Full SEO refresh", unit=JOB)):
     brand = _brand_or_404(brand_id)
+    _for(act, brand)
     run = insights.run_brand(brand, trigger=f"manual:{user['email']}")
-    _track(user, "run", f"Full SEO refresh — {len(run['todos'])} to-dos, "
-                        f"{len(run['topics'])} topics", brand, usage_action="session")
+    act.note(f"Full SEO refresh — {len(run['todos'])} to-dos, {len(run['topics'])} topics")
     return {"at": run["at"], "summary": run["summary"], "degraded": run["degraded"],
             "todo_count": len(run["todos"]), "topic_count": len(run["topics"])}
 
@@ -214,14 +218,16 @@ def brand_detail(brand_id: str, user=Depends(get_current_user)):
 
 
 @router.post("/seo-geo/site-review/{brand_id}")
-def run_site_review(brand_id: str, user=Depends(get_current_user)):
+def run_site_review(brand_id: str, user=Depends(get_current_user),
+                    act: Activity = trail.records("site_review", "Expert site review")):
     """Crawl the brand's site, build the corpus, and run the expert review."""
     brand = _brand_or_404(brand_id)
+    _for(act, brand)
     try:
         review = seo_site.analyze(brand)
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    _track(user, "site_review", f"Expert site review of {brand['domain']}", brand)
+    act.note(f"Expert site review of {brand['domain']}")
     return review
 
 
@@ -240,8 +246,10 @@ def get_pages(brand_id: str, user=Depends(get_current_user)):
 
 
 @router.post("/seo-geo/pages/{brand_id}/refresh")
-def refresh_pages(brand_id: str, user=Depends(get_current_user)):
+def refresh_pages(brand_id: str, user=Depends(get_current_user),
+                  act: Activity = trail.records("pages_refresh", "Rebuilt page intelligence")):
     brand = _brand_or_404(brand_id)
+    _for(act, brand)
     corpus = seo_state.load(f"corpus-{brand_id}") or {}
     if not corpus.get("pages"):
         raise HTTPException(status_code=409, detail="Run the site analysis first")
@@ -255,29 +263,34 @@ def refresh_pages(brand_id: str, user=Depends(get_current_user)):
         except CredentialMissing as exc:
             notes.append(f"Google Analytics: {exc}")
     intel = seo_pages.build_page_intel(brand, corpus["pages"], ga_pages, rows, data_notes=notes)
-    _track(user, "pages_refresh", f"Rebuilt page intelligence for {brand['domain']}", brand)
+    act.note(f"Rebuilt page intelligence for {brand['domain']}")
     return intel
 
 
 @router.post("/seo-geo/todos/{brand_id}/{todo_id}")
-def set_todo_status(brand_id: str, todo_id: str, payload: TodoStatusIn, user=Depends(get_current_user)):
-    _brand_or_404(brand_id)
+def set_todo_status(brand_id: str, todo_id: str, payload: TodoStatusIn,
+                    user=Depends(get_current_user),
+                    act: Activity = trail.records("todo_status", "Moved a to-do", unit=CHANGE)):
+    _for(act, _brand_or_404(brand_id))
     if payload.status not in TODO_STATUSES:
         raise HTTPException(status_code=422, detail=f"Status must be one of {sorted(TODO_STATUSES)}")
     insights.set_todo_status(brand_id, todo_id, payload.status)
+    act.note(f"To-do {todo_id} → {payload.status}")
     return {"id": todo_id, "status": payload.status}
 
 
 # ------------------------- keyword lab -------------------------
 
 @router.post("/seo-geo/keywords/{brand_id}/run")
-def run_keyword_lab(brand_id: str, user=Depends(get_current_user)):
+def run_keyword_lab(brand_id: str, user=Depends(get_current_user),
+                    act: Activity = trail.records("keyword_lab", "Keyword lab run")):
     brand = seo_site.effective_seeds(_brand_or_404(brand_id))
+    _for(act, brand)
     rows, notes = _rows_28d(brand)
     lab = seo_keywords.run_keyword_lab(
         brand, rows, trigger=f"manual:{user['email']}", extra_notes=notes
     )
-    _track(user, "keyword_lab", f"Keyword lab run — {len(lab.get('clusters', []))} clusters", brand)
+    act.note(f"Keyword lab run — {len(lab.get('clusters', []))} clusters")
     return lab
 
 
@@ -303,17 +316,24 @@ def get_competitors(brand_id: str, user=Depends(get_current_user)):
 
 
 @router.put("/seo-geo/competitors/{brand_id}")
-def set_competitors(brand_id: str, payload: CompetitorsIn, user=Depends(require_creator)):
+def set_competitors(brand_id: str, payload: CompetitorsIn, user=Depends(require_creator),
+                    act: Activity = trail.records("competitors_saved",
+                                                  "Edited the tracked competitors", unit=CHANGE)):
     brand = _brand_or_404(brand_id)
+    _for(act, brand)
     brand["competitors"] = [d.strip().lower() for d in payload.domains if d.strip()][:8]
     insights.upsert_brand(brand)
+    act.note(f"Tracked competitors set to {', '.join(brand['competitors']) or 'none'}")
     return {"tracked": brand["competitors"]}
 
 
 @router.post("/seo-geo/competitors/{brand_id}/track")
-def track_competitors(brand_id: str, user=Depends(get_current_user)):
+def track_competitors(brand_id: str, user=Depends(get_current_user),
+                      act: Activity = trail.records("competitor_track",
+                                                    "Rank snapshot + competitor sitemap check")):
     """Take a rank snapshot + check competitor sitemaps for new content, now."""
     brand = _brand_or_404(brand_id)
+    _for(act, brand)
     degraded: list[str] = []
     try:
         seo_competitors.rank_snapshot(brand)
@@ -324,19 +344,20 @@ def track_competitors(brand_id: str, user=Depends(get_current_user)):
         feed = seo_competitors.sitemap_watch(brand)
     except CredentialMissing as exc:
         degraded.append(f"Sitemap watch: {exc}")
-    _track(user, "competitor_track", "Rank snapshot + competitor sitemap check", brand)
     return {"shifts": seo_competitors.rank_shifts(brand_id), "feed": feed, "degraded": degraded}
 
 
 @router.post("/seo-geo/serp/{brand_id}")
-def serp_xray(brand_id: str, payload: QueryIn, user=Depends(get_current_user)):
+def serp_xray(brand_id: str, payload: QueryIn, user=Depends(get_current_user),
+              act: Activity = trail.records("serp_xray", "SERP X-ray")):
     """Reverse-engineer the top of the SERP for any query, on demand."""
     brand = _brand_or_404(brand_id)
+    _for(act, brand)
     try:
         result = seo_competitors.serp_deep_dive(brand, payload.query.strip())
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    _track(user, "serp_xray", f"SERP X-ray: “{payload.query.strip()}”", brand)
+    act.note(f"SERP X-ray: “{payload.query.strip()}”")
     return result
 
 
@@ -347,14 +368,16 @@ def get_competitor_profiles(brand_id: str, user=Depends(get_current_user)):
 
 
 @router.post("/seo-geo/competitors/{brand_id}/profiles/refresh")
-def refresh_competitor_profiles(brand_id: str, user=Depends(get_current_user)):
+def refresh_competitor_profiles(brand_id: str, user=Depends(get_current_user),
+                               act: Activity = trail.records("competitor_profiles",
+                                                             "Rebuilt top-competitor profiles")):
     """Rebuild the top-5 competitor profiles: visibility, keywords won, content feed."""
     brand = _brand_or_404(brand_id)
+    _for(act, brand)
     try:
         profiles = seo_competitors.build_profiles(brand)
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    _track(user, "competitor_profiles", "Rebuilt top-competitor profiles", brand)
     return profiles
 
 
@@ -367,20 +390,24 @@ def get_briefs(brand_id: str, user=Depends(get_current_user)):
 
 
 @router.post("/seo-geo/briefs/{brand_id}")
-def build_brief(brand_id: str, payload: KeywordIn, user=Depends(get_current_user)):
+def build_brief(brand_id: str, payload: KeywordIn, user=Depends(get_current_user),
+                act: Activity = trail.records("brief", "Built a content brief")):
     brand = _brand_or_404(brand_id)
+    _for(act, brand)
     rows, _ = _rows_28d(brand)
     try:
         brief = seo_briefs.build_brief(brand, payload.keyword.strip(), rows)
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    _track(user, "brief", f"Content brief for “{payload.keyword.strip()}”", brand)
+    act.note(f"Content brief for “{payload.keyword.strip()}”")
     return brief
 
 
 @router.post("/seo-geo/update-plan/{brand_id}")
-def build_update_plan(brand_id: str, payload: PageIn, user=Depends(get_current_user)):
+def build_update_plan(brand_id: str, payload: PageIn, user=Depends(get_current_user),
+                      act: Activity = trail.records("update_plan", "Built an update plan")):
     brand = _brand_or_404(brand_id)
+    _for(act, brand)
     rows, _ = _rows_28d(brand)
     try:
         plan = seo_briefs.update_plan(brand, payload.page.strip(), rows)
@@ -388,20 +415,22 @@ def build_update_plan(brand_id: str, payload: PageIn, user=Depends(get_current_u
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    _track(user, "update_plan", f"Update plan for {payload.page.strip()}", brand)
+    act.note(f"Update plan for {payload.page.strip()}")
     return plan
 
 
 # ------------------------- audit & draft scoring -------------------------
 
 @router.post("/seo-geo/audit/{brand_id}/run")
-def run_audit(brand_id: str, user=Depends(get_current_user)):
+def run_audit(brand_id: str, user=Depends(get_current_user),
+              act: Activity = trail.records("audit", "Technical site audit")):
     brand = _brand_or_404(brand_id)
+    _for(act, brand)
     try:
         report = seo_audit.site_audit(brand)
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    _track(user, "audit", f"Technical site audit of {brand['domain']}", brand)
+    act.note(f"Technical site audit of {brand['domain']}")
     return report
 
 
@@ -412,15 +441,17 @@ def get_audit(brand_id: str, user=Depends(get_current_user)):
 
 
 @router.post("/seo-geo/draft-score/{brand_id}")
-def draft_score(brand_id: str, payload: DraftIn, user=Depends(get_current_user)):
+def draft_score(brand_id: str, payload: DraftIn, user=Depends(get_current_user),
+                act: Activity = trail.records("draft_score", "Scored a draft")):
     brand = _brand_or_404(brand_id)
+    _for(act, brand)
     brief = next(
         (b for b in seo_briefs.list_briefs(brand_id)
          if b["keyword"].lower() == payload.keyword.strip().lower()),
         None,
     )
     score = seo_audit.score_draft(brand, payload.text, payload.keyword.strip(), brief)
-    _track(user, "draft_score", f"Scored a draft for “{payload.keyword.strip()}”", brand)
+    act.note(f"Scored a draft for “{payload.keyword.strip()}”")
     return score
 
 
@@ -498,16 +529,21 @@ def oauth_callback(request: Request, code: str = "", state: str = "", error: str
 
 
 @router.post("/seo-geo/oauth/disconnect/{brand_id}")
-def oauth_disconnect(brand_id: str, user=Depends(require_creator)):
-    _brand_or_404(brand_id)
+def oauth_disconnect(brand_id: str, user=Depends(require_creator),
+                     act: Activity = trail.records("gsc_disconnect",
+                                                   "Disconnected Search Console", unit=CHANGE)):
+    _for(act, _brand_or_404(brand_id))
     seo_oauth.disconnect(brand_id)
+    act.note(f"Search Console disconnected for {brand_id}")
     return {"connected": False}
 
 
 @router.post("/seo-geo/ask/{brand_id}")
-def ask_expert(brand_id: str, payload: AskIn, user=Depends(get_current_user)):
+def ask_expert(brand_id: str, payload: AskIn, user=Depends(get_current_user),
+               act: Activity = trail.records("ask", "Asked the SEO strategist")):
     """Grounded SEO-strategist chat over everything the agent knows about the brand."""
     brand = _brand_or_404(brand_id)
+    _for(act, brand)
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=422, detail="Ask a question")
@@ -515,14 +551,16 @@ def ask_expert(brand_id: str, payload: AskIn, user=Depends(get_current_user)):
         answer = seo_advisor.ask(brand, question)
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    _track(user, "ask", f"Asked: {question}", brand)
+    act.note(f"Asked: {question}")
     return answer
 
 
 # ------------------------------- cron -------------------------------
 
 @router.post("/seo-geo/cron/run")
-def cron_run(request: Request, response: Response):
+def cron_run(request: Request, response: Response,
+             act: Activity = trail.records("cron", "Scheduled SEO sweep",
+                                           unit=JOB, actor=CRON)):
     """Scheduled per-brand sweep.
 
     Status is honest: 200 every brand ran, 207 some brands failed, 502 EVERY
@@ -572,7 +610,6 @@ def cron_run(request: Request, response: Response):
         logger.warning("SEO cron sweep degraded: %d/%d brands failed", failed, len(results))
     else:
         out["status"] = "ok"
-    _track(run_tracking.CRON_USER, "cron",
-           f"Scheduled sweep across {len(results)} brands — {ok} ok, {failed} failed",
-           usage_action="session")
+    act.note(f"Scheduled sweep across {len(results)} brands — {ok} ok, {failed} failed",
+             status=str(out["status"]))
     return out

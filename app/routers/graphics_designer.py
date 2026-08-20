@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 
 from app.security import get_current_user
 from app.services import firestore_repo, imaging, storage
+from app.services.run_tracking import (CHANGE, JOB, ActivityTrail, StagedActivity,
+                                       silent)
 
 from graphics_designer_agent import (
     pipeline,
@@ -61,17 +63,16 @@ def _pack_for_run(run: dict):
     return registry.get_pack(run.get("brand_id"))
 
 
-def _log_usage(user: dict, action: str, *, count: int = 1, brand: str | None = None) -> None:
-    """Best-effort usage event for the Home dashboard (never breaks the request)."""
-    firestore_repo.log_usage_event(
-        user_id=str(user["id"]),
-        email=str(user.get("email", "")),
-        agent_id=GD_AGENT_ID,
-        category=GD_AGENT_CATEGORY,
-        action=action,
-        count=count,
-        brand=brand,
-    )
+#: The Graphics Designer's trail, in the STAGED shape — one document per run,
+#: updated in place as the run moves through its four stages, rather than one
+#: document per request. A single creative is fifteen-plus requests; an event
+#: row for each would be twenty documents describing one picture. See THE RULE
+#: and "TWO SHAPES OF THE SAME TRAIL" in app/services/run_tracking.py: this is a
+#: declared shape of the shared trail writing the same three stores, not a
+#: private bypass — which is what it was while the enforcement test had to
+#: special-case this file by name to let it through.
+trail = ActivityTrail(agent_id=GD_AGENT_ID, agent_name="Graphics Designer",
+                      category=GD_AGENT_CATEGORY)
 
 
 # GD runs through 4 stages → status slots A,B,C,D in the run tables.
@@ -96,23 +97,14 @@ def _creative_summary(run: dict) -> str:
     return f"{base} — “{head}”" if head else base
 
 
-def _start_run(user: dict, run: dict) -> None:
-    """Open the Table-1 (per-agent) and Table-2 (master) rows for a new GD run."""
-    firestore_repo.start_run(
-        run_id=str(run.get("id")),
-        agent_id=GD_AGENT_ID,
-        agent_name="Graphics Designer",
-        user_id=str(user["id"]),
-        user=str(user.get("email", "")),
-        session_id=str(user.get("session_id") or ""),
-        timezone=str(user.get("timezone") or "UTC"),
-        brand=_brand_name(run),
-        brand_id=run.get("brand_id"),
-        stages=GD_STAGE_LABELS,
-    )
+def _open_run(act: StagedActivity, run: dict) -> None:
+    """Open this run's row with the four stage slots it will fill."""
+    act.opened(str(run.get("id")), stages=GD_STAGE_LABELS,
+               brand=_brand_name(run), brand_id=run.get("brand_id"))
 
 
 def _advance_run(
+    act: StagedActivity,
     run: dict,
     *,
     stage: int,
@@ -120,7 +112,7 @@ def _advance_run(
     attempt: dict | None = None,
     run_status: str | None = None,
 ) -> None:
-    """Update a run's per-stage status + master row as a stage is generated,
+    """Move a run's per-stage status + master row as a stage is generated,
     approved, or the run completes (stage is 1-based; slot index = stage-1)."""
     asset = None
     if attempt and attempt.get("artifact"):
@@ -132,15 +124,16 @@ def _advance_run(
             "artifact": artifact,
             "url": _artifact_url(rid, artifact),
         }
-    firestore_repo.update_run(
-        run_id=str(run.get("id")),
-        agent_id=GD_AGENT_ID,
-        stage_index=stage - 1,
+    act.note(brand=_brand_name(run), brand_id=run.get("brand_id"))
+    act.advanced(
+        str(run.get("id")),
+        stage=stage,
         stage_status=stage_status,
         asset=asset,
         summary=_creative_summary(run),
         run_status=run_status,
     )
+
 
 def _archive_final_image(user: dict, run: dict) -> None:
     """Archive a COMPLETED run's final creative into the admin Image Library.
@@ -677,7 +670,10 @@ class CreateRunBody(BaseModel):
 
 @router.post("/gd/runs")
 def create_run_endpoint(body: CreateRunBody = Body(default=CreateRunBody()),
-                        user: dict = Depends(get_current_user)) -> dict:
+                        user: dict = Depends(get_current_user),
+                        act: StagedActivity = trail.stages(
+                            "run_created", "Started a Graphics Designer run",
+                            unit=JOB)) -> dict:
     from graphics_designer_agent.runs import create_run, save_run
 
     if body.aspect_ratio is not None and body.aspect_ratio not in ASPECT_RATIOS:
@@ -706,8 +702,7 @@ def create_run_endpoint(body: CreateRunBody = Body(default=CreateRunBody()),
         changed = True
     if changed:
         save_run(run)
-    _log_usage(user, "session", brand=body.brand_id)  # one run = one GD session
-    _start_run(user, run)  # open the Table-1 + Table-2 rows for this run
+    _open_run(act, run)  # one run = one GD session, one row in the run tables
     return _to_client(run)
 
 
@@ -760,6 +755,8 @@ class ConfigBody(BaseModel):
 
 
 @router.post("/gd/runs/{run_id}/config")
+@silent("patches the working state of an open run — fires on every editor "
+        "change; the run's own row is the record")
 def update_config(run_id: str, body: ConfigBody, user: dict = Depends(get_current_user)) -> dict:
     run = _owned_run(run_id, user)
     cfg = run["config"]
@@ -905,6 +902,7 @@ class TextPreviewBody(BaseModel):
 
 
 @router.post("/gd/runs/{run_id}/text-preview")
+@silent("renders a throwaway preview PNG — no model call, nothing persisted")
 def text_preview_endpoint(run_id: str, body: TextPreviewBody,
                           user: dict = Depends(get_current_user)) -> Response:
     """Live WYSIWYG preview of the Stage-3 text overlay.
@@ -920,6 +918,8 @@ def text_preview_endpoint(run_id: str, body: TextPreviewBody,
 
 
 @router.post("/gd/runs/{run_id}/suggest-placement")
+@silent("an in-run vision call the user re-rolls while arranging; it persists "
+        "nothing and the run's row is the record")
 def suggest_placement_endpoint(run_id: str, user: dict = Depends(get_current_user)) -> dict:
     """Propose a polished, premium arrangement for the Stage-3 elements present.
 
@@ -951,13 +951,14 @@ def suggest_placement_endpoint(run_id: str, user: dict = Depends(get_current_use
 
 
 @router.post("/gd/runs/{run_id}/generate")
-def generate_endpoint(run_id: str, body: GenerateBody, user: dict = Depends(get_current_user)) -> dict:
+def generate_endpoint(run_id: str, body: GenerateBody, user: dict = Depends(get_current_user),
+                      act: StagedActivity = trail.stages("generate",
+                                                         "Generated a stage")) -> dict:
     run = _owned_run(run_id, user)
     if body.stage == 3 and not _stage3_ready(run["config"]):
         raise HTTPException(409, "Approve the headline, highlight, CTA and every sub-heading before generating Stage 3.")
     attempt = _guard(lambda: pipeline.generate(run, body.stage, variant=body.variant))
-    _log_usage(user, "generate", brand=run.get("brand_id"))  # one creative produced
-    _advance_run(run, stage=body.stage, stage_status="generated", attempt=attempt)
+    _advance_run(act, run, stage=body.stage, stage_status="generated", attempt=attempt)
     payload = {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])},
                "run": _to_client(run)}
     if body.stage == 3 and attempt.get("set_id"):
@@ -1112,6 +1113,7 @@ async def stage4_endpoint(
     use_ai: bool = Form(default=False),
     logo_id: str | None = Form(default=None),
     user: dict = Depends(get_current_user),
+    act: StagedActivity = trail.stages("stage4", "Composed the final logo stage"),
 ) -> dict:
     run = _owned_run(run_id, user)
     # An uploaded file always wins (override); otherwise fall back to the brand's
@@ -1131,12 +1133,12 @@ async def stage4_endpoint(
             "No logo available — upload one, or pick a brand that has a logo in its kit.",
         )
     attempt = _guard(lambda: pipeline.generate_stage4(run, png, use_ai=use_ai))
-    _log_usage(user, "generate", brand=run.get("brand_id"))  # final logo composite
-    _advance_run(run, stage=4, stage_status="generated", attempt=attempt)
+    _advance_run(act, run, stage=4, stage_status="generated", attempt=attempt)
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
 
 
 @router.post("/gd/runs/{run_id}/elements/upload")
+@silent("stores an asset the caller supplied into an open run — no agent work")
 async def gd_element_upload(run_id: str, file: UploadFile = File(...),
                             user: dict = Depends(get_current_user)) -> dict:
     """Upload a transparent PNG/WebP to use as an ``image`` element. Returns the
@@ -1156,6 +1158,7 @@ async def gd_element_upload(run_id: str, file: UploadFile = File(...),
 
 
 @router.post("/gd/runs/{run_id}/subject/upload")
+@silent("stores an asset the caller supplied into an open run — no agent work")
 async def gd_subject_upload(run_id: str, file: UploadFile = File(...),
                             role: str = "subject",
                             user: dict = Depends(get_current_user)) -> dict:
@@ -1210,7 +1213,9 @@ class TweakBody(BaseModel):
 
 
 @router.post("/gd/runs/{run_id}/tweak")
-def tweak_endpoint(run_id: str, body: TweakBody, user: dict = Depends(get_current_user)) -> dict:
+def tweak_endpoint(run_id: str, body: TweakBody, user: dict = Depends(get_current_user),
+                   act: StagedActivity = trail.stages("tweak",
+                                                      "Retouched the final creative")) -> dict:
     """Step 5: guardrailed retouch of the approved final (spec 2026-07-15).
 
     Optional and user-initiated. A rejected tweak stores nothing and surfaces
@@ -1221,8 +1226,7 @@ def tweak_endpoint(run_id: str, body: TweakBody, user: dict = Depends(get_curren
         raise HTTPException(400, "Describe the change in 3–500 characters.")
     run = _owned_run(run_id, user)
     attempt = _guard(lambda: pipeline.generate_tweak(run, instruction))
-    _log_usage(user, "generate", brand=run.get("brand_id"))
-    _advance_run(run, stage=4, stage_status="generated", attempt=attempt)
+    _advance_run(act, run, stage=4, stage_status="generated", attempt=attempt)
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])},
             "run": _to_client(run)}
 
@@ -1233,12 +1237,15 @@ class ApproveBody(BaseModel):
 
 
 @router.post("/gd/runs/{run_id}/approve")
-def approve_endpoint(run_id: str, body: ApproveBody, user: dict = Depends(get_current_user)) -> dict:
+def approve_endpoint(run_id: str, body: ApproveBody, user: dict = Depends(get_current_user),
+                     act: StagedActivity = trail.stages("approve", "Approved a stage",
+                                                        unit=CHANGE)) -> dict:
     run = _owned_run(run_id, user)
     _guard(lambda: pipeline.approve(run, body.stage, body.attempt))
     # Mark this stage approved; approving Stage 4 (the logo composite) completes
     # the whole run.
     _advance_run(
+        act,
         run,
         stage=body.stage,
         stage_status="approved",
@@ -1255,6 +1262,8 @@ class BackBody(BaseModel):
 
 
 @router.post("/gd/runs/{run_id}/back")
+@silent("rewinds an open run to an earlier stage — the run's row already "
+        "carries where it stands")
 def back_endpoint(run_id: str, body: BackBody, user: dict = Depends(get_current_user)) -> dict:
     run = _owned_run(run_id, user)
     _guard(lambda: pipeline.go_back(run, body.stage))
@@ -1289,6 +1298,8 @@ class SuggestBody(BaseModel):
 
 
 @router.post("/gd/runs/{run_id}/suggest")
+@silent("the in-run strategist rail — one row per chat message would bury the "
+        "run it belongs to; the run's row is the record")
 def suggest_endpoint(run_id: str, body: SuggestBody, user: dict = Depends(get_current_user)) -> dict:
     run = _owned_run(run_id, user)
     pack = _pack_for_run(run)
@@ -1328,7 +1339,8 @@ class PlanBody(BaseModel):
 
 
 @router.post("/gd/runs/{run_id}/plan")
-def plan_endpoint(run_id: str, body: PlanBody, user: dict = Depends(get_current_user)) -> dict:
+def plan_endpoint(run_id: str, body: PlanBody, user: dict = Depends(get_current_user),
+                  act: StagedActivity = trail.stages("plan", "Auto-mode plan")) -> dict:
     """Auto mode: plan gradient / element / words / logo from the brief.
 
     Every pick is validated against the run's real pack inventory (retried with
@@ -1349,7 +1361,9 @@ def plan_endpoint(run_id: str, body: PlanBody, user: dict = Depends(get_current_
     cfg_brief["goal"] = plan["brief"]
     run["config"]["creative_brief"] = cfg_brief
     save_run(run)
-    _log_usage(user, "plan", brand=run.get("brand_id"))
+    # Counts toward this run's usage; the run's own row, opened at creation,
+    # is the audit record it belongs to.
+    act.note(brand=_brand_name(run), brand_id=run.get("brand_id"))
     return {"plan": plan, "run": _to_client(run)}
 
 
