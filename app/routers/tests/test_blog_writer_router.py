@@ -11,35 +11,26 @@ os.environ["BLOG_OFFLINE"] = "1"
 
 import app  # noqa: F401 - side effect: registers agent roots on sys.path
 import pytest
-from fastapi.testclient import TestClient
 
-from app.main import app as fastapi_app
-from app.security import get_current_user
+from app.routers.tests.conftest import client
 from blog_writer_agent import llm as bw_llm
 from seo_geo_agent import insights, sources
 
-client = TestClient(fastapi_app)
-
 BRAND = {"id": "legalsoft", "name": "Legal Soft", "domain": "legalsoft.com", "enabled": True}
+
+#: A plain writer — nothing in this router is creator-gated.
+WRITER = {"id": "u1", "email": "writer@legalsoft.com", "is_admin": False,
+          "is_creator": False, "session_id": "", "timezone": "UTC"}
 
 
 @pytest.fixture(autouse=True)
-def _harness(monkeypatch, tmp_path):
+def _harness(monkeypatch, tmp_path, as_caller):
     monkeypatch.setenv("BLOG_OFFLINE", "1")
     monkeypatch.setenv("BLOG_LOCAL_DIR", str(tmp_path / "blog_state"))
     monkeypatch.setenv("SEO_OFFLINE", "1")  # keeps the serper app-config fallback off Firestore
     monkeypatch.delenv("SEO_SERPER_API_KEY", raising=False)
     monkeypatch.setattr(insights, "list_brands", lambda: [dict(BRAND)])
-    prev = fastapi_app.dependency_overrides.get(get_current_user)
-    fastapi_app.dependency_overrides[get_current_user] = lambda: {
-        "id": "u1", "email": "writer@legalsoft.com", "is_admin": False,
-        "is_creator": False, "session_id": "", "timezone": "UTC",
-    }
-    yield
-    if prev is None:
-        fastapi_app.dependency_overrides.pop(get_current_user, None)
-    else:
-        fastapi_app.dependency_overrides[get_current_user] = prev
+    as_caller(WRITER)
 
 
 @pytest.fixture()

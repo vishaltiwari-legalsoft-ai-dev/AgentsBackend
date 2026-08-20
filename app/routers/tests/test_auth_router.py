@@ -7,19 +7,22 @@ that matters most, an *unconfigured* allowlist rejecting rather than admitting.
 
 Only the outer seams are faked: Google token verification and the Firestore
 user upsert. The router, the settings properties and the gate itself run real.
+
+Note what this module deliberately does *not* do: install a ``get_current_user``
+override. This endpoint is how a caller becomes authenticated, so a pre-authed
+caller would make the allowlist untestable. The shared harness in ``conftest.py``
+installs a caller only when a suite asks for one, so nothing here is authed —
+and its autouse guard still makes sure no sibling suite's override leaks in.
 """
 from __future__ import annotations
 
 import app  # noqa: F401 - side effect: registers agent roots on sys.path
 import pytest
-from fastapi.testclient import TestClient
 
 from app.config import settings
-from app.main import app as fastapi_app
 from app.routers import auth
+from app.routers.tests.conftest import client
 from app.services import firestore_repo
-
-client = TestClient(fastapi_app)
 
 CREDENTIAL = "a-google-id-token-that-the-verifier-will-accept"
 

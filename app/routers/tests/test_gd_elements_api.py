@@ -1,41 +1,21 @@
 """Integration tests for the Graphics Designer Element Library API (/api/gd).
 
 Runs fully offline: the ``fs`` run-storage backend is used (default, pointed at
-a tmp dir via ``GD_RUNS_DIR``) and the auth dependency is overridden with a fake
-user, mirroring ``test_mr_router.py``'s pattern for the MR router.
-
-The auth override is installed per-test by the ``_harness`` fixture and the
-previous value is restored on teardown. It must never be applied at module
-import time: ``dependency_overrides`` lives on the one process-global FastAPI
-app shared by every test module, so an import-time write leaks into whatever
-runs next and a sibling module's teardown silently deletes it — which made this
-suite pass only in alphabetical order (a 401 storm under ``-k``, ``-m``,
-sharding or random ordering).
+a tmp dir via ``GD_RUNS_DIR``) and the caller comes from the shared harness in
+``conftest.py``, which also guarantees the override cannot outlive the test.
 """
 
 import io
 
 import pytest
-from fastapi.testclient import TestClient
 
-from app.main import app as fastapi_app
-from app.security import get_current_user
-
-client = TestClient(fastapi_app)
-
-USER = {"id": "u1", "email": "t@legalsoft.com"}
+from app.routers.tests.conftest import client
 
 
 @pytest.fixture(autouse=True)
-def _harness(tmp_path, monkeypatch):
+def _harness(tmp_path, monkeypatch, as_caller):
     monkeypatch.setenv("GD_RUNS_DIR", str(tmp_path))
-    prev = fastapi_app.dependency_overrides.get(get_current_user)
-    fastapi_app.dependency_overrides[get_current_user] = lambda: dict(USER)
-    yield
-    if prev is None:
-        fastapi_app.dependency_overrides.pop(get_current_user, None)
-    else:
-        fastapi_app.dependency_overrides[get_current_user] = prev
+    as_caller()
 
 
 @pytest.fixture()

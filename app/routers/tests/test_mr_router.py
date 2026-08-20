@@ -1,15 +1,13 @@
 """Integration tests for the Marketing Research router (/api/mr).
 
 Runs fully offline: MR_OFFLINE=1 forces the deterministic narrative path and
-disables cloud writes; the auth dependency is overridden with a fake user.
+disables cloud writes; the caller is installed by ``as_caller`` from the shared
+harness in ``conftest.py``, which also guarantees the override cannot outlive
+the test.
 
-The auth override is installed per-test by the ``_harness`` fixture and the
-previous value is restored on teardown. It must never be applied at module
-import time: ``dependency_overrides`` lives on the one process-global FastAPI
-app shared by every test module, so an import-time write leaks into whatever
-runs next and a sibling module's teardown silently deletes it — which made this
-suite pass only in alphabetical order (a 401 storm under ``-k``, ``-m``,
-sharding or random ordering). Same shape as test_geo_router / test_browser_agent_router.
+``USER`` stays here because it is more than a login: MR silos every run by
+``user_id``, so ``USER["id"]`` is the tenancy key these tests assert reads are
+scoped to.
 """
 
 import io
@@ -18,14 +16,10 @@ import os
 os.environ["MR_OFFLINE"] = "1"
 
 import pytest
-from fastapi.testclient import TestClient
 
-from app.main import app as fastapi_app
-from app.security import get_current_user
+from app.routers.tests.conftest import DEFAULT_CALLER, client
 
-client = TestClient(fastapi_app)
-
-USER = {"id": "u1", "email": "t@legalsoft.com"}
+USER = dict(DEFAULT_CALLER)
 
 CSV = (
     b"Campaign,Cost,Source,Medium,Campaign name,Leads,Qualified leads,"
@@ -35,16 +29,10 @@ CSV = (
 
 
 @pytest.fixture(autouse=True)
-def _harness(tmp_path, monkeypatch):
+def _harness(tmp_path, monkeypatch, as_caller):
     monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
     monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "targets.json"))
-    prev = fastapi_app.dependency_overrides.get(get_current_user)
-    fastapi_app.dependency_overrides[get_current_user] = lambda: dict(USER)
-    yield
-    if prev is None:
-        fastapi_app.dependency_overrides.pop(get_current_user, None)
-    else:
-        fastapi_app.dependency_overrides[get_current_user] = prev
+    as_caller(USER)
 
 
 def test_ingest_then_report():

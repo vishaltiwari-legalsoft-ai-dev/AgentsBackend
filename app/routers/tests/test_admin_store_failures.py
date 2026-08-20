@@ -10,25 +10,16 @@ from __future__ import annotations
 
 import app  # noqa: F401 - side effect: registers agent roots on sys.path
 import pytest
-from fastapi.testclient import TestClient
 
-from app.main import app as fastapi_app
-from app.security import get_current_user, require_admin
+from app.routers.tests.conftest import client
 from app.services import firestore_repo
-
-client = TestClient(fastapi_app)
-
-USER = {"id": "u1", "email": "t@legalsoft.com", "is_admin": True, "is_creator": True}
 
 
 @pytest.fixture(autouse=True)
-def _as_admin():
-    prev = dict(fastapi_app.dependency_overrides)
-    fastapi_app.dependency_overrides[get_current_user] = lambda: dict(USER)
-    fastapi_app.dependency_overrides[require_admin] = lambda: dict(USER)
-    yield
-    fastapi_app.dependency_overrides.clear()
-    fastapi_app.dependency_overrides.update(prev)
+def _harness(as_admin):
+    """These endpoints sit behind ``require_admin``; the gate itself is not what
+    is under test here, so the shared harness installs an admin caller past it."""
+    as_admin()
 
 
 def _dead(*_a, **_kw):

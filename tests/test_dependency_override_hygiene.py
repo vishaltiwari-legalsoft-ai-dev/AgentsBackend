@@ -225,11 +225,16 @@ def test_the_scan_actually_reaches_the_modules_that_use_overrides():
         file for file in scanned
         if "dependency_overrides" in (BACKEND / file).read_text(encoding="utf-8-sig")
     }
-    # Every module that touches overrides today, by construction of the wave-1
-    # fix. The set may grow; it must never silently empty out.
-    assert len(users) >= 9, sorted(users)
-    assert "app/routers/tests/test_mr_router.py" in users
-    assert "app/routers/tests/test_geo_router.py" in users
+    # Every module that touches overrides today. The set may grow; it must
+    # never silently empty out.
+    #
+    # It shrank once, legitimately: the router suites used to install their own
+    # overrides, and `app/routers/tests/conftest.py` now owns that for all of
+    # them. Anchor on the file that holds the harness rather than on whichever
+    # suite happened to carry a copy of it, so centralising again does not read
+    # as the glob collapsing.
+    assert len(users) >= 8, sorted(users)
+    assert "app/routers/tests/conftest.py" in users
     assert "tests/test_admin_refresh_packs.py" in users
 
 

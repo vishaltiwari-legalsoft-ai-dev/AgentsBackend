@@ -9,30 +9,38 @@ os.environ["BROWSER_OFFLINE"] = "1"
 
 import app  # noqa: F401 - side effect: registers agent roots on sys.path
 import pytest
-from fastapi.testclient import TestClient
 
-from app.main import app as fastapi_app
-from app.security import get_current_user
+from app.routers.tests.conftest import client
 from browser_agent import actions, brain
 
-client = TestClient(fastapi_app)
-
+#: The signed-in owner. The e-mail is load-bearing: /status echoes it back, and
+#: the extension download is gated on its domain.
 USER = {"id": "u1", "email": "owner@legalsoft.com", "is_admin": False,
         "is_creator": False, "session_id": "", "timezone": "UTC"}
 
 
 @pytest.fixture(autouse=True)
-def _harness(monkeypatch, tmp_path):
+def _harness(monkeypatch, tmp_path, as_caller):
     monkeypatch.setenv("BROWSER_OFFLINE", "1")
     monkeypatch.setenv("BROWSER_LOCAL_DIR", str(tmp_path / "browser_state"))
     monkeypatch.delenv("BROWSER_AGENT_DISABLED", raising=False)
-    prev = fastapi_app.dependency_overrides.get(get_current_user)
-    fastapi_app.dependency_overrides[get_current_user] = lambda: dict(USER)
-    yield
-    if prev is None:
-        fastapi_app.dependency_overrides.pop(get_current_user, None)
-    else:
-        fastapi_app.dependency_overrides[get_current_user] = prev
+    as_caller(USER)
+
+
+@pytest.fixture()
+def as_someone(as_caller):
+    """Become a different account mid-test — the axis this suite is built on
+    (whose skills you can see, whose domain may download the extension).
+
+    Nothing is restored here on purpose: the conftest guard puts the overrides
+    map back after every test, so a swap cannot outlive the test that made it.
+    """
+
+    def _install(email: str, *, creator: bool = False, admin: bool = False) -> None:
+        as_caller({"id": "u9", "email": email, "is_admin": admin,
+                   "is_creator": creator, "session_id": "", "timezone": "UTC"})
+
+    return _install
 
 
 def _stub(monkeypatch, action: actions.Action):
@@ -59,12 +67,9 @@ def test_status_reports_email_and_policy():
     assert "blocked" in body
 
 
-def test_requires_auth():
-    fastapi_app.dependency_overrides.pop(get_current_user, None)
-    try:
-        assert client.get("/api/browser/status").status_code in (401, 403)
-    finally:
-        fastapi_app.dependency_overrides[get_current_user] = lambda: dict(USER)
+def test_requires_auth(unauthenticated):
+    unauthenticated()
+    assert client.get("/api/browser/status").status_code in (401, 403)
 
 
 def test_kill_switch_403(monkeypatch):
@@ -116,26 +121,17 @@ def test_stop_marks_stopped():
     assert r.status_code == 200 and r.json()["status"] == "stopped"
 
 
-def test_other_users_run_is_404(monkeypatch):
+def test_other_users_run_is_404(monkeypatch, as_caller):
     _stub(monkeypatch, actions.Action(kind="wait", why="settle"))
     run = _create()
-    fastapi_app.dependency_overrides[get_current_user] = lambda: {
-        "id": "u2", "email": "someone-else@x.com", "is_admin": False,
-        "session_id": "", "timezone": "UTC",
-    }
+    as_caller({"id": "u2", "email": "someone-else@x.com", "is_admin": False,
+               "session_id": "", "timezone": "UTC"})
     assert client.get(f"/api/browser/runs/{run['run_id']}").status_code == 404
 
 
 # --------------------------------------------------------------------------- #
 # Extension download — company accounts only (console login is NOT domain-gated)
 # --------------------------------------------------------------------------- #
-
-def _as(email: str, *, creator: bool = False, admin: bool = False) -> None:
-    fastapi_app.dependency_overrides[get_current_user] = lambda: {
-        "id": "u9", "email": email, "is_admin": admin, "is_creator": creator,
-        "session_id": "", "timezone": "UTC",
-    }
-
 
 def test_company_account_downloads_the_extension():
     r = client.get("/api/browser/extension")
@@ -144,43 +140,40 @@ def test_company_account_downloads_the_extension():
     assert len(r.content) > 1000
 
 
-def test_outside_account_is_refused_with_a_clear_reason():
-    _as("stranger@gmail.com")
+def test_outside_account_is_refused_with_a_clear_reason(as_someone):
+    as_someone("stranger@gmail.com")
     r = client.get("/api/browser/extension")
     assert r.status_code == 403
     assert "legalsoft.com" in r.json()["detail"]
 
 
-def test_owner_on_another_domain_still_gets_it():
+def test_owner_on_another_domain_still_gets_it(as_someone):
     # CREATOR_EMAILS_DEFAULT includes a gmail.com owner — a blanket domain rule
     # would lock them out of their own tool.
-    _as("owner@gmail.com", creator=True)
+    as_someone("owner@gmail.com", creator=True)
     assert client.get("/api/browser/extension").status_code == 200
 
 
-def test_allowed_domains_are_configurable(monkeypatch):
+def test_allowed_domains_are_configurable(monkeypatch, as_someone):
     monkeypatch.setenv("BROWSER_EXT_DOMAINS", "example.org")
-    _as("someone@example.org")
+    as_someone("someone@example.org")
     assert client.get("/api/browser/extension").status_code == 200
-    _as("someone@legalsoft.com")
+    as_someone("someone@legalsoft.com")
     assert client.get("/api/browser/extension").status_code == 403
 
 
-def test_status_reports_download_eligibility_and_version():
+def test_status_reports_download_eligibility_and_version(as_someone):
     body = client.get("/api/browser/status").json()
     assert body["can_download"] is True
     assert body["extension_version"]
 
-    _as("stranger@gmail.com")
+    as_someone("stranger@gmail.com")
     assert client.get("/api/browser/status").json()["can_download"] is False
 
 
-def test_download_needs_auth():
-    fastapi_app.dependency_overrides.pop(get_current_user, None)
-    try:
-        assert client.get("/api/browser/extension").status_code in (401, 403)
-    finally:
-        fastapi_app.dependency_overrides[get_current_user] = lambda: dict(USER)
+def test_download_needs_auth(unauthenticated):
+    unauthenticated()
+    assert client.get("/api/browser/extension").status_code in (401, 403)
 
 
 def test_missing_bundle_is_honest_503(monkeypatch):
@@ -239,17 +232,17 @@ def test_a_skill_learned_from_a_run_uses_the_runs_own_steps(monkeypatch):
     assert r.json()["steps"][0]["url"] == "https://example.com/"
 
 
-def test_another_users_skill_is_invisible_and_undeletable():
+def test_another_users_skill_is_invisible_and_undeletable(as_someone):
     skill_id = _save().json()["id"]
-    _as("stranger@legalsoft.com")
+    as_someone("stranger@legalsoft.com")
     assert client.get(f"/api/browser/skills/{skill_id}").status_code == 404
     assert client.delete(f"/api/browser/skills/{skill_id}").status_code == 404
     assert client.get("/api/browser/skills").json()["skills"] == []
 
 
-def test_an_admin_can_see_and_remove_any_skill():
+def test_an_admin_can_see_and_remove_any_skill(as_someone):
     skill_id = _save().json()["id"]
-    _as("boss@legalsoft.com", admin=True)
+    as_someone("boss@legalsoft.com", admin=True)
     assert client.get(f"/api/browser/skills/{skill_id}").status_code == 200
     assert client.delete(f"/api/browser/skills/{skill_id}").status_code == 200
 
@@ -261,12 +254,9 @@ def test_deleting_removes_it_for_good():
     assert client.get("/api/browser/skills").json()["skills"] == []
 
 
-def test_skills_need_auth():
-    fastapi_app.dependency_overrides.pop(get_current_user, None)
-    try:
-        assert client.get("/api/browser/skills").status_code in (401, 403)
-    finally:
-        fastapi_app.dependency_overrides[get_current_user] = lambda: dict(USER)
+def test_skills_need_auth(unauthenticated):
+    unauthenticated()
+    assert client.get("/api/browser/skills").status_code in (401, 403)
 
 
 def test_kill_switch_covers_skills(monkeypatch):

@@ -1,13 +1,10 @@
 """Integration tests for the SEO agent router (/api/seo-geo). Fully offline.
 
-The auth override is installed per-test by the ``_harness`` fixture and the
-previous value is *restored* on teardown. Restore, not ``pop``:
-``dependency_overrides`` lives on the one process-global FastAPI app shared by
-every test module, so an unconditional ``pop`` here deleted an override a
-sibling module was relying on. Paired with modules that installed theirs at
-import time, that made 29 router tests pass only in alphabetical order — this
-file sorts last today, and anything that reorders (``-k``, ``-m``, sharding,
-random order, or just a new file that sorts later) turned them into a 401 storm.
+The caller is a *non*-creator by default, which several tests below depend on:
+they assert the 403 first and only then escalate. Both the default caller and
+the escalation go through the shared harness in ``conftest.py``, whose autouse
+guard restores the overrides map around every test — so escalating is safe
+mid-test and needs no teardown here.
 """
 
 import os
@@ -15,35 +12,26 @@ import os
 os.environ["SEO_OFFLINE"] = "1"
 
 import pytest
-from fastapi.testclient import TestClient
 
-from app.main import app as fastapi_app
-from app.security import get_current_user
+from app.routers.tests.conftest import client
 
 USER = {"id": "u1", "email": "t@legalsoft.com", "is_admin": False, "is_creator": False}
 CREATOR = {**USER, "is_creator": True}
 
-client = TestClient(fastapi_app)
-
 
 @pytest.fixture(autouse=True)
-def _harness(tmp_path, monkeypatch):
+def _harness(tmp_path, monkeypatch, as_caller):
     monkeypatch.setenv("SEO_OFFLINE", "1")
     monkeypatch.setenv("SEO_LOCAL_DIR", str(tmp_path))
     monkeypatch.delenv("SEO_CRON_KEY", raising=False)
-    prev = fastapi_app.dependency_overrides.get(get_current_user)
-    fastapi_app.dependency_overrides[get_current_user] = lambda: dict(USER)
-    yield
-    if prev is None:
-        fastapi_app.dependency_overrides.pop(get_current_user, None)
-    else:
-        fastapi_app.dependency_overrides[get_current_user] = prev
+    as_caller(USER)
 
 
-def as_creator():
+@pytest.fixture()
+def as_creator(as_caller):
     """Escalate the current test to a creator. Safe to call mid-test — the
-    ``_harness`` teardown restores whatever was in place before it ran."""
-    fastapi_app.dependency_overrides[get_current_user] = lambda: dict(CREATOR)
+    conftest guard restores whatever was in place before the test ran."""
+    return lambda: as_caller(CREATOR)
 
 
 def test_overview_lists_default_brand_and_sources():
@@ -53,7 +41,7 @@ def test_overview_lists_default_brand_and_sources():
     assert body["brands"][0]["last_run"] is None
 
 
-def test_brand_create_requires_creator():
+def test_brand_create_requires_creator(as_creator):
     payload = {"name": "Acme", "domain": "acme.com"}
     assert client.post("/api/seo-geo/brands", json=payload).status_code == 403
     as_creator()
@@ -61,13 +49,13 @@ def test_brand_create_requires_creator():
     assert any(b["id"] == "acme" and b["gsc_property"] == "sc-domain:acme.com" for b in body["brands"])
 
 
-def test_brand_domain_validation():
+def test_brand_domain_validation(as_creator):
     as_creator()
     r = client.post("/api/seo-geo/brands", json={"name": "Bad", "domain": "not-a-domain"})
     assert r.status_code == 422
 
 
-def test_brand_domain_strips_www_and_protocol():
+def test_brand_domain_strips_www_and_protocol(as_creator):
     as_creator()
     body = client.post("/api/seo-geo/brands",
                        json={"name": "Berry", "domain": "https://www.BerryVirtual.com/"}).json()
@@ -103,7 +91,7 @@ def test_keyword_lab_offline_runs_heuristic():
     assert client.get("/api/seo-geo/keywords/legalsoft").json()["lab"]["brand_id"] == "legalsoft"
 
 
-def test_competitors_flow():
+def test_competitors_flow(as_creator):
     assert client.get("/api/seo-geo/competitors/legalsoft").json()["tracked"] == []
     assert client.put("/api/seo-geo/competitors/legalsoft", json={"domains": ["comp.com"]}).status_code == 403
     as_creator()
@@ -240,7 +228,7 @@ def test_cron_all_brands_failed_is_not_200(monkeypatch):
     assert body["brands"]["legalsoft"] == {"ok": False, "error": "GSC token revoked"}
 
 
-def test_cron_partial_sweep_is_207(monkeypatch):
+def test_cron_partial_sweep_is_207(monkeypatch, as_creator):
     """One broken brand out of two is neither success nor total failure: 207 so a
     human can act, and still 2xx so a permanently bad brand can't put the job in
     a retry loop."""

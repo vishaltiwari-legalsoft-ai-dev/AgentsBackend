@@ -10,38 +10,32 @@ os.environ["SEO_OFFLINE"] = "1"
 
 import app  # noqa: F401 - side effect: registers agent roots on sys.path
 import pytest
-from fastapi.testclient import TestClient
 
-from app.main import app as fastapi_app
-from app.security import get_current_user
+from app.routers.tests.conftest import client
 from final_geo_agent import geo_engines
 from seo_geo_agent import insights
 from final_geo_agent.geo_engines import EngineAnswer
 
-client = TestClient(fastapi_app)
-
 BRAND = {"id": "legalsoft", "name": "Legal Soft", "domain": "legalsoft.com",
          "seeds": ["legal virtual assistant"], "enabled": True}
 
+#: The default caller here is a creator — most of this router is creator-gated.
+OWNER = {"id": "u1", "email": "owner@legalsoft.com", "is_admin": False,
+         "is_creator": True, "session_id": "", "timezone": "UTC"}
+#: A signed-in colleague without the creator role, for the gate tests.
+VIEWER = {"id": "u2", "email": "viewer@legalsoft.com", "is_admin": False,
+          "is_creator": False, "session_id": "", "timezone": "UTC"}
+
 
 @pytest.fixture(autouse=True)
-def _harness(monkeypatch, tmp_path):
+def _harness(monkeypatch, tmp_path, as_caller):
     monkeypatch.setenv("SEO_OFFLINE", "1")
     monkeypatch.setenv("SEO_LOCAL_DIR", str(tmp_path / "geo_state"))
     # a real OPENROUTER_API_KEY in local .env must never leak into offline
     # tests — with the fallback live it would fire REAL paid engine polls
     monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "")
     monkeypatch.setattr(insights, "list_brands", lambda: [dict(BRAND)])
-    prev = fastapi_app.dependency_overrides.get(get_current_user)
-    fastapi_app.dependency_overrides[get_current_user] = lambda: {
-        "id": "u1", "email": "owner@legalsoft.com", "is_admin": False,
-        "is_creator": True, "session_id": "", "timezone": "UTC",
-    }
-    yield
-    if prev is None:
-        fastapi_app.dependency_overrides.pop(get_current_user, None)
-    else:
-        fastapi_app.dependency_overrides[get_current_user] = prev
+    as_caller(OWNER)
 
 
 @pytest.fixture()
@@ -261,16 +255,9 @@ def test_rescan_finds_a_competitor_tracked_after_the_poll(fake_engines):
     assert next(r for r in after["rows"] if r["is_self"])["mention"]["rate"] == 1.0
 
 
-def test_rescan_is_creator_only():
-    prev = fastapi_app.dependency_overrides[get_current_user]
-    fastapi_app.dependency_overrides[get_current_user] = lambda: {
-        "id": "u2", "email": "viewer@legalsoft.com", "is_admin": False,
-        "is_creator": False, "session_id": "", "timezone": "UTC",
-    }
-    try:
-        assert client.post(f"/api/geo/brands/{BRAND['id']}/rescan", json={}).status_code == 403
-    finally:
-        fastapi_app.dependency_overrides[get_current_user] = prev
+def test_rescan_is_creator_only(as_caller):
+    as_caller(VIEWER)
+    assert client.post(f"/api/geo/brands/{BRAND['id']}/rescan", json={}).status_code == 403
 
 
 def test_rescan_keeps_a_live_point_labelled_live(fake_engines):
