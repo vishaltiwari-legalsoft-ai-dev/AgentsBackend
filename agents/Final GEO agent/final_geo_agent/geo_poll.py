@@ -27,6 +27,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from itertools import zip_longest
 from typing import Any, Callable
 
 from seo_geo_agent import state
@@ -279,7 +280,20 @@ def _load_day_docs(brand_id: str, engines: list[str], day: str) -> dict[str, dic
 def _pending_tasks(
     prompts: list[dict], docs: dict[str, dict], runs: int
 ) -> list[tuple[str, dict, int]]:
-    tasks: list[tuple[str, dict, int]] = []
+    """Everything still owed for this day, INTERLEAVED across engines.
+
+    A step bills ``tasks[:granted]``, and a full sweep (~410 calls) has never
+    once fitted in the cron's wall clock — so whatever sits at the end of this
+    list is never measured at all. Grouped by engine, that end was always Google
+    AIO: a 250-call day bought perplexity 123/123, gemini 123/123, chatgpt 4/123
+    and **aio 0/41**, every day, which is why the panel showed no AI Overview
+    data despite a working SerpAPI key.
+
+    Round-robin instead. The same budget now buys a proportionate slice of every
+    engine, and AIO — one run per prompt where the chat engines take three —
+    finishes first rather than never.
+    """
+    per_engine: dict[str, list[tuple[str, dict, int]]] = {}
     for engine, doc in docs.items():
         # only SUCCESSFUL answers complete a task — an errored run (quota,
         # outage) stays pending so the next poll retries it instead of
@@ -289,10 +303,15 @@ def _pending_tasks(
             for a in doc.get("answers", []) if not a.get("error")
         }
         engine_runs = 1 if engine == geo_engines.AIO_ENGINE else runs
-        for prompt in prompts:
-            for run in range(1, engine_runs + 1):
-                if (prompt["id"], run) not in done:
-                    tasks.append((engine, prompt, run))
+        per_engine[engine] = [
+            (engine, prompt, run)
+            for prompt in prompts
+            for run in range(1, engine_runs + 1)
+            if (prompt["id"], run) not in done
+        ]
+    tasks: list[tuple[str, dict, int]] = []
+    for row in zip_longest(*per_engine.values()):
+        tasks.extend(task for task in row if task is not None)
     return tasks
 
 
@@ -744,6 +763,10 @@ def poll_until_done(
     finished = progress.get("done", 0) >= progress.get("total", 0) and not progress.get("terminal")
     if finished:
         mark_poll_completed(brand["id"])
+    elif steps:
+        # ran out of wall clock rather than work: the answers collected are
+        # still today's measurement, so the chart gets its point either way
+        _record_history(brand, ensure_config(brand), _today())
     return {
         "brand_id": brand["id"],
         "steps": steps,
@@ -878,10 +901,13 @@ def poll_step(
         len(batch), failures, settled["streaks"]
     )
     done_now = done_before + len(batch)
-    # The batch that finishes the day is the one that banks the trend point —
-    # the same moment for a hand-run poll and for the cron, so the chart does
-    # not depend on which path collected the answers.
-    if done_now >= total and not terminal:
+    # Bank the day's trend point whenever the loop is about to STOP — finished,
+    # or stopped honestly. Waiting for a completed sweep meant waiting for
+    # something that has never happened in production: the cron's wall clock is
+    # smaller than a full sweep, so the chart would only ever hold reconstructed
+    # points. A truncated day is a real measurement of a smaller sample, and it
+    # is already marked `partial` on the chart.
+    if done_now >= total or terminal:
         _record_history(brand, cfg, day)
     return _progress(
         done=done_now, total=total, used=settled["used"], cap=cap,

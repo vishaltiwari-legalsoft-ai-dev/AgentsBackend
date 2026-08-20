@@ -209,7 +209,10 @@ def test_partial_failure_is_not_terminal(monkeypatch):
 def test_consecutive_engine_failures_terminate(monkeypatch):
     """A batch that keeps making SOME progress never trips the all-failed rule,
     so a permanently dead engine needs the streak rule to stop the burn."""
-    seed_prompts(4)
+    # enough prompts that the HEALTHY engine still has work after three steps —
+    # otherwise the queue empties down to the dead engine and the all-failed
+    # rule fires first, which is not the rule under test here
+    seed_prompts(12)
     _engines(monkeypatch, perplexity=True, gemini=True)
     monkeypatch.setattr(
         geo_engines, "poll_engine",
@@ -217,7 +220,7 @@ def test_consecutive_engine_failures_terminate(monkeypatch):
         if engine == "perplexity"
         else EngineAnswer(engine=engine, model="fake", text="Legal Soft answers."),
     )
-    # 4 perplexity tasks (always fail, always pending) + 1 gemini task per step
+    # every step mixes both engines, so some progress is always made
     results = [
         geo_poll.poll_step(BRAND, runs=1, batch_size=5)
         for _ in range(geo_poll.FAIL_STREAK_LIMIT)
@@ -745,3 +748,51 @@ def test_derived_aliases_find_the_rival_the_typed_name_missed():
     text = "For law firm intake, Smith.ai and Legal Soft are the usual shortlist."
     mentions = geo_poll.detect_mentions(text, geo_poll.alias_map(cfg))
     assert mentions == {"self": 2, "smith-ai": 1}
+
+
+# ------------------------- task ordering / engine fairness -------------------------
+# Regression: tasks were queued engine by engine and a step bills tasks[:granted].
+# A full sweep (~410 calls) has never fitted in the cron's wall clock, so the
+# engine at the END of that queue was never called. That engine was Google AIO:
+# a working SerpAPI key, and 0 of 41 AIO answers collected, every single day.
+
+
+def test_pending_tasks_interleave_so_no_engine_is_starved():
+    prompts = [{"id": f"p{i}"} for i in range(4)]
+    docs = {e: {"answers": []} for e in ("perplexity", "gemini", "aio")}
+
+    tasks = geo_poll._pending_tasks(prompts, docs, runs=3)
+
+    # every engine appears inside the first handful of calls, not after
+    # a hundred belonging to somebody else
+    assert {engine for engine, _p, _r in tasks[:3]} == {"perplexity", "gemini", "aio"}
+    assert len(tasks) == 4 * 3 + 4 * 3 + 4      # nothing dropped: aio runs once
+
+
+def test_a_truncated_sweep_still_measures_every_engine():
+    prompts = [{"id": f"p{i}"} for i in range(40)]
+    docs = {e: {"answers": []} for e in ("perplexity", "gemini", "chatgpt", "aio")}
+
+    tasks = geo_poll._pending_tasks(prompts, docs, runs=3)
+    budget = tasks[:250]        # what one cron fire actually affords
+    got: dict[str, int] = {}
+    for engine, _p, _r in budget:
+        got[engine] = got.get(engine, 0) + 1
+
+    assert got["aio"] == 40                     # was 0 before: fully measured now
+    assert min(got[e] for e in ("perplexity", "gemini", "chatgpt")) > 60
+
+
+def test_already_answered_tasks_are_still_skipped_when_interleaved():
+    prompts = [{"id": "p0"}, {"id": "p1"}]
+    docs = {
+        "perplexity": {"answers": [{"prompt_id": "p0", "run": 1}]},
+        "aio": {"answers": []},
+    }
+
+    tasks = geo_poll._pending_tasks(prompts, docs, runs=1)
+
+    assert ("perplexity", {"id": "p0"}, 1) not in tasks
+    assert sorted((e, p["id"]) for e, p, _r in tasks) == [
+        ("aio", "p0"), ("aio", "p1"), ("perplexity", "p1"),
+    ]
