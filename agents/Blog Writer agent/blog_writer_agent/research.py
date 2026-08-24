@@ -34,7 +34,7 @@ ROUND_CAP = 4          # UI offers "Go deeper" past this; the loop never auto-ru
 # and ``state.save`` is not best-effort here, so ``save_run`` would raise and the
 # agent would stop persisting runs entirely, permanently. Per owner, not global:
 # a busy colleague must not evict everyone else's runs from the only list the UI
-# reads (``browser_agent.skills._capped`` solves the same problem the same way).
+# reads.
 INDEX_CAP_PER_USER = 200
 QUERIES_PER_ROUND = 6
 READS_PER_ROUND = 8

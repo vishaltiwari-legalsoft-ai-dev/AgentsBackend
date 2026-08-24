@@ -123,8 +123,7 @@ def test_the_sweep_actually_covers_the_service(client):
     paths = {route.path for route in _authenticated_get_routes()}
     assert len(paths) >= 20, sorted(paths)
     # One from each agent's router, so a whole router dropping out is visible.
-    for expected in ("/api/mr/runs", "/api/geo/config", "/api/browser/status",
-                     "/api/seo-geo/overview"):
+    for expected in ("/api/mr/runs", "/api/geo/config", "/api/seo-geo/overview"):
         assert expected in paths, sorted(paths)
 
 

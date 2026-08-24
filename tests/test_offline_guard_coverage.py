@@ -22,7 +22,7 @@ import pytest
 # --------------------------------------------------------------------------- #
 
 def test_the_agent_offline_flags_are_on_for_every_test():
-    for flag in ("MR_OFFLINE", "SEO_OFFLINE", "BLOG_OFFLINE", "BROWSER_OFFLINE"):
+    for flag in ("MR_OFFLINE", "SEO_OFFLINE", "BLOG_OFFLINE"):
         assert os.environ.get(flag) == "1", f"{flag} is not set for this run"
 
 

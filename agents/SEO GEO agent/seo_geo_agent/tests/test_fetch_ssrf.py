@@ -1,9 +1,8 @@
 """The server-side fetchers must not become a proxy into our own network.
 
 ``fetch_page`` / ``fetch_text`` / ``fetch_sitemap`` take a URL from a brand
-config, a sitemap, a SERP result — or, through the browser agent's ``read_url``
-tool, straight from a model — and hand the body, the status and the final URL
-back to the caller. The old check was ``url.startswith(("http://","https://"))``
+config, a sitemap or a SERP result, and hand the body, the status and the final
+URL back to the caller. The old check was ``url.startswith(("http://","https://"))``
 and nothing else, so ``http://169.254.169.254/`` was a valid request and a 302
 was a way around any check made before it.
 

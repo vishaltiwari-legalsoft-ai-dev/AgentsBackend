@@ -266,15 +266,14 @@ def agent_routes() -> list[APIRoute]:
 def test_the_sweep_actually_covers_the_service():
     """Non-vacuity. Every claim below is of the form "nothing is wrong"; if
     route discovery quietly returned nothing they would all pass on nothing."""
-    assert set(AGENT_ROUTERS.values()) >= {"a1", "a2", "a6", "a9", "a10", "a11"}, AGENT_ROUTERS
-    assert len(agent_routes()) >= 140, len(agent_routes())
+    assert set(AGENT_ROUTERS.values()) >= {"a1", "a2", "a6", "a9", "a10"}, AGENT_ROUTERS
+    assert len(agent_routes()) >= 130, len(agent_routes())
     declared = {_label(r) for r in agent_routes() if trail_marker(r)}
     assert len(declared) >= 60, sorted(declared)
     # One from each agent, so a whole router losing its trail is visible here
     # and not only in the aggregate count.
     for expected in (
         "POST /api/blog/runs (create_run)",
-        "POST /api/browser/runs (create_run)",
         "POST /api/creative/runs (create)",
         "POST /api/geo/brands/{brand_id}/poll/step (poll_step)",
         "POST /api/gd/runs (create_run_endpoint)",
@@ -334,7 +333,6 @@ def test_the_gets_that_hand_the_user_a_file_are_recorded():
     declared = {route.path for route in agent_routes() if trail_marker(route)}
     for path in (
         "/api/blog/runs/{run_id}/export",
-        "/api/browser/extension",
         "/api/mr/runs/{run_id}/pdf",
         "/api/mr/lead-analysis/pdf",
         "/api/mr/snapshots/vendor/{slug}/pdf",
@@ -351,7 +349,6 @@ def test_the_reads_that_render_a_panel_stay_out_of_the_trail():
     )
     assert recorded_reads == [
         "/api/blog/runs/{run_id}/export",
-        "/api/browser/extension",
         "/api/mr/lead-analysis/pdf",
         "/api/mr/runs/{run_id}/pdf",
         "/api/mr/snapshots/vendor/{slug}/pdf",
@@ -418,8 +415,6 @@ def _offline_workspace(monkeypatch, tmp_path):
     """Every agent this file drives, pointed at a throwaway workspace."""
     monkeypatch.setenv("SEO_OFFLINE", "1")
     monkeypatch.setenv("SEO_LOCAL_DIR", str(tmp_path / "seo"))
-    monkeypatch.setenv("BROWSER_OFFLINE", "1")
-    monkeypatch.setenv("BROWSER_LOCAL_DIR", str(tmp_path / "browser"))
     monkeypatch.setenv("GD_RUNS_DIR", str(tmp_path / "gd"))
 
 
@@ -493,40 +488,6 @@ def test_an_unknown_brand_records_nothing(store, as_caller):
     r = client.post("/api/seo-geo/audit/no-such-brand/run")
     assert r.status_code == 404, r.text
     assert store == {}
-
-
-def test_a_step_inside_an_open_run_records_nothing_until_it_ends(
-    store, as_caller, monkeypatch
-):
-    """The clause that keeps a thirty-step browser run at two rows instead of
-    thirty-one. Deleting it would not break a single endpoint — which is why it
-    is asserted rather than left to a comment."""
-    from browser_agent import actions, brain
-
-    created = client.post("/api/browser/runs", json={"goal": "Find the top story"})
-    assert created.status_code == 200, created.text
-    run_id = created.json()["run_id"]
-    assert [row["action"] for row in rows(store, "agent_runs__a11")] == ["run_start"]
-
-    monkeypatch.setattr(brain, "decide",
-                        lambda run, obs: actions.Action(kind="click", index=0, why="open"))
-    stepped = client.post(f"/api/browser/runs/{run_id}/step",
-                          json={"protocol": actions.PROTOCOL, "seq": 1,
-                                "dom": {"elements": []}})
-    assert stepped.status_code == 200, stepped.text
-    assert stepped.json()["done"] is False
-    assert [row["action"] for row in rows(store, "agent_runs__a11")] == ["run_start"], (
-        "a mid-run step recorded a row of its own"
-    )
-
-    monkeypatch.setattr(brain, "decide",
-                        lambda run, obs: actions.Action(kind="done", summary="found it", why="done"))
-    ended = client.post(f"/api/browser/runs/{run_id}/step",
-                        json={"protocol": actions.PROTOCOL, "seq": 2,
-                              "dom": {"elements": []}})
-    assert ended.status_code == 200, ended.text
-    actions_recorded = [row["action"] for row in rows(store, "agent_runs__a11")]
-    assert actions_recorded == ["run_start", "run_completed"], actions_recorded
 
 
 def test_a_staged_run_keeps_one_row_per_run_not_one_per_request(store, as_caller):

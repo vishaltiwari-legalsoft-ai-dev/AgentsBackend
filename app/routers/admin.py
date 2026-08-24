@@ -214,7 +214,6 @@ class AgentConfigBody(BaseModel):
     openrouter_vision_model: str | None = None
     gd_planner_model: str | None = None
     gd_polish_image_model: str | None = None
-    browser_planner_model: str | None = None
 
 
 @router.get("/admin/agents")

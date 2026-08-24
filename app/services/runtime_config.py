@@ -26,7 +26,6 @@ OVERRIDE_FIELDS: tuple[str, ...] = (
     "openrouter_vision_model",
     "gd_planner_model",
     "gd_polish_image_model",
-    "browser_planner_model",
     # GEO agent engine keys (see Settings.perplexity_api_key etc.)
     "perplexity_api_key",
     "gemini_api_key",
@@ -45,7 +44,6 @@ AGENT_OVERRIDE_FIELDS: tuple[str, ...] = (
     "openrouter_vision_model",
     "gd_planner_model",
     "gd_polish_image_model",
-    "browser_planner_model",
 )
 
 

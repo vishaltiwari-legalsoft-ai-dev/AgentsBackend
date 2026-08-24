@@ -459,9 +459,9 @@ class _PageParser(HTMLParser):
 
 
 # --- Outbound fetch safety -------------------------------------------------
-# These fetchers take a URL from a brand config, a sitemap, a SERP result or —
-# via the browser agent's read_url tool — straight from a model, then hand the
-# body, the status and the final URL back to the caller. Unrestricted that is
+# These fetchers take a URL from a brand config, a sitemap or a SERP result,
+# then hand the body, the status and the final URL back to the caller. Any of
+# those can be attacker-influenced. Unrestricted that is
 # an arbitrary GET from inside the VPC: 169.254.169.254 for metadata, a Redis
 # or admin port for a scan oracle, and the response reflected to whoever asked.
 # app/routers/canva.py::_fetch_bytes is the same idea with a fixed allowlist;

@@ -46,8 +46,8 @@ OWNER = {"id": "gd-tenant-a", "email": "a@legalsoft.com", "is_admin": False,
          "is_creator": False, "session_id": "", "timezone": "UTC"}
 
 #: A different signed-in tenant. Note ``is_admin: False`` *and* the admin case
-#: below: unlike the Browser Agent, ``_owned_run`` has no admin bypass, and
-#: ``test_not_even_an_admin_may_open_another_tenants_run`` pins that difference.
+#: below: ``_owned_run`` has no admin bypass, and
+#: ``test_not_even_an_admin_may_open_another_tenants_run`` pins that.
 STRANGER = {"id": "gd-tenant-b", "email": "b@legalsoft.com", "is_admin": False,
             "is_creator": False, "session_id": "", "timezone": "UTC"}
 
@@ -189,13 +189,12 @@ def test_another_users_run_is_404_everywhere(owned_run, as_caller, endpoint):
 
 
 def test_not_even_an_admin_may_open_another_tenants_run(owned_run, as_caller):
-    """``_owned_run`` has no admin bypass — unlike the Browser Agent's
-    ``_run_or_404``, which does.
+    """``_owned_run`` has no admin bypass.
 
-    Pinned because the two helpers are three lines apart in shape and one
-    ``or user.get("is_admin")`` apart in meaning. A refactor that unifies them
-    has to pick one behaviour, and this test makes that a decision rather than
-    an accident. See ``test_browser_agent_cross_tenant.py`` for the other side.
+    Pinned because an ownership helper is one ``or user.get("is_admin")``
+    away from a very different meaning. A refactor that unifies these
+    predicates has to pick one behaviour, and this test makes that a decision
+    rather than an accident.
     """
     as_caller({**STRANGER, "is_admin": True, "is_creator": True})
     response = client.get(f"/api/gd/runs/{owned_run['id']}")

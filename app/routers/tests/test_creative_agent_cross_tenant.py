@@ -126,9 +126,9 @@ def test_another_users_run_is_404_everywhere(owned_run_id, as_caller, endpoint):
 
 
 def test_not_even_an_admin_may_open_another_tenants_creative(owned_run_id, as_caller):
-    """``_owned`` has no admin bypass. Pinned so unifying the four predicates has
-    to *choose* whether admins keep reading everyone's work — the Browser Agent's
-    ``_run_or_404`` says yes, these three say no."""
+    """``_owned`` has no admin bypass. Pinned so unifying the ownership
+    predicates has to *choose* whether admins keep reading everyone's work —
+    every one of them says no today."""
     as_caller({**STRANGER, "is_admin": True, "is_creator": True})
     response = client.get(f"/api/creative/runs/{owned_run_id}")
     assert response.status_code == 404

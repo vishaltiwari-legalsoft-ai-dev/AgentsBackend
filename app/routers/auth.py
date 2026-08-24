@@ -29,10 +29,9 @@ class GoogleLogin(BaseModel):
 def is_allowed_email(email: str) -> bool:
     """Whether a *verified* Google address is permitted to sign in.
 
-    Holding a valid Google token proves identity, not membership — the same
-    reasoning already applied to the extension download in
-    ``browser_agent._may_download``. Sign-in is the one door that has to enforce
-    it, because Cloud Run serves this API --allow-unauthenticated.
+    Holding a valid Google token proves identity, not membership. Sign-in is
+    the one door that has to enforce it, because Cloud Run serves this API
+    --allow-unauthenticated.
 
     Allowed when the address is a project owner (Creator — they are named in
     config/env and must never be locked out of their own panel), is listed in

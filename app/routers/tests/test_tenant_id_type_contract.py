@@ -2,18 +2,17 @@
 
 ``get_current_user`` returns ``dict[str, object]``. The tenant lives at
 ``user["id"]`` and its type is annotated as ``object``, so every router decides
-for itself what to compare. Four routers, four decisions:
+for itself what to compare. Three routers, three decisions:
 
 ===================  ==================================  ==================
 router               stores                              compares
 ===================  ==================================  ==================
 graphics_designer    ``str(user["id"])``                 ``str(user["id"])``
 creative_agent       ``str(user["id"])``                 ``str(user["id"])``
-browser_agent        ``str(user.get("id") or "")``       ``str(user.get("id"))``
 marketing_research   ``user["id"]``  (raw)               ``user["id"]``  (raw)
 ===================  ==================================  ==================
 
-Three stringify, one does not. As long as every id really is a string the two
+Two stringify, one does not. As long as every id really is a string the two
 behaviours are identical, which is why this has never bitten: ``user["id"]``
 comes from the JWT ``sub`` claim, which carries a Firestore document id.
 
@@ -23,9 +22,9 @@ anywhere on the path — ``create_token(user_id: str, ...)`` is an annotation, a
 question the refactor has to answer anyway: **if two tenants' ids differ only by
 type, which routers treat them as the same tenant?**
 
-The answer today, proven below: Graphics Designer, Creative Agent and Browser
-Agent all collapse ``7`` and ``"7"`` into one tenant — a cross-tenant read.
-Marketing Research keeps them apart. Whatever the unified ``TenantId`` does, it
+The answer today, proven below: Graphics Designer and Creative Agent both
+collapse ``7`` and ``"7"`` into one tenant — a cross-tenant read. Marketing
+Research keeps them apart. Whatever the unified ``TenantId`` does, it
 cannot do both, and this file is where that choice becomes visible.
 
 Latent, not live: nothing in the sign-in path mints a non-string id today. These
@@ -58,7 +57,7 @@ CSV = (
 
 @pytest.fixture(autouse=True)
 def _harness(tmp_path, monkeypatch, as_caller):
-    """Throwaway stores for all four agents, numeric-id caller signed in."""
+    """Throwaway stores for all three agents, numeric-id caller signed in."""
     from graphics_designer_agent import runs as gd_runs
     from graphics_designer_agent.creative import runs as cruns
 
@@ -67,14 +66,11 @@ def _harness(tmp_path, monkeypatch, as_caller):
     monkeypatch.setattr(cruns, "CREATIVE_RUNS_ROOT", tmp_path / "creative")
     monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path / "mr"))
     monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "targets.json"))
-    monkeypatch.setenv("BROWSER_OFFLINE", "1")
-    monkeypatch.setenv("BROWSER_LOCAL_DIR", str(tmp_path / "browser"))
-    monkeypatch.delenv("BROWSER_AGENT_DISABLED", raising=False)
     as_caller(NUMERIC)
 
 
 # --------------------------------------------------------------------------- #
-# The three routers that stringify — a numeric id and its string collapse
+# The two routers that stringify — a numeric id and its string collapse
 # --------------------------------------------------------------------------- #
 
 def test_graphics_designer_treats_7_and_seven_as_the_same_tenant(as_caller):
@@ -110,17 +106,6 @@ def test_creative_agent_treats_7_and_seven_as_the_same_tenant(as_caller):
     assert read.json()["user_id"] == "7"
 
 
-def test_browser_agent_treats_7_and_seven_as_the_same_tenant(as_caller):
-    """``_run_or_404`` — ``str(user.get("id"))`` against a stored
-    ``str(user.get("id") or "")``. Collapses, and the run is listed too."""
-    run_id = client.post("/api/browser/runs",
-                         json={"goal": "read the release notes"}).json()["run_id"]
-
-    as_caller(STRINGY)
-    assert client.get(f"/api/browser/runs/{run_id}").status_code == 200
-    assert [r["id"] for r in client.get("/api/browser/runs").json()["runs"]] == [run_id]
-
-
 # --------------------------------------------------------------------------- #
 # The router that does not — and therefore isolates where the others do not
 # --------------------------------------------------------------------------- #
@@ -129,7 +114,7 @@ def test_marketing_research_treats_7_and_seven_as_two_different_tenants(as_calle
     """MR stores and compares the id raw, so ``7 != "7"`` and the two stay apart
     — at the named-resource comparison *and* in the aggregate list path.
 
-    This is the opposite answer to the three tests above, on the same input.
+    This is the opposite answer to the two tests above, on the same input.
     Both cannot survive a unified tenant key.
     """
     ingested = client.post("/api/mr/ingest",
@@ -146,18 +131,16 @@ def test_marketing_research_treats_7_and_seven_as_two_different_tenants(as_calle
     assert client.delete(f"/api/mr/datasets/{dataset_id}").status_code == 404
 
 
-def test_the_four_routers_do_not_agree_and_that_is_the_finding(as_caller):
+def test_the_routers_do_not_agree_and_that_is_the_finding(as_caller):
     """One test that states the disagreement in one place.
 
     Same two callers, same question — "may the second one read the first one's
     work?" — and the answer depends on which agent you ask. This is the summary
     a reviewer should see when the refactor lands: whatever the new tenant key
-    does with a non-string id, exactly one of these four columns keeps its
-    current behaviour.
+    does with a non-string id, exactly one of these columns keeps its current
+    behaviour.
     """
     gd_run = client.post("/api/gd/runs", json={}).json()["id"]
-    browser_run = client.post("/api/browser/runs",
-                              json={"goal": "read the notes"}).json()["run_id"]
     client.post("/api/mr/ingest",
                 files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
                 data={"platform": "google_ads"})
@@ -165,12 +148,10 @@ def test_the_four_routers_do_not_agree_and_that_is_the_finding(as_caller):
     as_caller(STRINGY)
     verdicts = {
         "graphics_designer": client.get(f"/api/gd/runs/{gd_run}").status_code,
-        "browser_agent": client.get(f"/api/browser/runs/{browser_run}").status_code,
         "marketing_research": 200 if client.get("/api/mr/datasets").json() else 404,
     }
     assert verdicts == {
         "graphics_designer": 200,     # same tenant
-        "browser_agent": 200,         # same tenant
         "marketing_research": 404,    # different tenant
     }, verdicts
 
@@ -178,12 +159,11 @@ def test_the_four_routers_do_not_agree_and_that_is_the_finding(as_caller):
 # --------------------------------------------------------------------------- #
 # The other half of the same disagreement: a caller with no id
 # --------------------------------------------------------------------------- #
-# ``user["id"]`` (GD, Creative, MR) and ``user.get("id")`` (Browser) also part
-# company when the key is absent. Unreachable through real sign-in — the JWT
-# always carries ``sub`` — so these are contract tests, not vulnerability tests.
-# They are here because a refactor that swaps ``dict`` for a typed tenant object
-# has to decide what an id-less caller is, and right now the codebase holds two
-# incompatible answers in the same request path.
+# ``user["id"]`` (GD, Creative, MR) subscripts, so an absent key is a crash
+# rather than a refusal. Unreachable through real sign-in — the JWT always
+# carries ``sub`` — so this is a contract test, not a vulnerability test. It is
+# here because a refactor that swaps ``dict`` for a typed tenant object has to
+# decide what an id-less caller is.
 
 def test_an_id_less_caller_crashes_the_subscripting_routers(as_caller):
     """GD raises ``KeyError`` rather than answering. A 500, not a refusal.
@@ -195,29 +175,3 @@ def test_an_id_less_caller_crashes_the_subscripting_routers(as_caller):
                "session_id": "", "timezone": "UTC"})
     with pytest.raises(KeyError):
         client.post("/api/gd/runs", json={})
-
-
-def test_an_id_less_caller_is_silently_given_the_string_none_by_browser_agent(
-    as_caller
-):
-    """Browser Agent does not crash — it invents a tenant.
-
-    ``create_run`` stores ``str(user.get("id") or "")`` → ``""`` while
-    ``_run_or_404`` compares ``str(user.get("id"))`` → ``"None"``. The two do
-    not match, so the caller cannot read back the run it just created: a run
-    that exists, is billed and is owned by nobody reachable.
-
-    Not exploitable today, and pinned for the shape rather than the risk — it is
-    the clearest evidence that ``user["id"]`` vs ``user.get("id")`` is a real
-    semantic difference and not a style choice.
-    """
-    as_caller({"email": "no-id@legalsoft.com", "is_admin": False, "is_creator": False,
-               "session_id": "", "timezone": "UTC"})
-    created = client.post("/api/browser/runs", json={"goal": "read the notes"})
-    assert created.status_code == 200
-
-    orphan = created.json()["run_id"]
-    assert client.get(f"/api/browser/runs/{orphan}").status_code == 404, (
-        "the creator of this run cannot read it back"
-    )
-    assert client.get("/api/browser/runs").json()["runs"] == []

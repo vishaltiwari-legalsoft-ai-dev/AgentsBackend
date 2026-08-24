@@ -217,12 +217,6 @@ def _build_catalog() -> dict[str, list[dict]]:
         "openrouter_model": _merge_curated("openrouter_model", list(text)),
         "openrouter_fast_model": _merge_curated("openrouter_fast_model", [dict(o) for o in text]),
         "gd_planner_model": _merge_curated("gd_planner_model", [dict(o) for o in text]),
-        # a11 Browser Agent planner. Was absent here, so allowed_ids() was
-        # empty and POST /api/admin/agents/a11 rejected every planner model
-        # as "not an allowed browser_planner_model" - a dead panel switch.
-        "browser_planner_model": _merge_curated(
-            "browser_planner_model", [dict(o) for o in text]
-        ),
         "openrouter_vision_model": _merge_curated("openrouter_vision_model", vision),
         "openrouter_image_model": _merge_curated("openrouter_image_model", image),
         # GD Stage-3 polish fan-out: same image-model universe, own field so

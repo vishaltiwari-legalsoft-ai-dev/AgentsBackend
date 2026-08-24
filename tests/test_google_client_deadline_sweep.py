@@ -3,11 +3,10 @@
 W2-C set explicit socket timeouts on the Google clients it found, and each of
 those has its own behavioural test (``tests/test_google_client_timeouts.py``,
 ``marketing_research_agent/tests/test_sheets_transport.py``,
-``seo_geo_agent/tests/test_google_client_timeouts.py``,
-``browser_agent/tests/test_tools_sheets_transport.py``). Those tests pin the
+``seo_geo_agent/tests/test_google_client_timeouts.py``). Those tests pin the
 clients that existed on the day they were written. Nothing pins the *rule*, so
-the seventh Google client somebody adds next month starts out unbounded again
-and every one of those suites still passes.
+the next Google client somebody adds starts out unbounded again and every one
+of those suites still passes.
 
 This file is the rule. It is structural on purpose:
 
@@ -114,7 +113,6 @@ def test_the_sweep_finds_the_google_clients_at_all():
         "app/services/drive_source.py",
         "agents/Marketing Research agent/marketing_research_agent/sources/sheets_source.py",
         "agents/SEO GEO agent/seo_geo_agent/sources.py",
-        "agents/Browser agent/browser_agent/tools.py",
         "agents/SEO GEO agent/seo_geo_agent/gsc_oauth.py",
     } <= seen, sorted(seen)
 
@@ -182,7 +180,6 @@ _DEADLINES = [
     ("marketing_research_agent.sources.sheets_source", "AUTH_TIMEOUT_SECONDS"),
     ("marketing_research_agent.sources.sheets_source", "EXPORT_TIMEOUT_SECONDS"),
     ("seo_geo_agent.sources", "GOOGLE_API_TIMEOUT_SECONDS"),
-    ("browser_agent.tools", "SHEETS_WRITE_TIMEOUT_SECONDS"),
 ]
 
 

@@ -124,7 +124,6 @@ MODEL_CATALOG: dict[str, list[dict[str, str | bool]]] = {
     "openrouter_fast_model": TEXT_MODELS,
     "openrouter_vision_model": VISION_MODELS,
     "gd_planner_model": TEXT_MODELS,
-    "browser_planner_model": TEXT_MODELS,
 }
 
 # The agents the Agent Configuration panel manages: ONLY the ones actually
@@ -177,18 +176,6 @@ AGENTS: list[dict[str, str | bool | list[str]]] = [
         # sources.llm_json(agent_id="a10") — fast model only. Engine polling
         # itself goes to the providers' own APIs, not OpenRouter.
         "fields": ["openrouter_fast_model"],
-    },
-    {
-        "id": "a11",
-        "name": "Browser Agent",
-        "role": "Web copilot in your Chrome",
-        "category": "data",
-        "live": True,
-        # Planner model breaks the task down once per run (browser_agent.planner);
-        # the reasoning model decides each act-loop step (browser_agent.brain);
-        # the fast model writes the tab digests (browser_agent.digest, fast=True).
-        # The Chrome extension is a thin sensor/actuator — every LLM call is here.
-        "fields": ["browser_planner_model", "openrouter_model", "openrouter_fast_model"],
     },
 ]
 

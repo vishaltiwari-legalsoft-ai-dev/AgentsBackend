@@ -31,14 +31,12 @@ import pytest
 os.environ.setdefault("MR_OFFLINE", "1")
 os.environ.setdefault("SEO_OFFLINE", "1")
 os.environ.setdefault("BLOG_OFFLINE", "1")
-os.environ.setdefault("BROWSER_OFFLINE", "1")
 
 # Which agent each test belongs to, derived from its path. Keep the fragments
 # lowercase — they are matched against a lowercased, forward-slashed path.
 _AGENT_MARKERS = (
     ("agents/graphics designer agent", "gd"),
     ("agents/marketing research agent", "mr"),
-    ("agents/browser agent", "browser"),
     ("agents/seo geo agent", "seo"),
     ("agents/final geo agent", "geo"),
     ("agents/blog writer agent", "blog"),
@@ -107,7 +105,7 @@ def _no_live_gcs(monkeypatch):
 def pytest_collection_modifyitems(items):
     """Tag every test with the agent it belongs to, derived from its path.
 
-    Lets a developer run only what they are working on — ``pytest -m browser``
+    Lets a developer run only what they are working on — ``pytest -m seo``
     — or skip the slowest suite while iterating — ``pytest -m "not gd"``.
     Path-derived on purpose: new test files are tagged automatically, so there
     is nothing for anyone to remember to add.
