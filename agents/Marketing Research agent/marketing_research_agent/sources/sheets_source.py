@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import os
 import re
 import threading
@@ -24,6 +25,8 @@ from typing import Callable, Sequence
 from .. import config
 from ..schemas import CampaignMetric, DataGap, DateRange, Lead
 from .base import CredentialMissingError
+
+logger = logging.getLogger("agentos.mr.sheets")
 
 _MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "june": 6,
@@ -375,6 +378,79 @@ def timed_http(creds, timeout: float):
     return google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=timeout))
 
 
+#: HTTP statuses worth another attempt — Google's own back-pressure and its
+#: transient 5xx. A 403 or 404 is an answer, not a blip, and retrying it just
+#: spends the cron's budget arriving at the same place.
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+#: Attempts per call, including the first. Three is chosen against the caller,
+#: not in the abstract: the MR cron fires every 3 minutes, so the worst case
+#: here (3 x SHEETS_TIMEOUT_SECONDS plus backoff, ~95s) still finishes before
+#: the next fire, and an overlapping fire is caught by SheetPullBusy anyway.
+_RETRY_ATTEMPTS = 3
+
+#: Waits *between* attempts, so len() is _RETRY_ATTEMPTS - 1. Short on purpose:
+#: a socket timeout has already spent 30s, and the thing being ridden out is a
+#: blip rather than an outage.
+_RETRY_BACKOFF_SECONDS = (1.0, 3.0)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Whether *exc* is the kind of failure a second attempt might survive.
+
+    ``TimeoutError`` covers ``socket.timeout``, which is what httplib2 raises
+    when the deadline in :func:`timed_http` expires — and it is what the MR cron
+    actually hits ("workbook unreadable: The read operation timed out", roughly
+    4% of fires). ``OSError`` catches the connection resets and DNS blips
+    underneath it; ``TimeoutError`` is already an ``OSError``, but naming it
+    keeps the intent legible.
+    """
+    from googleapiclient.errors import HttpError
+
+    if isinstance(exc, HttpError):
+        return getattr(exc.resp, "status", None) in _RETRYABLE_STATUS
+    return isinstance(exc, (TimeoutError, OSError))
+
+
+def _execute(request, *, what: str):
+    """``request.execute()`` that rides out a transient failure.
+
+    The Sheets reads behind the Marketing Research cron are two calls — a
+    ``spreadsheets().get`` for the tab list and one ``values().batchGet`` across
+    every tab — and the batch one is big enough to occasionally overrun its 30s
+    deadline. There was no retry at all, so a single blip failed the whole fire
+    and the snapshot for that tick simply did not happen.
+
+    Retries are deliberately *not* pushed down into ``num_retries`` on
+    ``execute()``: that handles retryable HTTP statuses but not the socket
+    timeout raised by the transport, which is the failure actually being seen.
+
+    A non-transient error is re-raised immediately and unchanged — callers
+    distinguish "the API refused us" from "the workbook is empty" and that
+    distinction must survive this wrapper.
+    """
+    import time
+
+    last: BaseException | None = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            return request.execute()
+        except Exception as exc:  # noqa: BLE001 — re-raised below unless transient
+            if not _is_transient(exc):
+                raise
+            last = exc
+            if attempt < len(_RETRY_BACKOFF_SECONDS):
+                logger.warning(
+                    "Sheets %s failed (%s); retrying in %ss (attempt %d/%d)",
+                    what, exc, _RETRY_BACKOFF_SECONDS[attempt],
+                    attempt + 2, _RETRY_ATTEMPTS,
+                )
+                time.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+    raise SheetsUnavailable(
+        f"Sheets {what} failed after {_RETRY_ATTEMPTS} attempts: {last}"
+    ) from last
+
+
 def _sheets_service():
     from googleapiclient.discovery import build
 
@@ -390,7 +466,8 @@ def workbook_meta(spreadsheet_id: str, *, service=None) -> dict:
     """Workbook title + tab list in one Sheets API call:
     ``{"title", "tabs": [{gid, title, hidden, rows, cols}]}``."""
     svc = service or _sheets_service()
-    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = _execute(svc.spreadsheets().get(spreadsheetId=spreadsheet_id),
+                    what="workbook metadata")
     tabs = []
     for s in meta.get("sheets", []):
         p = s["properties"]
@@ -415,11 +492,11 @@ def fetch_tab_values(spreadsheet_id: str, title: str, *, service=None) -> list[l
     """Read a tab's displayed values via the Sheets API as a list-of-lists of
     strings (FORMATTED_VALUE keeps the $ / % / , formatting parse_tracker strips)."""
     svc = service or _sheets_service()
-    resp = (
+    resp = _execute(
         svc.spreadsheets()
         .values()
-        .get(spreadsheetId=spreadsheet_id, range=f"'{title}'", valueRenderOption="FORMATTED_VALUE")
-        .execute()
+        .get(spreadsheetId=spreadsheet_id, range=f"'{title}'", valueRenderOption="FORMATTED_VALUE"),
+        what=f"tab read {title!r}",
     )
     return [["" if c is None else str(c) for c in row] for row in resp.get("values", [])]
 
@@ -427,11 +504,11 @@ def fetch_tab_values(spreadsheet_id: str, title: str, *, service=None) -> list[l
 def fetch_all_tab_values(spreadsheet_id: str, titles: list[str], *, service=None) -> dict[str, list[list[str]]]:
     """Read many tabs in one Sheets API call (values.batchGet)."""
     svc = service or _sheets_service()
-    resp = (
+    resp = _execute(
         svc.spreadsheets()
         .values()
-        .batchGet(spreadsheetId=spreadsheet_id, ranges=[f"'{t}'" for t in titles], valueRenderOption="FORMATTED_VALUE")
-        .execute()
+        .batchGet(spreadsheetId=spreadsheet_id, ranges=[f"'{t}'" for t in titles], valueRenderOption="FORMATTED_VALUE"),
+        what=f"batch read of {len(titles)} tabs",
     )
     out: dict[str, list[list[str]]] = {}
     for title, vr in zip(titles, resp.get("valueRanges", [])):
