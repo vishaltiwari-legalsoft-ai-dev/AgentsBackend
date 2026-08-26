@@ -12,9 +12,20 @@ from typing import Callable
 
 
 def _default_fetcher(url: str) -> str:
+    """Fetch *url* with the shared SSRF guard applied to every redirect hop.
+
+    The URL reaching here is competitor-monitoring configuration, not a
+    constant, so it is exactly the shape of input that must never be allowed to
+    address our own infrastructure. ``follow_redirects=False`` is deliberate and
+    load-bearing: ``safe_fetch.safe_get`` follows them itself so each hop is
+    re-checked, which a single pre-request check cannot do.
+    """
     import httpx
 
-    resp = httpx.get(url, timeout=20, follow_redirects=True)
+    from app.services import safe_fetch
+
+    with httpx.Client(timeout=20, follow_redirects=False) as client:
+        resp = safe_fetch.safe_get(client, url)
     resp.raise_for_status()
     return resp.text
 
