@@ -285,12 +285,46 @@ def _insight_bullets(summary: dict, todos: list[dict]) -> list[str]:
 # ---------------------------------- runs ----------------------------------
 
 def _ga_section(brand: dict, end: date) -> dict:
-    """Live GA4 overview for one brand; discovers + pins the property on first use."""
+    """Live GA4 overview for one brand; discovers + pins the property on first use.
+
+    ``ga_discover_property`` falls back to "the only property the service account
+    can see" when nothing matches the domain. That is a good convenience for the
+    first brand in a workspace and a silent misattribution for the second: with
+    one GA property shared and two brands, brand B inherits brand A's traffic and
+    ``upsert_brand`` then *pins* it, so the numbers never self-correct.
+
+    That is exactly what happened to ``berry-virtual``, whose panel reported
+    ``legal-soft``'s 25,595 sessions under the name "Legal Soft". So a discovered
+    property that another brand has already pinned is refused here rather than
+    claimed. Degrading is honest and recoverable — the run continues, the note
+    lands in ``degraded``, and whoever owns the brand pins the right
+    ``ga4_property``. Reporting another brand's traffic as yours is neither.
+
+    The check lives at the caller, not in ``ga_discover_property``, because only
+    this layer knows the brand registry — the adapter stays a pure Google API
+    wrapper, and its single-property fallback keeps working for the first brand.
+    """
     prop = brand.get("ga4_property")
     name = brand.get("ga4_property_name", "")
     if not prop:
         found = ga_discover_property(brand["domain"])
         prop, name = found["property"], found["name"]
+        taken_by = next(
+            (
+                other
+                for other in list_brands()
+                if other.get("id") != brand.get("id")
+                and other.get("ga4_property") == prop
+            ),
+            None,
+        )
+        if taken_by:
+            raise CredentialMissing(
+                f"GA property {name or prop!r} is already pinned to "
+                f"{taken_by.get('name') or taken_by.get('id')} — refusing to report "
+                f"its traffic as {brand.get('name') or brand.get('id')}. Set this "
+                f"brand's ga4_property explicitly if it really shares that property."
+            )
         upsert_brand({**brand, "ga4_property": prop, "ga4_property_name": name})
     data = ga_fetch_overview(
         prop,
