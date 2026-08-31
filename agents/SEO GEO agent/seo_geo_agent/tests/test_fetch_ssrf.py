@@ -147,9 +147,13 @@ def test_fetch_sitemap_refuses_a_private_child_sitemap(monkeypatch):
 
 
 def test_the_fetch_clients_never_auto_follow_redirects():
-    """Guard on the source: follow_redirects=True on any of these three would
-    silently return the hop-by-hop check to httpx, which does not do it."""
+    """Guard on the source: follow_redirects=True on any of the fetch clients
+    would silently return the hop-by-hop check to httpx, which does not do it.
+    Counted against the clients actually constructed, so adding a fetcher
+    without the flag fails here rather than silently auto-following."""
     source = open(sources.__file__, encoding="utf-8").read()
     tail = source.split("def fetch_page")[1]
     assert "follow_redirects=True" not in tail
-    assert tail.count("follow_redirects=False") == 3
+    clients = tail.count("httpx.Client(")
+    assert clients >= 3
+    assert tail.count("follow_redirects=False") == clients

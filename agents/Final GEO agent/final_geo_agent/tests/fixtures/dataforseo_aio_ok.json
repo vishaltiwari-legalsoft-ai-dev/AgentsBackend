@@ -1,0 +1,97 @@
+{
+  "version": "0.1.20260828",
+  "status_code": 20000,
+  "status_message": "Ok.",
+  "time": "3.1 sec.",
+  "cost": 0.002,
+  "tasks_count": 1,
+  "tasks_error": 0,
+  "tasks": [
+    {
+      "id": "08301122-1535-0139-0000-7f3c1c2d9e0a",
+      "status_code": 20000,
+      "status_message": "Ok.",
+      "time": "3.0 sec.",
+      "cost": 0.002,
+      "result_count": 1,
+      "path": ["v3", "serp", "google", "organic", "live", "advanced"],
+      "data": {
+        "api": "serp",
+        "function": "live",
+        "se": "google",
+        "se_type": "organic",
+        "keyword": "best legal intake service for law firms",
+        "location_code": 2840,
+        "language_code": "en",
+        "device": "desktop"
+      },
+      "result": [
+        {
+          "keyword": "best legal intake service for law firms",
+          "type": "organic",
+          "se_domain": "google.com",
+          "location_code": 2840,
+          "language_code": "en",
+          "check_url": "https://www.google.com/search?q=best+legal+intake+service",
+          "datetime": "2026-08-30 11:22:15 +00:00",
+          "item_types": ["ai_overview", "organic", "people_also_ask"],
+          "se_results_count": 128000000,
+          "items_count": 12,
+          "items": [
+            {
+              "type": "ai_overview",
+              "rank_group": 1,
+              "rank_absolute": 1,
+              "position": "left",
+              "asynchronous_ai_overview": false,
+              "markdown": "**Legal Soft** and **Smith.ai** are frequently recommended legal intake services for law firms.\n\n- **Legal Soft** offers trained virtual legal assistants who handle intake calls 24/7.\n- **Smith.ai** provides virtual receptionists with CRM integration.\n- **Ruby** focuses on live answering for small firms.",
+              "items": [
+                {
+                  "type": "ai_overview_element",
+                  "position": "left",
+                  "title": null,
+                  "text": "Legal Soft and Smith.ai are frequently recommended legal intake services for law firms.",
+                  "markdown": "**Legal Soft** and **Smith.ai** are frequently recommended legal intake services for law firms.",
+                  "links": null,
+                  "images": null,
+                  "references": null
+                }
+              ],
+              "references": [
+                {
+                  "type": "ai_overview_reference",
+                  "source": "Lawyerist",
+                  "domain": "www.lawyerist.com",
+                  "url": "https://lawyerist.com/reviews/legal-intake/",
+                  "title": "Best Legal Intake Services",
+                  "text": "..."
+                },
+                {
+                  "type": "ai_overview_reference",
+                  "source": "Clio",
+                  "domain": "www.clio.com",
+                  "link": "https://www.clio.com/blog/legal-intake-services/",
+                  "title": "Legal intake services compared"
+                },
+                {
+                  "type": "ai_overview_reference",
+                  "source": "Legal Soft",
+                  "domain": "legalsoft.com",
+                  "title": "Virtual legal intake"
+                }
+              ]
+            },
+            {
+              "type": "organic",
+              "rank_group": 1,
+              "rank_absolute": 2,
+              "domain": "www.lawyerist.com",
+              "title": "Best Legal Intake Services",
+              "url": "https://lawyerist.com/reviews/legal-intake/"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -23,9 +23,11 @@ from app.routers import (
     geo,
     graphics_designer,
     health,
+    issues,
     library,
     marketing_research,
     reference_library,
+    runs,
     seo_geo,
 )
 from app.services.gd_brand_source import firestore_spec_source
@@ -118,6 +120,8 @@ for router in (
     marketing_research,
     seo_geo,
     geo,
+    runs,
+    issues,
 ):
     app.include_router(router.router, prefix="/api")
 

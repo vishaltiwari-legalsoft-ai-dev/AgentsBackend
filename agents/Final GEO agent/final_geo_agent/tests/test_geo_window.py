@@ -225,7 +225,7 @@ def test_strategy_generate_opens_the_window_once(reads, fake_engine, monkeypatch
 
     expected = geo_window.DEFAULT_DAYS * len(geo_window.ENGINES)
     assert len(reads.poll_batches()) == 1, "the measured week is fetched twice"
-    assert reads.fetched() == expected == 28
+    assert reads.fetched() == expected == 35
     assert len(reports) == 1, "engine_report recomputed over identical answers"
 
 
@@ -246,7 +246,7 @@ def test_rescan_reads_the_whole_window_in_one_batch(reads, fake_engine):
 
     assert result["answers_updated"] == 2
     assert len(reads.poll_batches()) == 1, "day-docs are not fetched in one batch"
-    assert reads.fetched() == 30 * len(geo_window.ENGINES) == 120
+    assert reads.fetched() == 30 * len(geo_window.ENGINES) == 150
     # one solo read per doc actually rewritten (the transaction's own), and
     # nothing else: the 120 pre-flight probes are gone
     assert len(reads.solo_polls()) == 1

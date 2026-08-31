@@ -20,10 +20,23 @@ from seo_geo_agent.sources import CredentialMissing
 from final_geo_agent import (
     geo_engines, geo_prompts, geo_venues, geo_window,
 )
+from final_geo_agent.geo_store import mutate
 
 GEO_AGENT_ID = "a10"
 HISTORY_CAP = 3
 ACTION_STATUSES = ("todo", "in_progress", "done", "skipped")
+# The only numbers an action may promise to move: each is a key the baseline
+# stores, so the panel can draw baseline → current → target for it. A kpi off
+# this list is a promise nothing measures.
+KPI_KEYS = (
+    "mention_rate", "citation_rate", "sov_self", "aio_named_rate",
+    "aio_cited_rate", "source_gap_top_count", "missing_questions_count",
+)
+# A plan is executable or it is prose. Fewer steps than the floor and the
+# action is refused; past the cap the tail is cut — the brief asks for 3-5.
+MIN_STEPS = 2
+STEP_CAP = 6
+ASSIGNEE_MAX = 80
 # The plan is grounded in "this week's" measured numbers, and the baseline it
 # stores is what the panel later compares against — so the window is a property
 # of the plan, not a caller's choice.
@@ -62,11 +75,16 @@ anything you invent is dropped before the user ever sees it. On-site work uses v
 names the URL path in the deliverable instead.
 3. Each action states a DELIVERABLE: the artefact that exists once it is done ("a 600-word \
 answer post", "the completed G2 profile", "an outreach email to the editor of X"), never an \
-activity ("engage with the community"). If a marketer cannot start it on Monday morning from \
-what you wrote, rewrite it.
+activity ("engage with the community"). And it lists 3-5 STEPS: imperative sentences under 140 \
+characters, each naming the artefact, venue or URL path it acts on, in the order a marketer does \
+them. An action with fewer than 2 concrete steps is REFUSED before the user sees it - a plan that \
+reads well but cannot be executed is worse than no plan. If a marketer cannot start it on Monday \
+morning from what you wrote, rewrite it.
 4. Actions must be executable by a small marketing team: owner role, effort (low/medium/high), \
-expected impact (low/medium/high).
-5. Each action names the ONE kpi (from the allowed metric keys) it is meant to move.
+impact (low/medium/high), and an "expected_impact" of 1-2 sentences naming WHICH number moves \
+(the action's kpi), by roughly how much, and by when.
+5. Each action names the ONE kpi it is meant to move, from the allowed metric keys listed at the \
+end of this brief. Any other key is replaced by mention_rate and flagged as a guess.
 6. Group the actions into 3-4 WAVES by calendar time: weeks 1-2 first, then 3-4, then 5-8, then \
 9-12 if needed. Cheap retrieval-rail wins (technical fixes, answer-shaped content, review \
 profiles) belong in the earliest waves; parametric mention-building (communities, editorial \
@@ -94,6 +112,8 @@ this plan, and what success looks like in 90 days",
           "title": "...",
           "venue": "EXACT name from the VENUES list, or empty string for our own site",
           "deliverable": "the artefact that exists once this is done",
+          "steps": ["3-5 imperative sentences, each under 140 characters, each naming the \
+artefact, venue or URL path it acts on"],
           "detail": "2-4 sentences: exactly how to produce it, specific to THIS brand \
 and THIS venue, including whatever the venue's rules require",
           "owner_role": "content|outreach|founder|ops",
@@ -101,7 +121,8 @@ and THIS venue, including whatever the venue's rules require",
           "impact": "low|medium|high",
           "kpi": "one of the allowed metric keys",
           "target": "measurable 90-day target for that kpi, phrased as a number",
-          "why_evidence": "the measured fact that makes this worth doing"
+          "why_evidence": "the measured fact that makes this worth doing",
+          "expected_impact": "1-2 sentences: WHICH number moves, by roughly how much, by when"
         }
       ]
     }
@@ -115,8 +136,7 @@ and THIS venue, including whatever the venue's rules require",
 that AI answers are sampled so week-to-week wiggle is noise while the trend is signal"
 }
 
-Allowed metric keys for "kpi": mention_rate, citation_rate, sov_self, aio_named_rate, \
-aio_cited_rate, source_gap_top_count, missing_questions_count."""
+Allowed metric keys for "kpi": """ + ", ".join(KPI_KEYS) + "."
 
 
 def _now() -> str:
@@ -297,11 +317,16 @@ def _wave_order(weeks: str) -> int:
 def _clean_action(raw: dict, discovery: dict, dropped: list[dict]) -> dict | None:
     """One action, or None if it should never reach the user.
 
-    The venue check is the point of this function. The strategist is handed a
+    Two checks decide it. The venue check: the strategist is handed a
     discovered venue list and told to copy names from it; a name outside that
     list means the model produced a place from memory, and a plan whose first
     step is a subreddit that does not exist destroys trust in the whole panel.
-    Those actions are dropped and recorded, never quietly rewritten.
+    The steps check: an action with fewer than ``MIN_STEPS`` concrete steps is
+    a sentiment, not work, and a plan that reads well but cannot be started is
+    the failure a model is best at. Both are dropped and recorded, never
+    quietly rewritten. A kpi off ``KPI_KEYS`` IS rewritten — to
+    ``mention_rate``, flagged ``kpi_coerced`` — because the work itself is
+    still doable and only its scoreboard was wrong.
     """
     title = str(raw.get("title", "")).strip()
     if not title:
@@ -311,6 +336,17 @@ def _clean_action(raw: dict, discovery: dict, dropped: list[dict]) -> dict | Non
     if venue_name and venue is None:
         dropped.append({"title": title, "venue": venue_name, "reason": "venue not in discovered list"})
         return None
+    raw_steps = raw.get("steps")
+    steps = [
+        step for step in
+        (x.strip() for x in (raw_steps if isinstance(raw_steps, list) else []) if isinstance(x, str))
+        if step
+    ][:STEP_CAP]
+    if len(steps) < MIN_STEPS:
+        dropped.append({"title": title, "venue": venue_name,
+                        "reason": "no concrete steps — a plan must be executable"})
+        return None
+    kpi = str(raw.get("kpi", "")).strip()
     return {
         "id": uuid.uuid4().hex[:8],
         "title": title,
@@ -323,19 +359,19 @@ def _clean_action(raw: dict, discovery: dict, dropped: list[dict]) -> dict | Non
         } if venue else None,
         "deliverable": str(raw.get("deliverable", "")).strip(),
         # a list a team can tick off, not a paragraph they have to parse
-        "steps": [
-            step for step in
-            (str(x).strip() for x in (raw.get("steps") or [])[:4])
-            if step
-        ],
+        "steps": steps,
+        "expected_impact": str(raw.get("expected_impact", "")).strip(),
         "detail": str(raw.get("detail", "")).strip(),
         "owner_role": str(raw.get("owner_role", "ops")),
         "effort": raw.get("effort") if raw.get("effort") in ("low", "medium", "high") else "medium",
         "impact": raw.get("impact") if raw.get("impact") in ("low", "medium", "high") else "medium",
-        "kpi": str(raw.get("kpi", "mention_rate")),
+        "kpi": kpi if kpi in KPI_KEYS else "mention_rate",
+        "kpi_coerced": kpi not in KPI_KEYS,
         "target": str(raw.get("target", "")),
         "why_evidence": str(raw.get("why_evidence", "")).strip(),
         "status": "todo",
+        "assignee": "",
+        "assigned_at": None,
     }
 
 
@@ -368,9 +404,12 @@ def _clean(raw: dict, baseline: dict, discovery: dict) -> dict:
                 "actions": actions,
             })
     if not waves:
+        unverified = sum(1 for d in dropped if d["reason"].startswith("venue"))
+        unexecutable = len(dropped) - unverified
         raise ValueError(
             "Strategy model returned no usable actions"
-            + (f" — {len(dropped)} named venues we could not verify" if dropped else "")
+            + (f" — {unverified} named venues we could not verify" if unverified else "")
+            + (f" — {unexecutable} had no concrete steps" if unexecutable else "")
             + " — try again"
         )
     monitoring = raw.get("monitoring") or {}
@@ -416,16 +455,29 @@ def generate_strategy(brand: dict) -> dict:
     raw = _llm_strategy(STRATEGIST_SYSTEM, _evidence_prompt(brand, baseline, discovery))
     strategy = _clean(raw, baseline, discovery)
 
-    doc = state.load(strategy_doc_id(brand["id"])) or {"brand_id": brand["id"], "history": []}
-    if doc.get("current"):
-        doc.setdefault("history", []).insert(0, {
-            "generated_at": doc["current"].get("generated_at"),
-            "summary": doc["current"].get("summary", "")[:400],
-        })
-        doc["history"] = doc["history"][:HISTORY_CAP]
-    doc["current"] = strategy
-    state.save(strategy_doc_id(brand["id"]), doc)
-    return doc
+    def change(doc: dict) -> tuple[dict, dict]:
+        doc = {"brand_id": brand["id"], "history": [], **(doc or {})}
+        if doc.get("current"):
+            doc["history"] = [{
+                "generated_at": doc["current"].get("generated_at"),
+                "summary": doc["current"].get("summary", "")[:400],
+            }, *list(doc.get("history") or [])][:HISTORY_CAP]
+        doc["current"] = strategy
+        return doc, doc
+
+    return mutate(strategy_doc_id(brand["id"]), change)
+
+
+def _with_defaults(action: dict) -> dict:
+    """Every key the panel reads, present. Plans stored before ``steps``,
+    ``expected_impact`` or ``assignee`` existed still load and render; a key
+    missing here reached the browser as ``undefined`` and blanked the tab."""
+    return {
+        "venue": None, "deliverable": "", "steps": [], "why_evidence": "",
+        "expected_impact": "", "kpi_coerced": False,
+        "assignee": "", "assigned_at": None,
+        **action,
+    }
 
 
 def _as_waves(current: dict) -> dict:
@@ -446,10 +498,7 @@ def _as_waves(current: dict) -> dict:
         return current
     waves = []
     for pillar in current.get("pillars") or []:
-        actions = [
-            {"venue": None, "deliverable": "", "steps": [], "why_evidence": "", **action}
-            for action in pillar.get("actions") or []
-        ]
+        actions = [_with_defaults(action) for action in pillar.get("actions") or []]
         span = max((int(a.get("timeframe_weeks") or 0) for a in actions), default=0)
         waves.append({
             "weeks": f"1-{span}" if span else "1-4",
@@ -463,25 +512,68 @@ def _as_waves(current: dict) -> dict:
     return {**current, "waves": waves, "shape": "migrated-from-pillars"}
 
 
+def _normalise(current: dict) -> dict:
+    """A stored plan in the shape the panel reads, whichever version wrote it.
+    Pure — returns fresh wave and action dicts, so a caller may edit them."""
+    current = _as_waves(current)
+    return {
+        **current,
+        "waves": [
+            {**wave, "actions": [_with_defaults(a) for a in wave.get("actions") or []]}
+            for wave in current.get("waves") or []
+        ],
+    }
+
+
 def load_strategy(brand_id: str) -> dict | None:
     doc = state.load(strategy_doc_id(brand_id))
     if doc and doc.get("current"):
-        doc = {**doc, "current": _as_waves(doc["current"])}
+        doc = {**doc, "current": _normalise(doc["current"])}
     return doc
 
 
-def set_action_status(brand_id: str, action_id: str, status: str) -> dict:
-    if status not in ACTION_STATUSES:
+def update_action(
+    brand_id: str, action_id: str, *,
+    status: str | None = None, assignee: str | None = None,
+) -> dict:
+    """Move an action and/or hand it to someone; returns the whole document.
+
+    ``assignee`` is free text — a name, an email, "the agency" — because the
+    plan is worked by a team the console holds no roster for; ``""`` clears
+    it. Transactional: two teammates ticking different actions off the same
+    plan at once must both land, and a read-then-save here lost one of them.
+    """
+    if status is not None and status not in ACTION_STATUSES:
         raise ValueError(f"status must be one of {ACTION_STATUSES}")
-    doc = load_strategy(brand_id)      # normalises an old pillars-shaped plan
-    if not doc or not doc.get("current"):
-        raise KeyError("No strategy generated yet")
-    doc["current"].pop("pillars", None)   # the write below persists the wave shape
-    for wave in doc["current"].get("waves") or []:
-        for action in wave["actions"]:
-            if action["id"] == action_id:
-                action["status"] = status
-                action["status_at"] = _now()
-                state.save(strategy_doc_id(brand_id), doc)
-                return doc
-    raise KeyError(f"Unknown action: {action_id}")
+    if assignee is not None:
+        assignee = str(assignee).strip()
+        if len(assignee) > ASSIGNEE_MAX:
+            raise ValueError(f"assignee must be at most {ASSIGNEE_MAX} characters")
+    if status is None and assignee is None:
+        raise ValueError("nothing to update — give a status or an assignee")
+
+    def change(doc: dict) -> tuple[dict, dict]:
+        if not doc or not doc.get("current"):
+            raise KeyError("No strategy generated yet")
+        current = _normalise(doc["current"])
+        current.pop("pillars", None)   # the write below settles the wave shape
+        now = _now()
+        for wave in current["waves"]:
+            for action in wave["actions"]:
+                if action.get("id") != action_id:
+                    continue
+                if status is not None:
+                    action["status"] = status
+                    action["status_at"] = now
+                if assignee is not None:
+                    action["assignee"] = assignee
+                    action["assigned_at"] = now
+                updated = {**doc, "current": current}
+                return updated, updated
+        raise KeyError(f"Unknown action: {action_id}")
+
+    return mutate(strategy_doc_id(brand_id), change)
+
+
+def set_action_status(brand_id: str, action_id: str, status: str) -> dict:
+    return update_action(brand_id, action_id, status=status)

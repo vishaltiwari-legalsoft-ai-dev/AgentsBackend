@@ -24,20 +24,21 @@ import datetime as dt
 import json
 import logging
 import re
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from itertools import zip_longest
 from typing import Any, Callable
 
 from seo_geo_agent import state
-from final_geo_agent import geo_engines, geo_history, geo_prompts, geo_window
+from final_geo_agent import (
+    geo_engines, geo_history, geo_prompts, geo_runlog, geo_store, geo_window,
+)
 from seo_geo_agent.sources import CredentialMissing, llm_json
 
 logger = logging.getLogger("agentos.geo.poll")
 
 DEFAULT_DAILY_CAP = 2000
-DEFAULT_RUNS = 3
+DEFAULT_RUNS = geo_engines.CHAT_RUNS_PER_PROMPT
 DEFAULT_BATCH = 10  # tasks (engine calls) per step
 # A full sweep is ~40 prompts x 3 engines x 3 runs + 40 AIO = ~400 engine calls.
 # Run sequentially at ~5s each that is half an hour with a browser tab held
@@ -63,15 +64,14 @@ DEFAULT_POLL_INTERVAL_DAYS = 2
 # sweep cut short does not resume tomorrow, it restarts. So this number decides
 # whether a sweep can ever finish at all, not merely how fast it does.
 DEFAULT_CRON_BUDGET_SECONDS = 800
-# Google AIO runs on SerpAPI's free ~250 searches/month: one run per prompt
-# (SERP content, low variance) under a hard monthly credit guard.
-AIO_MONTHLY_CAP = 200
-# ...and that allowance is small enough that WHICH prompts get spent on it is a
-# real decision. Brand-intent prompts ("is Legal Soft good for personal injury
-# firms") are the weakest use of a credit: the buyer already has the name, and
-# the live panel shows AIO already answers those in our favour. Discovery
-# happens on category and problem questions, so the credits go there.
-AIO_INTENTS: tuple[str, ...] = ("category", "problem")
+# The SERP engines (Google AI Overview, AI Mode) are billed per call — a few
+# tenths of a cent each on DataForSEO — so this is a spend ceiling of a few
+# dollars per brand per month, not a vendor quota. It applies to every SERP
+# engine JOINTLY, under the counter and override keys the AIO-only guard
+# already stored (``counters_aio`` / ``aio_monthly_cap``): the key names are
+# storage-stable and stay as they are.
+SERP_MONTHLY_CAP = 2000
+AIO_MONTHLY_CAP = SERP_MONTHLY_CAP
 # How many consecutive batches an engine may fail every single call in before
 # the poll is declared terminal. 1 batch = a blip worth retrying; 3 in a row on
 # the same engine is a dead key or an outage, and its tasks can never complete,
@@ -291,13 +291,58 @@ def _load_day_docs(brand_id: str, engines: list[str], day: str) -> dict[str, dic
     }
 
 
+def _engine_prompts(engine: str, prompts: list[dict]) -> list[dict]:
+    """The prompts this engine is asked: every one, unless its spec restricts
+    it to the discovery intents (the billed SERP engines). A prompt with no
+    recorded intent counts as category."""
+    spec = geo_engines.ENGINE_SPECS.get(engine)
+    intents = spec.intents if spec is not None else None
+    if intents is None:
+        return prompts
+    return [p for p in prompts if (p.get("intent") or "category") in intents]
+
+
 def aio_prompts(prompts: list[dict]) -> list[dict]:
     """The subset of the universe Google AI Overview is polled for."""
-    return [p for p in prompts if (p.get("intent") or "category") in AIO_INTENTS]
+    return _engine_prompts(geo_engines.AIO_ENGINE, prompts)
 
 
-def _engine_prompts(engine: str, prompts: list[dict]) -> list[dict]:
-    return aio_prompts(prompts) if engine == geo_engines.AIO_ENGINE else prompts
+def _engine_runs(engine: str, runs: int) -> int:
+    """Runs per prompt for this engine in a sweep asking for ``runs``.
+
+    A SERP engine is pinned to its spec: the content is a snapshot, not a
+    sample, and each call is billed, so the caller's sample size does not
+    multiply it. Chat engines sample ``runs`` times.
+    """
+    spec = geo_engines.ENGINE_SPECS.get(engine)
+    if spec is not None and spec.kind == "serp":
+        return spec.runs_per_prompt
+    return runs
+
+
+def representative_order(prompts: list[dict]) -> list[dict]:
+    """Round-robin the universe across intents so a TRUNCATED sweep still
+    samples every question kind.
+
+    Tasks used to be built in universe order, and generated universes open
+    with the brand-intent questions — so a budget-starved brand measured ONLY
+    those. legal soft banked five straight daily points of score 96 with
+    mention_rate 1.0 on n_prompts=3 while its full-window rate was 0.23: not a
+    math bug, a sampling bug. Category first and brand last, because brand
+    questions nearly always name the brand and are the least informative
+    spend of a scarce call.
+    """
+    groups: dict[str, list[dict]] = {}
+    for prompt in prompts:
+        groups.setdefault(prompt.get("intent") or "category", []).append(prompt)
+    order = [g for g in ("category", "problem", "brand") if g in groups]
+    order += [g for g in groups if g not in order]
+    return [
+        prompt
+        for row in zip_longest(*(groups[g] for g in order))
+        for prompt in row
+        if prompt is not None
+    ]
 
 
 def _pending_tasks(
@@ -316,6 +361,7 @@ def _pending_tasks(
     engine, and AIO — one run per prompt where the chat engines take three —
     finishes first rather than never.
     """
+    prompts = representative_order(prompts)
     per_engine: dict[str, list[tuple[str, dict, int]]] = {}
     for engine, doc in docs.items():
         # only SUCCESSFUL answers complete a task — an errored run (quota,
@@ -325,11 +371,10 @@ def _pending_tasks(
             (a["prompt_id"], a["run"])
             for a in doc.get("answers", []) if not a.get("error")
         }
-        engine_runs = 1 if engine == geo_engines.AIO_ENGINE else runs
         per_engine[engine] = [
             (engine, prompt, run)
             for prompt in _engine_prompts(engine, prompts)
-            for run in range(1, engine_runs + 1)
+            for run in range(1, _engine_runs(engine, runs) + 1)
             if (prompt["id"], run) not in done
         ]
     tasks: list[tuple[str, dict, int]] = []
@@ -351,47 +396,11 @@ def aio_used_month(cfg: dict) -> int:
 
 
 # --------------------------------------------------------------- atomicity ----
-# Offline state is plain JSON files, so a process-local lock is the whole
-# guarantee there; that is enough for tests and single-process local dev.
-_LOCAL_LOCK = threading.Lock()
-
-
-def _mutate(doc_id: str, change: Callable[[dict], tuple[dict, Any]]) -> Any:
-    """Atomic read-modify-write of one state doc; returns ``change``'s result.
-
-    ``change(current) -> (new_doc, result)`` runs INSIDE the transaction and may
-    be retried on contention, so it must be a pure function of ``current``.
-
-    Read-then-write without this is a lost update: two overlapping poll steps
-    both read ``used=1990`` against a 2000 cap, each fires ten paid calls, and
-    both write 2000 — ten calls billed, zero counted, repeatable forever. The
-    same shape drops answer records from a day-doc when two steps overlap.
-    """
-    if state.use_cloud():
-        from google.cloud import firestore
-
-        from app.services import firestore_repo
-
-        # state owns the collection naming — reuse its ref builder rather than
-        # keep a second copy of it here. Same cached client the txn runs on.
-        ref = state._firestore_doc(doc_id)
-        transaction = firestore_repo._db().transaction()
-
-        @firestore.transactional
-        def _apply(txn) -> Any:
-            snap = ref.get(transaction=txn)
-            current = snap.to_dict() if snap.exists else {}
-            new_doc, result = change(current or {})
-            # same JSON round-trip state.save uses: no dataclasses/dates/sets
-            txn.set(ref, json.loads(json.dumps(new_doc, default=str)))
-            return result
-
-        return _apply(transaction)
-
-    with _LOCAL_LOCK:
-        new_doc, result = change(state.load(doc_id) or {})
-        state.save(doc_id, new_doc)
-        return result
+# The transactional primitive lives in ``geo_store`` so modules this one imports
+# (``geo_prompts``) can share it. Kept under the private name here because the
+# call sites below were written against it.
+_LOCAL_LOCK = geo_store.LOCAL_LOCK
+_mutate = geo_store.mutate
 
 
 def _trim_counters(cfg: dict) -> dict:
@@ -436,10 +445,12 @@ def _settle_calls(
     engine_stored: dict[str, int] | None = None,
     engine_totals: dict[str, int] | None = None,
 ) -> dict:
-    """Hand back the unspent reservation, bank AIO credits, update fail streaks.
+    """Hand back the unspent reservation, bank SERP credits, update fail streaks.
 
     One atomic write closing out the step. Returns
-    ``{"used": int, "aio_month": int, "streaks": {engine: consecutive_fails}}``.
+    ``{"used": int, "aio_month": int, "streaks": {engine: consecutive_fails},
+    "steps": int}`` — ``steps`` being how many steps today's sweep has taken
+    so far, which only this transaction can count exactly.
 
     ``engine_totals`` is ``{engine: answers now stored in today's day-doc}``,
     straight out of the merge transactions that just ran. Banking it here costs
@@ -458,11 +469,13 @@ def _settle_calls(
             aio[_month()] = int(aio.get(_month(), 0)) + aio_credits
             cfg["counters_aio"] = aio
         health = cfg.get("poll_health") or {}
-        # streaks are per-day: a new day starts everyone clean
-        streaks = dict(health.get("streaks") or {}) if health.get("day") == day else {}
+        # streaks and the step count are per-day: a new day starts clean
+        same_day = health.get("day") == day
+        streaks = dict(health.get("streaks") or {}) if same_day else {}
         for engine, failed in engine_failed.items():
             streaks[engine] = streaks.get(engine, 0) + 1 if failed else 0
-        cfg["poll_health"] = {"day": day, "streaks": streaks}
+        steps = (int(health.get("steps") or 0) if same_day else 0) + 1
+        cfg["poll_health"] = {"day": day, "streaks": streaks, "steps": steps}
         # When an engine last produced a usable answer. The report window is
         # short and AIO runs once per prompt where chat engines run three
         # times, so AIO ages out first and used to vanish from the panel
@@ -488,25 +501,30 @@ def _settle_calls(
             "used": counters[day],
             "aio_month": int((cfg.get("counters_aio") or {}).get(_month(), 0)),
             "streaks": streaks,
+            "steps": steps,
         }
 
     return _mutate(config_doc_id(brand_id), change)
 
 
-def _merge_answers(brand_id: str, engine: str, day: str, records: list[dict]) -> int:
+def _merge_answers(
+    brand_id: str, engine: str, day: str, records: list[dict]
+) -> list[dict]:
     """Append this step's records to the engine's day-doc, atomically; return
-    how many answers the doc holds afterwards.
+    the answers the doc holds afterwards.
 
     Re-reads inside the transaction so a concurrent step's answers survive
     instead of being overwritten by our stale in-memory copy.
 
-    The returned count is the day-doc's true post-merge length — after retry
-    replacement and after overflow trimming — which is the only place that
-    number is known for free. ``_settle_calls`` banks it on the config so the
-    brand listing can report ``recent_answers`` without hydrating the corpus.
+    What comes back is the day-doc's true post-merge content — after retry
+    replacement and after overflow trimming — which is the only place it is
+    known for free. Its length is what ``_settle_calls`` banks on the config so
+    the brand listing can report ``recent_answers`` without hydrating the
+    corpus, and the run log summarises the sweep from it without re-reading
+    the day.
     """
 
-    def change(doc: dict) -> tuple[dict, int]:
+    def change(doc: dict) -> tuple[dict, list[dict]]:
         doc = dict(doc or {})
         doc.setdefault("brand_id", brand_id)
         doc.setdefault("engine", engine)
@@ -531,7 +549,7 @@ def _merge_answers(brand_id: str, engine: str, day: str, records: list[dict]) ->
         while len(json.dumps(doc["answers"])) > DOC_TRIM_BYTES and doc["answers"]:
             doc["answers"].pop(0)
             doc["overflow_trimmed"] = int(doc.get("overflow_trimmed", 0)) + 1
-        return doc, len(doc["answers"])
+        return doc, list(doc["answers"])
 
     return _mutate(poll_doc_id(brand_id, engine, day), change)
 
@@ -619,15 +637,14 @@ def _usable_engines(engines: list[str] | None) -> list[str]:
 def _total_tasks(prompts: list[dict], usable: list[str], runs: int) -> int:
     """Engine calls a complete sweep costs.
 
-    AIO is SERP content with low variance, so it runs once per prompt where the
-    chat engines run ``runs`` times — and only over the discovery prompts, so
-    the SerpAPI allowance is not spent on questions that already name us. This
-    MUST agree with :func:`_pending_tasks`, or a sweep can never report itself
-    finished.
+    Each engine's spec decides its prompts and its runs: SERP engines are
+    snapshots, once per prompt and only over the discovery prompts, so billed
+    calls are not spent on questions that already name us; chat engines are
+    sampled ``runs`` times over everything. This MUST agree with
+    :func:`_pending_tasks`, or a sweep can never report itself finished.
     """
     return sum(
-        len(_engine_prompts(e, prompts)) * (1 if e == geo_engines.AIO_ENGINE else runs)
-        for e in usable
+        len(_engine_prompts(e, prompts)) * _engine_runs(e, runs) for e in usable
     )
 
 
@@ -780,7 +797,9 @@ def poll_until_done(
         if clock() >= deadline:
             stop = "budget exhausted — remaining tasks resume on the next run"
             break
-        progress = poll_step(brand, engines=engines, runs=runs, batch_size=batch_size)
+        progress = poll_step(
+            brand, engines=engines, runs=runs, batch_size=batch_size, trigger="cron",
+        )
         steps += 1
         if progress.get("terminal"):
             stop = progress.get("terminal_reason") or "terminal"
@@ -814,8 +833,15 @@ def poll_step(
     engines: list[str] | None = None,
     runs: int = DEFAULT_RUNS,
     batch_size: int = DEFAULT_BATCH,
+    *,
+    trigger: str = "manual",
 ) -> dict:
-    """Execute up to ``batch_size`` engine calls; return progress for the UI loop."""
+    """Execute up to ``batch_size`` engine calls; return progress for the UI loop.
+
+    ``trigger`` names who is driving the loop — ``"manual"`` from the console,
+    ``"cron"`` from :func:`poll_until_done` — and is recorded on the run log
+    entry when this step turns out to be the one that ends the sweep.
+    """
     cfg = ensure_config(brand)
     usable = _usable_engines(engines)
     if not usable:
@@ -828,21 +854,23 @@ def poll_step(
     if not prompts:
         raise ValueError("No enabled prompts — generate the prompt universe first")
 
-    # monthly credit guard for the SerpAPI free tier: when the month's AIO
-    # budget is spent, AIO simply leaves the panel until next month — honestly
+    # joint monthly spend guard for the billed SERP engines: when the month's
+    # budget is spent they simply leave the panel until next month — honestly
     # reported, never a surprise bill or a silent hole
-    aio_cap = int(cfg.get("aio_monthly_cap") or AIO_MONTHLY_CAP)
-    aio_capped = geo_engines.AIO_ENGINE in usable and aio_used_month(cfg) >= aio_cap
+    serp_cap = int(cfg.get("aio_monthly_cap") or SERP_MONTHLY_CAP)
+    aio_capped = (
+        any(e in geo_engines.SERP_ENGINES for e in usable)
+        and aio_used_month(cfg) >= serp_cap
+    )
     if aio_capped:
-        usable = [e for e in usable if e != geo_engines.AIO_ENGINE]
+        usable = [e for e in usable if e not in geo_engines.SERP_ENGINES]
         if not usable:
-            raise ValueError("AIO monthly credit budget is spent — resumes next month")
+            raise ValueError("SERP monthly call budget is spent — resumes next month")
 
     day = _today()
     docs = _load_day_docs(brand["id"], usable, day)
     tasks = _pending_tasks(prompts, docs, runs)
-    total = _total_tasks(prompts, usable, runs
-    )
+    total = _total_tasks(prompts, usable, runs)
     done_before = total - len(tasks)
     cap = int(cfg.get("daily_cap") or DEFAULT_DAILY_CAP)
 
@@ -872,8 +900,11 @@ def poll_step(
     records: dict[str, list[dict]] = {}
     attempts: dict[str, int] = {}
     failures: dict[str, list[str]] = {}
-    aio_credits = 0
+    serp_credits = 0
     spent = 0
+    # engine -> the day-doc's answers as they stand after this step's merge;
+    # engines this step did not touch keep the copy loaded above
+    stored: dict[str, list[dict]] = {}
     try:
         # The network waits overlap; everything that touches a counter stays on
         # this thread, in submission order, so budgets and streaks behave
@@ -881,12 +912,15 @@ def poll_step(
         for (engine, prompt, run), answer in zip(batch, _answers_for(batch)):
             spent += 1  # billed the moment the call goes out, success or not
             attempts[engine] = attempts.get(engine, 0) + 1
-            if engine == geo_engines.AIO_ENGINE:
-                aio_credits += getattr(answer, "credits", 1)
+            if engine in geo_engines.SERP_ENGINES:
+                serp_credits += getattr(answer, "credits", 1)
             record = answer.to_dict() | {
                 "prompt_id": prompt["id"],
                 "prompt_text": prompt["text"],
                 "intent": prompt.get("intent", ""),
+                # the buyer the prompt is written as; optional on the prompt,
+                # always present on the record so readers need no default
+                "persona": str(prompt.get("persona") or ""),
                 "run": run,
                 "at": _now(),
             }
@@ -913,24 +947,22 @@ def poll_step(
         # Whatever happened, store the answers we already paid for and hand
         # back the part of the reservation we never spent — an exception must
         # not leave the day's budget charged for calls that never went out.
-        stored_totals: dict[str, int] = {}
         for engine, engine_records in records.items():
-            stored_totals[engine] = _merge_answers(
-                brand["id"], engine, day, engine_records
-            )
+            stored[engine] = _merge_answers(brand["id"], engine, day, engine_records)
         settled = _settle_calls(
-            brand["id"], day, granted, spent, aio_credits,
+            brand["id"], day, granted, spent, serp_credits,
             {e: len(failures.get(e, [])) == n for e, n in attempts.items()},
             # "no AI Overview shown" is a successful observation, so it counts
             # as the engine having been measured
             {e: sum(1 for r in recs if not r.get("error")) for e, recs in records.items()},
-            engine_totals=stored_totals,
+            engine_totals={e: len(answers) for e, answers in stored.items()},
         )
 
     terminal, terminal_reason = _terminal_signal(
         len(batch), failures, settled["streaks"]
     )
     done_now = done_before + len(batch)
+    completed = done_now >= total and not terminal
     # Bank the day's trend point whenever the loop is about to STOP — finished,
     # or stopped honestly. Waiting for a completed sweep meant waiting for
     # something that has never happened in production: the cron's wall clock is
@@ -939,6 +971,17 @@ def poll_step(
     # is already marked `partial` on the chart.
     if done_now >= total or terminal:
         _record_history(brand, cfg, day)
+        # A sweep the console drove to the end is as complete as one the cron
+        # drove; the schedule moves on either, or the brand stays "due" and
+        # the next cron fire re-polls a day that is already fully measured.
+        if completed:
+            mark_poll_completed(brand["id"])
+        _record_run(
+            brand, day,
+            [a for e in docs for a in (stored[e] if e in stored else docs[e].get("answers") or [])],
+            trigger=trigger, steps=settled["steps"], done=done_now, total=total,
+            completed=completed, terminal_reason=terminal_reason,
+        )
     return _progress(
         done=done_now, total=total, used=settled["used"], cap=cap,
         engines=usable, day=day, aio_capped=aio_capped,
@@ -1188,4 +1231,69 @@ def _record_history(brand: dict, cfg: dict, day: str, *,
         )
     except Exception:  # noqa: BLE001 — derived artifact, never fatal to a sweep
         logger.exception("geo: could not record history point for %s on %s",
+                         brand.get("id"), day)
+
+
+def _run_summary(
+    day: str, answers: list[dict], *, trigger: str, steps: int, done: int,
+    total: int, completed: bool, terminal_reason: str | None,
+    score: float | None, plan_progress: dict | None,
+) -> dict:
+    """One run-log entry from the day's answers as they now stand on disk.
+
+    ``answers`` spans every engine the sweep could call, so the timings are the
+    sweep's — the earliest record is when it started, whichever step wrote
+    it — and the counts are the day-doc's, retry replacement included.
+    """
+    finished = dt.datetime.now(dt.timezone.utc)
+    stamps = [t for a in answers if (t := _parse_at(a.get("at"))) is not None]
+    started = min(stamps) if stamps else None
+    errors: dict[str, int] = {}
+    measured: set[str] = set()
+    for a in answers:
+        if a.get("error"):
+            errors[a["engine"]] = errors.get(a["engine"], 0) + 1
+        else:
+            measured.add(a.get("engine", ""))
+    return {
+        "day": day,
+        "started_at": started.isoformat() if started else None,
+        "finished_at": finished.isoformat(),
+        "duration_s": round((finished - started).total_seconds(), 1) if started else None,
+        "trigger": trigger,
+        "steps": steps,
+        "done": done,
+        "total": total,
+        "completed": completed,
+        "stopped_because": "completed" if completed else (terminal_reason or "terminal"),
+        "terminal_reason": terminal_reason,
+        "engines": [e for e in geo_engines.ALL_ENGINES if e in measured],
+        "calls": len(answers),
+        "errors": errors,
+        "no_aio": sum(1 for a in answers if a.get("no_aio")),
+        "score": score,
+        "plan_progress": plan_progress,
+    }
+
+
+def _record_run(
+    brand: dict, day: str, answers: list[dict], *, trigger: str, steps: int,
+    done: int, total: int, completed: bool, terminal_reason: str | None,
+) -> None:
+    """Log the sweep that just ended. Same discipline as ``_record_history``:
+    the answers are paid for and stored, so a failure here is logged with its
+    traceback and never turns a finished sweep into an error."""
+    try:
+        point = next(
+            (p for p in geo_history.load_points(brand["id"]) if p.get("date") == day),
+            None,
+        )
+        geo_runlog.record_run(brand["id"], _run_summary(
+            day, answers, trigger=trigger, steps=steps, done=done, total=total,
+            completed=completed, terminal_reason=terminal_reason,
+            score=(point or {}).get("score"),
+            plan_progress=geo_runlog.plan_progress(brand["id"]),
+        ))
+    except Exception:  # noqa: BLE001 — derived artifact, never fatal to a sweep
+        logger.exception("geo: could not record run log for %s on %s",
                          brand.get("id"), day)

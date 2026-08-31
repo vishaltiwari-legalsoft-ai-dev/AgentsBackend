@@ -10,23 +10,29 @@ Honesty rules carried throughout: warnings instead of fake precision (thin
 corpus, low article share, volatile SERP), semantic layer degrades to
 lexical-only with a visible label when no embedding key is configured, and
 every report states that the score is a pattern-match to current winners.
+
+Every analysis belongs to one brand: the snapshot and the index both carry
+the brand id in their doc id, so one brand's analyses are invisible to
+another's list, lookups and volatility comparison. Doc ids are hyphen-only
+(``state.py``'s rule for the local-file fallback).
 """
 from __future__ import annotations
 
 import datetime as dt
 import re
 import uuid
+from typing import Callable
 
 import httpx
 
 from seo_geo_agent import state
 from seo_geo_agent.sources import CredentialMissing
 
-from . import opt_extract, opt_score, opt_semantic, opt_serp, opt_structure, opt_terms, opt_text
+from . import geo_store, opt_extract, opt_score, opt_semantic, opt_serp, opt_structure, opt_terms, opt_text
 from .opt_config import OptimizerConfig, load_config
 
-ANALYSIS_DOC = "optimizer_analysis__{aid}"
-INDEX_DOC = "optimizer_index"
+ANALYSIS_DOC = "optimizer-analysis-{brand_id}-{aid}"
+INDEX_DOC = "optimizer-index-{brand_id}"
 INDEX_CAP = 30
 REPORT_TERMS = 20
 
@@ -156,6 +162,8 @@ def _score_draft(doc: dict, draft: str, embedder, cfg: OptimizerConfig) -> dict:
     gaps = opt_score.gap_report(
         coverage.gaps if coverage else [], entries, bands, feats, cfg.score
     )
+    covered = [(c.label, c.evidence) for c in coverage.per_subtopic if c.covered] if coverage else []
+    strengths = opt_score.strengths_report(covered, entries, bands, feats, cfg.score)
     return {
         "total": total,
         "term_coverage": round(term_cov, 3),
@@ -165,6 +173,7 @@ def _score_draft(doc: dict, draft: str, embedder, cfg: OptimizerConfig) -> dict:
         "winners_median": doc.get("winners_median_score"),
         "degraded": degraded,
         "gaps": [g.model_dump() for g in gaps[:12]],
+        "strengths": strengths,
         "draft_features": feats,
         "subtopic_coverage": [c.model_dump() for c in coverage.per_subtopic] if coverage else [],
         "draft_term_counts": {e["term"]: counts.get(e["term"], 0) for e in doc["term_profile"]},
@@ -196,7 +205,7 @@ def _winner_median(profile: list[dict], subtopics: list[opt_semantic.Subtopic],
 # ----------------------------------------------------------------- analyze
 
 def analyze(keyword: str, locale: str = "en-US", draft: str = "", *,
-            provider=None, embedder=None, own_domain: str = "",
+            brand_id: str, provider=None, embedder=None, own_domain: str = "",
             vertical: str | None = None) -> dict:
     cfg = load_config(vertical)
     provider = provider or opt_serp.SerperProvider()
@@ -284,10 +293,10 @@ def analyze(keyword: str, locale: str = "en-US", draft: str = "", *,
     winners_median = _winner_median(profile, subtopics, bands, articles, corpus_median, cfg)
 
     aid = _analysis_id(keyword)
-    volatility = _volatility(keyword, locale, [r["url"] for r in result_rows], cfg)
+    volatility = _volatility(brand_id, keyword, locale, [r["url"] for r in result_rows], cfg)
     doc = {
         "meta": {
-            "analysis_id": aid, "keyword": keyword, "locale": locale,
+            "analysis_id": aid, "brand_id": brand_id, "keyword": keyword, "locale": locale,
             "vertical": vertical, "created_at": _now_iso(), "provider": serp.provider,
             "aio_present": serp.aio_present, "paa": serp.paa[:10],
             "n_docs": len(articles), "article_share": round(article_share, 2),
@@ -305,53 +314,87 @@ def analyze(keyword: str, locale: str = "en-US", draft: str = "", *,
     }
     if draft.strip():
         doc["last_report"] = _score_draft(doc, draft, embedder, cfg)
-    state.save(ANALYSIS_DOC.format(aid=aid), doc)
-    _index_add(doc)
+    # a fresh id: nothing else can be writing this doc yet, so a plain save
+    state.save(ANALYSIS_DOC.format(brand_id=brand_id, aid=aid), doc)
+    _index_put(brand_id, _index_entry(doc))
     return doc
 
 
-def rescore(analysis_id: str, draft: str, embedder=None) -> dict:
-    doc = state.load(ANALYSIS_DOC.format(aid=analysis_id))
-    if not doc:
-        raise KeyError(f"unknown analysis: {analysis_id}")
+def rescore(brand_id: str, analysis_id: str, draft: str, embedder=None) -> dict:
+    doc = get_analysis(brand_id, analysis_id)
     cfg = load_config(doc["meta"].get("vertical"))
     # embedder resolution happens inside _score_draft, pinned to the snapshot's model
     report = _score_draft(doc, draft, embedder, cfg)
-    doc["last_report"] = report
-    state.save(ANALYSIS_DOC.format(aid=analysis_id), doc)
-    _index_add(doc)
+    _update(brand_id, analysis_id, lambda current: {**current, "last_report": report})
     return report
 
 
-def get_analysis(analysis_id: str) -> dict | None:
-    return state.load(ANALYSIS_DOC.format(aid=analysis_id))
+def attach_page_check(brand_id: str, analysis_id: str, block: dict) -> dict:
+    """Store a page-check block on its analysis; returns the whole doc."""
+    return _update(brand_id, analysis_id, lambda current: {**current, "page_check": block})
 
 
-def list_analyses() -> list[dict]:
-    return (state.load(INDEX_DOC) or {}).get("analyses", [])
+def get_analysis(brand_id: str, analysis_id: str) -> dict:
+    """``LookupError`` (never ``KeyError``, which the router reads as a bad
+    vertical) when this brand has no such analysis."""
+    doc = state.load(ANALYSIS_DOC.format(brand_id=brand_id, aid=analysis_id))
+    if not doc:
+        raise LookupError(f"unknown analysis {analysis_id!r} for brand {brand_id!r}")
+    return doc
 
 
-def _index_add(doc: dict) -> None:
+def list_analyses(brand_id: str) -> list[dict]:
+    return (state.load(INDEX_DOC.format(brand_id=brand_id)) or {}).get("analyses", [])
+
+
+def _update(brand_id: str, analysis_id: str, change: Callable[[dict], dict]) -> dict:
+    """Transactional edit of one analysis doc, then its index row. Rescore and
+    page check can land on the same doc at once; ``change`` must be pure over
+    the current doc because ``mutate`` may retry it."""
+    doc_id = ANALYSIS_DOC.format(brand_id=brand_id, aid=analysis_id)
+
+    def apply(current: dict) -> tuple[dict, dict]:
+        if not current:
+            raise LookupError(f"unknown analysis {analysis_id!r} for brand {brand_id!r}")
+        new = change(current)
+        return new, new
+
+    doc = geo_store.mutate(doc_id, apply)
+    _index_put(brand_id, _index_entry(doc))
+    return doc
+
+
+def _index_entry(doc: dict) -> dict:
     meta = doc["meta"]
-    entry = {
+    check = doc.get("page_check") or {}
+    return {
         "id": meta["analysis_id"], "keyword": meta["keyword"], "locale": meta["locale"],
         "created_at": meta["created_at"], "n_docs": meta["n_docs"],
         "score": (doc.get("last_report") or {}).get("total"),
+        "verdict": (check.get("verdict") or {}).get("label"),
+        "source_url": check.get("source_url", ""),
     }
-    index = [e for e in list_analyses() if e["id"] != entry["id"]]
-    index.insert(0, entry)
-    state.save(INDEX_DOC, {"analyses": index[:INDEX_CAP]})
 
 
-def _volatility(keyword: str, locale: str, urls: list[str], cfg: OptimizerConfig) -> str:
-    """Overlap vs the previous snapshot of the same keyword — advice shelf life."""
+def _index_put(brand_id: str, entry: dict) -> None:
+    def apply(current: dict) -> tuple[dict, None]:
+        rows = [e for e in current.get("analyses", []) if e["id"] != entry["id"]]
+        rows.insert(0, entry)
+        return {"analyses": rows[:INDEX_CAP]}, None
+
+    geo_store.mutate(INDEX_DOC.format(brand_id=brand_id), apply)
+
+
+def _volatility(brand_id: str, keyword: str, locale: str, urls: list[str],
+                cfg: OptimizerConfig) -> str:
+    """Overlap vs this brand's previous snapshot of the same keyword — advice shelf life."""
     previous = next(
-        (e for e in list_analyses() if e["keyword"] == keyword and e["locale"] == locale),
+        (e for e in list_analyses(brand_id) if e["keyword"] == keyword and e["locale"] == locale),
         None,
     )
     if not previous:
         return "first-analysis"
-    old = state.load(ANALYSIS_DOC.format(aid=previous["id"])) or {}
+    old = state.load(ANALYSIS_DOC.format(brand_id=brand_id, aid=previous["id"])) or {}
     old_urls = {r["url"] for r in old.get("results", [])}
     if not old_urls or not urls:
         return "unknown"

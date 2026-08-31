@@ -22,7 +22,7 @@
     "filtered by (vendor_slug) and (month). They were written that way on",
     "purpose, so the cost fix could ship without waiting on an index build.",
     "",
-    "The two entries below are the composites the code ALREADY requires today."
+    "The first three entries below are the composites the code ALREADY requires today."
   ],
   "indexes": [
     {
@@ -41,6 +41,15 @@
       "fields": [
         { "fieldPath": "brand_id", "order": "ASCENDING" },
         { "fieldPath": "creative_metadata.author", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "_why": "firestore_repo.list_runs_for_user - the console's Runs panel and every figure Home derives from it: where(user_id ==) + order_by(created_at DESC) + limit. REQUIRED TODAY. Without it Firestore refuses the query and the code falls back to an unordered read sorted in process, which is correct but caps at 3000 rows per caller and costs a wasted round-trip on the first read of each 10-minute window.",
+      "collectionGroup": "runs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "user_id", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
       ]
     },
     {

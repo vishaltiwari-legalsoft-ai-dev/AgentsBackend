@@ -51,12 +51,17 @@ def _has(spec: dict, collection: str, *paths: str) -> bool:
     return False
 
 
-def test_the_two_composites_the_code_requires_today_are_recorded(spec):
+def test_the_composites_the_code_requires_today_are_recorded(spec):
     assert _has(spec, "creative_events", "user_id", "created_at"), (
         "firestore_repo.list_usage_events needs this one — it is an equality "
         "plus an inequality, which Firestore cannot serve without a composite")
     assert _has(spec, "creatives", "brand_id", "creative_metadata.author"), (
         "firestore_repo.delete_ingested_creatives needs this one")
+    assert _has(spec, "runs", "user_id", "created_at"), (
+        "firestore_repo.list_runs_for_user needs this one — an equality filter "
+        "plus an ordering on a different field. Without it the console's Runs "
+        "panel falls back to reading unordered and sorting in process, which is "
+        "correct but capped at 3000 rows per caller")
 
 
 def test_the_mr_read_path_queries_stayed_index_free():

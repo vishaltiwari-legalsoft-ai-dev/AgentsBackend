@@ -22,8 +22,11 @@ few answers is marked ``partial`` instead of being drawn as a cliff.
 from __future__ import annotations
 
 import datetime as dt
+from collections import defaultdict
+from statistics import mean
 
 from final_geo_agent import geo_metrics
+from final_geo_agent.geo_store import mutate
 from seo_geo_agent import state
 
 # What the score is made of. Presence dominates because being named at all is
@@ -66,6 +69,8 @@ BACKFILL_DAYS = 30
 # floor exists because a trend needs at least a week to be a trend.
 MIN_SERIES_DAYS = 7
 MAX_SERIES_DAYS = 365
+# A quarter of weekly bars: enough to see a plan's 90-day horizon end to end.
+DEFAULT_ROLLUP_WEEKS = 12
 
 
 def clamp_series_days(days: object) -> int:
@@ -172,6 +177,21 @@ def build_point(
         "n_measured": len(measured),
         "n_answers": len(answers),
         "n_prompts": block["mention"].get("n_prompts", 0),
+        # The three states one answer can be in, as counts over the SAME
+        # denominator (``n_measured``).
+        #
+        # ``mention_rate`` and ``citation_rate`` cannot be combined into these:
+        # the citation rate is computed over answers that carry citations at
+        # all, which is a different and smaller population. Multiplying both by
+        # ``n_measured`` and subtracting produced "named, no link: -9" on a real
+        # brand — a count that cannot exist. So the split is counted here, from
+        # the answers themselves, and the panel either has all three or draws
+        # none of them.
+        "n_named": sum(1 for a in measured if "self" in (a.get("mentions") or {})),
+        "n_named_cited": sum(
+            1 for a in measured
+            if "self" in (a.get("mentions") or {}) and a.get("brand_cited")
+        ),
         "engines": {
             engine: (b["mention"] or {}).get("rate")
             for engine, b in report["engines"].items()
@@ -217,11 +237,6 @@ def load_points(brand_id: str) -> list[dict]:
 
 def save_points(brand_id: str, points: list[dict]) -> list[dict]:
     """Merge ``points`` into the brand's history document, atomically."""
-    # Imported here, not at module scope: geo_poll imports this module to
-    # record a point when a sweep completes, and a top-level import back would
-    # be a cycle. The transaction is geo_poll's, because that is where the
-    # read-modify-write helper for these documents lives.
-    from final_geo_agent.geo_poll import mutate
 
     def change(doc: dict) -> tuple[dict, list[dict]]:
         doc = dict(doc or {})
@@ -258,8 +273,6 @@ def backfill(
     chart until its next sweep. Points are marked ``source: "backfill"`` so the
     panel can be explicit that they were derived after the fact.
     """
-    from final_geo_agent.geo_poll import mutate
-
     built = [
         point
         for day in sorted(days_map)
@@ -344,3 +357,66 @@ def trend(points: list[dict]) -> dict:
         "since_start": _movement(current["score"], (first or {}).get("score")),
         "n_points": len(scored),
     }
+
+
+# ------------------------------------------------------------------ weekly
+
+
+def _iso_week(day: object) -> tuple[str, str] | None:
+    """``"20260827"`` -> ``("2026-W35", "2026-08-24")``; unreadable -> None."""
+    try:
+        date = dt.datetime.strptime(str(day), "%Y%m%d").date()
+    except (TypeError, ValueError):
+        return None
+    year, week, _weekday = date.isocalendar()
+    return f"{year}-W{week:02d}", dt.date.fromisocalendar(year, week, 1).isoformat()
+
+
+def _mean_or_none(values: list, digits: int) -> float | None:
+    present = [float(v) for v in values if v is not None]
+    return round(mean(present), digits) if present else None
+
+
+def weekly_rollup(points: list[dict], *, weeks: int = DEFAULT_ROLLUP_WEEKS) -> list[dict]:
+    """Points bucketed by ISO week, oldest→newest, the last ``weeks`` of them.
+
+    Derived on read and never stored: the per-sweep points are the record, and
+    a banked rollup would drift from them the moment a same-day point was
+    replaced by a fuller measurement. A week with no sweep is absent rather
+    than drawn as zero, so ``delta_score`` is against the previous week that
+    actually has a score — the same rule ``trend`` uses for "since last".
+
+    ``all_partial`` is the week-level version of a point's ``partial`` flag:
+    every sweep that week was thin, so the bar is provisional, not a cliff.
+    """
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    starts: dict[str, str] = {}
+    for point in points:
+        stamped = _iso_week(point.get("date"))
+        if stamped is None:
+            continue
+        week, start = stamped
+        buckets[week].append(point)
+        starts[week] = start
+
+    out: list[dict] = []
+    previous_score: float | None = None
+    for week in sorted(buckets):
+        bucket = buckets[week]
+        score = _mean_or_none([p.get("score") for p in bucket], 1)
+        out.append({
+            "week": week,
+            "start": starts[week],
+            "score": score,
+            "mention_rate": _mean_or_none([p.get("mention_rate") for p in bucket], 4),
+            "citation_rate": _mean_or_none([p.get("citation_rate") for p in bucket], 4),
+            "n_sweeps": len(bucket),
+            "all_partial": all(p.get("partial") for p in bucket),
+            "delta_score": (
+                round(score - previous_score, 1)
+                if score is not None and previous_score is not None else None
+            ),
+        })
+        if score is not None:
+            previous_score = score
+    return out[-max(1, int(weeks)):]

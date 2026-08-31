@@ -105,6 +105,62 @@ def test_prompt_rollup_appear_vs_missing():
     assert rollup["p1"]["engines_hit"] == ["perplexity"]
 
 
+def test_prompt_rollup_rows_carry_the_persona_off_the_answer_record():
+    answers = [
+        dict(ans("p1", 1, mentions={"self": 1}), persona="solo practitioner"),
+        ans("p2", 1),                                   # polled before personas existed
+    ]
+    rollup = {r["prompt_id"]: r for r in geo_metrics.prompt_rollup(answers)}
+    assert rollup["p1"]["persona"] == "solo practitioner"
+    assert rollup["p2"]["persona"] == ""
+
+
+# ---------------------------------------------------------------- personas
+# The same per-prompt-then-mean discipline as mention_stats, cut by who asks.
+
+
+def test_persona_rollup_averages_per_prompt_then_across_prompts():
+    answers = [
+        dict(ans("p1", 1, mentions={"self": 1}), persona="solo", brand_cited=True),
+        dict(ans("p1", 2), persona="solo", brand_cited=False),      # flaky: 1 of 2 runs
+        dict(ans("p2", 1, mentions={"self": 1}), persona="solo", brand_cited=False),
+        dict(ans("p3", 1), persona="firm admin"),
+        dict(ans("p3", 2, error="HTTP 500"), persona="firm admin"),  # errors never count
+    ]
+    rows = {r["persona"]: r for r in geo_metrics.persona_rollup(answers)}
+    solo = rows["solo"]
+    assert solo["n_prompts"] == 2 and solo["n_answers"] == 3
+    assert solo["mention_rate"] == 0.75           # mean(0.5, 1.0), not 2/3
+    assert solo["cited_rate"] == 0.25             # mean(0.5, 0.0)
+    admin = rows["firm admin"]
+    assert (admin["n_prompts"], admin["n_answers"]) == (1, 1)
+    assert admin["mention_rate"] == 0.0 and admin["cited_rate"] == 0.0
+
+
+def test_persona_rollup_keeps_unassigned_answers_visible_and_last():
+    answers = [
+        ans("p1", 1, mentions={"self": 1}),                          # no persona at all
+        dict(ans("p2", 1), persona="solo"),
+        dict(ans("p3", 1), persona="agency"),
+    ]
+    rows = geo_metrics.persona_rollup(answers)
+    assert [r["persona"] for r in rows] == ["agency", "solo", ""]
+    assert rows[-1]["mention_rate"] == 1.0
+
+
+def test_persona_rollup_is_empty_when_nothing_was_measured():
+    assert geo_metrics.persona_rollup([ans("p1", 1, error="HTTP 429")]) == []
+
+
+def test_engine_report_carries_the_persona_rollup():
+    answers = [dict(ans("p1", 1, mentions={"self": 1}), persona="solo")]
+    report = geo_metrics.engine_report(answers, ["self"], "legalsoft.com")
+    assert report["persona_rollup"] == [{
+        "persona": "solo", "n_prompts": 1, "n_answers": 1,
+        "mention_rate": 1.0, "cited_rate": 0.0,
+    }]
+
+
 def test_no_aio_rows_stay_out_of_rate_denominators():
     answers = [
         ans("p1", 1, mentions={"self": 1}),

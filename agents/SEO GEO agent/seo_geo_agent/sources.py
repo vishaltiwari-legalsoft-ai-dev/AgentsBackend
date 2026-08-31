@@ -577,6 +577,46 @@ def fetch_page(url: str, client: httpx.Client | None = None) -> PageFacts:
             cli.close()
 
 
+def fetch_html(url: str, *, max_bytes: int = 2_000_000, timeout: float = 20.0,
+               client: httpx.Client | None = None) -> tuple[str, str]:
+    """One user-supplied URL -> ``(final_url, html)``, address-checked on every hop.
+
+    The only fetcher here that hands the raw document back, for callers that
+    run their own extractor (the Content Optimizer's page check). Two outcomes:
+    the page, or ``ValueError`` saying in plain words why not — a scheme that
+    is not http(s), a host that resolves to a non-public address on the first
+    request or on any redirect, a transport failure, a non-200 status, a
+    non-HTML body, or a body over ``max_bytes``. Wrapping the httpx errors is
+    deliberate: a URL a user typed has one failure mode from their side
+    ("could not fetch this"), so one exception type carries all of them and
+    the message says which. ``CredentialMissing`` offline, like every fetcher
+    above.
+    """
+    if not state.use_cloud():
+        raise CredentialMissing("offline mode")
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"{url[:200]!r} is not an http(s) address")
+    own = client is None
+    cli = client or httpx.Client(timeout=timeout, follow_redirects=False, headers={"User-Agent": FETCH_UA})
+    try:
+        try:
+            resp = _safe_get(cli, url)
+        except httpx.HTTPError as exc:
+            raise ValueError(f"could not fetch {url[:200]}: {exc}") from exc
+        if resp.status_code != 200:
+            raise ValueError(f"{url[:200]} returned HTTP {resp.status_code}")
+        content_type = resp.headers.get("content-type", "html")
+        if "html" not in content_type:
+            raise ValueError(f"{url[:200]} is not an HTML page ({content_type})")
+        if len(resp.content) > max_bytes:
+            raise ValueError(f"{url[:200]} is larger than {max_bytes} bytes")
+        return str(resp.url), resp.text
+    finally:
+        if own:
+            cli.close()
+
+
 def fetch_text(url: str, client: httpx.Client | None = None) -> dict:
     """Raw text fetch (robots.txt, redirect checks): {status, text, final_url}."""
     if not state.use_cloud():

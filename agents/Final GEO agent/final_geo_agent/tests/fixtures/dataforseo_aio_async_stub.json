@@ -1,0 +1,64 @@
+{
+  "version": "0.1.20260828",
+  "status_code": 20000,
+  "status_message": "Ok.",
+  "time": "2.4 sec.",
+  "cost": 0.002,
+  "tasks_count": 1,
+  "tasks_error": 0,
+  "tasks": [
+    {
+      "id": "08301123-1535-0139-0000-2a8e5b1f6c3d",
+      "status_code": 20000,
+      "status_message": "Ok.",
+      "time": "2.3 sec.",
+      "cost": 0.002,
+      "result_count": 1,
+      "path": ["v3", "serp", "google", "organic", "live", "advanced"],
+      "data": {
+        "api": "serp",
+        "function": "live",
+        "se": "google",
+        "se_type": "organic",
+        "keyword": "how do law firms stop missing after-hours calls",
+        "location_code": 2840,
+        "language_code": "en",
+        "device": "desktop"
+      },
+      "result": [
+        {
+          "keyword": "how do law firms stop missing after-hours calls",
+          "type": "organic",
+          "se_domain": "google.com",
+          "location_code": 2840,
+          "language_code": "en",
+          "check_url": "https://www.google.com/search?q=how+do+law+firms+stop+missing+after-hours+calls",
+          "datetime": "2026-08-30 11:23:02 +00:00",
+          "item_types": ["ai_overview", "organic"],
+          "se_results_count": 41000000,
+          "items_count": 11,
+          "items": [
+            {
+              "type": "ai_overview",
+              "rank_group": 1,
+              "rank_absolute": 1,
+              "position": "left",
+              "asynchronous_ai_overview": true,
+              "markdown": "",
+              "items": [],
+              "references": []
+            },
+            {
+              "type": "organic",
+              "rank_group": 1,
+              "rank_absolute": 2,
+              "domain": "www.smith.ai",
+              "title": "After-hours answering for law firms",
+              "url": "https://smith.ai/blog/after-hours"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

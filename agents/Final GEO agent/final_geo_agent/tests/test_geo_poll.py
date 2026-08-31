@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from final_geo_agent import geo_engines, geo_poll, geo_prompts
+from final_geo_agent import geo_engines, geo_history, geo_poll, geo_prompts, geo_runlog
 from final_geo_agent.geo_engines import EngineAnswer
 from seo_geo_agent import state
 from seo_geo_agent.sources import CredentialMissing
@@ -826,9 +826,298 @@ def test_total_tasks_agrees_with_the_queue_or_a_sweep_can_never_finish():
     prompts = [{"id": f"b{i}", "intent": "brand"} for i in range(3)] + [
         {"id": f"c{i}", "intent": "category"} for i in range(5)
     ]
-    usable = ["perplexity", "gemini", "aio"]
+    usable = ["perplexity", "gemini", "aio", "ai_mode"]
     docs = {e: {"answers": []} for e in usable}
 
     assert geo_poll._total_tasks(prompts, usable, runs=3) == len(
         geo_poll._pending_tasks(prompts, docs, runs=3)
     )
+
+
+# ------------------------- SERP engines are specs, not identity checks -------------------------
+# Google AI Mode joins AI Overview as a second SERP engine. The planner must not
+# know its name: one run per prompt, discovery prompts only, and the round-robin
+# — all read off the spec.
+
+
+def test_ai_mode_plans_like_aio_one_run_over_discovery_prompts_only():
+    prompts = [
+        {"id": "b1", "intent": "brand"},
+        {"id": "c1", "intent": "category"},
+        {"id": "p1", "intent": "problem"},
+    ]
+    docs = {e: {"answers": []} for e in ("perplexity", "aio", "ai_mode")}
+
+    tasks = geo_poll._pending_tasks(prompts, docs, runs=3)
+
+    ai_mode = [(p["id"], r) for e, p, r in tasks if e == "ai_mode"]
+    assert ai_mode == [("c1", 1), ("p1", 1)]                # no brand prompt, no run 2
+    assert {e for e, _p, _r in tasks[:3]} == {"perplexity", "aio", "ai_mode"}   # interleaved
+    assert geo_poll._total_tasks(prompts, list(docs), runs=3) == len(tasks) == 9 + 2 + 2
+
+
+def test_the_caller_sample_size_never_multiplies_a_serp_engine():
+    prompts = [{"id": "c1", "intent": "category"}]
+    for engine in geo_engines.SERP_ENGINES:
+        assert geo_poll._engine_runs(engine, 5) == 1
+    assert geo_poll._engine_runs("perplexity", 5) == 5
+    assert geo_poll._total_tasks(prompts, ["chatgpt", "aio", "ai_mode"], runs=5) == 5 + 1 + 1
+
+
+@pytest.fixture()
+def serp_engines(monkeypatch):
+    calls = []
+
+    def scripted(engine, prompt):
+        calls.append((engine, prompt))
+        if engine in geo_engines.SERP_ENGINES:
+            return EngineAnswer(engine=engine, model=f"google-{engine}", via="dataforseo",
+                                text="Legal Soft appears in the AI answer.", credits=1)
+        return EngineAnswer(engine=engine, model="fake", text="Legal Soft answers.")
+
+    monkeypatch.setattr(geo_engines, "available_engines", lambda: {
+        "perplexity": True, "gemini": False, "chatgpt": False, "aio": True, "ai_mode": True,
+    })
+    monkeypatch.setattr(geo_engines, "poll_engine", scripted)
+    return calls
+
+
+def test_every_serp_engine_spends_the_joint_monthly_counter(serp_engines):
+    seed_prompts(2)
+
+    res = geo_poll.poll_step(BRAND, runs=1, batch_size=50)
+
+    assert (res["done"], res["total"]) == (6, 6)          # 2 chat + 2 aio + 2 ai_mode
+    assert res["aio_credits_month"] == 4                  # both SERP engines, not the chat one
+    assert sorted(e for e, _p in serp_engines if e in geo_engines.SERP_ENGINES) == [
+        "ai_mode", "ai_mode", "aio", "aio",
+    ]
+
+
+def test_the_serp_monthly_cap_is_joint_and_drops_every_serp_engine(serp_engines):
+    seed_prompts(2)
+    geo_poll.ensure_config(BRAND)
+    geo_poll.save_config(BRAND["id"], {"aio_monthly_cap": 3})     # override key unchanged
+    cfg = geo_poll.ensure_config(BRAND)
+    cfg.setdefault("counters_aio", {})[geo_poll._month()] = 3   # counter key unchanged
+    state.save(geo_poll.config_doc_id(BRAND["id"]), cfg)
+
+    res = geo_poll.poll_step(BRAND, runs=1, batch_size=50)
+
+    assert res["aio_capped"] is True
+    assert "aio" not in res["engines"] and "ai_mode" not in res["engines"]
+    assert res["engines"] == ["perplexity"]                     # chat engines still polled
+    assert (res["done"], res["total"]) == (2, 2)
+    assert geo_poll.SERP_MONTHLY_CAP == geo_poll.AIO_MONTHLY_CAP == 2000
+
+
+def test_only_serp_engines_available_and_capped_is_an_honest_error(serp_engines, monkeypatch):
+    seed_prompts(2)
+    monkeypatch.setattr(geo_engines, "available_engines",
+                        lambda: {"perplexity": False, "aio": True, "ai_mode": True})
+    cfg = geo_poll.ensure_config(BRAND)
+    cfg["aio_monthly_cap"] = 1
+    cfg["counters_aio"] = {geo_poll._month(): 1}
+    state.save(geo_poll.config_doc_id(BRAND["id"]), cfg)
+
+    with pytest.raises(ValueError, match="monthly"):
+        geo_poll.poll_step(BRAND, runs=1, batch_size=50)
+
+
+# ------------------------- persona rides along on the record -------------------------
+
+
+def test_persona_is_copied_onto_the_stored_record(fake_engine):
+    # a persona is a key the universe document knows; the prompts module
+    # untags anything else on write, so it is registered the real way first
+    geo_prompts.set_personas(BRAND["id"], [
+        {"key": "solo", "label": "Solo practitioner", "description": "one-lawyer firm"},
+    ])
+    geo_prompts.save_universe(BRAND["id"], [
+        {"id": "p1", "text": "q1", "intent": "category", "stage": "consideration",
+         "enabled": True, "persona": "solo"},
+        {"id": "p2", "text": "q2", "intent": "category", "stage": "consideration",
+         "enabled": True},                                          # older prompt, no persona
+    ])
+
+    geo_poll.poll_step(BRAND, runs=1, batch_size=10)
+
+    by_id = {a["prompt_id"]: a for a in geo_poll.recent_answers(BRAND["id"], days=1)}
+    assert by_id["p1"]["persona"] == "solo"
+    assert by_id["p2"]["persona"] == ""
+    assert by_id["p1"]["intent"] == "category"
+
+
+# ------------------------- a console-driven sweep completes too -------------------------
+# Only ``poll_until_done`` stamped the schedule, so a sweep the panel drove to
+# the end stayed "due" forever and the next cron fire re-polled a day that was
+# already fully measured.
+
+
+def test_a_sweep_finished_from_the_console_stamps_the_schedule(fake_engine):
+    seed_prompts(3)
+
+    first = geo_poll.poll_step(BRAND, runs=1, batch_size=2)
+    assert first["done"] < first["total"]
+    assert "last_poll_completed_at" not in geo_poll.ensure_config(BRAND)   # still due
+
+    geo_poll.poll_step(BRAND, runs=1, batch_size=2)
+
+    cfg = geo_poll.ensure_config(BRAND)
+    assert cfg["last_poll_completed_at"]
+    assert geo_poll.poll_due(cfg)[0] is False
+    assert geo_poll.poll_status(BRAND, runs=1)["due_now"] is False
+
+
+def test_a_terminal_step_never_stamps_the_schedule(monkeypatch):
+    seed_prompts(2)
+    _engines(monkeypatch, perplexity=True)
+    monkeypatch.setattr(geo_engines, "poll_engine",
+                        lambda e, p: EngineAnswer(engine=e, model="fake", error="HTTP 401"))
+
+    res = geo_poll.poll_step(BRAND, runs=1, batch_size=10)
+
+    assert res["terminal"] is True
+    assert "last_poll_completed_at" not in geo_poll.ensure_config(BRAND)
+
+
+# ------------------------- the run log -------------------------
+# Written from exactly one place: the step that ends the sweep.
+
+
+def test_the_run_log_gets_one_entry_when_the_sweep_ends(fake_engine):
+    seed_prompts(3)
+
+    geo_poll.poll_step(BRAND, runs=1, batch_size=2)
+    assert geo_runlog.recent_runs(BRAND["id"]) == []              # not over yet
+
+    geo_poll.poll_step(BRAND, runs=1, batch_size=2)
+
+    runs = geo_runlog.recent_runs(BRAND["id"])
+    assert len(runs) == 1
+    run = runs[0]
+    assert run["id"]
+    assert run["day"] == geo_poll._today()
+    assert run["trigger"] == "manual"
+    assert run["completed"] is True and run["stopped_because"] == "completed"
+    assert run["terminal_reason"] is None
+    assert run["steps"] == 2
+    assert (run["done"], run["total"]) == (3, 3)
+    assert run["calls"] == 3 and run["errors"] == {} and run["no_aio"] == 0
+    assert run["engines"] == ["perplexity"]
+    assert run["started_at"] <= run["finished_at"] and run["duration_s"] >= 0
+    assert run["score"] is None            # 3 answers is below the chart's minimum sample
+    assert run["plan_progress"] is None    # no Action Plan yet
+
+    geo_poll.poll_step(BRAND, runs=1, batch_size=2)                # idle step: nothing to log
+    assert len(geo_runlog.recent_runs(BRAND["id"])) == 1
+
+
+def test_a_cron_sweep_is_logged_as_cron_with_the_banked_score(fake_engine):
+    seed_prompts(12)                                              # enough for a chart point
+
+    result = geo_poll.poll_until_done(BRAND, runs=1, batch_size=5)
+
+    runs = geo_runlog.recent_runs(BRAND["id"])
+    assert len(runs) == 1
+    run = runs[0]
+    assert run["trigger"] == "cron"
+    assert run["steps"] == result["steps"] == 3
+    assert run["completed"] is True and run["calls"] == 12
+    banked = geo_history.load_points(BRAND["id"])[-1]
+    assert banked["date"] == geo_poll._today()
+    assert run["score"] == banked["score"] is not None
+
+
+def test_a_terminal_sweep_is_logged_with_its_reason_and_errors(monkeypatch):
+    seed_prompts(2)
+    _engines(monkeypatch, perplexity=True)
+    monkeypatch.setattr(geo_engines, "poll_engine",
+                        lambda e, p: EngineAnswer(engine=e, model="fake", error="HTTP 401: bad key"))
+
+    res = geo_poll.poll_step(BRAND, runs=1, batch_size=10)
+
+    run = geo_runlog.recent_runs(BRAND["id"])[0]
+    assert run["completed"] is False
+    assert run["terminal_reason"] == res["terminal_reason"]
+    assert run["stopped_because"] == res["terminal_reason"]
+    assert run["errors"] == {"perplexity": 2}
+    assert run["engines"] == []                                   # nothing was measured
+    assert run["calls"] == 2 and (run["done"], run["total"]) == (2, 2)
+
+
+def test_no_aio_observations_are_counted_on_the_run_log(monkeypatch):
+    seed_prompts(2)
+    monkeypatch.setattr(geo_engines, "available_engines",
+                        lambda: {"perplexity": False, "aio": True, "ai_mode": False})
+    monkeypatch.setattr(geo_engines, "poll_engine",
+                        lambda e, p: EngineAnswer(engine=e, model="google-ai-overview",
+                                                  via="dataforseo", no_aio=True))
+
+    geo_poll.poll_step(BRAND, runs=1, batch_size=10)
+
+    run = geo_runlog.recent_runs(BRAND["id"])[0]
+    assert run["no_aio"] == 2 and run["errors"] == {}
+    assert run["engines"] == ["aio"]                              # the slot was checked
+
+
+def test_the_run_log_records_where_the_plan_stood(fake_engine):
+    from final_geo_agent import geo_strategy
+
+    seed_prompts(2)
+    state.save(geo_strategy.strategy_doc_id(BRAND["id"]), {
+        "brand_id": BRAND["id"], "history": [],
+        "current": {"generated_at": "2026-08-20T00:00:00+00:00", "summary": "s", "waves": [
+            {"weeks": "1-2", "title": "w", "objective": "", "why_evidence": "",
+             "actions": [{"id": "a1", "title": "A", "status": "done"},
+                         {"id": "a2", "title": "B", "status": "todo"}]},
+        ]},
+    })
+
+    geo_poll.poll_step(BRAND, runs=1, batch_size=10)
+
+    assert geo_runlog.recent_runs(BRAND["id"])[0]["plan_progress"] == {"done": 1, "total": 2}
+
+
+def test_a_run_log_failure_never_breaks_a_paid_sweep(fake_engine, monkeypatch):
+    seed_prompts(2)
+
+    def broken(*a, **k):
+        raise RuntimeError("run log datastore down")
+    monkeypatch.setattr(geo_runlog, "record_run", broken)
+
+    res = geo_poll.poll_step(BRAND, runs=1, batch_size=10)
+
+    assert (res["done"], res["total"]) == (2, 2) and res["terminal"] is False
+    assert geo_poll.ensure_config(BRAND)["last_poll_completed_at"]     # the sweep still completed
+    assert len(geo_poll.recent_answers(BRAND["id"], days=1)) == 2      # and the answers are stored
+
+
+def test_truncated_sweep_samples_every_intent_not_just_the_brand_questions():
+    """Universe order opens with brand-intent questions, and a budget-starved
+    sweep used to measure only those — five days of mention_rate 1.0 on
+    n_prompts=3 while the full-window truth was 0.23. The first few tasks of a
+    sweep must span intents, and brand questions go last."""
+    prompts = (
+        [{"id": f"b{i}", "text": f"brand q{i}", "intent": "brand"} for i in range(6)]
+        + [{"id": f"c{i}", "text": f"cat q{i}", "intent": "category"} for i in range(6)]
+        + [{"id": f"p{i}", "text": f"prob q{i}", "intent": "problem"} for i in range(6)]
+    )
+    ordered = geo_poll.representative_order(prompts)
+    first_three = {p["intent"] for p in ordered[:3]}
+    assert first_three == {"category", "problem", "brand"}
+    # category leads, brand trails within each round
+    assert ordered[0]["intent"] == "category"
+    assert ordered[2]["intent"] == "brand"
+    # nothing lost, nothing duplicated
+    assert sorted(p["id"] for p in ordered) == sorted(p["id"] for p in prompts)
+
+
+def test_representative_order_handles_missing_and_unknown_intents():
+    prompts = [
+        {"id": "a", "text": "x", "intent": "category"},
+        {"id": "b", "text": "y"},                       # missing -> category bucket
+        {"id": "c", "text": "z", "intent": "weird"},    # unknown keeps its own bucket
+    ]
+    ordered = geo_poll.representative_order(prompts)
+    assert sorted(p["id"] for p in ordered) == ["a", "b", "c"]

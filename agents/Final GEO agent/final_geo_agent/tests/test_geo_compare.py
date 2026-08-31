@@ -36,6 +36,24 @@ def test_normalize_domain_accepts_urls_rejects_plain_names():
     assert geo_compare.normalize_domain("") == ""
 
 
+def test_entity_key_prefers_key_then_name_and_is_blank_for_neither():
+    assert geo_compare.entity_key({"key": "clio", "name": "Clio"}) == "clio"
+    assert geo_compare.entity_key({"name": " Smokeball "}) == "Smokeball"
+    assert geo_compare.entity_key({"key": "", "name": "Clio"}) == "Clio"
+    assert geo_compare.entity_key({}) == ""
+
+
+def test_one_key_rule_keeps_a_name_only_rival_consistent_across_every_map():
+    """A rival keyed one way in the rows and another in the domain map is a
+    rival whose numbers never meet."""
+    cfg = {"competitors": [{"name": "MyCase", "domain": "mycase.com"}]}
+    assert geo_compare.entity_keys(cfg) == ["self", "MyCase"]
+    assert geo_compare.entity_names(cfg, BRAND)["MyCase"] == "MyCase"
+    assert geo_compare.entity_domains(cfg, BRAND)["MyCase"] == "mycase.com"
+    rows = geo_compare.build([ans("p1", 1, mentions={"MyCase": 1})], cfg, BRAND)["rows"]
+    assert [r["key"] for r in rows] == ["self", "MyCase"]
+
+
 def test_entity_domains_prefers_explicit_then_alias():
     cfg = {"competitors": [
         {"key": "a", "name": "A", "domain": "a.io", "aliases": ["other.com"]},
@@ -170,6 +188,20 @@ def test_untracked_domains_ranked_by_where_we_are_absent():
     ]
     found = geo_compare.untracked_domains(answers, ["legalsoft.com"])
     assert [d["domain"] for d in found] == ["quiet.com", "loud.com"]
+
+
+def test_untracked_domains_count_the_distinct_questions_each_is_cited_on():
+    """Volume and breadth are different threats: 30 citations on one question
+    is a page that owns it; 30 across a dozen questions is a rival."""
+    answers = [
+        ans("p1", 1, citations=[{"domain": "g2.com"}, {"domain": "capterra.com"}]),
+        ans("p1", 2, citations=[{"domain": "g2.com"}]),          # same question again
+        ans("p2", 1, citations=[{"domain": "g2.com"}]),
+        ans("p3", 1, citations=[{"domain": "g2.com"}], error="HTTP 500"),   # not measured
+    ]
+    found = {d["domain"]: d for d in geo_compare.untracked_domains(answers, [])}
+    assert (found["g2.com"]["count"], found["g2.com"]["n_questions"]) == (3, 2)
+    assert (found["capterra.com"]["count"], found["capterra.com"]["n_questions"]) == (1, 1)
 
 
 def test_untracked_domain_counted_once_per_answer():

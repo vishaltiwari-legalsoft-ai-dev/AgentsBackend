@@ -28,7 +28,7 @@ The ledger is also documentation with teeth. ``WORKSPACE_SHARED`` is not a
 euphemism for "insecure" — it is a checked-in, counted statement that these
 routes serve the same rows to every signed-in caller, which is *correct* for a
 single shared team workspace and *wrong* the moment a second client is added.
-Today that count is 47. When the workspace boundary lands, the number moves,
+Today that count is 48. When the workspace boundary lands, the number moves,
 and :func:`test_workspace_shared_surface_has_not_grown_silently` makes anyone
 who grows it say so on purpose.
 """
@@ -112,7 +112,9 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     ("POST", "/api/admin/settings"): CREATOR_ONLY,
     ("POST", "/api/admin/settings/test"): CREATOR_ONLY,
     ("PUT", "/api/geo/brands/{brand_id}/config"): CREATOR_ONLY,
+    ("PUT", "/api/geo/brands/{brand_id}/personas"): CREATOR_ONLY,
     ("PUT", "/api/geo/brands/{brand_id}/prompts"): CREATOR_ONLY,
+    ("POST", "/api/geo/brands/{brand_id}/prompts/bulk"): CREATOR_ONLY,
     ("POST", "/api/geo/brands/{brand_id}/prompts/custom"): CREATOR_ONLY,
     ("POST", "/api/geo/brands/{brand_id}/prompts/generate"): CREATOR_ONLY,
     ("POST", "/api/geo/brands/{brand_id}/rescan"): CREATOR_ONLY,
@@ -218,6 +220,11 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     ("GET", "/api/mr/trends"): TENANT_SCOPED,
     ("GET", "/api/mr/workbook"): TENANT_SCOPED,
     ("POST", "/api/mr/workbook/scan"): TENANT_SCOPED,
+    # The console's record. `firestore_repo.list_runs_for_user` filters on
+    # `user_id` before it orders, and both the count and the fallback scan carry
+    # the same filter, so there is no path through this route that reads a row
+    # belonging to anyone else.
+    ("GET", "/api/runs"): TENANT_SCOPED,
     ("GET", "/api/usage"): TENANT_SCOPED,
     # --- shared across the whole workspace, with no boundary object -------- #
     # Canva: one module-level ``_active_token`` in ``routers/canva.py`` holds
@@ -231,6 +238,13 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     ("GET", "/api/geo/brands/{brand_id}/comparison"): WORKSPACE_SHARED,
     ("GET", "/api/geo/brands/{brand_id}/config"): WORKSPACE_SHARED,
     ("GET", "/api/geo/brands/{brand_id}/history"): WORKSPACE_SHARED,
+    # Page check: docs are ``optimizer-analysis-{brand_id}-{aid}`` and
+    # ``optimizer-index-{brand_id}`` — brand-keyed like the rest of GEO, and
+    # still no user or workspace key.
+    ("POST", "/api/geo/brands/{brand_id}/page-check"): WORKSPACE_SHARED,
+    ("GET", "/api/geo/brands/{brand_id}/page-checks"): WORKSPACE_SHARED,
+    ("GET", "/api/geo/brands/{brand_id}/page-checks/{check_id}"): WORKSPACE_SHARED,
+    ("POST", "/api/geo/brands/{brand_id}/page-checks/{check_id}/rescore"): WORKSPACE_SHARED,
     ("GET", "/api/geo/brands/{brand_id}/poll/status"): WORKSPACE_SHARED,
     ("POST", "/api/geo/brands/{brand_id}/poll/step"): WORKSPACE_SHARED,
     ("GET", "/api/geo/brands/{brand_id}/prompts"): WORKSPACE_SHARED,
@@ -238,10 +252,10 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     ("GET", "/api/geo/brands/{brand_id}/strategy"): WORKSPACE_SHARED,
     ("PUT", "/api/geo/brands/{brand_id}/strategy/actions/{action_id}"): WORKSPACE_SHARED,
     ("GET", "/api/geo/config"): WORKSPACE_SHARED,
-    ("GET", "/api/geo/optimizer/analyses"): WORKSPACE_SHARED,
-    ("GET", "/api/geo/optimizer/analyses/{analysis_id}"): WORKSPACE_SHARED,
-    ("POST", "/api/geo/optimizer/analyze"): WORKSPACE_SHARED,
-    ("POST", "/api/geo/optimizer/rescore"): WORKSPACE_SHARED,
+    # Issues: a read-only composition of the shared brand registry with each
+    # brand's SEO run, GEO config, run log and plan — the same rows
+    # ``/seo-geo/overview`` serves, for the same reason.
+    ("GET", "/api/issues"): WORKSPACE_SHARED,
     # MR snapshots: ``marketing_research_agent/snapshots.py`` has no ``user_id``
     # in any function — every row is keyed by vendor slug and date alone, while
     # the rest of the MR router scopes carefully. This is the inconsistency the
@@ -283,7 +297,12 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
 #: *ratchet*, not a target: the workspace-tenancy migration should drive it
 #: down, and nothing should drive it up without editing this number and saying
 #: why in the commit.
-WORKSPACE_SHARED_BASELINE = 47
+#:
+#: 47 → 48 on 2026-08-30: the four brand-blind ``/geo/optimizer/*`` routes were
+#: replaced one-for-one by the four brand-scoped ``/geo/brands/{id}/page-check*``
+#: routes (net zero), and ``GET /api/issues`` was added — a read over the same
+#: shared brand registry every other GEO/SEO read already composes.
+WORKSPACE_SHARED_BASELINE = 48
 
 
 # --------------------------------------------------------------------------- #

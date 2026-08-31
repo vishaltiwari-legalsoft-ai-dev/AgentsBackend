@@ -191,6 +191,48 @@ def gap_report(
     return sorted(gaps, key=lambda g: -g.priority)
 
 
+STRENGTHS_CAP = 12
+
+
+def strengths_report(
+    covered_subtopics: list[tuple[str, str]],   # (label, evidence chunk text)
+    entries: list[TermEntry],
+    bands: dict[str, StructureBand],
+    draft_features: dict[str, float],
+    cfg: ScoreCfg,
+) -> list[dict]:
+    """The mirror of ``gap_report``: what the draft already does the way the
+    winners do, in the same order (subtopics, terms, structure) and the same
+    voice, so a page check can set pros beside cons. Plain dicts because this
+    is the shape the page-check block persists. Capped so a long draft cannot
+    bury three real cons under forty pros."""
+    out: list[dict] = []
+    for label, evidence in covered_subtopics:
+        msg = f"Covers '{label}'"
+        if evidence:
+            msg += f" — \"{evidence[:120]}\""
+        out.append({"kind": "subtopic", "message": msg})
+    for e in sorted(entries, key=lambda e: -e.importance):
+        if e.brand_optin or term_credit(e, cfg) < 1.0:
+            continue
+        rng = f"{e.lo}-{e.hi}" if e.hi > e.lo else str(e.lo)
+        if e.draft_count <= e.hi:
+            msg = f"'{e.term}' used {e.draft_count}x — inside the winners' {rng} range"
+        else:
+            msg = f"'{e.term}' used {e.draft_count}x — covers the winners' {rng} range (extra repetitions earn nothing)"
+        out.append({"kind": "term", "message": msg})
+    for feature, b in bands.items():
+        v = draft_features.get(feature)
+        if v is None or b.kind == "modes" or b.lo is None or b.hi is None:
+            continue
+        if band_score(v, b.lo, b.hi, cfg.band_decay_factor) >= 1.0:
+            out.append({
+                "kind": "structure",
+                "message": f"{feature}: {v:g} is inside the winners' band {b.lo:g}-{b.hi:g}",
+            })
+    return out[:STRENGTHS_CAP]
+
+
 def winners_median_score(winner_totals: list[float]) -> int | None:
     """Comparability anchor: 'your 31 vs winners' median 78'."""
     if not winner_totals:

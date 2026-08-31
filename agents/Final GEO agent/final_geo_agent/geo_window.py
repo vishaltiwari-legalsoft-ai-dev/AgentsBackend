@@ -48,11 +48,11 @@ from final_geo_agent import geo_engines, geo_metrics
 from seo_geo_agent import state
 
 # The engine list a READER scans. Deliberately ``ALL_ENGINES`` and deliberately
-# stated once: ``ENGINE_KEY_FIELDS`` omits ``aio`` (it has no chat key field),
-# and a reader that picked that up made every stored AI Overview answer
-# invisible on 2026-08-11. The poll PLANNER is the one legitimate exception —
-# it iterates only the engines it may actually call — and it says so at its own
-# call site.
+# stated once: ``ENGINE_KEY_FIELDS`` covers only the chat engines (the SERP
+# engines are keyed per vendor, not per engine), and a reader that picked that
+# up made every stored AI Overview answer invisible on 2026-08-11. The poll
+# PLANNER is the one legitimate exception — it iterates only the engines it may
+# actually call — and it says so at its own call site.
 ENGINES: tuple[str, ...] = geo_engines.ALL_ENGINES
 
 #: Bounds of the answer window, in days. This is the *measured* window — how far

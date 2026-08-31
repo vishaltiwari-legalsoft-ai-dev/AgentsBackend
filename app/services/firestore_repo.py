@@ -613,6 +613,104 @@ def list_usage_events(
 
 
 # --------------------------------------------------------------------------- #
+# The record — one caller's runs across every agent
+# --------------------------------------------------------------------------- #
+# ``runs`` is written by two shapes of the same trail (see run_tracking): an
+# append-only row per unit of work, and one row per Graphics Designer run
+# updated in place. Both carry ``user_id``, so the record reads the same way for
+# either. The admin Database panel browses this collection raw; this pair is the
+# *product* read — scoped to the caller, newest first.
+
+def count_runs_for_user(user_id: str) -> int | None:
+    """How many runs this caller has ever filed.
+
+    ``None`` when the count could not be read — same contract as
+    :func:`count_collection`, so the console can say "we never found out"
+    instead of printing a zero that reads as "you have never run anything".
+    """
+    if not user_id:
+        return 0
+    try:
+        result = (
+            _db()
+            .collection("runs")
+            .where(filter=firestore.FieldFilter("user_id", "==", user_id))
+            .count()
+            .get()
+        )
+        return int(result[0][0].value) if result and result[0] else 0
+    except Exception:
+        logger.warning("could not count runs for a user", exc_info=True)
+        return None
+
+
+#: How many of one caller's rows the unordered fallback will pull before it
+#: gives up on being complete. Well above today's whole-collection size, and low
+#: enough that a runaway agent cannot turn one page load into a full scan.
+_RUNS_SCAN_CAP = 3000
+
+#: When the ordered read was last refused for want of an index, as a monotonic
+#: clock reading. Firestore rejects the query *before* running it, so an
+#: un-memoised fallback pays a guaranteed failed round-trip on every single page
+#: load — measured at ~1s of the 2.3s this endpoint took. Remembering the
+#: refusal skips it; re-trying after the interval means creating the index
+#: brings the fast path back without a redeploy.
+_runs_index_missing_at: float | None = None
+_RUNS_INDEX_RETRY_SECONDS = 600.0
+
+
+def list_runs_for_user(user_id: str, limit: int = 200) -> list[dict[str, Any]] | None:
+    """This caller's runs, newest first.
+
+    The ordered form needs a composite index on ``(user_id ASC, created_at
+    DESC)``. Until that index exists Firestore refuses the query outright, and
+    refusing to show anybody their own record because an index is missing is a
+    worse answer than reading the rows and sorting them here — so a refused
+    ordered query falls back to an unordered read of the same filter, sorted in
+    process. The fallback is capped and logs loudly, because it stops being
+    acceptable the moment one caller has more runs than the cap.
+
+    ``None`` means the read itself failed. ``[]`` means this caller has no runs.
+    """
+    global _runs_index_missing_at
+    if not user_id:
+        return []
+    col = _db().collection("runs")
+    scoped = col.where(filter=firestore.FieldFilter("user_id", "==", user_id))
+
+    now = time.monotonic()
+    index_known_missing = (
+        _runs_index_missing_at is not None
+        and (now - _runs_index_missing_at) < _RUNS_INDEX_RETRY_SECONDS
+    )
+    if not index_known_missing:
+        try:
+            docs = scoped.order_by(
+                "created_at", direction=firestore.Query.DESCENDING
+            ).limit(limit).stream()
+            rows = [doc.to_dict() | {"id": doc.id} for doc in docs]
+            _runs_index_missing_at = None
+            return rows
+        except Exception:
+            _runs_index_missing_at = now
+            logger.warning(
+                "runs: the ordered read was refused — create the composite index "
+                "(user_id ASC, created_at DESC) on `runs`. Sorting in process "
+                "meanwhile; not retrying the ordered read for %ss.",
+                int(_RUNS_INDEX_RETRY_SECONDS),
+                exc_info=True,
+            )
+
+    try:
+        rows = [doc.to_dict() | {"id": doc.id} for doc in scoped.limit(_RUNS_SCAN_CAP).stream()]
+    except Exception:
+        logger.warning("could not read the runs record", exc_info=True)
+        return None
+    rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    return rows[:limit]
+
+
+# --------------------------------------------------------------------------- #
 # Admin database viewer (read-only inspection of raw collections)
 # --------------------------------------------------------------------------- #
 # A whitelist the admin "Database" panel may read so the team can *see* the data

@@ -90,10 +90,13 @@ Let the jar sit overnight. Twelve hours works for most beans.
 """
 
 
-def run_analyze(draft: str = DRAFT):
+BRAND_ID = "coffeelab"
+
+
+def run_analyze(draft: str = DRAFT, brand_id: str = BRAND_ID):
     return opt_pipeline.analyze(
         "how to make cold brew coffee", "en-US", draft,
-        provider=build_provider(), embedder=FakeEmbedder(),
+        brand_id=brand_id, provider=build_provider(), embedder=FakeEmbedder(),
         own_domain="mybrand.example.com",
     )
 
@@ -101,6 +104,7 @@ def run_analyze(draft: str = DRAFT):
 def test_end_to_end_analyze():
     doc = run_analyze()
     meta = doc["meta"]
+    assert meta["brand_id"] == BRAND_ID
     assert meta["n_docs"] == 9 and meta["volatility"] == "first-analysis"
     assert meta["article_share"] > 0.7 and meta["warnings"] == []
 
@@ -120,6 +124,8 @@ def test_end_to_end_analyze():
     assert 0 <= report["total"] <= 100
     assert report["winners_median"] is not None and report["winners_median"] > report["total"]
     assert any("fridge" in g["message"] for g in report["gaps"])   # storage gap surfaced
+    # the mirror: what the draft already does like the winners, same voice
+    assert any(s["kind"] == "subtopic" and "ratio" in s["message"] for s in report["strengths"])
     assert doc["disclaimer"].startswith("This score measures")
 
 
@@ -127,21 +133,22 @@ def test_rescore_is_deterministic_and_pinned():
     doc = run_analyze()
     aid = doc["meta"]["analysis_id"]
     first = doc["last_report"]["total"]
-    again = opt_pipeline.rescore(aid, DRAFT, embedder=FakeEmbedder())
-    third = opt_pipeline.rescore(aid, DRAFT, embedder=FakeEmbedder())
+    again = opt_pipeline.rescore(BRAND_ID, aid, DRAFT, embedder=FakeEmbedder())
+    third = opt_pipeline.rescore(BRAND_ID, aid, DRAFT, embedder=FakeEmbedder())
     assert again["total"] == third["total"] == first
 
     improved = DRAFT + "\n## Keeping it fresh\nStore the bottle in the fridge, it will keep about a week.\n"
-    better = opt_pipeline.rescore(aid, improved, embedder=FakeEmbedder())
+    better = opt_pipeline.rescore(BRAND_ID, aid, improved, embedder=FakeEmbedder())
     assert better["total"] > first                     # closing the storage gap pays
-    assert opt_pipeline.get_analysis(aid)["last_report"]["total"] == better["total"]
+    assert opt_pipeline.get_analysis(BRAND_ID, aid)["last_report"]["total"] == better["total"]
+    assert opt_pipeline.list_analyses(BRAND_ID)[0]["score"] == better["total"]
 
 
 def test_keyless_semantic_degrades_honestly(monkeypatch):
     monkeypatch.setattr(opt_semantic.runtime_config, "get", lambda *a, **k: "")
     doc = opt_pipeline.analyze(
         "how to make cold brew coffee", "en-US", DRAFT,
-        provider=build_provider(), own_domain="mybrand.example.com",
+        brand_id=BRAND_ID, provider=build_provider(), own_domain="mybrand.example.com",
     )
     assert "semantic_unavailable" in doc["meta"]["degraded"]
     assert any("lexical-only" in w for w in doc["meta"]["warnings"])
@@ -166,7 +173,9 @@ def test_article_share_warning_on_commercial_serp():
         SerpData(keyword="cold brew maker", locale="en-US", provider="fixture", results=results),
         pages,
     )
-    doc = opt_pipeline.analyze("cold brew maker", "en-US", "", provider=provider, embedder=FakeEmbedder())
+    doc = opt_pipeline.analyze(
+        "cold brew maker", "en-US", "", brand_id=BRAND_ID, provider=provider, embedder=FakeEmbedder(),
+    )
     assert any("may not want an article" in w for w in doc["meta"]["warnings"])
     assert any("usable winners" in w for w in doc["meta"]["warnings"])   # small-n honesty
 
@@ -175,9 +184,10 @@ def test_second_snapshot_gets_volatility_label():
     run_analyze()
     doc2 = run_analyze()
     assert doc2["meta"]["volatility"] == "stable"      # identical fixture SERP
-    index = opt_pipeline.list_analyses()
+    index = opt_pipeline.list_analyses(BRAND_ID)
     assert index[0]["id"] == doc2["meta"]["analysis_id"]
     assert index[0]["score"] == doc2["last_report"]["total"]
+    assert index[0]["verdict"] is None and index[0]["source_url"] == ""   # no page check yet
 
 
 def test_page_type_classifier():

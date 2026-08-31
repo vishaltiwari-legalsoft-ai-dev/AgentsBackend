@@ -1,0 +1,28 @@
+{
+  "version": "0.1.20260828",
+  "status_code": 20000,
+  "status_message": "Ok.",
+  "time": "0.1 sec.",
+  "cost": 0,
+  "tasks_count": 1,
+  "tasks_error": 1,
+  "tasks": [
+    {
+      "id": "08301125-1535-0139-0000-4b7a9d3e8f2c",
+      "status_code": 40501,
+      "status_message": "Invalid Field: 'location_code'.",
+      "time": "0 sec.",
+      "cost": 0,
+      "result_count": 0,
+      "path": ["v3", "serp", "google", "organic", "live", "advanced"],
+      "data": {
+        "api": "serp",
+        "function": "live",
+        "se": "google",
+        "se_type": "organic",
+        "keyword": "best legal intake service for law firms"
+      },
+      "result": null
+    }
+  ]
+}

@@ -161,9 +161,13 @@ def prompt_rollup(answers: list[dict]) -> list[dict]:
             "prompt_id": pid,
             "text": a.get("prompt_text", ""),
             "intent": a.get("intent", ""),
+            "persona": "",
             "n": 0, "self_hits": 0, "cited_hits": 0,
             "rivals": defaultdict(int), "engines_hit": set(),
         })
+        # answers polled before prompts carried a persona have none; the first
+        # answer that does names the question's persona
+        row["persona"] = row["persona"] or str(a.get("persona") or "")
         row["n"] += 1
         mentions = a.get("mentions") or {}
         if "self" in mentions:
@@ -182,6 +186,7 @@ def prompt_rollup(answers: list[dict]) -> list[dict]:
             "prompt_id": row["prompt_id"],
             "text": row["text"],
             "intent": row["intent"],
+            "persona": row["persona"],
             "n": row["n"],
             "self_rate": round(row["self_hits"] / row["n"], 3) if row["n"] else 0.0,
             "cited_rate": round(row["cited_hits"] / row["n"], 3) if row["n"] else 0.0,
@@ -189,6 +194,44 @@ def prompt_rollup(answers: list[dict]) -> list[dict]:
             "engines_hit": sorted(e for e in row["engines_hit"] if e),
         })
     out.sort(key=lambda r: (-r["self_rate"], r["text"]))
+    return out
+
+
+def persona_rollup(answers: list[dict]) -> list[dict]:
+    """Per buyer persona: how often the brand is named and cited on that
+    persona's questions. Same discipline as ``mention_stats`` — a rate per
+    prompt across its runs, then the mean across prompts — so one over-polled
+    question cannot carry a persona.
+
+    ``persona`` comes off the answer record. Answers polled before prompts
+    carried one land under ``""`` and stay visible; a persona the panel cannot
+    see is a persona nobody notices is unmeasured.
+    """
+    by_persona: dict[str, dict[str, list[tuple[bool, bool]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for a in _ok(answers):
+        pid = a.get("prompt_id") or ""
+        if not pid:
+            continue
+        mentions = a.get("mentions") or {}
+        by_persona[str(a.get("persona") or "")][pid].append(
+            ("self" in mentions, bool(a.get("brand_cited")))
+        )
+
+    out = []
+    for persona, prompts in by_persona.items():
+        named = [mean(1.0 if hit else 0.0 for hit, _ in runs) for runs in prompts.values()]
+        cited = [mean(1.0 if hit else 0.0 for _, hit in runs) for runs in prompts.values()]
+        out.append({
+            "persona": persona,
+            "n_prompts": len(prompts),
+            "n_answers": sum(len(runs) for runs in prompts.values()),
+            "mention_rate": round(mean(named), 4) if named else None,
+            "cited_rate": round(mean(cited), 4) if cited else None,
+        })
+    # named personas alphabetically, the unassigned bucket last
+    out.sort(key=lambda r: (r["persona"] == "", r["persona"]))
     return out
 
 
@@ -240,4 +283,5 @@ def engine_report(answers: list[dict], entities: list[str], own_domain: str) -> 
             e: mention_stats(answers, e) for e in entities if e != "self"
         },
         "prompt_rollup": prompt_rollup(answers),
+        "persona_rollup": persona_rollup(answers),
     }

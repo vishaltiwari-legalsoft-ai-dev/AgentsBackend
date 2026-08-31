@@ -1,0 +1,90 @@
+{
+  "version": "0.1.20260828",
+  "status_code": 20000,
+  "status_message": "Ok.",
+  "time": "6.8 sec.",
+  "cost": 0.004,
+  "tasks_count": 1,
+  "tasks_error": 0,
+  "tasks": [
+    {
+      "id": "08301124-1535-0139-0000-9c4d7e2b5a1f",
+      "status_code": 20000,
+      "status_message": "Ok.",
+      "time": "6.7 sec.",
+      "cost": 0.004,
+      "result_count": 1,
+      "path": ["v3", "serp", "google", "ai_mode", "live", "advanced"],
+      "data": {
+        "api": "serp",
+        "function": "live",
+        "se": "google",
+        "se_type": "ai_mode",
+        "keyword": "best legal intake service for law firms",
+        "location_code": 2840,
+        "language_code": "en"
+      },
+      "result": [
+        {
+          "keyword": "best legal intake service for law firms",
+          "type": "ai_mode",
+          "se_domain": "google.com",
+          "location_code": 2840,
+          "language_code": "en",
+          "check_url": "https://www.google.com/search?q=best+legal+intake+service&udm=50",
+          "datetime": "2026-08-30 11:24:40 +00:00",
+          "item_types": ["ai_overview"],
+          "items_count": 1,
+          "items": [
+            {
+              "type": "ai_overview",
+              "rank_group": 1,
+              "rank_absolute": 1,
+              "position": "left",
+              "markdown": "## Choosing a legal intake service\n\nFor most small and mid-sized firms the shortlist is **Legal Soft**, **Smith.ai** and **MyCase intake**. Legal Soft is the usual pick when a firm wants a dedicated, trained assistant rather than a shared receptionist pool.\n\n| Provider | Best for |\n|---|---|\n| Legal Soft | dedicated virtual legal assistants |\n| Smith.ai | overflow receptionist coverage |\n| MyCase | firms already on MyCase |",
+              "items": [
+                {
+                  "type": "ai_overview_element",
+                  "position": "left",
+                  "title": "Choosing a legal intake service",
+                  "text": "For most small and mid-sized firms the shortlist is Legal Soft, Smith.ai and MyCase intake.",
+                  "markdown": "For most small and mid-sized firms the shortlist is **Legal Soft**, **Smith.ai** and **MyCase intake**."
+                }
+              ],
+              "references": [
+                {
+                  "type": "ai_overview_reference",
+                  "source": "MyCase",
+                  "domain": "www.mycase.com",
+                  "url": "https://www.mycase.com/blog/legal-intake/",
+                  "title": "Legal intake: a guide"
+                },
+                {
+                  "type": "ai_overview_reference",
+                  "source": "Perspective",
+                  "domain": "getperspective.ai",
+                  "url": "https://getperspective.ai/legal-intake-services",
+                  "title": "Legal intake services ranked"
+                },
+                {
+                  "type": "ai_overview_reference",
+                  "source": "Smith.ai",
+                  "domain": "smith.ai",
+                  "url": "https://smith.ai/law-firms",
+                  "title": "Smith.ai for law firms"
+                },
+                {
+                  "type": "ai_overview_reference",
+                  "source": "Legal Soft",
+                  "domain": "www.legalsoft.com",
+                  "url": "https://www.legalsoft.com/intake",
+                  "title": "Legal Soft intake"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -35,11 +35,13 @@ def _action(title, venue, **over):
         "title": title, "venue": venue,
         "deliverable": "a 600-word expert answer post",
         "steps": ["Open the three linked threads", "Draft a 600-word answer with two numbers",
-                  "Post it from the founder account", "", "fifth step should be dropped"],
+                  "Post it from the founder account", "", 42,
+                  "Reply to every comment within a day"],
         "detail": "Self-promo is banned there.",
         "owner_role": "content", "effort": "medium", "impact": "high",
         "kpi": "mention_rate", "target": "30%",
         "why_evidence": "cited 14x where the brand was absent",
+        "expected_impact": "mention_rate from 21% to ~30% on the three threads by week 6",
     }
     base.update(over)
     return base
@@ -149,10 +151,14 @@ def test_actions_carry_the_resolved_venue_with_its_real_url(monkeypatch):
     assert reddit["venue"]["kind"] == "community"
     assert reddit["venue"]["cited_where_absent"] == 14
     assert reddit["deliverable"] == "a 600-word expert answer post"
-    # a list a team ticks off, capped and stripped of blanks — never a paragraph
+    # a list a team ticks off — strings only, blanks out, never a paragraph
     assert reddit["steps"] == ["Open the three linked threads",
                                "Draft a 600-word answer with two numbers",
-                               "Post it from the founder account"]
+                               "Post it from the founder account",
+                               "Reply to every comment within a day"]
+    assert reddit["expected_impact"].startswith("mention_rate from 21%")
+    assert reddit["kpi"] == "mention_rate" and reddit["kpi_coerced"] is False
+    assert reddit["assignee"] == "" and reddit["assigned_at"] is None
 
 
 def test_on_site_actions_have_no_venue_and_are_kept(monkeypatch):
@@ -233,6 +239,110 @@ def test_plan_records_whether_venue_discovery_was_complete(monkeypatch):
     assert current["venues"]["errors"]
 
 
+# ------------------------------------------------- the executability guard
+# A plan that reads well but cannot be started Monday morning is refused.
+
+
+def _one_wave(*actions, weeks="1-2"):
+    return {**FAKE_PLAN, "waves": [{"weeks": weeks, "title": "x", "objective": "",
+                                    "why_evidence": "", "actions": list(actions)}]}
+
+
+def test_an_action_with_fewer_than_two_steps_is_dropped_and_recorded(monkeypatch):
+    seed_measured_data(monkeypatch)
+    # two waves: a wave holds at most ACTIONS_PER_WAVE items before cleaning
+    first = _one_wave(
+        _action("Two real steps", "", steps=["Draft the /pricing answer block", "Publish it"]),
+        _action("One step only", "", steps=["Write it"]),
+        _action("No steps at all", "", steps=[]),
+    )["waves"][0]
+    second = _one_wave(
+        _action("Steps as prose", "", steps="First do this, then that"),
+        _action("Blank steps", "", steps=["", "   ", 7]),
+        weeks="3-4",
+    )["waves"][0]
+    monkeypatch.setattr(geo_strategy, "_llm_strategy",
+                        lambda s, p: {**FAKE_PLAN, "waves": [first, second]})
+
+    current = geo_strategy.generate_strategy(BRAND)["current"]
+
+    assert [a["title"] for w in current["waves"] for a in w["actions"]] == ["Two real steps"]
+    dropped = {d["title"]: d["reason"] for d in current["dropped_actions"]}
+    assert set(dropped) == {"One step only", "No steps at all", "Steps as prose", "Blank steps"}
+    assert all("no concrete steps" in reason for reason in dropped.values())
+
+
+def test_a_plan_of_nothing_but_unexecutable_actions_fails_loudly(monkeypatch):
+    seed_measured_data(monkeypatch)
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: _one_wave(
+        _action("Vibes", "", steps=["Be more visible"]),
+    ))
+    with pytest.raises(ValueError, match="no concrete steps"):
+        geo_strategy.generate_strategy(BRAND)
+
+
+def test_steps_are_capped_at_six(monkeypatch):
+    seed_measured_data(monkeypatch)
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: _one_wave(
+        _action("Long list", "", steps=[f"Step {i}" for i in range(1, 10)]),
+    ))
+
+    action = geo_strategy.generate_strategy(BRAND)["current"]["waves"][0]["actions"][0]
+
+    assert action["steps"] == [f"Step {i}" for i in range(1, 7)]
+    assert len(action["steps"]) == geo_strategy.STEP_CAP == 6
+
+
+def test_a_kpi_off_the_allowed_list_is_coerced_and_flagged(monkeypatch):
+    seed_measured_data(monkeypatch)
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: _one_wave(
+        _action("Guessed kpi", "", kpi="brand_awareness"),
+        _action("Real kpi", "", kpi="citation_rate"),
+    ))
+
+    actions = {a["title"]: a for a in geo_strategy.generate_strategy(BRAND)["current"]["waves"][0]["actions"]}
+
+    assert actions["Guessed kpi"]["kpi"] == "mention_rate"
+    assert actions["Guessed kpi"]["kpi_coerced"] is True     # flagged, never silent
+    assert actions["Real kpi"]["kpi"] == "citation_rate"
+    assert actions["Real kpi"]["kpi_coerced"] is False
+
+
+def test_expected_impact_is_stored_and_defaults_to_empty(monkeypatch):
+    seed_measured_data(monkeypatch)
+    plan = _one_wave(
+        _action("Promised", "", expected_impact="  citation_rate 8% -> 15% by week 8  "),
+        _action("Silent", ""),
+    )
+    del plan["waves"][0]["actions"][1]["expected_impact"]
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: plan)
+
+    actions = {a["title"]: a for a in geo_strategy.generate_strategy(BRAND)["current"]["waves"][0]["actions"]}
+
+    assert actions["Promised"]["expected_impact"] == "citation_rate 8% -> 15% by week 8"
+    assert actions["Silent"]["expected_impact"] == ""
+
+
+def test_the_brief_lists_every_allowed_kpi_and_demands_steps_and_impact(monkeypatch):
+    seed_measured_data(monkeypatch)
+    captured = {}
+
+    def fake_llm(system, prompt):
+        captured["system"] = system
+        return FAKE_PLAN
+
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", fake_llm)
+    geo_strategy.generate_strategy(BRAND)
+
+    system = captured["system"]
+    assert len(geo_strategy.KPI_KEYS) == 7
+    for key in geo_strategy.KPI_KEYS:
+        assert key in system
+    # the model is told the contract the adapter enforces, not surprised by it
+    assert '"steps"' in system and '"expected_impact"' in system
+    assert "fewer than 2 concrete steps is REFUSED" in system
+
+
 def test_with_no_venues_the_brief_forbids_naming_any(monkeypatch):
     seed_measured_data(monkeypatch)
     empty = {"category": "x", "venues": [], "counts": {}, "searched": 0,
@@ -277,6 +387,49 @@ def test_action_status_updates_and_validates(monkeypatch):
         geo_strategy.set_action_status(BRAND["id"], action_id, "banana")
     with pytest.raises(KeyError):
         geo_strategy.set_action_status(BRAND["id"], "nope1234", "done")
+
+
+def test_update_action_assigns_and_moves_in_one_write(monkeypatch):
+    seed_measured_data(monkeypatch)
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: FAKE_PLAN)
+    doc = geo_strategy.generate_strategy(BRAND)
+    action_id = doc["current"]["waves"][0]["actions"][0]["id"]
+
+    def saved():
+        return geo_strategy.load_strategy(BRAND["id"])["current"]["waves"][0]["actions"][0]
+
+    geo_strategy.update_action(BRAND["id"], action_id, assignee="  Priya  ")
+    assert saved()["assignee"] == "Priya" and saved()["assigned_at"]
+    assert saved()["status"] == "todo"                     # untouched by an assignment
+
+    geo_strategy.update_action(BRAND["id"], action_id, status="in_progress")
+    assert saved()["status"] == "in_progress" and saved()["assignee"] == "Priya"
+
+    geo_strategy.update_action(BRAND["id"], action_id, status="done", assignee="")
+    assert saved()["status"] == "done" and saved()["assignee"] == ""
+
+    for status in geo_strategy.ACTION_STATUSES:            # the router imports this tuple
+        assert geo_strategy.update_action(BRAND["id"], action_id, status=status)
+
+
+def test_update_action_refuses_bad_input_without_writing(monkeypatch):
+    seed_measured_data(monkeypatch)
+    monkeypatch.setattr(geo_strategy, "_llm_strategy", lambda s, p: FAKE_PLAN)
+    doc = geo_strategy.generate_strategy(BRAND)
+    action_id = doc["current"]["waves"][0]["actions"][0]["id"]
+
+    with pytest.raises(ValueError, match="status must be"):
+        geo_strategy.update_action(BRAND["id"], action_id, status="banana")
+    with pytest.raises(ValueError, match="80 characters"):
+        geo_strategy.update_action(BRAND["id"], action_id, assignee="x" * 81)
+    with pytest.raises(ValueError, match="nothing to update"):
+        geo_strategy.update_action(BRAND["id"], action_id)
+    with pytest.raises(KeyError):
+        geo_strategy.update_action(BRAND["id"], "nope1234", status="done")
+    with pytest.raises(KeyError, match="No strategy"):
+        geo_strategy.update_action("never-planned", action_id, status="done")
+    action = geo_strategy.load_strategy(BRAND["id"])["current"]["waves"][0]["actions"][0]
+    assert action["status"] == "todo" and action["assignee"] == ""
 
 
 # ---------------------------------------------- plans saved before waves existed
@@ -335,8 +488,43 @@ def test_migrated_actions_gain_the_fields_the_panel_reads():
     assert action["venue"] is None          # no venue was ever recorded — not invented
     assert action["deliverable"] == ""
     assert action["steps"] == []            # the panel finds the key, never undefined
+    assert action["expected_impact"] == "" and action["kpi_coerced"] is False
+    assert action["assignee"] == "" and action["assigned_at"] is None
     assert action["status"] == "done"       # the team's own progress survives
     assert action["id"] == "a2"
+
+
+def test_a_wave_plan_stored_before_steps_and_impact_existed_still_loads():
+    """Wave-shaped plans written last month have no steps, expected_impact,
+    kpi_coerced or assignee. They load with defaults; nothing is invented."""
+    from seo_geo_agent import state
+    state.save(geo_strategy.strategy_doc_id(BRAND["id"]), {
+        "brand_id": BRAND["id"], "history": [],
+        "current": {
+            "summary": "wave plan, early shape",
+            "waves": [{"weeks": "1-2", "title": "Quick wins", "objective": "", "why_evidence": "",
+                       "actions": [{"id": "w1", "title": "Complete G2 profile", "venue": None,
+                                    "deliverable": "the profile", "detail": "d",
+                                    "owner_role": "ops", "effort": "low", "impact": "medium",
+                                    "kpi": "citation_rate", "target": "12%",
+                                    "why_evidence": "e", "status": "in_progress"}]}],
+            "monitoring": {"cadence": "", "review_ritual": "", "leading_indicators": []},
+            "expectations": "", "baseline": {"n_answers": 40},
+            "generated_at": "2026-08-20T00:00:00+00:00",
+        },
+    })
+
+    current = geo_strategy.load_strategy(BRAND["id"])["current"]
+    action = current["waves"][0]["actions"][0]
+
+    assert "shape" not in current                     # nothing was migrated
+    assert action["steps"] == [] and action["expected_impact"] == ""
+    assert action["kpi_coerced"] is False and action["assignee"] == ""
+    assert action["status"] == "in_progress" and action["kpi"] == "citation_rate"
+    # and it can still be worked: the write fills the defaults in for good
+    geo_strategy.update_action(BRAND["id"], "w1", assignee="Sam")
+    reread = state.load(geo_strategy.strategy_doc_id(BRAND["id"]))["current"]["waves"][0]["actions"][0]
+    assert reread["assignee"] == "Sam" and reread["steps"] == []
 
 
 def test_status_edits_work_on_a_migrated_plan_and_persist_the_new_shape():

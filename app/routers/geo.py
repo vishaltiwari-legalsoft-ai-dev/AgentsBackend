@@ -1,8 +1,8 @@
 """GEO agent (a10) API — AI answer-engine visibility for a2's brands.
 
 Mounted under ``/api``. Conventions follow the a2 SEO router: any signed-in
-user can read and poll; registry-shaping mutations (prompts, config) are
-Creator-only; ``CredentialMissing`` surfaces as 503 with the real message
+user can read and poll; registry-shaping mutations (prompts, personas, config)
+are Creator-only; ``CredentialMissing`` surfaces as 503 with the real message
 (never fabricated data); unknown brand → 404; bad state → 409/422.
 """
 from __future__ import annotations
@@ -12,15 +12,16 @@ import hmac
 import logging
 import os
 import time
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response
 from pydantic import BaseModel, Field
 
 from app.security import get_current_user, require_creator
 from app.services.run_tracking import CHANGE, CRON, JOB, Activity, ActivityTrail
 from final_geo_agent import (
-    geo_compare, geo_engines, geo_history, geo_poll, geo_prompts, geo_strategy,
-    geo_window, opt_pipeline,
+    geo_compare, geo_engines, geo_history, geo_poll, geo_prompts, geo_runlog,
+    geo_strategy, geo_window, opt_pipeline, page_check,
 )
 from seo_geo_agent import insights
 from seo_geo_agent.sources import CredentialMissing
@@ -44,6 +45,10 @@ def _for(act: Activity, brand: dict) -> None:
 # Least wall clock worth handing a brand. Below this a step cannot finish even
 # one batch, so the brand is better left due than charged for a partial batch.
 MIN_BRAND_SECONDS = 20.0
+
+#: Sweep entries the history payload carries — enough to read a quarter of
+#: two-day sweeps against the chart without a second request.
+HISTORY_RUNS = 30
 
 
 def _cron_budget_seconds() -> float:
@@ -100,6 +105,11 @@ class PromptItem(BaseModel):
     stage: str = "consideration"
     enabled: bool = True
     source: str = "ai"          # "ai" | "custom" — custom survives regeneration
+    # None = "this client does not know about personas": the key is dropped
+    # from the record and the store keeps whatever persona the prompt already
+    # carries. An editor built before personas existed must not be able to
+    # untag the whole universe by round-tripping it.
+    persona: str | None = Field(default=None, max_length=geo_prompts.PERSONA_KEY_MAX)
 
 
 class CustomPromptIn(BaseModel):
@@ -108,15 +118,49 @@ class CustomPromptIn(BaseModel):
     stage: str = "consideration"
 
 
+class BulkPromptsIn(BaseModel):
+    # the raw paste, one prompt per line; the store parses, validates and
+    # reports per line, so the bound here is only a body-size ceiling
+    text: str = Field(min_length=1, max_length=20_000)
+    persona: str = Field(default="", max_length=geo_prompts.PERSONA_KEY_MAX)
+    intent: str = "category"
+    stage: str = "consideration"
+
+
 class PromptsIn(BaseModel):
     prompts: list[PromptItem]
 
 
+class PersonaIn(BaseModel):
+    # Bounds are loose on purpose: the store normalises (whitespace collapse,
+    # key slugging) before it validates, and its ``ValueError`` — the message
+    # the panel shows verbatim — is the one that should reach the caller.
+    key: str | None = Field(default=None, max_length=80)
+    label: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=1000)
+
+
+class PersonasIn(BaseModel):
+    personas: list[PersonaIn] = Field(max_length=geo_prompts.MAX_PERSONAS)
+
+
+class CompetitorIn(BaseModel):
+    key: str | None = Field(default=None, max_length=80)
+    name: str = Field(min_length=1, max_length=80)
+    domain: str | None = Field(default=None, max_length=200)
+    aliases: list[Annotated[str, Field(max_length=80)]] | None = Field(default=None, max_length=12)
+
+
 class ConfigIn(BaseModel):
-    # None = leave untouched (same convention as admin settings).
+    # None = leave untouched (same convention as admin settings). The
+    # competitor list is replaced whole, so removing a rival is a PUT of the
+    # list without it.
     aliases: dict[str, list[str]] | None = None
-    competitors: list[dict] | None = None
+    competitors: list[CompetitorIn] | None = Field(default=None, max_length=25)
     daily_cap: int | None = Field(default=None, ge=10, le=20000)
+    # spend ceiling for the per-call SERP engines (AI Overview + AI Mode),
+    # joint across both, per calendar month
+    aio_monthly_cap: int | None = Field(default=None, ge=1, le=20000)
     # scheduled polling: how many days between sweeps, and whether the cron
     # may run this brand at all
     poll_interval_days: int | None = Field(default=None, ge=1, le=30)
@@ -146,8 +190,10 @@ def geo_config(user: dict = Depends(get_current_user)) -> dict:
         # per-engine mode + model: a chip must never read "Perplexity" when the
         # answer actually came from an OpenRouter stand-in
         "engine_status": geo_engines.engine_status(),
+        "engine_labels": geo_engines.ENGINE_LABELS,
         "default_runs": geo_poll.DEFAULT_RUNS,
         "default_daily_cap": geo_poll.DEFAULT_DAILY_CAP,
+        "default_aio_monthly_cap": geo_poll.AIO_MONTHLY_CAP,
     }
 
 
@@ -182,7 +228,9 @@ def geo_brands(user: dict = Depends(get_current_user)) -> dict:
 @router.get("/geo/brands/{brand_id}/prompts")
 def get_prompts(brand: dict = Depends(reader_brand)) -> dict:
     brand_id = brand["id"]
-    return geo_prompts.load_universe(brand_id) or {"brand_id": brand_id, "prompts": []}
+    return geo_prompts.load_universe(brand_id) or {
+        "brand_id": brand_id, "prompts": [], "personas": [],
+    }
 
 
 @router.post("/geo/brands/{brand_id}/prompts/generate")
@@ -218,6 +266,28 @@ def add_custom_prompt(
     return universe
 
 
+@router.post("/geo/brands/{brand_id}/prompts/bulk")
+def add_prompts_bulk(
+    body: BulkPromptsIn,
+    brand: dict = Depends(creator_brand),
+    act: Activity = trail.records("prompts_bulk_add", "Pasted prompts into the universe"),
+) -> dict:
+    """A pasted list, one prompt per line. Partial acceptance is the normal
+    outcome and answers 200: the per-line ``skipped`` reasons ARE the response,
+    not an error — a paste of 60 lines with 3 duplicates must land 57."""
+    _for(act, brand)
+    try:
+        result = geo_prompts.add_prompts(
+            brand["id"], body.text,
+            persona=body.persona, intent=body.intent, stage=body.stage,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    added, skipped = len(result["added"]), len(result["skipped"])
+    act.note(f"Pasted prompts — {added} added, {skipped} skipped", count=added)
+    return result
+
+
 @router.put("/geo/brands/{brand_id}/prompts")
 def put_prompts(
     body: PromptsIn, brand: dict = Depends(creator_brand),
@@ -226,10 +296,36 @@ def put_prompts(
     if not body.prompts:
         raise HTTPException(status_code=422, detail="At least one prompt is required")
     _for(act, brand)
+    try:
+        universe = geo_prompts.save_universe(
+            brand["id"],
+            # exclude_none drops only ``persona`` — every other field has a
+            # non-None default — which is the "keep the stored tag" signal
+            [p.model_dump(exclude_none=True) for p in body.prompts],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     act.note(f"Prompt universe saved — {len(body.prompts)} prompts")
-    return geo_prompts.save_universe(
-        brand["id"], [p.model_dump() for p in body.prompts]
-    )
+    return universe
+
+
+@router.put("/geo/brands/{brand_id}/personas")
+def put_personas(
+    body: PersonasIn, brand: dict = Depends(creator_brand),
+    act: Activity = trail.records("personas_saved", "Edited the prompt personas", unit=CHANGE),
+) -> dict:
+    """Replace the persona list; an empty list clears it. Prompts tagged with a
+    persona that disappears here are untagged in the same write."""
+    _for(act, brand)
+    try:
+        universe = geo_prompts.set_personas(
+            brand["id"], [p.model_dump(exclude_none=True) for p in body.personas],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    labels = ", ".join(p["label"] for p in universe.get("personas") or []) or "none"
+    act.note(f"Personas saved — {labels}", count=len(body.personas))
+    return universe
 
 
 @router.get("/geo/brands/{brand_id}/config")
@@ -248,7 +344,10 @@ def put_geo_brand_config(
     # aliases — and a poll against it would then find the brand in none of its
     # own answers.
     geo_poll.ensure_config(brand)
-    patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    # exclude_none serves both levels: an omitted top-level field is left
+    # untouched, and a competitor without a domain is stored without one rather
+    # than with ``"domain": null`` for the alias derivation to trip over
+    patch = body.model_dump(exclude_none=True)
     _for(act, brand)
     act.note(f"GEO config saved — {', '.join(sorted(patch)) or 'no fields'}")
     return geo_poll.save_config(brand["id"], patch)
@@ -302,7 +401,7 @@ def report(
         # when it was measured instead of disappearing from the panel
         "engine_last_seen": cfg.get("engine_last_seen") or {},
         "competitor_names": {
-            (c.get("key") or c.get("name", "")): c.get("name", "")
+            geo_compare.entity_key(c): c.get("name", "")
             for c in cfg.get("competitors") or []
         },
     }
@@ -363,7 +462,11 @@ def rescan(
 
 
 @router.get("/geo/brands/{brand_id}/history")
-def history(days: int = 90, brand: dict = Depends(reader_brand)) -> dict:
+def history(
+    days: int = 90,
+    weeks: int = geo_history.DEFAULT_ROLLUP_WEEKS,
+    brand: dict = Depends(reader_brand),
+) -> dict:
     """The GEO score over time — one point per completed sweep.
 
     Points are banked when a sweep finishes, so this is a read of stored
@@ -371,11 +474,17 @@ def history(days: int = 90, brand: dict = Depends(reader_brand)) -> dict:
     polling before the history document existed gets ONE reconstruction from
     its remaining day-docs; the stamp on the document stops that from running
     again on every panel load.
+
+    ``weekly`` is the same series bucketed by ISO week (derived here, never
+    stored) and ``runs`` is the sweep log behind the points — what stopped a
+    sweep and which engines it reached — so a point that looks wrong can be
+    read against the run that produced it.
     """
     brand_id = brand["id"]
     # the SERIES window (how far back the chart is drawn), not the answer
     # window below it — different quantity, different owner, different bounds
     days = geo_history.clamp_series_days(days)
+    weeks = max(1, min(weeks, 52))
     # Built but not fetched: the backfill branch is the only one that reads
     # answers, so a brand whose points are already banked pays nothing here.
     window = geo_window.open_window(brand, geo_history.BACKFILL_DAYS)
@@ -397,6 +506,8 @@ def history(days: int = 90, brand: dict = Depends(reader_brand)) -> dict:
         "days": days,
         "points": windowed,
         "trend": geo_history.trend(windowed),
+        "weekly": geo_history.weekly_rollup(windowed, weeks=weeks),
+        "runs": geo_runlog.recent_runs(brand_id, HISTORY_RUNS),
         "component_labels": geo_history.COMPONENT_LABELS,
         "min_point_answers": geo_history.MIN_POINT_ANSWERS,
         "names": geo_compare.entity_names(cfg, brand),
@@ -406,73 +517,107 @@ def history(days: int = 90, brand: dict = Depends(reader_brand)) -> dict:
     }
 
 
-# ------------------------- Content Optimizer (Layers 1-6) -------------------------
+# ------------------------------- Page check (Content Optimizer) -------------------------------
 
 
-class OptimizerAnalyzeIn(BaseModel):
-    keyword: str = Field(min_length=2, max_length=200)
-    locale: str = Field(default="en-US", max_length=10)
+class PageCheckIn(BaseModel):
+    # exactly one of url / draft; the check itself refuses both and neither
+    url: str = Field(default="", max_length=2000)
     draft: str = Field(default="", max_length=200_000)
-    vertical: str | None = None
-    own_domain: str = Field(default="", max_length=200)
+    keyword: str = Field(default="", max_length=200)
+    locale: str = Field(default="en-US", max_length=10)
 
 
-class OptimizerRescoreIn(BaseModel):
-    analysis_id: str = Field(min_length=3, max_length=80)
+class PageRescoreIn(BaseModel):
     draft: str = Field(min_length=1, max_length=200_000)
 
 
-@router.post("/geo/optimizer/analyze")
-def optimizer_analyze(body: OptimizerAnalyzeIn,
-                      act: Activity = trail.records("optimizer_analyze",
-                                                    "Content Optimizer analysis")) -> dict:
-    """Fresh SERP snapshot + profiles (+ draft score when a draft is sent).
-    Costs one Serper call + ~20 page fetches + embeddings; snapshot is pinned."""
-    act.note(f"Content Optimizer: {body.keyword}")
+#: Analysis ids are ``<keyword-slug>-<8 hex>`` and become part of a document
+#: id, so the path segment is held to the characters the generator emits.
+CheckId = Annotated[str, Path(min_length=3, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")]
+
+
+def _page_check_http(exc: Exception) -> HTTPException:
+    """The page-check exception → status mapping, in the one order that is
+    correct: ``KeyError`` (unknown vertical, 422) is a subclass of
+    ``LookupError`` (no such analysis under this brand, 404), so it has to be
+    tested first or every bad vertical would read as a missing analysis."""
+    if isinstance(exc, CredentialMissing):
+        return HTTPException(status_code=503, detail=str(exc))
+    if isinstance(exc, KeyError):
+        return HTTPException(status_code=422, detail=f"Unknown vertical: {exc}")
+    if isinstance(exc, LookupError):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=422, detail=str(exc))
+    raise exc
+
+
+@router.post("/geo/brands/{brand_id}/page-check")
+def page_check_run(
+    body: PageCheckIn,
+    brand: dict = Depends(reader_brand),
+    act: Activity = trail.records("page_check", "Checked a page against the SERP winners"),
+) -> dict:
+    """One page (URL) or one draft against today's winners for its target
+    query, plus a cannibalization read against the brand's own pages. Costs
+    one Serper call + ~20 page fetches + embeddings; the snapshot is pinned
+    under the brand so a re-score never re-spends."""
+    _for(act, brand)
     try:
-        return opt_pipeline.analyze(
-            body.keyword, body.locale, body.draft,
-            own_domain=body.own_domain, vertical=body.vertical,
+        doc = page_check.check(
+            brand, url=body.url, draft=body.draft,
+            keyword=body.keyword, locale=body.locale,
         )
-    except CredentialMissing as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except KeyError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-@router.post("/geo/optimizer/rescore")
-def optimizer_rescore(body: OptimizerRescoreIn,
-                      act: Activity = trail.records("optimizer_rescore",
-                                                    "Content Optimizer re-score")) -> dict:
-    """Re-score an edited draft against the PINNED snapshot — deterministic,
-    no new SERP call. Refresh = run analyze again explicitly."""
-    act.note(f"Re-score draft vs {body.analysis_id}")
-    try:
-        return opt_pipeline.rescore(body.analysis_id, body.draft)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except CredentialMissing as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
-@router.get("/geo/optimizer/analyses")
-def optimizer_analyses(user: dict = Depends(get_current_user)) -> dict:
-    return {"analyses": opt_pipeline.list_analyses()}
-
-
-@router.get("/geo/optimizer/analyses/{analysis_id}")
-def optimizer_analysis(analysis_id: str, user: dict = Depends(get_current_user)) -> dict:
-    doc = opt_pipeline.get_analysis(analysis_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Unknown analysis")
+    except (CredentialMissing, LookupError, ValueError) as exc:
+        raise _page_check_http(exc) from exc
+    block = doc.get("page_check") or {}
+    verdict = (block.get("verdict") or {}).get("label", "")
+    subject = block.get("source_url") or "draft"
+    act.note(f"Page check — {subject}: {verdict or 'no verdict'} "
+             f"for '{block.get('target_query', '')}'", run_id=doc["meta"]["analysis_id"])
     return doc
+
+
+@router.get("/geo/brands/{brand_id}/page-checks")
+def page_checks(brand: dict = Depends(reader_brand)) -> dict:
+    return {"analyses": opt_pipeline.list_analyses(brand["id"])}
+
+
+@router.get("/geo/brands/{brand_id}/page-checks/{check_id}")
+def page_check_get(check_id: CheckId, brand: dict = Depends(reader_brand)) -> dict:
+    try:
+        return opt_pipeline.get_analysis(brand["id"], check_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/geo/brands/{brand_id}/page-checks/{check_id}/rescore")
+def page_check_rescore(
+    check_id: CheckId, body: PageRescoreIn,
+    brand: dict = Depends(reader_brand),
+    act: Activity = trail.records("page_check_rescore", "Re-scored a draft against a pinned page check"),
+) -> dict:
+    """Re-score an edited draft against the PINNED snapshot — deterministic,
+    no new SERP call. Refresh = run the check again explicitly."""
+    _for(act, brand)
+    try:
+        report = opt_pipeline.rescore(brand["id"], check_id, body.draft)
+    except (CredentialMissing, LookupError, ValueError) as exc:
+        raise _page_check_http(exc) from exc
+    act.note(f"Re-scored draft vs {check_id} — {report.get('total')}", run_id=check_id)
+    return report
 
 
 # ------------------------------- Action Plan (strategy) -------------------------------
 
 
-class ActionStatusIn(BaseModel):
-    status: str = Field(pattern="^(todo|in_progress|done|skipped)$")
+class ActionUpdateIn(BaseModel):
+    # The tuple is the enum — ``Literal[("a", "b")]`` is ``Literal["a", "b"]`` —
+    # so the allowed statuses are stated once, in the store.
+    status: Literal[geo_strategy.ACTION_STATUSES] | None = None  # type: ignore[valid-type]
+    # free text — a name, an email, "the agency"; "" clears
+    assignee: str | None = Field(default=None, max_length=geo_strategy.ASSIGNEE_MAX)
 
 
 @router.post("/geo/brands/{brand_id}/strategy/generate")
@@ -500,19 +645,28 @@ def strategy_get(brand: dict = Depends(reader_brand)) -> dict:
 
 
 @router.put("/geo/brands/{brand_id}/strategy/actions/{action_id}")
-def strategy_action_status(
-    action_id: str, body: ActionStatusIn,
+def strategy_action_update(
+    action_id: str, body: ActionUpdateIn,
     brand: dict = Depends(reader_brand),
-    act: Activity = trail.records("strategy_action", "Moved an Action Plan item", unit=CHANGE),
+    act: Activity = trail.records("strategy_action", "Updated an Action Plan item", unit=CHANGE),
 ) -> dict:
+    """Move an action and/or hand it to someone. Either field alone is a valid
+    request; neither is a 422 from the store, not a silent no-op write."""
     _for(act, brand)
     try:
-        doc = geo_strategy.set_action_status(brand["id"], action_id, body.status)
+        doc = geo_strategy.update_action(
+            brand["id"], action_id, status=body.status, assignee=body.assignee,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    act.note(f"Action {action_id} → {body.status}")
+    changes = []
+    if body.status is not None:
+        changes.append(f"→ {body.status}")
+    if body.assignee is not None:
+        changes.append(f"assigned to {body.assignee.strip() or 'nobody'}")
+    act.note(f"Action {action_id} {', '.join(changes)}")
     return doc
 
 

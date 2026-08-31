@@ -33,6 +33,14 @@ def normalize_domain(value: str) -> str:
     return match.group(1) if match else ""
 
 
+def entity_key(comp: dict) -> str:
+    """The key one configured competitor is tracked under: its explicit ``key``,
+    else its ``name``. ``""`` for a record with neither, which every caller
+    skips. The one spelling of this rule — a competitor keyed one way in the
+    rows and another in the domain map is a rival whose numbers never meet."""
+    return str(comp.get("key") or comp.get("name") or "").strip()
+
+
 def entity_domains(cfg: dict, brand: dict) -> dict[str, str]:
     """entity key -> the domain its citations are counted against.
 
@@ -46,7 +54,7 @@ def entity_domains(cfg: dict, brand: dict) -> dict[str, str]:
     if own:
         domains["self"] = own
     for comp in cfg.get("competitors") or []:
-        key = comp.get("key") or comp.get("name", "")
+        key = entity_key(comp)
         if not key:
             continue
         domain = normalize_domain(comp.get("domain", ""))
@@ -63,7 +71,7 @@ def entity_domains(cfg: dict, brand: dict) -> dict[str, str]:
 def entity_names(cfg: dict, brand: dict) -> dict[str, str]:
     names = {"self": brand.get("name", "") or brand.get("id", "")}
     for comp in cfg.get("competitors") or []:
-        key = comp.get("key") or comp.get("name", "")
+        key = entity_key(comp)
         if key:
             names[key] = comp.get("name", "") or key
     return names
@@ -268,8 +276,10 @@ def untracked_domains(
     counts: dict[str, int] = defaultdict(int)
     absent: dict[str, int] = defaultdict(int)
     examples: dict[str, list[str]] = defaultdict(list)
+    questions: dict[str, set[str]] = defaultdict(set)
     for a in geo_metrics.measurable(answers):
         we_are_named = "self" in (a.get("mentions") or {})
+        pid = a.get("prompt_id") or ""
         seen: set[str] = set()
         for cite in a.get("citations") or []:
             domain = normalize_domain(cite.get("domain") or "")
@@ -281,9 +291,10 @@ def untracked_domains(
             counts[domain] += 1
             if not we_are_named:
                 absent[domain] += 1
-            pid = a.get("prompt_id") or ""
-            if pid and pid not in examples[domain] and len(examples[domain]) < 3:
-                examples[domain].append(pid)
+            if pid:
+                questions[domain].add(pid)
+                if pid not in examples[domain] and len(examples[domain]) < 3:
+                    examples[domain].append(pid)
     ranked = sorted(
         counts.items(), key=lambda kv: (-absent.get(kv[0], 0), -kv[1], kv[0])
     )[:top_n]
@@ -292,6 +303,9 @@ def untracked_domains(
             "domain": domain,
             "count": count,
             "answers_you_absent": absent.get(domain, 0),
+            # breadth, next to the volume above: a domain cited 30x on one
+            # question is a page; cited 30x across 12 questions is a rival
+            "n_questions": len(questions[domain]),
             "example_prompt_ids": examples[domain],
         }
         for domain, count in ranked
@@ -302,7 +316,7 @@ def entity_keys(cfg: dict) -> list[str]:
     """``self`` plus every tracked competitor key, in configured order."""
     keys = ["self"]
     for comp in cfg.get("competitors") or []:
-        key = comp.get("key") or comp.get("name", "")
+        key = entity_key(comp)
         if key and key not in keys:
             keys.append(key)
     return keys
