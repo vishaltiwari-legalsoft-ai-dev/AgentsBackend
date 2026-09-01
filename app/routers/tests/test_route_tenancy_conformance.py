@@ -111,6 +111,7 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     ("GET", "/api/admin/settings"): CREATOR_ONLY,
     ("POST", "/api/admin/settings"): CREATOR_ONLY,
     ("POST", "/api/admin/settings/test"): CREATOR_ONLY,
+    ("GET", "/api/cron/jobs"): CREATOR_ONLY,
     ("PUT", "/api/geo/brands/{brand_id}/config"): CREATOR_ONLY,
     ("PUT", "/api/geo/brands/{brand_id}/personas"): CREATOR_ONLY,
     ("PUT", "/api/geo/brands/{brand_id}/prompts"): CREATOR_ONLY,
