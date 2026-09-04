@@ -191,12 +191,31 @@ def _find_blocks(rows: list[list[str]], title: str,
     return blocks
 
 
-def _row_for(rows: list[list[str]], start: int, end: int, candidates: list[str]) -> int | None:
+def _row_for(rows: list[list[str]], start: int, end: int, candidates: Sequence[str],
+             occurrence: int = 1) -> int | None:
+    """Index of the row this field should be read from, or None.
+
+    ``candidates`` keeps its meaning: label priority, exact stripped-lowercase
+    match, first one that resolves wins.
+
+    ``occurrence`` (1-based) says WHICH row wins when the same label repeats
+    inside the block — the convention ``_TEAM_MAP``/``_canonical_block`` in
+    snapshots.py already uses, carried in the same tuple position. A candidate
+    that appears fewer than ``occurrence`` times is simply not a match, so the
+    next candidate is tried and an unmatched field stays absent (never 0).
+
+    The default is occurrence 1, which is byte-for-byte the previous
+    first-match-wins behaviour — every existing caller resolves the row it
+    always resolved.
+    """
     for want in candidates:
+        hits = 0
         for i in range(start, end):
             label = (rows[i][0] if i < len(rows) and rows[i] else "").strip().lower()
             if label == want:
-                return i
+                hits += 1
+                if hits == occurrence:
+                    return i
     return None
 
 
@@ -596,20 +615,153 @@ def is_rollup_platform(platform: str) -> bool:
     return is_rollup_title(title)
 
 
+# The three labels the roll-up tab carries TWICE: once in the Projected — Not
+# Actualized block and again in the Paying block below it. Named once so the
+# occurrence-1 and occurrence-2 entries can never drift apart. The "($)" spelling
+# is the one _TEAM_MAP proves against the live workbook; the plain spelling is
+# what the roll-up tab itself shows. Listing both means either layout resolves,
+# and a workbook that mixes them leaves the field ABSENT rather than wrong.
+_DUP_SERVICES_SOLD_NA = ("total services sold (not actualized)",)
+_DUP_AMOUNT_SOLD_NA = ("revenue amount sold ($) (not actualized)",
+                       "revenue amount sold (not actualized)")
+_DUP_AMOUNT_SOLD_NO_FEE_NA = ("revenue amount sold w/o setup fee (not actualized)",)
+
 # Team-level rows the roll-up tab reports itself. These are THE official
 # figures (the roll-up aggregates ledger/raw sources — Referral, Websites, … —
 # that have no vendor tab, so a vendor-tab sum can NEVER reproduce them).
-# Order per field = label priority, exact stripped-lowercase match.
-_OFFICIAL_FIELD_LABELS: dict[str, list[str]] = {
-    "budget": ["budget"],
-    "spend": ["spend"],
-    "leads": ["leads"],
-    "qualified_leads": ["qualified leads"],
-    "demos_booked": ["total demos booked (sdr+vapi+direct)", "total demos booked"],
-    "qual_demos_booked": ["qualified demos booked (sdr+vapi+direct)", "qualified demos booked"],
-    "demos_completed": ["demos completed (sdr+vapi+direct)", "total demos completed"],
-    "services_sold": ["total services sold (actualized)"],
+#
+# ``field: (labels, occurrence)``. Order within ``labels`` = priority, exact
+# stripped-lowercase match; ``occurrence`` is 1-based and picks which row wins
+# when that label repeats inside the block. Same convention and same tuple
+# position as ``_TEAM_MAP`` / ``_canonical_block`` in snapshots.py, whose label
+# strings these reuse — copied deliberately rather than imported, because that
+# module's routes are WORKSPACE_SHARED and importing it here would pull its
+# scoping into the report path.
+#
+# Occurrence is not cosmetic: the Paying block repeats three of the Projected —
+# Not Actualized block's labels verbatim, so first-match-wins quietly published
+# the Projected figures under the Paying names. One block's numbers appearing
+# under another block's rows is exactly the 2026-08-15 "wrong numbers" defect.
+_OFFICIAL_FIELD_LABELS: dict[str, tuple[Sequence[str], int]] = {
+    # --- investment ---------------------------------------------------------
+    "budget": (["budget"], 1),
+    "spend": (["spend"], 1),
+    # Performance is blank for this row on the live sheet — the Investment
+    # fallback in parse_official_totals is what actually resolves it.
+    "management_fees": (["management fees"], 1),
+    # --- leads --------------------------------------------------------------
+    "leads": (["leads"], 1),
+    "qualified_leads": (["qualified leads"], 1),
+    "qualified_lead_ratio_pct": (["qualified lead ratio"], 1),
+    "lost_dnc_bad_lead": (["lost dnc (bad lead)"], 1),
+    "cost_per_lead": (["cost per lead"], 1),
+    "cost_per_qualified_lead": (["cost per qualified lead"], 1),
+    # --- demos --------------------------------------------------------------
+    "demos_booked": (["total demos booked (sdr+vapi+direct)", "total demos booked"], 1),
+    "qual_demos_booked": (["qualified demos booked (sdr+vapi+direct)", "qualified demos booked"], 1),
+    "demos_completed": (["demos completed (sdr+vapi+direct)", "total demos completed"], 1),
+    # The Direct-only count, and the reason it is here: the report's Conversion
+    # Rate is revenue clients / demos completed (DIRECT), not / the all-in count
+    # above. Q1 48/248 = 19.35% and Q2 57/212 = 26.89% land on the published
+    # figures exactly, where 48/272 = 17.65% does not. Without this row the two
+    # cards sit next to each other and cannot be reconciled by the reader.
+    "demos_completed_direct": (["total demos completed (direct)"], 1),
+    "show_up_rate_pct": (["total show up rate (%) (sdr+vapi+direct)"], 1),
+    "leads_to_demo_booked_pct": (["leads to demo booked overall"], 1),
+    "leads_to_qual_demo_booked_pct": (["leads to qualified demo booked"], 1),
+    "cost_per_demo_booked": (["cost per demo booked (sdr+vapi+direct)"], 1),
+    "cost_per_qual_demo_booked": (["cost per qualified demo booked (sdr+vapi+direct)"], 1),
+    "cost_per_demo_completed": (["cost per demo completed (sdr+vapi+direct)"], 1),
+    # --- projected revenue (actualized) -------------------------------------
+    "projected_new_clients": (["number of projected new clients (actualized)"], 1),
+    "projected_services_sold": (["total projected services sold (actualized)"], 1),
+    "projected_amount_sold": (["projected total amount sold ($) actualized",
+                               "projected total amount sold ($) (actualized)"], 1),
+    "projected_mrr_without_setup_fee": (
+        ["projected mrr from new sales w/o set up fees (actualized)"], 1),
+    # --- actualized revenue -------------------------------------------------
+    "revenue_clients": (["number of revenue clients (actualized)"], 1),
+    "services_sold": (["total services sold (actualized)"], 1),
+    "revenue_amount_sold": (["revenue amount sold (actualized)"], 1),
+    "revenue_amount_sold_without_setup_fee": (
+        ["revenue amount sold w/o setup fee (actualized)"], 1),
+    # --- projected, NOT actualized (the FIRST of the two duplicate blocks) ---
+    "projected_new_clients_not_actualized": (
+        ["number of projected new clients (not actualized)"], 1),
+    "services_sold_not_actualized": (_DUP_SERVICES_SOLD_NA, 1),
+    "revenue_amount_sold_not_actualized": (_DUP_AMOUNT_SOLD_NA, 1),
+    "revenue_amount_sold_without_setup_fee_not_actualized": (_DUP_AMOUNT_SOLD_NO_FEE_NA, 1),
+    # --- paying, NOT actualized (the SECOND block — occurrence 2, not 1) -----
+    "paying_new_clients": (["number of paying new clients (not actualized)"], 1),
+    "paying_services_sold": (_DUP_SERVICES_SOLD_NA, 2),
+    "paying_revenue_amount_sold": (_DUP_AMOUNT_SOLD_NA, 2),
+    "paying_revenue_amount_sold_without_setup_fee": (_DUP_AMOUNT_SOLD_NO_FEE_NA, 2),
+    # --- inbound sales pipeline ---------------------------------------------
+    "inbound_pipeline_revenue_amount_sold": (
+        ["revenue amount sold (inbound sales pipeline)"], 1),
+    # --- goal & blended financials ------------------------------------------
+    # Reported against the NOT-actualized revenue: 452,607.70 / 480,000 = 94.29%
+    # and 660,703.09 / 535,000 = 123.50%, both matching the published figures.
+    # A ratio, so a multi-month roll-up must recompute it from the summed
+    # components - never average it, and never sum it.
+    "revenue_target_pct": (["percentage of revenue target goal",
+                            "% of revenue target goal (not actualized)",
+                            "percentage of revenue target goal (not actualized)"], 1),
+    # The goal MOVES between periods (480,000 -> 535,000), so it is read from
+    # the sheet every time and can never be pinned as a constant anywhere.
+    "revenue_sold_goal": (["revenue sold goal amount"], 1),
+    "average_deal_amount": (["average deal amount"], 1),
+    # Ratios both: recompute from summed components when rolling months up.
+    "conversion_rate_pct": (["conversion rate (%)"], 1),
+    # The sheet's ROAS row is the ACTUALIZED one - 262,947.70 / 239,581.57 =
+    # 109.75%, the published "ROAS - Actualized (%)". The not-actualized
+    # sibling has no row at all and is derived below.
+    "roas_pct": (["roas"], 1),
+    "cac": (["cac"], 1),
 }
+
+
+def _expected_occurrences(field_map: dict[str, tuple[Sequence[str], int]]) -> dict[tuple[str, ...], int]:
+    """Labels the map claims at MORE than one occurrence, and the highest one.
+
+    Occurrence matching has a failure mode of its own: if the sheet loses one of
+    the two duplicate blocks, the survivor becomes occurrence 1 and would be
+    published under the OTHER block's name — a Paying figure reported as
+    Projected. Nothing in the row tells us which block survived, so a block that
+    carries fewer copies than the map declares means every field sharing that
+    label is reported absent. Absent is recoverable; a plausible wrong number on
+    a board report is not.
+    """
+    out: dict[tuple[str, ...], int] = {}
+    for labels, occurrence in field_map.values():
+        key = tuple(labels)
+        out[key] = max(out.get(key, 0), occurrence)
+    return {labels: occ for labels, occ in out.items() if occ > 1}
+
+
+_EXPECTED_OCCURRENCES = _expected_occurrences(_OFFICIAL_FIELD_LABELS)
+
+
+def _derive_official_fields(fields: dict[str, float]) -> None:
+    """Add the official figures that have no row of their own, in place.
+
+    Derived from the components of the SAME month column, never from an average
+    across months: averaging the monthly ROAS figures instead of recomputing it
+    from summed revenue and spend measures +1.74pp of error on this data. A
+    caller that rolls several months up must therefore recompute this from the
+    summed components, not sum or average this field.
+
+    A derived field is emitted only when every input is present and usable, so a
+    renamed or removed sheet row leaves it ABSENT — the same rule the parsed
+    fields follow. A missing metric must never arrive as 0.
+    """
+    revenue = fields.get("revenue_amount_sold_not_actualized")
+    spend = fields.get("spend")
+    if revenue is None or not spend:
+        return  # missing input, or a zero denominator — no honest ratio exists
+    # Percent, matching the sheet's own ROAS row (a "188.92%" cell parses to
+    # 188.92), so the derived figure and the parsed one are comparable.
+    fields["roas_not_actualized_pct"] = round(revenue / spend * 100, 2)
 
 
 def parse_official_totals(
@@ -634,10 +786,13 @@ def parse_official_totals(
     blocks = _find_blocks(rows, title)
     start, end = (blocks[0][1], blocks[0][2]) if blocks else (1, len(rows))
     out: dict[str, dict[str, float]] = {}
-    for field, labels in _OFFICIAL_FIELD_LABELS.items():
-        i = _row_for(rows, start, end, labels)
+    for field, (labels, occurrence) in _OFFICIAL_FIELD_LABELS.items():
+        expected = _EXPECTED_OCCURRENCES.get(tuple(labels))
+        if expected and _row_for(rows, start, end, labels, expected) is None:
+            continue  # a duplicate block went missing - report none, guess none
+        i = _row_for(rows, start, end, labels, occurrence)
         if i is None:
-            continue
+            continue  # renamed/removed row -> absent field, never a zero
         row = rows[i]
         cell = lambda c: row[c] if 0 <= c < len(row) else ""
         for month, perf, inv in months:
@@ -646,6 +801,8 @@ def parse_official_totals(
                 v = _num(cell(inv))
             if v is not None:
                 out.setdefault(f"{year:04d}-{month:02d}", {})[field] = v
+    for fields in out.values():
+        _derive_official_fields(fields)
     return out
 
 
