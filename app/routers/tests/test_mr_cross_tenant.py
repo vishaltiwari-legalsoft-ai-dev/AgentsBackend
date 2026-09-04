@@ -27,6 +27,21 @@ until 2026-08-21 — a second tenant read and overwrote the first tenant's
 thresholds, and every report built from them. It is keyed on ``user["id"]`` now
 and the last section pins that, at the store and at the two places the figures
 are *applied* (report flags, overview traffic lights).
+
+And the blind spot this file had of its own (fixed 2026-09-05). The harness
+below has set ``MR_SOURCES_FILE`` since the day it was written, and not one
+assertion ever touched ``/mr/sources``. Meanwhile ``sources_registry`` kept one
+global document with no caller anywhere in it, so any signed-in user could
+enumerate and permanently disconnect every other user's connected Google
+Sheet — demonstrated in production, one desk deleting another's "Confidential
+P&L" — while this suite stayed green and the route ledger called all three
+routes TENANT_SCOPED.
+
+The resolution is NOT per-user sources; see ``sources_registry``'s docstring
+for why (one shared primary tracker, one shared service account, a cron that
+scans every workbook). Reads stay shared and the ledger now says
+WORKSPACE_SHARED. What closed is the destructive path, and the last section
+here is what holds it shut.
 """
 from __future__ import annotations
 
@@ -459,3 +474,202 @@ def test_another_tenant_cannot_read_a_board_run(board_on, as_caller):
     as_caller(STRANGER)
     assert client.get(f"/api/mr/runs/{run_id}").status_code == 404
     assert run_id not in [r["id"] for r in client.get("/api/mr/runs").json()]
+
+
+# --------------------------------------------------------------------------- #
+# The sheet-sources registry — shared reads, owned deletes
+# --------------------------------------------------------------------------- #
+# The registry is ONE document for the whole workspace and stays that way: the
+# primary tracker is a deployment-wide constant every caller already reads, the
+# secondaries are reached through a shared service account rather than anyone's
+# own Google identity, and the nightly lead-analysis cron scans all of them.
+# Shared reads are therefore the intended behaviour, and the ledger says so.
+#
+# The DELETE was the defect. It took no caller at all until 2026-09-05, so a
+# signed-in user could disconnect a sheet somebody else had connected and
+# nothing recorded who that had been. Every assertion below fails if that
+# argument is dropped again.
+
+ADMIN = {"id": "mr-tenant-admin", "email": "admin@legalsoft.com", "is_admin": True,
+         "is_creator": False, "session_id": "", "timezone": "UTC"}
+
+SHEET_A = "1AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTt0"
+SHEET_LEGACY = "2AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTt0"
+
+#: ``sources_registry.removal_refusal`` — pinned here so the wording the console
+#: shows and the wording the registry raises cannot drift apart.
+REFUSED_NOT_YOURS = ("Only the person who connected this sheet, or an admin, "
+                     "can disconnect it.")
+
+
+@pytest.fixture()
+def sheets_reachable(monkeypatch):
+    """``POST /mr/sources`` without Google.
+
+    The endpoint validates access by opening the workbook, which needs a live
+    Sheets API. Both reads are stubbed at the router's own namespace: the meta
+    call succeeds (so the add proceeds) and the first-pass profile raises (which
+    the handler already treats as "no tabs yet"). Nothing here reaches the
+    network, which is the point.
+    """
+    from app.routers import marketing_research as mr_router
+
+    def _meta(spreadsheet_id, **_kw):
+        return {"title": f"Workbook {spreadsheet_id[:4]}", "tabs": ["Sheet1"]}
+
+    def _no_fetch(*_a, **_kw):
+        raise RuntimeError("no Sheets API in tests")
+
+    monkeypatch.setattr(mr_router, "workbook_meta", _meta)
+    monkeypatch.setattr(mr_router.mr_workbook, "fetch_workbook", _no_fetch)
+
+
+def _connect(sheet_id: str) -> dict:
+    resp = client.post("/api/mr/sources", json={"url": sheet_id})
+    assert resp.status_code == 200, resp.text
+    return resp.json()["source"]
+
+
+def _listed_ids() -> list[str]:
+    return [s["id"] for s in client.get("/api/mr/sources").json()["sources"]]
+
+
+def test_the_source_tests_run_against_a_throwaway_store(tmp_path):
+    """The guard, verified from inside pytest rather than assumed.
+
+    ``backend/conftest.py`` has been proven leaky twice, and this suite writes
+    to the same collection (``mr_config``) that once took a test fixture into
+    production. Three things are checked: the offline flag is on, the registry
+    agrees it is offline, and its file is this test's tmp path — plus that the
+    cloud handle raises rather than connecting, so a future edit that ignores
+    ``_use_cloud`` still cannot reach the real database.
+    """
+    from marketing_research_agent import sources_registry as reg
+    from marketing_research_agent import goals as mr_goals
+
+    assert os.environ.get("MR_OFFLINE") == "1"
+    assert mr_goals._use_cloud() is False
+    assert reg._sources_path() == tmp_path / "sources.json"
+    with pytest.raises(RuntimeError, match="Firestore access blocked"):
+        reg._doc()
+
+
+def test_a_connected_sheet_records_who_connected_it(sheets_reachable):
+    """``added_by`` is the whole basis of the delete gate. Nothing recorded it
+    before, which is why the gate could not exist."""
+    src = _connect(SHEET_A)
+    assert src["added_by"] == OWNER["id"]
+
+    row = next(s for s in client.get("/api/mr/sources").json()["sources"]
+               if s["id"] == SHEET_A)
+    assert row["added_by"] == OWNER["id"]
+    assert row["can_remove"] is True
+
+
+def test_the_registry_is_shared_and_that_is_deliberate(sheets_reachable, as_caller):
+    """The control for the refusal tests below, and the statement of intent.
+
+    Every "the stranger is refused" assertion would also pass if the stranger
+    simply could not see the row. They can: the listing is workspace-wide on
+    purpose, so a refusal below is a real refusal and not an accident of
+    visibility. If this ever flips to per-user sources, this test is the one
+    that has to be rewritten first — deliberately.
+    """
+    _connect(SHEET_A)
+
+    as_caller(STRANGER)
+    listing = client.get("/api/mr/sources").json()
+    assert SHEET_A in [s["id"] for s in listing["sources"]]
+    theirs = next(s for s in listing["sources"] if s["id"] == SHEET_A)
+    assert theirs["added_by"] == OWNER["id"], "the listing hides who connected it"
+    assert theirs["can_remove"] is False, "the console would show a button that 403s"
+
+
+def test_another_tenant_cannot_disconnect_a_sheet_they_did_not_connect(
+        sheets_reachable, as_caller):
+    """THE defect, closed.
+
+    Reproduces what the review did against production: a second signed-in user,
+    with nothing but their own token, disconnecting somebody else's workbook.
+    Both halves are asserted — the 403, and that the sheet is still connected
+    afterwards — because a refusal that still mutated the store is not a
+    refusal. Delete ``requested_by`` from ``remove_source`` and this goes red on
+    the status code; weaken ``may_remove`` and it goes red on the listing.
+    """
+    _connect(SHEET_A)
+
+    as_caller(STRANGER)
+    refused = client.delete(f"/api/mr/sources/{SHEET_A}")
+    assert refused.status_code == 403, (
+        "another user disconnected a sheet they did not connect: "
+        f"{refused.status_code} {refused.text}"
+    )
+    assert refused.json()["detail"] == REFUSED_NOT_YOURS
+    assert SHEET_A in _listed_ids(), "the sheet was disconnected despite the refusal"
+
+    as_caller(OWNER)
+    assert SHEET_A in _listed_ids()
+
+
+def test_the_person_who_connected_a_sheet_can_still_disconnect_it(sheets_reachable):
+    """The other half: the gate must not close the feature.
+
+    Without this, deleting the whole endpoint would pass every test above.
+    """
+    _connect(SHEET_A)
+    removed = client.delete(f"/api/mr/sources/{SHEET_A}")
+    assert removed.status_code == 200, removed.text
+    assert removed.json()["removed"] == SHEET_A
+    assert SHEET_A not in _listed_ids()
+
+
+def test_an_admin_can_disconnect_a_sheet_somebody_else_connected(
+        sheets_reachable, as_caller):
+    """Somebody has to be able to clean up after a colleague who has left."""
+    _connect(SHEET_A)
+
+    as_caller(ADMIN)
+    removed = client.delete(f"/api/mr/sources/{SHEET_A}")
+    assert removed.status_code == 200, removed.text
+    assert SHEET_A not in _listed_ids()
+
+
+def test_a_sheet_connected_before_attribution_stays_visible_to_everyone(as_caller):
+    """The migration case, at the HTTP surface.
+
+    Rows written before ``added_by`` existed have no owner and none can be
+    invented — no store ever recorded one. They are NOT hidden and NOT deleted:
+    that would be data loss dressed as a security fix. They stay listed for the
+    whole workspace exactly as before, and only an admin can retire one.
+    """
+    from marketing_research_agent import sources_registry as reg
+
+    reg.add_source(SHEET_LEGACY, label="Confidential P&L")  # pre-attribution shape
+    assert reg.owner_of(reg.find_source(SHEET_LEGACY)) is None
+
+    for who in (OWNER, STRANGER, ADMIN):
+        as_caller(who)
+        assert SHEET_LEGACY in _listed_ids(), (
+            f"a legacy source vanished from {who['id']}'s list")
+
+    as_caller(STRANGER)
+    refused = client.delete(f"/api/mr/sources/{SHEET_LEGACY}")
+    assert refused.status_code == 403
+    assert "admin" in refused.json()["detail"]
+    assert SHEET_LEGACY in _listed_ids()
+
+    as_caller(ADMIN)
+    assert client.delete(f"/api/mr/sources/{SHEET_LEGACY}").status_code == 200
+    assert SHEET_LEGACY not in _listed_ids()
+
+
+def test_the_kill_switch_still_refuses_both_write_paths(sheets_reachable, monkeypatch):
+    """``MR_MULTI_SHEET=0`` turns the feature off. It defaults to ON — see
+    ``.env.example`` — so this is the behaviour a deployment opts into, and the
+    ownership gate must not have quietly replaced it."""
+    _connect(SHEET_A)
+    monkeypatch.setenv("MR_MULTI_SHEET", "0")
+
+    assert client.post("/api/mr/sources", json={"url": SHEET_LEGACY}).status_code == 403
+    assert client.delete(f"/api/mr/sources/{SHEET_A}").status_code == 403
+    assert client.get("/api/mr/sources").json()["enabled"] is False

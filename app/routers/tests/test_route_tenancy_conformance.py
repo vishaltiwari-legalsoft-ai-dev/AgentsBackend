@@ -230,7 +230,6 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     ("POST", "/api/gd/runs/{run_id}/suggest-placement"): TENANT_SCOPED,
     ("POST", "/api/gd/runs/{run_id}/text-preview"): TENANT_SCOPED,
     ("POST", "/api/gd/runs/{run_id}/tweak"): TENANT_SCOPED,
-    ("POST", "/api/mr/ask"): TENANT_SCOPED,
     # The board report. Every read it makes goes through ``_load_dataset(user["id"])``,
     # which queries ``mr_runs`` filtered on ``user_id`` server-side; the run it
     # writes is stamped with the same id, and the idempotency lookup that may
@@ -256,14 +255,9 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     ("GET", "/api/mr/runs/{run_id}"): TENANT_SCOPED,
     ("GET", "/api/mr/runs/{run_id}/pdf"): TENANT_SCOPED,
     ("POST", "/api/mr/schedule/{period}"): TENANT_SCOPED,
-    ("GET", "/api/mr/sources"): TENANT_SCOPED,
-    ("POST", "/api/mr/sources"): TENANT_SCOPED,
-    ("DELETE", "/api/mr/sources/{spreadsheet_id}"): TENANT_SCOPED,
     ("GET", "/api/mr/targets"): TENANT_SCOPED,
     ("POST", "/api/mr/targets"): TENANT_SCOPED,
     ("GET", "/api/mr/trends"): TENANT_SCOPED,
-    ("GET", "/api/mr/workbook"): TENANT_SCOPED,
-    ("POST", "/api/mr/workbook/scan"): TENANT_SCOPED,
     # The console's record. `firestore_repo.list_runs_for_user` filters on
     # `user_id` before it orders, and both the count and the fallback scan carry
     # the same filter, so there is no path through this route that reads a row
@@ -305,6 +299,24 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     # brand's SEO run, GEO config, run log and plan — the same rows
     # ``/seo-geo/overview`` serves, for the same reason.
     ("GET", "/api/issues"): WORKSPACE_SHARED,
+    # MR workbook substrate — ``/ask``, ``/workbook``, ``/workbook/scan`` and
+    # the sources registry behind them. All four were TENANT_SCOPED until
+    # 2026-09-05 and none of them ever was: they read ONE deployment-wide
+    # spreadsheet (``MR_SHEETS_SPREADSHEET_ID``) plus the workspace's connected
+    # secondaries, through ``_workbook_bundle``, with no user id anywhere in
+    # the path. The label was the defect, not the sharing — the sheets are read
+    # through one shared service account rather than any caller's own Google
+    # identity, and the nightly lead-analysis cron scans all of them.
+    #
+    # ``DELETE /mr/sources/{id}`` is listed here because it operates on the same
+    # shared registry, but it is NOT open to every caller: since 2026-09-05
+    # ``sources_registry.remove_source`` requires the caller and refuses (403)
+    # unless they connected that sheet or hold an admin/creator role. Rows
+    # connected before ``added_by`` existed have no recorded owner and are
+    # admin-removable only. Pinned behaviourally in ``test_mr_cross_tenant.py``
+    # ("the sheet-sources registry" section) — this comment is the map, that
+    # file is the proof.
+    ("POST", "/api/mr/ask"): WORKSPACE_SHARED,
     # MR snapshots: ``marketing_research_agent/snapshots.py`` has no ``user_id``
     # in any function — every row is keyed by vendor slug and date alone, while
     # the rest of the MR router scopes carefully. This is the inconsistency the
@@ -315,6 +327,11 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     ("GET", "/api/mr/snapshots/portfolio"): WORKSPACE_SHARED,
     ("GET", "/api/mr/snapshots/vendor/{slug}"): WORKSPACE_SHARED,
     ("GET", "/api/mr/snapshots/vendor/{slug}/pdf"): WORKSPACE_SHARED,
+    ("GET", "/api/mr/sources"): WORKSPACE_SHARED,
+    ("POST", "/api/mr/sources"): WORKSPACE_SHARED,
+    ("DELETE", "/api/mr/sources/{spreadsheet_id}"): WORKSPACE_SHARED,
+    ("GET", "/api/mr/workbook"): WORKSPACE_SHARED,
+    ("POST", "/api/mr/workbook/scan"): WORKSPACE_SHARED,
     # SEO: ``state.save("brands", …)`` is a single global Firestore document,
     # and every other doc id is ``…-{brand_id}``.
     ("POST", "/api/seo-geo/ask/{brand_id}"): WORKSPACE_SHARED,
@@ -356,7 +373,23 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
 #: health rollup. Workspace-wide by design: it reads every caller's run rows
 #: and names who used each agent, which is the panel's whole point for one
 #: shared team and a per-caller filter the day a second tenant signs in.
-WORKSPACE_SHARED_BASELINE = 49
+#:
+#: 49 → 55 on 2026-09-05: the MR workbook substrate. NOT six routes that got
+#: wider — six routes that were always this wide and were labelled
+#: TENANT_SCOPED anyway (``POST /mr/ask``, ``GET /mr/workbook``,
+#: ``POST /mr/workbook/scan``, and the three ``/mr/sources`` routes). A
+#: security review of a neighbouring route demonstrated the consequence in
+#: production: one signed-in user enumerated another's connected sheet and
+#: deleted it, token and all, and the suite stayed green because the ledger
+#: said the routes were scoped and the MR cross-tenant suite never asked.
+#:
+#: The exposure is unchanged by this edit; what changed is that the number now
+#: counts it. The registry stays shared on purpose (one shared service account
+#: reads every sheet, one shared primary tracker feeds every caller, and the
+#: nightly cron scans all of them), and the destructive path was closed
+#: separately: ``DELETE /mr/sources/{id}`` now requires the caller and refuses
+#: unless they connected the sheet or hold an admin/creator role.
+WORKSPACE_SHARED_BASELINE = 55
 
 #: The GEO editor surface, BY NAME. Not a count — a count would let a future
 #: route join the role while another left it and say nothing, and the thing

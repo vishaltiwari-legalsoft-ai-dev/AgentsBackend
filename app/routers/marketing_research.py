@@ -975,13 +975,34 @@ def ask(body: dict | None = None, user=Depends(get_current_user),
     return answer
 
 
+def _may_remove_any_sheet(user: dict) -> bool:
+    """Who may disconnect a sheet they did not connect.
+
+    Admins and creators, and nobody else. They are also the only callers who
+    can retire the pre-attribution rows — the ones connected before
+    ``added_by`` existed, which no store can name an owner for.
+    """
+    return bool(user.get("is_admin") or user.get("is_creator"))
+
+
 @router.get("/mr/sources")
 def sheet_sources(user=Depends(get_current_user)):
-    """Connected workbooks (multi-sheet). The primary tracker is always first."""
+    """Connected workbooks (multi-sheet). The primary tracker is always first.
+
+    WORKSPACE_SHARED, deliberately: this lists what the whole workspace has
+    connected, because the agent reads every one of them for every caller and
+    reaches them through one shared service account rather than anybody's own
+    Google identity. ``sources_registry``'s docstring carries the argument.
+
+    Each row now says who connected it (``added_by``) and whether THIS caller
+    may disconnect it (``can_remove``), so the console can hide a button that
+    would only earn a 403.
+    """
     return {
         "enabled": mr_sources_registry.multi_sheet_enabled(),
         "service_account": mr_sources_registry.service_account_email(),
-        "sources": mr_sources_registry.list_sources(),
+        "sources": mr_sources_registry.list_sources(
+            viewer_id=user["id"], privileged=_may_remove_any_sheet(user)),
     }
 
 
@@ -1003,7 +1024,8 @@ def add_sheet_source(body: dict | None = None, user=Depends(get_current_user),
         raise HTTPException(
             403, f"Could not open that sheet. Share it with {sa} as Viewer, then try again.")
     try:
-        src = mr_sources_registry.add_source(sid, label=str(meta.get("title") or sid))
+        src = mr_sources_registry.add_source(
+            sid, label=str(meta.get("title") or sid), added_by=user["id"])
     except ValueError as exc:
         raise HTTPException(409, str(exc))
     # First-pass understanding, cached per workbook — never fails the add.
@@ -1021,11 +1043,27 @@ def add_sheet_source(body: dict | None = None, user=Depends(get_current_user),
 def remove_sheet_source(spreadsheet_id: str, user=Depends(get_current_user),
                         act: Activity = trail.records("disconnect_sheet",
                                                       "Disconnected a sheet", unit=CHANGE)):
-    """Disconnect a secondary sheet — the agent stops reading it immediately."""
+    """Disconnect a secondary sheet — the agent stops reading it immediately.
+
+    The registry is shared; this operation is not. Until 2026-09-05 it took no
+    caller at all, so any signed-in user could permanently disconnect a sheet
+    somebody else had connected. ``remove_source`` now requires the caller and
+    refuses unless they connected it or hold an elevated role.
+
+    A refusal is 403, not the 404 the run endpoints use. 404 exists there to
+    avoid an ownership oracle — but this row is already in the caller's own
+    ``GET /mr/sources`` listing, so a 404 would leak nothing and lie about a
+    sheet the caller can plainly see. It also never reaches ``act.note``, so a
+    refused attempt records no "disconnected" activity.
+    """
     if not mr_sources_registry.multi_sheet_enabled():
         raise HTTPException(403, "Multi-sheet support is disabled on this deployment (MR_MULTI_SHEET).")
     try:
-        removed = mr_sources_registry.remove_source(spreadsheet_id)
+        removed = mr_sources_registry.remove_source(
+            spreadsheet_id, requested_by=user["id"],
+            privileged=_may_remove_any_sheet(user))
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     if not removed:
