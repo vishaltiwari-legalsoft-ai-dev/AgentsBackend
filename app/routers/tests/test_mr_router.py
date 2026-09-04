@@ -908,6 +908,140 @@ def test_a_board_report_with_no_capture_says_so_rather_than_publishing_zeros(boa
     assert "sheet pull" in r.json()["detail"]
 
 
+# --- a period nobody has figures for is refused, and refused before it costs --
+# The route used to build ANY period. Five data-free periods returned five 200s
+# and minted five runs of 0/38, because a period missing every month records no
+# gap and so read as a legitimately empty quarter. The key space is ~170,000
+# single periods, every one a guaranteed cache miss, and the idempotency lookup
+# linearly scans the workspace's runs - so the junk was self-amplifying and the
+# tax fell on every other caller on the instance.
+
+
+def _board_run_ids() -> list[str]:
+    """Every board run in the store, read back through the route that lists
+    them. The assertion that matters after a refusal is "nothing was written",
+    and that is only meaningful against the persisted set."""
+    return [r["id"] for r in client.get("/api/mr/runs").json()
+            if r["kind"] in ("board_report", "board_report_comparison")]
+
+
+@pytest.mark.parametrize("period", ["2026-Q3", "2026-12", "9999-12", "2027"])
+def test_a_period_with_no_figures_at_all_is_refused_and_stores_nothing(
+        board_on, period):
+    """422 like every sibling kind, and - the point of the fix - no run.
+
+    ``/mr/reports/monthly_summary`` has answered 422 to exactly this input since
+    it shipped ("No tracker data for January 1900."); the board kinds were the
+    two that did not.
+    """
+    _seed_official()
+    assert _board_run_ids() == []
+    r = client.post("/api/mr/board-report", json={"period": period})
+    assert r.status_code == 422, r.text
+    assert "No roll-up figures" in r.json()["detail"], r.json()["detail"]
+    assert period in r.json()["detail"]
+    assert _board_run_ids() == [], "a refused period still minted a run"
+
+
+def test_a_comparison_with_no_figures_on_either_side_is_refused(board_on):
+    _seed_official()
+    r = client.post("/api/mr/board-report",
+                    json={"period": "2026-Q3", "compare_to": "2026-Q4"})
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert "2026-Q3 or 2026-Q4" in detail, detail
+    assert "either period" in detail, detail
+    assert _board_run_ids() == []
+
+
+def test_a_comparison_against_an_absent_period_still_builds(board_on):
+    """One column of figures is still a report. "Q1 against a quarter we have
+    nothing for" is a question someone can legitimately ask, and the coverage
+    block already says which column is empty and why - so only a request where
+    NEITHER side landed anything is refused."""
+    _seed_official()
+    r = client.post("/api/mr/board-report",
+                    json={"period": "2026-Q1", "compare_to": "2026-Q3"})
+    assert r.status_code == 200, r.text
+    counts = [c["filled_count"]
+              for c in r.json()["structured"]["coverage"]["columns"]]
+    assert counts[0] > 0 and counts[1] == 0, counts
+
+
+def test_a_partly_covered_period_still_builds_and_names_the_missing_month(board_on):
+    """The boundary the guard must not cross, and the reason it cannot be a
+    bare ``filled_count == 0`` check.
+
+    ``_sum_over`` withholds a field the moment ONE month of the period is
+    missing it, so a quarter holding two of three months also fills zero of 38
+    - identically to a quarter holding nothing. What separates them is that the
+    partial period NAMES the month it withheld for. Refusing on the count alone
+    would turn the deliberate "withhold the total, name the month" behaviour
+    into a 422.
+    """
+    _seed_official(months={k: BOARD_MONTHS[k] for k in ("2026-01", "2026-02")})
+    r = client.post("/api/mr/board-report", json={"period": "2026-Q1"})
+    assert r.status_code == 200, r.text
+    s = r.json()["structured"]
+    values = {row["key"]: row["value"] for row in s["rows"]}
+    assert values["spend"] is None, "two thirds of a quarter published as the quarter"
+    assert any("2026-03" in g for g in s["gaps"]), s["gaps"]
+    assert s["coverage"]["columns"][0]["filled_count"] == 0
+    assert _board_run_ids(), "a buildable period was not stored"
+
+
+# --- what a 422 is allowed to quote back --------------------------------------
+
+def test_an_unparseable_period_is_quoted_back_clipped_not_whole(board_on):
+    """The echo is the useful part of the message and it stays - bounded.
+
+    A period is at most 7 characters, so nothing legitimate is shortened; a
+    caller-chosen payload of arbitrary length is no longer reflected whole.
+    """
+    _seed_official()
+    r = client.post("/api/mr/board-report", json={"period": "Q" * 120})
+    assert r.status_code == 422, r.text
+    echoed = r.json()["detail"].split("'")[1]
+    assert len(echoed) <= 40, f"{len(echoed)} characters echoed back"
+    assert echoed.endswith("...")
+    assert "Q" * 41 not in r.json()["detail"]
+
+
+@pytest.mark.parametrize("period", [{"x": "y"}, ["2026-Q1"], 2026, True])
+def test_a_period_that_is_not_a_string_never_reaches_the_body_as_a_structure(
+        board_on, period):
+    """A period the caller did not send as text is an absent period, not a
+    malformed one. Stringifying it put ``{'x': 'y'}`` into the 422 verbatim."""
+    _seed_official()
+    r = client.post("/api/mr/board-report", json={"period": period})
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert "needs a 'period'" in detail, detail
+    for fragment in ("{", "[", "x", "y", "2026", "True"):
+        assert fragment not in detail.replace("YYYY", ""), (fragment, detail)
+
+
+def test_the_dark_switch_hides_the_report_not_the_route(board_on, monkeypatch,
+                                                        unauthenticated):
+    """What the kill switch does and does not buy, pinned so the docstring
+    cannot drift back to claiming concealment.
+
+    Auth first: an anonymous caller gets 401 with the switch on AND off, so the
+    404 never leaks which state a deployment is in. That ordering is the
+    load-bearing claim. But the route is still visibly registered - FastAPI
+    parses the body before it resolves dependencies, so a malformed body
+    answers 422 here where an unrouted path answers 404.
+    """
+    unauthenticated()
+    bad = {"content": b"{not json", "headers": {"content-type": "application/json"}}
+    for switch in ("1", "0"):
+        monkeypatch.setenv("MR_BOARD_REPORT", switch)
+        assert client.post("/api/mr/board-report",
+                           json={"period": "2026-Q1"}).status_code == 401, switch
+        assert client.post("/api/mr/board-report", **bad).status_code == 422, switch
+    assert client.post("/api/mr/board-report-nope", **bad).status_code == 404
+
+
 def test_the_board_kinds_are_not_buildable_through_the_narrated_report_route():
     """They are real kinds, so ``/mr/reports/{kind}`` recognises them — and has
     to hand them on rather than 500 inside a builder that refuses them."""

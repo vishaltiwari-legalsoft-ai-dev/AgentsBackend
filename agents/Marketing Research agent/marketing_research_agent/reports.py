@@ -753,11 +753,34 @@ def board_report_enabled() -> bool:
 
     Mirrors ``sources_registry.multi_sheet_enabled()`` (env read on every call,
     so a deployment flips it without a code change and a test can set it),
-    inverted: this one is opt-IN. Off, the route answers 404 - the same answer
-    an unknown path gives, so a deployment that has not enabled the feature does
-    not advertise that it exists.
+    inverted: this one is opt-IN. Off, the route answers 404 with the same
+    detail an unknown path gives, so a deployment that has not enabled the
+    feature builds nothing and stores nothing. It is a kill switch rather than
+    concealment - the route stays registered and a malformed body still answers
+    422 where an unrouted path answers 404. See the handler's docstring.
     """
     return os.environ.get("MR_BOARD_REPORT", "0").strip().lower() in ("1", "true", "on")
+
+
+#: Longest run of caller text ``_echo_period`` will put in a 422 body.
+_PERIOD_ECHO_LIMIT = 40
+
+
+def _echo_period(text: object) -> str:
+    """A caller's period as it can safely appear in an error the caller reads.
+
+    Echoing what we parsed is the whole point of the message - "'last quarter'
+    is not a board-report period" is only useful because it quotes the input.
+    But the input is unbounded and untyped, so two things are clipped off here:
+    anything that did not arrive as text is named by its type rather than
+    rendered (a dict must never reach the body as a structure), and text longer
+    than :data:`_PERIOD_ECHO_LIMIT` is truncated. A period is at most 7
+    characters, so nothing legitimate is ever shortened.
+    """
+    if not isinstance(text, str):
+        return f"<{type(text).__name__}>"
+    t = text.strip()
+    return t if len(t) <= _PERIOD_ECHO_LIMIT else t[:_PERIOD_ECHO_LIMIT - 3] + "..."
 
 
 def board_period(text: str) -> br.PeriodSpec:
@@ -769,7 +792,7 @@ def board_period(text: str) -> br.PeriodSpec:
     that hardcodes a quarter forecloses them. Anything unparseable is a
     user-facing error; no period is ever substituted for another.
     """
-    t = (text or "").strip().upper()
+    t = text.strip().upper() if isinstance(text, str) else ""
     m = _MONTH_RE.match(t)
     if m and 1 <= int(m.group(2)) <= 12:
         return br.month_period(int(m.group(1)), int(m.group(2)))
@@ -780,7 +803,8 @@ def board_period(text: str) -> br.PeriodSpec:
     if y:
         return br.year_period(int(y.group(1)))
     raise PeriodError(
-        f"'{text}' is not a board-report period (expected YYYY-MM, YYYY-Qn or YYYY).")
+        f"'{_echo_period(text)}' is not a board-report period "
+        "(expected YYYY-MM, YYYY-Qn or YYYY).")
 
 
 def _capture_date(ds: dict) -> date:
@@ -810,6 +834,31 @@ def _absent_reason(metric, rollup) -> str:
     return f"the roll-up tab does not report '{metric.source}' for this period"
 
 
+def _filled_count(r) -> int:
+    """How many catalog rows this column could fill - the number ``_coverage``
+    publishes as ``filled_count``, computed here so the guard and the response
+    can never disagree about it."""
+    return sum(1 for m in br.CATALOG if r.value(m.key) is not None)
+
+
+def _holds_nothing(r) -> bool:
+    """True when not one month of this period put anything into the roll-up.
+
+    ``filled_count == 0`` on its own is NOT emptiness, and reading it that way
+    is the trap here. :func:`board_report._sum_over` withholds a field the
+    moment ONE month of the period is missing it, so a genuinely partial period
+    - half a year, a quarter with one thin month - also fills zero of 38. What
+    separates the two is that the partial period names the months it withheld
+    for (``gaps``) while a period nobody has any figures for has nothing to
+    name, and ``components`` catches the remaining case: a month that reported
+    a field the catalog happens not to read. All three have to be silent.
+
+    Refusing on ``filled_count`` alone would regress the deliberate "withhold
+    the total, name the month" behaviour into a 422.
+    """
+    return not r.components and not r.gaps and _filled_count(r) == 0
+
+
 def _coverage(columns: list) -> dict:
     """Which catalog rows each column could fill, and why the rest could not.
     ``columns`` is ``[(label, PeriodRollup), ...]``.
@@ -835,7 +884,7 @@ def _coverage(columns: list) -> dict:
             "filled": filled,
             "absent": sorted(reasons),
             "absent_reasons": reasons,
-            "filled_count": len(filled),
+            "filled_count": _filled_count(r),
             "metric_count": len(br.CATALOG),
         })
     return {"columns": out, "metric_count": len(br.CATALOG),
@@ -915,18 +964,39 @@ def build_board_report(dataset: dict, user_id: str, *, period: str,
 
     captured_on = _capture_date(dataset)
     key = br.cache_key([s for s in (spec_a, spec_b) if s is not None], captured_on)
-    cached = _cached_board_run(user_id, kind, key)
-    if cached is not None:
-        return {**cached, "reused": True}
 
     # ``channels=`` is deliberately not passed: see CHANNEL_SOURCE_STATUS. The
     # roll-up then leaves ``untracked`` None and the channel table empty, which
     # is the absent state and not a zeroed one.
     rollup_a = br.roll_up(spec_a, official)
     columns = [(spec_a.label, rollup_a)]
+    rollup_b = None
     if spec_b is not None:
         rollup_b = br.roll_up(spec_b, official)
         columns.append((spec_b.label, rollup_b))
+
+    # The empty-window refusal, the board's analogue of ``if not metrics`` on
+    # the campaign kinds. Without it EVERY period was buildable: year 9999 and
+    # any of the ~170,000 others answered 200 with 0 of 38 filled and minted a
+    # run, because a period missing every month records no gap and so looked
+    # like a legitimately empty quarter. One column with figures is still a
+    # report - a comparison against an absent period is a real question - so
+    # only a request where nothing at all landed is refused.
+    #
+    # Ahead of the cache lookup, not just ahead of ``save_run``: that lookup
+    # linearly scans this workspace's runs, and a period we are about to refuse
+    # should neither pay for the scan nor grow what everyone else scans.
+    if all(_holds_nothing(r) for _label, r in columns):
+        names = " or ".join(s.key for s in (spec_a, spec_b) if s is not None)
+        raise PeriodError(
+            f"No roll-up figures for {names} - the Overall tab reports nothing "
+            f"for any month of {'either period' if spec_b else 'that period'}.")
+
+    cached = _cached_board_run(user_id, kind, key)
+    if cached is not None:
+        return {**cached, "reused": True}
+
+    if rollup_b is not None:
         ledger = br.compare(rollup_a, rollup_b, captured_on=captured_on)
         structured = {**ledger.as_dict(), "r_array": ledger.to_r_array()}
     else:

@@ -1162,6 +1162,19 @@ def make_report(kind: str, body: dict | None = None, user=Depends(get_current_us
     return report
 
 
+def _period_field(body: dict | None, name: str) -> str:
+    """One period out of the request body, as text or not at all.
+
+    ``str()`` on whatever arrived is what let ``{"period": {"x": "..."}}`` reach
+    the 422 body as the structure's own repr. A period the caller did not send
+    as a string is not a malformed period, it is an absent one, and it gets the
+    same "needs a 'period'" answer an empty body gets. Length is bounded
+    further down, in ``reports._echo_period``.
+    """
+    value = (body or {}).get(name)
+    return value.strip() if isinstance(value, str) else ""
+
+
 @router.post("/mr/board-report")
 def board_report(body: dict | None = None, user=Depends(get_current_user),
                  act: Activity = trail.records("report:board",
@@ -1176,11 +1189,16 @@ def board_report(body: dict | None = None, user=Depends(get_current_user),
     route that returns a document lands with it, and until then this returns the
     ledger and nothing pretends to be a document.
 
-    **Dark by default.** With ``MR_BOARD_REPORT`` unset this answers 404 - the
-    same answer an unknown path gives - so a deployment that has not enabled the
-    feature does not advertise that it exists. The auth dependency resolves
-    first either way, so an anonymous caller still gets 401 and never learns
-    which it was.
+    **Dark by default.** With ``MR_BOARD_REPORT`` unset this answers 404 with
+    the same ``"Not Found"`` detail an unrouted path gives, so a deployment
+    that has not enabled the feature builds no report and writes no run. It
+    does not hide that the route is registered: FastAPI parses the body before
+    it resolves dependencies, so a malformed body answers 422 here and 404 on
+    a path that does not exist. This is a kill switch, not concealment.
+
+    The auth ordering is the load-bearing part, and it holds: the switch sits
+    INSIDE the handler, after ``Depends``, so an anonymous caller gets 401
+    whether the feature is on or off and never learns which it was.
 
     Idempotent: the report is keyed on (periods, capture date, generator
     version), so asking twice for the same quarter of the same capture returns
@@ -1189,8 +1207,8 @@ def board_report(body: dict | None = None, user=Depends(get_current_user),
     """
     if not reports.board_report_enabled():
         raise HTTPException(404, "Not Found")
-    period = str((body or {}).get("period") or "").strip()
-    compare_to = str((body or {}).get("compare_to") or "").strip() or None
+    period = _period_field(body, "period")
+    compare_to = _period_field(body, "compare_to") or None
     if not period:
         raise HTTPException(
             422, "A board report needs a 'period' (YYYY-MM, YYYY-Qn or YYYY).")
