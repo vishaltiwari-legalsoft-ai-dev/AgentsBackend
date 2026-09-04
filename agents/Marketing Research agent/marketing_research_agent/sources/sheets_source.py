@@ -615,39 +615,69 @@ def is_rollup_platform(platform: str) -> bool:
     return is_rollup_title(title)
 
 
-# The three labels the roll-up tab carries TWICE: once in the Projected — Not
-# Actualized block and again in the Paying block below it. Named once so the
-# occurrence-1 and occurrence-2 entries can never drift apart. The "($)" spelling
-# is the one _TEAM_MAP proves against the live workbook; the plain spelling is
-# what the roll-up tab itself shows. Listing both means either layout resolves,
-# and a workbook that mixes them leaves the field ABSENT rather than wrong.
+# Two labels the roll-up tab really does repeat across its Projected — Not
+# Actualized and Paying blocks. Named once so the two entries reading them can
+# never drift apart.
+#
+# The revenue-amount row is deliberately NOT here: the live tab spells it
+# "revenue amount sold ($) (not actualized)" in the Projected block and
+# "revenue amount sold (not actualized)" in the Paying block, two distinct
+# labels with one hit each. Carrying both spellings as candidates of one entry
+# was a real production defect — occurrence counts per candidate, never across
+# the tuple, so occurrence 2 found nothing and BOTH revenue figures (and the
+# ROAS derived from one of them) dropped out of the payload entirely.
 _DUP_SERVICES_SOLD_NA = ("total services sold (not actualized)",)
-_DUP_AMOUNT_SOLD_NA = ("revenue amount sold ($) (not actualized)",
-                       "revenue amount sold (not actualized)")
 _DUP_AMOUNT_SOLD_NO_FEE_NA = ("revenue amount sold w/o setup fee (not actualized)",)
+
+# Block headers inside the team block: each opens a section, is unique on the
+# tab, and is what actually tells the repeated rows apart. A field disambiguated
+# by an anchor is read ONLY from that anchor's window — the rows between it and
+# the next anchor — so a stray copy of the label elsewhere on the tab can never
+# be picked up, and deleting one block leaves the other block reading correctly
+# instead of silently shifting under it.
+#
+# This replaces occurrence counting for the repeated rows, on live evidence:
+# "revenue amount sold w/o setup fee (not actualized)" appears THREE times on
+# the tab (Projected, Paying, and a blank stray down in the Goal & Blended
+# section). Occurrence 2 is the Paying copy only for as long as all three stay
+# put; delete the Projected copy and occurrence 2 lands on the blank stray while
+# occurrence 1 serves the Paying figure under the Projected name.
+_ANCHOR_PROJECTED_NA = "number of projected new clients (not actualized)"
+_ANCHOR_PAYING_NA = "number of paying new clients (not actualized)"
+# Boundary only — no field reads from it, but it closes the Paying window so the
+# stray copy further down the tab falls outside every window.
+_ANCHOR_INBOUND = "number of paying new clients (inbound sales pipeline)"
+_OFFICIAL_BLOCK_ANCHORS = (_ANCHOR_PROJECTED_NA, _ANCHOR_PAYING_NA, _ANCHOR_INBOUND)
 
 # Team-level rows the roll-up tab reports itself. These are THE official
 # figures (the roll-up aggregates ledger/raw sources — Referral, Websites, … —
 # that have no vendor tab, so a vendor-tab sum can NEVER reproduce them).
 #
-# ``field: (labels, occurrence)``. Order within ``labels`` = priority, exact
-# stripped-lowercase match; ``occurrence`` is 1-based and picks which row wins
-# when that label repeats inside the block. Same convention and same tuple
-# position as ``_TEAM_MAP`` / ``_canonical_block`` in snapshots.py, whose label
-# strings these reuse — copied deliberately rather than imported, because that
-# module's routes are WORKSPACE_SHARED and importing it here would pull its
-# scoping into the report path.
+# ``field: (labels, disambiguator)``. Order within ``labels`` = priority, exact
+# stripped-lowercase match. The disambiguator says which row wins when the label
+# is not unique on the tab, and is one of two things:
 #
-# Occurrence is not cosmetic: the Paying block repeats three of the Projected —
-# Not Actualized block's labels verbatim, so first-match-wins quietly published
-# the Projected figures under the Paying names. One block's numbers appearing
-# under another block's rows is exactly the 2026-08-15 "wrong numbers" defect.
-_OFFICIAL_FIELD_LABELS: dict[str, tuple[Sequence[str], int]] = {
+#   int  — a 1-based occurrence within the block, the convention and tuple
+#          position ``_TEAM_MAP`` / ``_canonical_block`` in snapshots.py use
+#          (whose label strings these reuse — copied deliberately rather than
+#          imported, because that module's routes are WORKSPACE_SHARED and
+#          importing it here would pull its scoping into the report path).
+#   str  — a block anchor from _OFFICIAL_BLOCK_ANCHORS: read this row only from
+#          the section that anchor opens. Positional, so it survives a stray
+#          copy of the label elsewhere on the tab.
+#
+# Neither is cosmetic: the Paying block repeats the Projected — Not Actualized
+# block's rows, so first-match-wins quietly published the Projected figures
+# under the Paying names. One block's numbers appearing under another block's
+# rows is exactly the 2026-08-15 "wrong numbers" defect.
+_OFFICIAL_FIELD_LABELS: dict[str, tuple[Sequence[str], int | str]] = {
     # --- investment ---------------------------------------------------------
     "budget": (["budget"], 1),
     "spend": (["spend"], 1),
     # Performance is blank for this row on the live sheet — the Investment
-    # fallback in parse_official_totals is what actually resolves it.
+    # fallback in parse_official_totals is what resolves it when it is billed at
+    # all. Both cells have been empty since June 2026, so this field is legitimately
+    # ABSENT for recent months; it must never be reported as a $0 fee.
     "management_fees": (["management fees"], 1),
     # --- leads --------------------------------------------------------------
     "leads": (["leads"], 1),
@@ -685,17 +715,23 @@ _OFFICIAL_FIELD_LABELS: dict[str, tuple[Sequence[str], int]] = {
     "revenue_amount_sold": (["revenue amount sold (actualized)"], 1),
     "revenue_amount_sold_without_setup_fee": (
         ["revenue amount sold w/o setup fee (actualized)"], 1),
-    # --- projected, NOT actualized (the FIRST of the two duplicate blocks) ---
-    "projected_new_clients_not_actualized": (
-        ["number of projected new clients (not actualized)"], 1),
-    "services_sold_not_actualized": (_DUP_SERVICES_SOLD_NA, 1),
-    "revenue_amount_sold_not_actualized": (_DUP_AMOUNT_SOLD_NA, 1),
-    "revenue_amount_sold_without_setup_fee_not_actualized": (_DUP_AMOUNT_SOLD_NO_FEE_NA, 1),
-    # --- paying, NOT actualized (the SECOND block — occurrence 2, not 1) -----
-    "paying_new_clients": (["number of paying new clients (not actualized)"], 1),
-    "paying_services_sold": (_DUP_SERVICES_SOLD_NA, 2),
-    "paying_revenue_amount_sold": (_DUP_AMOUNT_SOLD_NA, 2),
-    "paying_revenue_amount_sold_without_setup_fee": (_DUP_AMOUNT_SOLD_NO_FEE_NA, 2),
+    # --- projected, NOT actualized (read from the Projected block only) ------
+    # The anchor rows themselves are unique labels and need no disambiguation.
+    "projected_new_clients_not_actualized": ([_ANCHOR_PROJECTED_NA], 1),
+    "services_sold_not_actualized": (_DUP_SERVICES_SOLD_NA, _ANCHOR_PROJECTED_NA),
+    # Distinct label from the Paying block's, per the live tab — anchored anyway,
+    # so the day someone normalises the two spellings nothing silently collides.
+    "revenue_amount_sold_not_actualized": (
+        ["revenue amount sold ($) (not actualized)"], _ANCHOR_PROJECTED_NA),
+    "revenue_amount_sold_without_setup_fee_not_actualized": (
+        _DUP_AMOUNT_SOLD_NO_FEE_NA, _ANCHOR_PROJECTED_NA),
+    # --- paying, NOT actualized (read from the Paying block only) ------------
+    "paying_new_clients": ([_ANCHOR_PAYING_NA], 1),
+    "paying_services_sold": (_DUP_SERVICES_SOLD_NA, _ANCHOR_PAYING_NA),
+    "paying_revenue_amount_sold": (
+        ["revenue amount sold (not actualized)"], _ANCHOR_PAYING_NA),
+    "paying_revenue_amount_sold_without_setup_fee": (
+        _DUP_AMOUNT_SOLD_NO_FEE_NA, _ANCHOR_PAYING_NA),
     # --- inbound sales pipeline ---------------------------------------------
     "inbound_pipeline_revenue_amount_sold": (
         ["revenue amount sold (inbound sales pipeline)"], 1),
@@ -721,8 +757,14 @@ _OFFICIAL_FIELD_LABELS: dict[str, tuple[Sequence[str], int]] = {
 }
 
 
-def _expected_occurrences(field_map: dict[str, tuple[Sequence[str], int]]) -> dict[tuple[str, ...], int]:
+def _expected_occurrences(
+    field_map: dict[str, tuple[Sequence[str], int | str]],
+) -> dict[tuple[str, ...], int]:
     """Labels the map claims at MORE than one occurrence, and the highest one.
+
+    Currently empty: every repeated row in the map is anchored to its block
+    instead. It stays because an int disambiguator is still supported, and a
+    future entry that counts occurrences must not silently lose this guard.
 
     Occurrence matching has a failure mode of its own: if the sheet loses one of
     the two duplicate blocks, the survivor becomes occurrence 1 and would be
@@ -733,13 +775,33 @@ def _expected_occurrences(field_map: dict[str, tuple[Sequence[str], int]]) -> di
     a board report is not.
     """
     out: dict[tuple[str, ...], int] = {}
-    for labels, occurrence in field_map.values():
+    for labels, where in field_map.values():
+        if not isinstance(where, int):
+            continue  # anchored fields are bounded by their block, not counted
         key = tuple(labels)
-        out[key] = max(out.get(key, 0), occurrence)
+        out[key] = max(out.get(key, 0), where)
     return {labels: occ for labels, occ in out.items() if occ > 1}
 
 
 _EXPECTED_OCCURRENCES = _expected_occurrences(_OFFICIAL_FIELD_LABELS)
+
+
+def _anchor_windows(rows: list[list[str]], start: int, end: int) -> dict[str, tuple[int, int]]:
+    """``anchor label -> (first row after it, first row of the next section)``.
+
+    Only anchors actually present are returned, so a field whose anchor has been
+    renamed away resolves to nothing and is reported absent — the same rule the
+    parsed rows follow. Guessing which section a repeated row belonged to is the
+    one outcome worth avoiding.
+    """
+    found = []
+    for anchor in _OFFICIAL_BLOCK_ANCHORS:
+        i = _row_for(rows, start, end, [anchor])
+        if i is not None:
+            found.append((i, anchor))
+    found.sort()
+    bounds = [i for i, _ in found] + [end]
+    return {anchor: (i + 1, bounds[n + 1]) for n, (i, anchor) in enumerate(found)}
 
 
 def _derive_official_fields(fields: dict[str, float]) -> None:
@@ -786,11 +848,21 @@ def parse_official_totals(
     blocks = _find_blocks(rows, title)
     start, end = (blocks[0][1], blocks[0][2]) if blocks else (1, len(rows))
     out: dict[str, dict[str, float]] = {}
-    for field, (labels, occurrence) in _OFFICIAL_FIELD_LABELS.items():
-        expected = _EXPECTED_OCCURRENCES.get(tuple(labels))
-        if expected and _row_for(rows, start, end, labels, expected) is None:
-            continue  # a duplicate block went missing - report none, guess none
-        i = _row_for(rows, start, end, labels, occurrence)
+    windows = _anchor_windows(rows, start, end)
+    for field, (labels, where) in _OFFICIAL_FIELD_LABELS.items():
+        if isinstance(where, str):
+            window = windows.get(where)
+            if window is None:
+                continue  # the block header that identifies this row is gone
+            lo, hi = window
+            i = _row_for(rows, lo, hi, labels)
+            if i is not None and _row_for(rows, lo, hi, labels, 2) is not None:
+                continue  # two copies inside one section - ambiguous, withhold
+        else:
+            expected = _EXPECTED_OCCURRENCES.get(tuple(labels))
+            if expected and _row_for(rows, start, end, labels, expected) is None:
+                continue  # a duplicate block went missing - report none, guess none
+            i = _row_for(rows, start, end, labels, where)
         if i is None:
             continue  # renamed/removed row -> absent field, never a zero
         row = rows[i]
@@ -840,6 +912,12 @@ def fetch_official_totals(
         if not is_rollup_title(tab["title"]):
             continue
         try:
+            # 120 rows of headroom over a tab whose team block is 81 labelled
+            # rows today. What falls off first is the TAIL - the Goal & Blended
+            # section (% of revenue target goal, revenue sold goal, average deal
+            # amount, conversion rate, ROAS, CAC), CAC being the 79th label - so
+            # rows inserted higher up cost the KPIs, not the funnel. Raise this
+            # before the tab grows, not after the board report loses its ratios.
             rows = fetch_tab_values(spreadsheet_id, tab["title"], service=svc)[:120]
         except Exception as exc:  # noqa: BLE001 — re-raised, never swallowed
             raise SheetsUnavailable(
