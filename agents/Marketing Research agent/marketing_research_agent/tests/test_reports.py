@@ -663,9 +663,17 @@ def test_board_report_never_sums_or_averages_a_sheet_ratio_row():
     """The structural half of the rule: the fields the roll-up sums and the
     fields that must be recomputed are disjoint, and ``_OFFICIAL_TOTAL_FIELDS``
     in reports.py — which sums each of its fields across months — may never gain
-    one of them as it widens."""
+    one of them as it widens.
+
+    ``MONTHLY_FIELDS`` is the same surface one level down: it names the fields
+    the roll-up carries per month for the by-month chart, and a ratio in it
+    would be a per-month recompute that cannot reconcile with the period ratio
+    printed beside it.
+    """
     assert br.ADDITIVE_FIELDS & br.RECOMPUTED_FIELDS == frozenset()
     assert set(reports._OFFICIAL_TOTAL_FIELDS) & br.RECOMPUTED_FIELDS == set()
+    assert set(br.MONTHLY_FIELDS) & br.RECOMPUTED_FIELDS == set()
+    assert set(br.MONTHLY_FIELDS) <= br.ADDITIVE_FIELDS
     for m in br.CATALOG:
         if m.formula:
             assert not set(m.formula.components()) & br.SHEET_RATIO_FIELDS, m.key
@@ -774,6 +782,100 @@ def test_board_report_a_permanently_blank_field_is_a_normal_absent_state():
     roll = br.roll_up(br.quarter_period(2026, 1), cells)
     assert "management_fees" not in roll.components
     assert roll.values == _q1().values and not roll.gaps
+
+
+# --- the by-month cells the chart draws --------------------------------------
+
+def test_board_report_carries_three_series_per_month_and_not_the_whole_catalog():
+    """The by-month chart needs figures the period totals cannot reconstruct, so
+    the roll-up carries the months through uncollapsed — but only the three
+    fields the chart draws.
+
+    The bound is the point. These cells ride in every ``ReportLedger`` and
+    therefore in every persisted run; a cell per month per metric would be 38 x N
+    numbers stored to draw three bars.
+    """
+    assert br.MONTHLY_FIELDS == ("spend", "revenue_amount_sold",
+                                 "revenue_amount_sold_not_actualized")
+    roll = _q1()
+    assert [c.month for c in roll.monthly] == list(_Q1_MONTHS)
+    for cell in roll.monthly:
+        assert set(cell.values) == set(br.MONTHLY_FIELDS), cell.month
+        # Not a slice of the whole roll-up: the other 30-odd additive fields are
+        # summed into the period and never carried per month.
+        assert "leads" not in cell.values and "revenue_clients" not in cell.values
+
+    cells = _monthly(0, _Q1_MONTHS)
+    for field in br.MONTHLY_FIELDS:
+        drawn = [c.value(field) for c in roll.monthly]
+        assert drawn == [cells[mk][field] for mk in _Q1_MONTHS], field
+        # The bars re-sum to the column the ledger prints, or the chart and the
+        # table beside it are telling a reader two different stories.
+        assert round(sum(drawn), 2) == pytest.approx(roll.components[field], abs=0.02)
+
+    ledger = br.compare(_q1(), _q2())
+    assert [c.month for c in ledger.monthly[0]] == list(_Q1_MONTHS)
+    assert [c.month for c in ledger.monthly[1]] == list(_Q2_MONTHS)
+    # Two tuples, not one merged list: a single-period ledger is the same period
+    # twice, and merging here would draw every month of it twice.
+    same = br.compare(_q1(), _q1())
+    assert same.monthly[0] == same.monthly[1]
+
+    payload = json.loads(json.dumps(ledger.as_dict()))
+    assert payload["monthly"][0][0] == {
+        "month": "2026-01", "values": {f: cells["2026-01"][f] for f in br.MONTHLY_FIELDS}}
+
+
+def test_board_report_a_month_that_did_not_report_is_absent_not_zero():
+    """The absent-vs-zero rule, one level down from the period totals.
+
+    A field a month did not report is simply not a key in that month's cell, and
+    the month still gets a cell. Both halves matter: a 0 would draw a bar
+    claiming nothing was spent, and dropping the month would shorten the chart's
+    axis so a two-thirds-covered quarter reads as a complete two-month period.
+    """
+    cells = _monthly(0, _Q1_MONTHS)
+    del cells["2026-02"]["revenue_amount_sold"]
+    roll = br.roll_up(br.quarter_period(2026, 1), cells)
+
+    assert [c.month for c in roll.monthly] == list(_Q1_MONTHS)   # no month dropped
+    feb = roll.monthly[1]
+    assert "revenue_amount_sold" not in feb.values
+    assert feb.value("revenue_amount_sold") is None
+    assert feb.value("revenue_amount_sold") != 0
+    assert feb.value("spend") == cells["2026-02"]["spend"]       # not collateral
+
+    # The period total is withheld while the two months that DID report still
+    # carry their cells — that pair is what keeps a partial period visibly
+    # partial instead of publishing a two-month sum as the quarter.
+    assert roll.value("revenue_amount_sold") is None
+    assert roll.value("roas_pct") is None
+    assert roll.monthly[0].value("revenue_amount_sold") is not None
+    assert roll.monthly[2].value("revenue_amount_sold") is not None
+    assert any("\'revenue_amount_sold\' is missing for 2026-02" in g for g in roll.gaps)
+
+    # A month the sheet has nothing for at all still holds its slot, empty.
+    blank = br.roll_up(br.quarter_period(2026, 1), {mk: cells[mk] for mk in _Q1_MONTHS[:2]})
+    assert [c.month for c in blank.monthly] == list(_Q1_MONTHS)
+    assert blank.monthly[2].values == {}
+
+
+def test_board_report_refuses_a_monthly_field_that_cannot_be_summed():
+    """The guard that keeps the list three summable fields wide.
+
+    Proven by handing the validator a broken list rather than by editing module
+    globals — the same shape as the catalog guards above.
+    """
+    br._validate_monthly()          # the shipping list, at import and here
+
+    with pytest.raises(ValueError, match="recomputed from summed components"):
+        br._validate_monthly(("roas_pct",), br.ADDITIVE_FIELDS, br.RECOMPUTED_FIELDS)
+    with pytest.raises(ValueError, match="recomputed from summed components"):
+        br._validate_monthly(("cost_per_lead",), br.ADDITIVE_FIELDS, br.RECOMPUTED_FIELDS)
+    with pytest.raises(ValueError, match="not a field the roll-up sums"):
+        br._validate_monthly(("management_fees",), br.ADDITIVE_FIELDS, br.RECOMPUTED_FIELDS)
+    with pytest.raises(ValueError, match="duplicate field"):
+        br._validate_monthly(("spend", "spend"), br.ADDITIVE_FIELDS, br.RECOMPUTED_FIELDS)
 
 
 # --- the untracked / Other reconciliation row --------------------------------
@@ -898,7 +1000,11 @@ def test_board_report_cache_key_covers_periods_capture_date_and_version():
     key = br.cache_key(periods, day)
     assert len(key) == 64 and key == br.cache_key(periods, day)
     assert key != br.cache_key(periods, date(2026, 9, 5))
-    assert key != br.cache_key(periods, day, version="mr-board-report/2")
+    # A sentinel that can never BE the shipping version. Writing the next
+    # version number here instead makes this line pass for the wrong reason the
+    # day someone bumps to it, and the by-month change did exactly that bump.
+    assert br.GENERATOR_VERSION != "mr-board-report/never"
+    assert key != br.cache_key(periods, day, version="mr-board-report/never")
     assert key != br.cache_key(list(reversed(periods)), day)
     assert key != br.cache_key([br.quarter_period(2026, 1), br.quarter_period(2026, 3)], day)
     ledger = br.compare(_q1(), _q2(), captured_on=day)
@@ -1753,6 +1859,126 @@ def test_board_report_render_untracked_columns_may_be_absent_and_render_absent()
     assert "Roll-up warnings" in page
 
 
+# --- the headline chart is by month, off the ledger\'s own cells --------------
+
+def _month_bars(svg: str) -> list[tuple[float, float]]:
+    """``(x, height)`` per drawn bar, in emit order, legend swatches dropped.
+
+    The legend is three 11px squares; every bar is far wider than that at any
+    axis length this chart reaches, so width is the discriminator.
+    """
+    found = re.findall(
+        r'<rect x="([-\d.]+)" y="[-\d.]+" width="([\d.]+)" height="([\d.]+)"', svg)
+    return [(float(x), float(h)) for x, w, h in found if float(w) > 12]
+
+
+def test_board_report_render_draws_the_period_by_month_not_by_column():
+    """The marketing team\'s headline chart is "By month — spend vs revenue":
+    three series across Jan/Feb/Mar in the Q1 file and Apr/May/Jun in the Q2
+    one. It was drawn per COLUMN while the ledger carried only period totals;
+    the roll-up now carries the months, so the real series is drawn.
+
+    The assertion that matters is the one a divided total would fail: spend is
+    front-loaded across this quarter and actualized revenue is back-loaded, so
+    the two series slope opposite ways. Three equal bars would be a period total
+    cut in three and presented as a trend.
+    """
+    one = _standalone()
+    svg = _svg_named(one, "Spend against revenue sold, by month")
+
+    labels = re.findall(r"<text[^>]*>([^<]*)</text>", svg)
+    assert ["Jan", "Feb", "Mar"] == [l for l in labels if l in ("Jan", "Feb", "Mar")]
+    for series in ("Spend", "Revenue Sold (Actualized)", "Revenue Sold (Not Actualized)"):
+        assert series in labels, series
+    assert "By month — spend vs revenue" in one
+    assert "Q1 covers Jan – Mar 2026." in one
+
+    bars = _month_bars(svg)
+    assert len(bars) == 9, bars                      # 3 months x 3 series
+    assert [x for x, _ in bars] == sorted(x for x, _ in bars)   # left to right
+    spend = [h for i, (_, h) in enumerate(bars) if i % 3 == 0]
+    revenue = [h for i, (_, h) in enumerate(bars) if i % 3 == 1]
+    assert spend[0] > spend[1] > spend[2], spend
+    assert revenue[0] < revenue[1] < revenue[2], revenue
+
+    # Bar heights are the months\' own figures, to the axis scale.
+    cells = brr._chart_months(brr.single_period(_q1_ch()))
+    values = [c.value("spend") for c in cells]
+    assert spend[0] / spend[2] == pytest.approx(values[0] / values[2], abs=0.01)
+
+    # Two periods draw both windows on one axis, in order, each month once —
+    # and a single-period ledger is the same period twice, so the dedup is what
+    # keeps the standalone chart at three months rather than six.
+    two = _comparison()
+    two_svg = _svg_named(two, "Spend against revenue sold, by month")
+    drawn = [l for l in re.findall(r"<text[^>]*>([^<]*)</text>", two_svg)
+             if len(l) == 3 and l.isalpha()]
+    assert drawn == ["Jan", "Feb", "Mar", "Apr", "May", "Jun"]
+    assert len(_month_bars(two_svg)) == 18
+    assert "Q1 covers Jan – Mar 2026. Q2 covers Apr – Jun 2026." in two
+    assert "never a period total divided across its months" in two
+
+
+def test_board_report_render_a_month_missing_a_series_keeps_its_slot_as_an_em_dash():
+    """The absent-vs-zero rule, on the chart. A month that did not report a
+    series keeps its place on the axis with an em-dash where the bar would be:
+    a zero bar states no spend and a dropped month shortens the quarter.
+
+    The same month withholds that column\'s period TOTAL, so the ledger row
+    beside the chart is an em-dash while two of its bars still stand. That
+    disagreement is the design — a partly covered period has to look partly
+    covered.
+    """
+    cells = _monthly(0, _Q1_MONTHS)
+    del cells["2026-02"]["revenue_amount_sold"]
+    page = brr.render(brr.single_period(br.roll_up(
+        br.quarter_period(2026, 1), cells, channels=_channels(0, _Q1_MONTHS))))
+    svg = _svg_named(page, "Spend against revenue sold, by month")
+
+    labels = re.findall(r"<text[^>]*>([^<]*)</text>", svg)
+    assert [l for l in labels if l in ("Jan", "Feb", "Mar")] == ["Jan", "Feb", "Mar"]
+    assert labels.count("—") == 1                    # exactly the one hole
+    assert len(_month_bars(svg)) == 8                 # 9 slots, 1 unreported
+
+    assert "Revenue Sold (Actualized) — Feb 2026" in page
+    assert "Not reported, and drawn as an em-dash in the bar" in page
+    assert "a partly covered period stays visibly partial" in page
+
+    # ...and the standalone card for the same metric is absent, not a two-month
+    # sum: two bars stand in the chart while the headline figure is withheld.
+    card = _between(page, '<div class="card hl">', "</div></div>")
+    assert br.BY_KEY["revenue_amount_sold"].label in card
+    assert 'class="absent"' in card and "$0" not in card
+    assert "not reported for this period — this is absent, not zero" in card
+    assert br.BY_KEY["revenue_amount_sold"].label + " — not reported" in page
+    assert "Roll-up warnings" in page
+
+
+def test_board_report_render_drops_the_by_month_chart_rather_than_inventing_months():
+    """A ledger with no monthly cells — a hand-built one, or a run persisted
+    before they existed. The chart is not reconstructed by cutting the period
+    total into equal months, which would draw a flat trend nobody measured."""
+    full = br.compare(_q1_ch(), _q2_ch())
+    bare = br.ReportLedger(columns=full.columns, periods=full.periods, rows=full.rows,
+                           channels=full.channels, untracked=full.untracked,
+                           gaps=full.gaps)
+    assert bare.monthly == ((), ())
+    page = brr.render(bare)
+    assert "carries no monthly cells, so the by-month chart is not drawn" in page
+    assert "<title>Spend against revenue sold, by month</title>" not in page
+    assert "Q1 covers Jan – Mar 2026" in page       # still says what it covers
+    assert _kickers(page) == ["00", "01", "02", "03", "04"]      # nothing else lost
+
+
+def test_board_report_render_series_styles_cannot_drift_from_the_carried_fields():
+    """The chart\'s three series and the ledger\'s three carried fields are one
+    decision. Adding a field in ``board_report`` with no style here would drop
+    it from the chart silently, so the pairing is refused at import."""
+    assert tuple(brr._MONTH_SERIES_STYLE) == br.MONTHLY_FIELDS
+    assert [c for _, c in brr._MONTH_SERIES_STYLE.values()] == [brr.SLATE, brr.GOLD,
+                                                                brr.INK]
+
+
 # --- no invisible bars -------------------------------------------------------
 
 def test_board_report_render_roas_chart_keeps_the_small_channels_visible():
@@ -1780,16 +2006,14 @@ def test_board_report_render_roas_chart_keeps_the_small_channels_visible():
 
 
 def test_board_report_render_draws_three_bar_charts_and_nothing_else():
-    """Grouped vertical (spend vs revenue), horizontal (revenue by channel, and
-    the sorted movers), and vertical against a benchmark (ROAS). No line, no
-    pie, no doughnut — and no monthly series, because the ledger carries period
-    totals and the renderer does not invent months it never received."""
+    """Grouped vertical (spend vs revenue by month), horizontal (revenue by
+    channel, and the sorted movers), and vertical against a benchmark (ROAS).
+    No line, no pie, no doughnut, and still no library."""
     page = _comparison()
-    for title in ("Spend against revenue sold", "Percent change Q1 to Q2",
+    for title in ("Spend against revenue sold, by month", "Percent change Q1 to Q2",
                   "Revenue sold by channel", "ROAS by channel against break-even"):
         svg = _svg_named(page, title)
         assert "<rect" in svg and "<circle" not in svg and "<polyline" not in svg
-    assert "Monthly detail is not part of the ledger" in page
 
     movers = _svg_named(page, "Percent change Q1 to Q2")
     assert 'stroke="' + brr.INK + '" stroke-width="1.5"' in movers      # zero line
@@ -1868,6 +2092,38 @@ def test_board_report_render_keeps_the_typography_decision_the_user_made():
     assert "@font-face" not in css and "data:font" not in css
     for name, value in brr.PALETTE.items():
         assert "--" + name + ":" + value in css
+
+
+def test_board_report_render_says_the_brand_is_unset_rather_than_printing_a_hole():
+    """``brand`` is optional and nothing calls :func:`render` yet, so the first
+    call site is the one that can get it wrong. An unnamed brand reads as
+    unnamed — on the cover, in the tab title and in the footer — instead of
+    collapsing to a page that looks finished and does not say whose it is.
+
+    Whitespace is the case that bites: a name read out of a config row can
+    arrive as ``" "``, which is truthy, and would print an eyebrow with a gap in
+    front of it that nobody could account for.
+    """
+    ledger = br.compare(_q1_ch(), _q2_ch())
+    assert brr._brand_of(None) == brr.UNNAMED_BRAND
+    assert brr._brand_of("") == brr.UNNAMED_BRAND
+    assert brr._brand_of("   ") == brr.UNNAMED_BRAND
+    assert brr._brand_of("  Legal Soft  ") == "Legal Soft"
+
+    for missing in (None, "", "   ", "\t"):
+        page = brr.render(ledger) if missing is None else brr.render(ledger, brand=missing)
+        assert f"{brr.UNNAMED_BRAND} · Growth marketing" in page
+        assert f"<title>{brr.UNNAMED_BRAND} — Q1 vs Q2 board report</title>" in page
+        assert f"<b>{brr.UNNAMED_BRAND} — Q1 vs Q2 comparison.</b>" in page
+        assert "> · Growth marketing<" not in page       # never the blank eyebrow
+
+    named = brr.render(ledger, brand="Legal Soft")
+    assert "Legal Soft · Growth marketing" in named
+    assert "<title>Legal Soft — Q1 vs Q2 board report</title>" in named
+    assert "<b>Legal Soft — Q1 vs Q2 comparison.</b>" in named
+    assert brr.UNNAMED_BRAND not in named
+    # An explicit title still wins; the brand is not welded into it.
+    assert "<title>Board pack</title>" in brr.render(ledger, title="Board pack")
 
 
 def test_board_report_render_refuses_a_ledger_that_is_not_two_columns():

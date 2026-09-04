@@ -9,7 +9,10 @@ Two things live here and nothing else (no routes, no HTML, no PDF):
   renderer change.
 * :func:`roll_up` / :func:`compare` — many months of the roll-up tab's official
   figures collapsed into one period, and two such periods laid side by side in
-  the ledger shape the report renders.
+  the ledger shape the report renders. The roll-up also carries the period's
+  months through *uncollapsed* — but only :data:`MONTHLY_FIELDS`, the three
+  series the by-month chart draws, because a cell per month per metric would
+  put 38 x N numbers into every stored run to draw three bars.
 
 Three rules are load-bearing enough to say up front, because each one has a
 wrong-number failure mode that looks entirely plausible on a board slide:
@@ -48,7 +51,7 @@ from typing import Iterable, Mapping, Sequence
 #: Bumped whenever a change here would produce different numbers or rows for
 #: the same inputs. It is part of the idempotency key, so a bump re-derives
 #: rather than serving a stale roll-up.
-GENERATOR_VERSION = "mr-board-report/1"
+GENERATOR_VERSION = "mr-board-report/2"
 
 MONEY, PCT, INT = "money", "pct", "int"
 FORMATS = frozenset({MONEY, PCT, INT})
@@ -283,6 +286,26 @@ RECOMPUTED_FIELDS: frozenset[str] = frozenset(
     m.key for m in CATALOG if m.derived
 ) | SHEET_RATIO_FIELDS
 
+#: The fields the roll-up carries **per month** as well as summed, in the order
+#: the by-month chart draws them: spend, actualized revenue sold, not-actualized
+#: revenue sold.
+#:
+#: Deliberately three fields and not :data:`ADDITIVE_FIELDS`. The monthly cells
+#: ride along in every :class:`ReportLedger` and therefore in every persisted
+#: run, so this list is the ledger's weight: three fields x N months, not
+#: thirty-odd. Adding one is a decision about storage, which is why it is a
+#: named constant with a guard rather than a comprehension at the call site.
+#:
+#: Every entry must be an *additive* source field. A ratio has no honest monthly
+#: cell to carry — recomputing it per month gives a number that does not
+#: reconcile with the period ratio printed next to it, which is the averaging
+#: defect rule 2 exists to prevent, one level down.
+MONTHLY_FIELDS: tuple[str, ...] = (
+    "spend",
+    "revenue_amount_sold",
+    "revenue_amount_sold_not_actualized",
+)
+
 
 def _groups_in_order(catalog: Sequence[Metric]) -> bool:
     """True when catalog rows appear in ``GROUPS`` order with no group split in
@@ -294,6 +317,30 @@ def _groups_in_order(catalog: Sequence[Metric]) -> bool:
                 return False
             seen.append(m.group)
     return seen == [g for g in GROUPS if g in seen]
+
+
+def _validate_monthly(fields: Sequence[str] = MONTHLY_FIELDS,
+                      additive: frozenset[str] = ADDITIVE_FIELDS,
+                      recomputed: frozenset[str] = RECOMPUTED_FIELDS) -> None:
+    """Fail at import if the by-month series stops being summable.
+
+    Takes its three sets as arguments for the same reason
+    :func:`_validate_catalog` does — the refusal is provable without reaching
+    into module globals to break something.
+    """
+    seen: set[str] = set()
+    for f in fields:
+        if f in seen:
+            raise ValueError(f"MONTHLY_FIELDS: duplicate field {f!r}")
+        seen.add(f)
+        if f in recomputed:
+            raise ValueError(
+                f"MONTHLY_FIELDS: {f!r} is recomputed from summed components, so it "
+                "has no honest per-month cell — carry its components instead")
+        if f not in additive:
+            raise ValueError(
+                f"MONTHLY_FIELDS: {f!r} is not a field the roll-up sums, so no month "
+                "would ever report it")
 
 
 def _validate_catalog(catalog: Sequence[Metric] = CATALOG) -> None:
@@ -342,6 +389,7 @@ def _validate_catalog(catalog: Sequence[Metric] = CATALOG) -> None:
 
 
 _validate_catalog()
+_validate_monthly()
 
 
 # --- periods ----------------------------------------------------------------
@@ -460,6 +508,30 @@ class Untracked:
 
 
 @dataclass(frozen=True)
+class MonthCell:
+    """One month of a period, carried through uncollapsed for the chart.
+
+    ``values`` holds only the :data:`MONTHLY_FIELDS` this month actually
+    reported. A field the month did not report is simply not a key — the same
+    absent-is-not-zero rule the period totals follow, one level down.
+
+    Every month of the period gets a cell, including a month that reported
+    nothing at all. Dropping an empty month would silently shorten the chart's
+    axis, and a quarter drawn as two bars reads as a complete two-month period
+    rather than as the partially-covered quarter it is.
+    """
+
+    month: str
+    values: Mapping[str, float]
+
+    def value(self, field: str) -> float | None:
+        return self.values.get(field)
+
+    def as_dict(self) -> dict:
+        return {"month": self.month, "values": dict(self.values)}
+
+
+@dataclass(frozen=True)
 class PeriodRollup:
     """One report column: a period's totals, its channels, and what is missing."""
 
@@ -469,6 +541,10 @@ class PeriodRollup:
     channels: tuple[ChannelTotals, ...] = ()
     untracked: Untracked | None = None
     gaps: tuple[str, ...] = ()
+    #: One cell per month of ``period.months``, in period order, carrying only
+    #: :data:`MONTHLY_FIELDS`. Never re-ordered and never filtered: the chart's
+    #: axis is this tuple.
+    monthly: tuple[MonthCell, ...] = ()
 
     def value(self, key: str) -> float | None:
         return self.values.get(key)
@@ -481,6 +557,7 @@ class PeriodRollup:
             "channels": [c.as_dict() for c in self.channels],
             "untracked": self.untracked.as_dict() if self.untracked else None,
             "gaps": list(self.gaps),
+            "monthly": [c.as_dict() for c in self.monthly],
         }
 
 
@@ -506,6 +583,27 @@ def _sum_over(months: Sequence[str], per_month: Mapping[str, Mapping[str, float]
     return out
 
 
+def _month_cells(months: Sequence[str],
+                 per_month: Mapping[str, Mapping[str, float]]) -> tuple[MonthCell, ...]:
+    """The period's months, uncollapsed, carrying :data:`MONTHLY_FIELDS` only.
+
+    Unlike :func:`_sum_over` this withholds nothing, because there is no subset
+    here to be misread as a whole: a month reported a field or it did not. The
+    withheld *period total* and the present *monthly cells* coexist on purpose —
+    that pair is what makes a partially-covered period look partial rather than
+    look like a shorter period that is complete.
+    """
+    out: list[MonthCell] = []
+    for mk in months:
+        row = per_month.get(mk) or {}
+        out.append(MonthCell(
+            month=mk,
+            values={f: round(float(row[f]), 2) for f in MONTHLY_FIELDS
+                    if row.get(f) is not None},
+        ))
+    return tuple(out)
+
+
 def _share(part: float | None, whole: float | None) -> float | None:
     if part is None or not whole:
         return None
@@ -529,6 +627,10 @@ def roll_up(
     Additive fields are summed. Ratios are **recomputed from those sums** — never
     averaged across months, which measures +1.74pp of error on ROAS for this
     data. Anything a month does not report stays missing all the way out.
+
+    The period's months also come through uncollapsed in ``monthly``, carrying
+    :data:`MONTHLY_FIELDS` and nothing else — the by-month chart's own data,
+    which the period totals cannot reconstruct.
     """
     gaps: list[str] = []
     components = _sum_over(period.months, official, ADDITIVE_FIELDS,
@@ -554,7 +656,8 @@ def roll_up(
 
     return PeriodRollup(period=period, components=components, values=values,
                         channels=tuple(channel_totals), untracked=untracked,
-                        gaps=tuple(gaps))
+                        gaps=tuple(gaps),
+                        monthly=_month_cells(period.months, official))
 
 
 def _reconcile_untracked(
@@ -663,6 +766,11 @@ class ReportLedger:
     untracked: tuple[Untracked | None, Untracked | None] = (None, None)
     gaps: tuple[str, ...] = ()
     cache_key: str = ""
+    #: Column A's months, then column B's, each in period order. Two tuples and
+    #: not one merged list: which column a month belongs to is the renderer's
+    #: business, and a single-period ledger is the same period twice, so merging
+    #: here would draw every month of it twice.
+    monthly: tuple[tuple[MonthCell, ...], tuple[MonthCell, ...]] = ((), ())
 
     def to_r_array(self) -> list[list]:
         """The template's ``R[]``: group bands interleaved with metric rows."""
@@ -686,6 +794,7 @@ class ReportLedger:
             "channels": [c.as_dict() for c in self.channels],
             "untracked": [u.as_dict() if u else None for u in self.untracked],
             "gaps": list(self.gaps),
+            "monthly": [[c.as_dict() for c in side] for side in self.monthly],
         }
 
 
@@ -721,6 +830,7 @@ def compare(a: PeriodRollup, b: PeriodRollup, *,
         untracked=(a.untracked, b.untracked),
         gaps=tuple(a.gaps) + tuple(b.gaps),
         cache_key=cache_key([a.period, b.period], captured_on) if captured_on else "",
+        monthly=(a.monthly, b.monthly),
     )
 
 

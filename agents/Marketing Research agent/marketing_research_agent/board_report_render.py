@@ -39,22 +39,37 @@ defect the supplied templates shipped:
    near 40%/95%, which on a linear axis renders the three channels that matter
    as three slivers. The ratio chart caps its axis off the median and draws the
    outlier as a torn bar with its true value printed, so the break-even line at
-   100% sits where a reader can actually use it.
+   100% sits where a reader can actually use it. The by-month chart follows the
+   same rule from the other side: a month that did not report a series is an
+   em-dash in that bar's slot, and the month keeps its place on the axis, so a
+   half-covered quarter cannot be drawn as a complete short one.
 4. **Every dynamic string is escaped.** Metric labels come from the catalog
    today and prose will come from an LLM tomorrow, on a page that goes to
    clients.
 
-**Fonts: a fallback stack, not embedded faces.** Fraunces alone is a ~110KB
-variable woff2; with Inter's four weights and three of IBM Plex Mono, base64 at
-+33% would add roughly 700KB–1MB to every file the team emails, and would put
-binary blobs plus their licences in this repo. The stacks below name the design's
-three faces first — a machine that has them still gets the intended page — and
-fall back through faces present by default on Windows, macOS and a headless
-Chromium container (Georgia/Palatino, Segoe UI/Helvetica, Consolas/DejaVu Sans
-Mono), with ``tabular-nums`` and an explicit ``"tnum"`` feature so figures stay
-column-aligned in whichever face resolves. If pixel-exact Fraunces is later
-worth the megabyte, the swap is one function: emit an ``@font-face`` block with
-data URIs and prepend it to :data:`CSS`.
+**Fonts: the fallback stack is a stopgap, and it is losing.** The decision is
+to embed the three faces, because none of Fraunces, Inter or IBM Plex Mono ships
+by default on Windows or macOS — so the stacks below, which were justified on
+file size, in practice hand a client Georgia/Segoe UI/Consolas rather than the
+typography the marketing team approved. The size argument does not survive that:
+a design nobody sees is not a saving.
+
+Embedding is **blocked on the source files, not on this module**. Subsetting to
+the report's own repertoire (digits, currency, percent, arrows, Latin text) needs
+the upstream faces and their SIL OFL text on disk, plus a subsetter; of the three,
+only IBM Plex Mono is present on a build box here. Nothing is fetched from the
+network to fix that, and no unlicensed binary is committed to get the look. Until
+the faces and their licences land in the repo, the stacks below stay: they name
+the design's three faces first (a machine that has them still gets the intended
+page) and fall back through faces present by default on Windows, macOS and a
+headless Chromium container (Georgia/Palatino, Segoe UI/Helvetica, Consolas/DejaVu
+Sans Mono), with ``tabular-nums`` and an explicit ``"tnum"`` feature so figures
+stay column-aligned in whichever face resolves.
+
+When the faces do land, the swap is one function: emit an ``@font-face`` block of
+``src:url(data:font/woff2;base64,...)`` and prepend it to :data:`CSS`. The
+self-containment guard has to widen with it — outward ``url(`` stays banned, a
+``data:`` one does not.
 
 Deliberately importing nothing but the ledger. ``board_report`` is consumed and
 never modified; ``reports``, ``sheets_source`` and ``pdf_export`` are not
@@ -75,11 +90,13 @@ from .board_report import (
     CAC_KEY,
     INT,
     MONEY,
+    MONTHLY_FIELDS,
     PCT,
     UNTRACKED_LABEL,
     ChannelRow,
     ChannelTotals,
     LedgerRow,
+    MonthCell,
     PeriodRollup,
     ReportLedger,
     compare,
@@ -87,7 +104,7 @@ from .board_report import (
 
 #: Bumped when the rendered document changes shape for the same ledger. The
 #: ledger's own ``cache_key`` covers the numbers; this covers the page.
-RENDERER_VERSION = "mr-board-report-render/1"
+RENDERER_VERSION = "mr-board-report-render/2"
 
 # --- palette and type --------------------------------------------------------
 # Fixed by the marketing team's templates and kept as data so the CSS and the
@@ -129,9 +146,39 @@ SANS = ("Inter,'Segoe UI',system-ui,-apple-system,'Helvetica Neue',"
 MONO = ("'IBM Plex Mono','SF Mono','Cascadia Mono','DejaVu Sans Mono',"
         "Consolas,'Courier New',monospace")
 
+#: What the cover, the document title and the footer say when nobody named the
+#: brand. A visible placeholder and deliberately not ``""``: this is a
+#: client-facing document, and the first call site that forgets the argument —
+#: or passes a workspace name that is blank or whitespace — must produce a page
+#: a reviewer notices rather than a cover reading "· Growth marketing" with a
+#: hole in front of it. Not a hardcoded tenant name either: one workspace's brand
+#: printed on every other workspace's report is the worse failure of the two.
+UNNAMED_BRAND = "Brand not set"
+
 #: What an absent figure looks like. An em-dash plus a marker class the "basis
 #: & data gaps" panel then explains — never 0, never an empty cell.
 ABSENT = '<span class="absent" title="not reported for this period">&#8212;</span>'
+
+#: The by-month chart's three series: the sheet field, its legend label and its
+#: fill. Slate spend, gold actualized revenue sold, navy not-actualized — the
+#: marketing team's own three, which is why
+#: :data:`board_report.MONTHLY_FIELDS` carries exactly these three fields and
+#: not the whole catalog.
+#:
+#: Keyed by field and ordered by ``MONTHLY_FIELDS`` rather than duplicating that
+#: order here, so a field added there without a style is an import-time refusal
+#: instead of a series silently missing from the chart.
+_MONTH_SERIES_STYLE: dict[str, tuple[str, str]] = {
+    "spend": ("Spend", SLATE),
+    "revenue_amount_sold": ("Revenue Sold (Actualized)", GOLD),
+    "revenue_amount_sold_not_actualized": ("Revenue Sold (Not Actualized)", INK),
+}
+
+_unstyled = [f for f in MONTHLY_FIELDS if f not in _MONTH_SERIES_STYLE]
+if _unstyled:
+    raise ValueError(
+        f"board_report.MONTHLY_FIELDS carries {_unstyled} with no series style here — "
+        "give each one a label and a fill, or the by-month chart drops it silently")
 
 #: The eight rows the at-a-glance band publishes, by catalog key. Labels come
 #: from the catalog, never from a copy kept here.
@@ -417,6 +464,11 @@ def _grouped_vbar(categories: Sequence[str], series: Sequence[_Series], *,
     inner = min(group_w * 0.74, n_ser * 58.0)
     bar_w = inner / n_ser
     label_bars = n_cat * n_ser <= 8
+    # This axis holds months now, and a year-against-year comparison is
+    # twenty-four of them. Label size and truncation follow the group width, so
+    # a long axis crowds rather than overprints.
+    cat_size = max(7.5, min(11.0, group_w * 0.34))
+    cat_chars = max(4, int(group_w / (cat_size * 0.55)))
     for gi, cat in enumerate(categories):
         gx = left + gi * group_w + (group_w - inner) / 2
         for si, s in enumerate(series):
@@ -432,8 +484,8 @@ def _grouped_vbar(categories: Sequence[str], series: Sequence[_Series], *,
                 out.append(_text(bx + (bar_w - 4) / 2, y - 5, _axis_label(v, fmt),
                                  size=9, anchor="middle"))
         out.append(_text(left + gi * group_w + group_w / 2, top + plot_h + 20,
-                         _trunc(cat, 26), size=11, anchor="middle", sans=True,
-                         fill=INK))
+                         _trunc(cat, cat_chars), size=cat_size, anchor="middle",
+                         sans=True, fill=INK))
     return _svg(width, height, title, desc, "".join(out))
 
 
@@ -823,6 +875,15 @@ def _months_label(period) -> str:
     return f"{first} – {last}"
 
 
+def _brand_of(brand: str | None) -> str:
+    """``None``, ``""`` and ``"   "`` all mean the same thing — nobody named the
+    brand — so they resolve to the same visible :data:`UNNAMED_BRAND` rather
+    than to a blank. Whitespace is the case that matters: a name read out of a
+    config row can arrive as ``" "``, which is truthy, and the cover would print
+    an eyebrow with a gap in it and no one would know why."""
+    return (brand or "").strip() or UNNAMED_BRAND
+
+
 def _channel_side(row: ChannelRow, second: bool) -> ChannelTotals | None:
     return row.b if second else row.a
 
@@ -852,11 +913,11 @@ def _head(title: str) -> str:
     )
 
 
-def _cover(ledger: ReportLedger, *, two: bool, brand: str | None,
+def _cover(ledger: ReportLedger, *, two: bool, brand: str,
            prose: ReportProse | None) -> str:
     a_label, b_label = ledger.columns
     rows = _by_key(ledger)
-    eyebrow = f"{brand} · Growth marketing" if brand else "Growth marketing"
+    eyebrow = f"{brand} · Growth marketing"
     if two:
         heading = f"{_esc(a_label)} vs {_esc(b_label)} <em>— the shift</em>"
         rev, cac = rows.get("revenue_amount_sold"), rows.get(CAC_KEY)
@@ -928,7 +989,7 @@ def _glance(ledger: ReportLedger) -> str:
           "direction of the move. An em-dash means the figure was not reported; it is not zero."
           "</p>"
         + '<div class="chart-grid" style="margin-top:22px">'
-        + _period_bar(ledger, two=True) + "</div></div></div>"
+        + _month_bar(ledger, two=True) + "</div></div></div>"
     )
 
 
@@ -1160,44 +1221,108 @@ def _channel_charts(ledger: ReportLedger, *, two: bool) -> str:
     )
 
 
-def _period_bar(ledger: ReportLedger, *, two: bool) -> str:
-    """Chart (a) — spend against actualized and not-actualized revenue.
+def _chart_months(ledger: ReportLedger) -> tuple[MonthCell, ...]:
+    """The chart's axis: column A's months, then any of column B's it does not
+    already carry.
 
-    Drawn per **column**, not per month: :class:`ReportLedger` carries period
-    totals and never the monthly cells the roll-up summed, so a by-month chart
-    would have to invent its data. The month keys are printed under each column
-    so a reader knows what the bar covers.
+    The dedup is load-bearing in both directions. A single-period ledger is the
+    same period twice (:func:`single_period`), so without it every month would
+    be drawn twice; two periods that genuinely overlap would double a real
+    month the same way. First occurrence wins, which keeps column A's cell
+    authoritative for a month both columns claim.
     """
-    rows = _by_key(ledger)
-    cats = []
-    for i, label in enumerate(ledger.columns):
-        cats.append(f"{label} ({_months_label(ledger.periods[i])})")
-    if not two:
-        cats = cats[:1]
+    out: list[MonthCell] = []
+    seen: set[str] = set()
+    for side in ledger.monthly:
+        for cell in side:
+            if cell.month not in seen:
+                seen.add(cell.month)
+                out.append(cell)
+    return tuple(out)
 
-    def vals(key: str) -> tuple[float | None, ...]:
-        row = rows.get(key)
-        if row is None:
-            return tuple(None for _ in cats)
-        return (row.a, row.b)[: len(cats)] if two else (row.a,)
 
+def _month_axis(cells: Sequence[MonthCell]) -> list[str]:
+    """``Jan``, ``Feb``, ``Mar`` — the template's own axis.
+
+    Short names only: the axis can be twenty-four entries long in a
+    year-against-year comparison, and ``Jan 2026`` twenty-four times either
+    overprints or truncates. Which months these are is stated in the note under
+    the chart, where there is room to say it once. A key that is not
+    ``YYYY-MM`` prints as it came, for the same reason :func:`_month_name`
+    refuses to invent a name for one.
+    """
+    out: list[str] = []
+    for cell in cells:
+        name = _month_name(cell.month)
+        out.append(name.rsplit(" ", 1)[0] if " " in name else name)
+    return out
+
+
+def _month_bar(ledger: ReportLedger, *, two: bool) -> str:
+    """Chart (a) — the template's headline: spend vs revenue, **by month**.
+
+    The bars are the ledger's own :class:`MonthCell` values, which
+    :func:`board_report.roll_up` carried through uncollapsed. Nothing here
+    divides a period total by its month count: a chart drawn that way would be
+    three identical bars claiming to be a trend.
+
+    Every month of every column keeps its slot on the axis. A series a month did
+    not report is an em-dash where its bar would be — absent, not zero, and not
+    a month quietly dropped so the axis looks complete. That month also withholds
+    its column's period total in the ledger, so the chart and the ledger row
+    disagree on purpose; the note says so.
+    """
+    cells = _chart_months(ledger)
+    spans = [f"{label} covers {_months_label(ledger.periods[i])}"
+             for i, label in enumerate(ledger.columns)][: 2 if two else 1]
+    if not cells:
+        # A ledger built without monthly cells — a hand-made one, or a run
+        # persisted before they existed. The chart is dropped rather than
+        # reconstructed from the period totals, which is the same refusal the
+        # rest of this module makes about data it was not given.
+        return (
+            '<div class="panel full"><h3>By month — spend vs revenue</h3>'
+            '<p class="cap">Actualized and not-actualized revenue against spend, '
+            "by month.</p>"
+            '<p class="chart-note">This ledger carries no monthly cells, so the '
+            "by-month chart is not drawn. It is not reconstructed by dividing the "
+            "period totals across their months — that would be one flat bar per "
+            f'month presented as a trend. {_esc(". ".join(spans))}.</p></div>'
+        )
+
+    cats = _month_axis(cells)
     series = [
-        _Series("Spend", SLATE, vals("spend")),
-        _Series("Revenue sold (actualized)", GOLD, vals("revenue_amount_sold")),
-        _Series("Revenue sold (not actualized)", INK,
-                vals("revenue_amount_sold_not_actualized")),
+        _Series(_MONTH_SERIES_STYLE[f][0], _MONTH_SERIES_STYLE[f][1],
+                tuple(c.value(f) for c in cells))
+        for f in MONTHLY_FIELDS
     ]
     chart = _grouped_vbar(cats, series, fmt=MONEY,
-                          title="Spend against revenue sold",
+                          title="Spend against revenue sold, by month",
                           desc="Spend, actualized revenue sold and not-actualized revenue "
-                               "sold, per reported period.")
+                               "sold, one group per reported month.")
+
+    note = [". ".join(spans) + ".",
+            "Each bar is that month's own reported figure, never a period total "
+            "divided across its months."]
+    absent: list[str] = []
+    for f in MONTHLY_FIELDS:
+        gone = [_month_name(c.month) for c in cells if c.value(f) is None]
+        if gone:
+            absent.append(f"{_MONTH_SERIES_STYLE[f][0]} — {', '.join(gone)}")
+    if absent:
+        note.append("Not reported, and drawn as an em-dash in the bar's slot rather "
+                    "than as a zero: " + "; ".join(absent) + ".")
+        note.append("A month missing a figure also withholds that column's period "
+                    "total in the ledger, so a bar can stand here while the ledger "
+                    "row shows an em-dash — a partly covered period stays visibly "
+                    "partial instead of being summed from the months that did "
+                    "report.")
     return (
-        '<div class="panel full"><h3>Spend vs revenue sold</h3>'
-        '<p class="cap">Actualized and not-actualized revenue against spend.</p>'
+        '<div class="panel full"><h3>By month — spend vs revenue</h3>'
+        '<p class="cap">Actualized and not-actualized revenue against spend, '
+        "by month.</p>"
         f'<div class="chart-box">{chart}</div>'
-        '<p class="chart-note">Period totals. Monthly detail is not part of the ledger this '
-        "page renders, so it is not drawn rather than inferred. A bar replaced by an em-dash "
-        "is an absent figure, not a zero.</p></div>"
+        f'<p class="chart-note">{_esc(" ".join(note))}</p></div>'
     )
 
 
@@ -1245,7 +1370,7 @@ def _charts_section(ledger: ReportLedger, *, two: bool, num: str, heading: str) 
     return (
         '<section style="padding-top:0"><div class="wrap">'
         + _kicker(num, heading)
-        + '<div class="chart-grid">' + _period_bar(ledger, two=two) + "</div>"
+        + '<div class="chart-grid">' + _month_bar(ledger, two=two) + "</div>"
         + _channel_table(ledger, two=two)
         + _untracked_note(ledger, two=two)
         + _channel_charts(ledger, two=two)
@@ -1394,10 +1519,10 @@ def _basis_panel(ledger: ReportLedger, *, two: bool) -> str:
             "denominator differs from the row next to it.</p>" + "".join(blocks) + "</div>")
 
 
-def _footer(ledger: ReportLedger, *, two: bool, brand: str | None,
+def _footer(ledger: ReportLedger, *, two: bool, brand: str,
             captured_on: date | None) -> str:
     a_label, b_label = ledger.columns
-    who = f"{brand} — " if brand else ""
+    who = f"{brand} — "
     what = f"{a_label} vs {b_label} comparison" if two else f"{a_label} report"
     when = f" Data captured {captured_on.isoformat()}." if captured_on else ""
     return (
@@ -1423,13 +1548,20 @@ def render(ledger: ReportLedger, *, prose: ReportProse | None = None,
     ``prose`` is the optional LLM-written slot and is treated as plain text.
     Omit it and the report is still complete: the cover simply has no thesis
     line, and the win/miss columns are derived from the ledger's own arithmetic.
+
+    ``brand`` is optional and defaults to :data:`UNNAMED_BRAND`, which prints.
+    Nothing calls this yet, so the first call site is the one that can get it
+    wrong; an unnamed brand therefore reads as unnamed on the cover, in the tab
+    title and in the footer, rather than collapsing to a page that looks
+    finished and is missing whose report it is.
     """
     if len(ledger.columns) != 2 or len(ledger.periods) != 2:
         raise ValueError("a ReportLedger always has two columns and two periods")
     two = not is_single_period(ledger)
+    brand = _brand_of(brand)
     a_label, b_label = ledger.columns
     doc_title = title or (
-        f"{brand + ' — ' if brand else ''}"
+        f"{brand} — "
         + (f"{a_label} vs {b_label}" if two else f"{a_label}")
         + " board report"
     )
