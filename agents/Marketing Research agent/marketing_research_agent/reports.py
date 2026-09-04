@@ -913,6 +913,13 @@ def _single_column(r, key: str) -> dict:
         "channels": [c.as_dict() for c in r.channels],
         "untracked": [r.untracked.as_dict() if r.untracked else None],
         "gaps": list(r.gaps),
+        # Carried for the same reason ``ReportLedger`` carries it: the by-month
+        # chart's three series cannot be reconstructed from period totals, and
+        # this shape is hand-built rather than a ledger, so leaving it out costs
+        # a stored one-period run its headline chart and nothing else - silently,
+        # because the renderer's honest "no monthly cells" panel looks like a
+        # design choice rather than a dropped field.
+        "monthly": [c.as_dict() for c in r.monthly],
     }
 
 

@@ -1249,6 +1249,42 @@ def test_board_comparison_carries_the_ledger_and_the_renderer_array(
     assert len(s["r_array"]) == len(br.CATALOG) + len(br.GROUPS)
 
 
+def test_a_stored_single_period_run_keeps_the_months_its_chart_needs(
+        monkeypatch, tmp_path):
+    """The one-column store shape is hand-built rather than a ``ReportLedger``,
+    so it does not inherit the monthly cells and had to be given them.
+
+    Nothing caught that it had lost them: the renderer degrades honestly when a
+    ledger carries no months — it says so and draws nothing — which looks exactly
+    like a design choice. This is the assertion that tells the two apart.
+    """
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    r = reports.build_board_report(_board_dataset(), user_id="u1", period="2026-Q1")
+    s = r["structured"]
+    assert [c["month"] for c in s["monthly"]] == list(_Q1_MONTHS)
+    cells = _monthly(0, _Q1_MONTHS)
+    for cell in s["monthly"]:
+        assert set(cell["values"]) == set(br.MONTHLY_FIELDS), cell["month"]
+        for field in br.MONTHLY_FIELDS:
+            assert cell["values"][field] == pytest.approx(
+                cells[cell["month"]][field], abs=0.02)
+
+    # It survives the store round-trip through the tenancy-scoped read the
+    # route uses, which is the path that was dropping it.
+    stored = reports.runs.list_runs("u1", kind="board_report")
+    assert len(stored) == 1
+    assert stored[0]["structured"]["monthly"] == s["monthly"]
+
+    # Both stored shapes carry it, or a standalone and a comparison disagree
+    # about whether the headline chart can be drawn at all.
+    two = reports.build_board_report(_board_dataset(), user_id="u1",
+                                     period="2026-Q1", compare_to="2026-Q2")
+    assert [[c["month"] for c in side]
+            for side in two["structured"]["monthly"]] == [list(_Q1_MONTHS),
+                                                          list(_Q2_MONTHS)]
+
+
 def test_two_periods_of_different_shapes_compare(monkeypatch, tmp_path):
     """Nothing on this path is quarter-shaped — a month against a month is the
     same code, which is what keeps the columns "A" and "B" rather than Q1/Q2."""
@@ -1469,9 +1505,11 @@ def test_the_board_report_is_off_unless_a_deployment_turns_it_on(monkeypatch):
 # it, read the bytes. No fixture files and no golden HTML — a golden file makes
 # every layout change a diff review instead of an assertion.
 
+import base64
 import re
 from html.parser import HTMLParser
 
+from marketing_research_agent import board_report_fonts as brf
 from marketing_research_agent import board_report_render as brr
 
 #: Tags that never close. SVG shapes are emitted self-closing, so the balance
@@ -1560,8 +1598,17 @@ def test_board_report_render_reaches_the_network_nowhere_at_all():
     in review and total in effect."""
     for page in (_comparison(), _standalone()):
         for token in ("http://", "https://", "<script", "<link", "@import",
-                      "<iframe", "<img", "<object", "<embed", "srcset", "url("):
+                      "<iframe", "<img", "<object", "<embed", "srcset"):
             assert token not in page, token
+        # ``url(`` was banned outright until the faces were embedded. It is now
+        # allowed for ``data:`` and NOTHING else: a data URI is bytes already in
+        # the file, any other url() is a fetch, and a fetch behind a corporate
+        # proxy is exactly the failure this test exists to prevent. Capped at 24
+        # characters so a 39KB base64 payload is not captured to read five of it.
+        outward = [u for u in re.findall(r"url\(([^)]{0,24})", page)
+                   if not u.startswith("data:")]
+        assert not outward, outward
+        assert "url(data:font/woff2;base64," in page      # and they ARE embedded
         assert page.startswith('<!DOCTYPE html><html lang="en">')
         assert page.rstrip().endswith("</html>")
         # Charts are markup, not a library.
@@ -1592,8 +1639,23 @@ def test_board_report_render_is_pure_and_imports_nothing_that_could_do_io():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add("." * node.level + node.module.split(".")[0])
     assert imported == {"__future__", "html", "math", "dataclasses", "datetime",
-                        "typing", ".board_report"}
+                        "typing", ".board_report", ".board_report_fonts"}
     assert "today()" not in source        # a date is passed in, never read
+
+    # The faces are DATA. fontTools and brotli are build-time only, so neither
+    # may appear at runtime: a renderer that subset on request would be slow,
+    # non-deterministic, and would put a font compiler on the request path.
+    for banned in ("fontTools", "fonttools", "brotli"):
+        assert banned not in source, banned
+    font_src = pathlib.Path(brf.__file__).read_text(encoding="utf-8")
+    font_imports: set[str] = set()
+    for node in ast.walk(ast.parse(font_src)):
+        if isinstance(node, ast.Import):
+            font_imports |= {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            font_imports.add("." * node.level + node.module.split(".")[0])
+    assert font_imports == {"__future__"}, font_imports
+    assert "open(" not in font_src and "def " not in font_src
 
     assert _comparison() == _comparison()
     assert _standalone() == _standalone()
@@ -2075,23 +2137,99 @@ def test_board_report_render_carries_the_print_rules_the_templates_lacked():
                      print_block)
 
 
-def test_board_report_render_keeps_the_typography_decision_the_user_made():
-    """Fraunces / Inter / IBM Plex Mono with tabular figures — a client-facing
-    document, deliberately not the console's Archivo. The faces are named first
-    and then fall back through what a Windows, macOS or headless-Chromium box
-    actually has, because embedding them would add roughly a megabyte of base64
-    to every file the team emails."""
+def test_board_report_render_embeds_the_typography_the_user_decided_on():
+    """Fraunces / Inter / IBM Plex Mono, carried IN the file.
+
+    None of the three ships by default on Windows or macOS and the PDF
+    container has none of them either, so naming them first and falling through
+    to Georgia/Segoe UI/Consolas meant the approved typography was silently not
+    delivered — a client opened the file and saw Georgia.
+    """
     css = _between(_comparison(), "<style>", "</style>")
     assert css.index("Fraunces") < css.index("Georgia")
     assert "Inter," in css and "'IBM Plex Mono'" in css
     assert "font-variant-numeric:tabular-nums" in css
     assert 'font-feature-settings:"tnum" 1' in css
-    for fallback in ("Georgia", "'Segoe UI'", "Consolas", "'DejaVu Sans Mono'"):
-        assert fallback in css, fallback
-    # Fallbacks, not @font-face blobs, and not a remote stylesheet.
-    assert "@font-face" not in css and "data:font" not in css
+    assert css.count("@font-face") == len(brf.FACES) == 5
     for name, value in brr.PALETTE.items():
         assert "--" + name + ":" + value in css
+
+    # Every declared family must be spelled exactly as the stacks spell it, or
+    # the face is embedded, paid for in bytes, and then never selected.
+    for family, style, weight, _copyright, _licence, _b64 in brf.FACES:
+        assert (f"@font-face{{font-family:'{family}';font-style:{style};"
+                f"font-weight:{weight};src:url(data:font/woff2;base64,") in css
+        stack = {"Fraunces": brr.SERIF, "Inter": brr.SANS,
+                 "IBM Plex Mono": brr.MONO}[family]
+        assert stack.startswith(family) or stack.startswith("'" + family + "'")
+    assert {f for f, *_ in brf.FACES} == {"Fraunces", "Inter", "IBM Plex Mono"}
+
+
+def test_board_report_render_carries_the_font_licence_with_the_file():
+    """The SIL OFL requires the licence to travel with a redistribution, and
+    this document IS the redistribution — it is emailed as one file with nothing
+    attached. So each family's copyright rides in a CSS comment on its block,
+    and the full text sits beside the binaries in the repo."""
+    css = _between(_comparison(), "<style>", "</style>")
+    fonts_dir = pathlib.Path(brr.__file__).parent / "fonts"
+
+    seen: set[str] = set()
+    for family, _style, _weight, copyright_line, licence, _b64 in brf.FACES:
+        assert copyright_line and "Copyright" in copyright_line, family
+        assert brr._licence_note(copyright_line) in css, family
+        assert f"SIL Open Font License 1.1, full text in fonts/{licence}" in css
+        text = (fonts_dir / licence).read_text(encoding="utf-8")
+        assert "SIL OPEN FONT LICENSE Version 1.1" in text, licence
+        seen.add(licence)
+    assert seen == {"Fraunces-OFL.txt", "Inter-OFL.txt", "IBMPlexMono-OFL.txt"}
+
+    # The notice is kept, the fetchable scheme is not: Inter's own string is
+    # "(https://github.com/rsms/inter)", and a page whose self-containment is
+    # proven by a flat text search cannot carry an "https://" anywhere at all.
+    # The attribution is unharmed - Fraunces already reads "(github.com/...)".
+    assert brr._licence_note("(c) X (https://example.com/f)") == "(c) X (example.com/f)"
+    assert brr._licence_note("ends */ here") == "ends * / here"
+    assert "github.com/rsms/inter" in css and "https://github.com" not in css
+
+    # A comment that ended early would dump the rest of the stylesheet into the
+    # page as text, and that one string comes from a font's own name table.
+    assert css.count("/*") == css.count("*/")
+
+
+def test_board_report_render_keeps_the_fallback_stack_behind_the_embedded_faces():
+    """The stack is not vestigial now that the faces ship — it does two jobs.
+
+    A subsetting mistake degrades to Georgia instead of to tofu. And three
+    glyphs this document actually prints are absent from the upstream faces:
+    Delta, which is the ledger's own change-column header, and the two triangles
+    the stylesheet injects for every rise and fall. The browser resolves those
+    per glyph down the stack, which is a feature rather than a gap.
+    """
+    css = _between(_comparison(), "<style>", "</style>")
+    for fallback in ("Georgia", "'Segoe UI'", "Consolas", "'DejaVu Sans Mono'",
+                     "Palatino", "Helvetica", "serif", "sans-serif", "monospace"):
+        assert fallback in css, fallback
+    assert brr.SERIF.endswith("serif") and brr.SANS.endswith("sans-serif")
+    assert brr.MONO.endswith("monospace")
+
+    # The three that fall through, and the fact that they are really printed.
+    page = _comparison()
+    assert "&Delta;" in page
+    assert "\\25B2" in css and "\\25BC" in css
+
+
+def test_board_report_render_font_payload_is_baked_not_generated():
+    """Same ledger, same bytes — with 127KB of base64 in the page. The faces are
+    string constants in a generated module, so nothing is compressed, subset or
+    timestamped at request time and the document stays byte-for-byte stable."""
+    assert brr.render(br.compare(_q1_ch(), _q2_ch())) == \
+        brr.render(br.compare(_q1_ch(), _q2_ch()))
+    assert brr._font_face_css() == brr._font_face_css()
+    for _f, _s, _w, _c, _l, b64 in brf.FACES:
+        assert isinstance(b64, str) and b64.isascii()
+        assert set(b64) <= set(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+        assert base64.b64decode(b64)[:4] == b"wOF2", "not a woff2 payload"
 
 
 def test_board_report_render_says_the_brand_is_unset_rather_than_printing_a_hole():
@@ -2124,6 +2262,121 @@ def test_board_report_render_says_the_brand_is_unset_rather_than_printing_a_hole
     assert brr.UNNAMED_BRAND not in named
     # An explicit title still wins; the brand is not welded into it.
     assert "<title>Board pack</title>" in brr.render(ledger, title="Board pack")
+
+
+def _specificity(selector: str) -> tuple[int, int, int]:
+    """``(id, class-ish, type)`` for one compound selector.
+
+    Deliberately not a CSS parser — it handles the handful of selectors that
+    paint a table cell in this stylesheet, and nothing more.
+    """
+    ids = len(re.findall(r"#[\w-]+", selector))
+    classes = (len(re.findall(r"\.[\w-]+", selector))
+               + len(re.findall(r"(?<!:):[\w-]+(?:\([^)]*\))?", selector)))
+    types = len(re.findall(r"(?:^|[\s>+~])([a-zA-Z][\w-]*)", selector))
+    return (ids, classes, types)
+
+
+def _contrast(hex_a: str, hex_b: str) -> float:
+    """WCAG 2.1 contrast ratio between two ``#rrggbb`` colours."""
+    def lum(h: str) -> float:
+        parts = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        srgb = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+                for c in parts]
+        return 0.2126 * srgb[0] + 0.7152 * srgb[1] + 0.0722 * srgb[2]
+    a, b = sorted((lum(hex_a), lum(hex_b)), reverse=True)
+    return (a + 0.05) / (b + 0.05)
+
+
+def test_board_report_render_first_column_header_is_not_invisible():
+    """Inherited from the supplied templates, and invisible until the page was
+    rendered rather than asserted about.
+
+    The sticky first column paints itself white so body cells stay opaque while
+    the table scrolls horizontally. That selector is ``(0,2,2)`` and so beat
+    ``table.cmp thead th`` at ``(0,1,3)`` — leaving the HEADER cell white while
+    it still inherited ``color:var(--paper)``. Measured on the rendered page:
+    white on #FBFAF7, 1.03:1. "Metric" and "Channel" were simply not there, on
+    screen as much as in print.
+
+    Asserted through specificity and contrast rather than by grepping for the
+    fix, so the defect cannot come back by another route — a new rule, a
+    reordering, or a colour change.
+    """
+    css = _between(_comparison(), "<style>", "</style>")
+    ink, paper = brr.PALETTE["ink"], brr.PALETTE["paper"]
+
+    # Every selector in this sheet that paints a background on a thead th that
+    # is also :first-child, inside table.cmp.
+    candidates = ("table.cmp th:first-child", "table.cmp thead th",
+                  "table.cmp thead th:first-child")
+    winner, best = None, None
+    for selector in candidates:
+        m = re.search(re.escape(selector) + r"[^{]*\{([^}]*)\}", css)
+        assert m, f"{selector!r} is no longer in the stylesheet"
+        bg = re.search(r"background:([^;}]+)", m.group(1))
+        assert bg, f"{selector!r} sets no background"
+        rank = (_specificity(selector), m.start())
+        if best is None or rank > best:
+            winner, best = (selector, bg.group(1).strip()), rank
+
+    assert _specificity("table.cmp th:first-child") == (0, 2, 2)
+    assert _specificity("table.cmp thead th") == (0, 1, 3)
+    assert _specificity("table.cmp thead th:first-child") == (0, 2, 3)
+    assert winner == ("table.cmp thead th:first-child", "var(--ink)"), winner
+    assert _contrast(ink, paper) >= 4.5, _contrast(ink, paper)
+    assert _contrast("#ffffff", paper) < 1.1     # what it used to be
+
+    # ...and the sticky column still paints BODY cells opaque, which is why the
+    # white rule exists at all. Fixing the header by deleting it would trade one
+    # defect for a different one.
+    body = re.search(r"table\.cmp th:first-child,table\.cmp td:first-child\{([^}]*)\}",
+                     css)
+    assert body and "background:#fff" in body.group(1)
+    assert "position:sticky" in body.group(1)
+
+    # Both compositions carry a table.cmp header whose first cell was blank:
+    # the comparison has the ledger AND the channel table, the standalone has
+    # the channel table alone.
+    two = _comparison()
+    assert "<th>Metric</th>" in two and "<th>Channel</th>" in two
+    assert "<th>Channel</th>" in _standalone()
+
+
+def test_board_report_render_prints_the_scorecard_five_across_on_a4():
+    """A4 content width is 210mm - 2x11mm = 188mm, about 711 CSS px — UNDER this
+    page's own 900px breakpoint. So the PDF took the phone layout: the scorecard
+    fell from five columns to two, roughly tripled in height, and with
+    ``break-inside:avoid`` stopped fitting page one at all.
+
+    Five across is restored rather than reduced: that strip is the scorecard and
+    it is the first thing a reader looks at. It is scaled down to fit 711px
+    instead. ``.chart-grid`` and ``.ins`` stay stacked, which does read better
+    on A4.
+    """
+    css = _between(_standalone(), "<style>", "</style>")
+    assert "@page{size:A4;margin:13mm 11mm}" in css
+    a4_px = (210 - 2 * 11) / 25.4 * 96
+    assert 705 < a4_px < 715, a4_px
+    assert a4_px < 900, "the breakpoint no longer catches A4 - re-check this fix"
+
+    mobile = css.index("@media(max-width:900px)")
+    printed = css.index("@media print")
+    assert printed > mobile, "the print override only wins on source order"
+    assert ".score{grid-template-columns:repeat(2,1fr)}" in css[mobile:printed]
+
+    block = css[printed:]
+    assert ".score{grid-template-columns:repeat(5,1fr);gap:9px}" in block
+    assert ".card{padding:12px}" in block and ".card .v{font-size:20px}" in block
+    # Identical specificity in both blocks, so source order is the whole
+    # mechanism and moving the print block would silently undo this.
+    assert _specificity(".score") == (0, 1, 0)
+    # Stacking these two on A4 is deliberate and stays.
+    assert ".chart-grid,.ins{grid-template-columns:1fr}" in css[mobile:printed]
+    assert ".chart-grid{grid-template-columns" not in block
+
+    # Ten cards, still two bands of five.
+    assert _standalone().count('<div class="card') == 20
 
 
 def test_board_report_render_refuses_a_ledger_that_is_not_two_columns():

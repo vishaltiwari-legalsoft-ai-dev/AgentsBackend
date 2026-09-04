@@ -46,30 +46,36 @@ defect the supplied templates shipped:
 4. **Every dynamic string is escaped.** Metric labels come from the catalog
    today and prose will come from an LLM tomorrow, on a page that goes to
    clients.
+5. **Two rules exist to beat a more specific rule, not to restyle anything.**
+   Both were inherited from the supplied templates and both were invisible until
+   the page was rendered rather than asserted about. The sticky first column
+   paints itself white so body cells stay opaque while the table scrolls, at
+   specificity ``(0,2,2)`` — which also beat ``table.cmp thead th`` at
+   ``(0,1,3)``, leaving the HEADER's first cell white under ``color:var(--paper)``:
+   1.03:1, so “Metric” and “Channel” were unreadable. And A4 content width is
+   ~711px, under this page's own 900px breakpoint, so the PDF took the phone
+   layout and the five-across scorecard collapsed to two-across, roughly tripling
+   its height and pushing it off page one. The print block therefore restores the
+   grid explicitly. Neither fix restyles anything; each one out-specifies or
+   out-orders a rule that was winning by accident.
 
-**Fonts: the fallback stack is a stopgap, and it is losing.** The decision is
-to embed the three faces, because none of Fraunces, Inter or IBM Plex Mono ships
-by default on Windows or macOS — so the stacks below, which were justified on
-file size, in practice hand a client Georgia/Segoe UI/Consolas rather than the
-typography the marketing team approved. The size argument does not survive that:
-a design nobody sees is not a saving.
+**Fonts are embedded, and the fallback stack stays behind them.** None of
+Fraunces, Inter or IBM Plex Mono ships by default on Windows or macOS, and the
+PDF container has none of them either, so naming them first and falling through
+to Georgia/Segoe UI/Consolas meant a client saw Georgia — the typography was
+approved and then silently not delivered. :func:`_font_face_css` emits five
+subset faces as ``data:`` URIs from :mod:`.board_report_fonts`, which is
+GENERATED (see ``fonts/build_embedded.py``) and holds nothing but base64 string
+constants. Nothing is fetched, nothing is generated per request, and no font
+library is imported here — which is what keeps the document deterministic.
 
-Embedding is **blocked on the source files, not on this module**. Subsetting to
-the report's own repertoire (digits, currency, percent, arrows, Latin text) needs
-the upstream faces and their SIL OFL text on disk, plus a subsetter; of the three,
-only IBM Plex Mono is present on a build box here. Nothing is fetched from the
-network to fix that, and no unlicensed binary is committed to get the look. Until
-the faces and their licences land in the repo, the stacks below stay: they name
-the design's three faces first (a machine that has them still gets the intended
-page) and fall back through faces present by default on Windows, macOS and a
-headless Chromium container (Georgia/Palatino, Segoe UI/Helvetica, Consolas/DejaVu
-Sans Mono), with ``tabular-nums`` and an explicit ``"tnum"`` feature so figures
-stay column-aligned in whichever face resolves.
-
-When the faces do land, the swap is one function: emit an ``@font-face`` block of
-``src:url(data:font/woff2;base64,...)`` and prepend it to :data:`CSS`. The
-self-containment guard has to widen with it — outward ``url(`` stays banned, a
-``data:`` one does not.
+The stacks below are unchanged and still matter, for two reasons rather than
+one: a subsetting mistake degrades to Georgia instead of to tofu, and three
+glyphs the document actually prints — ``Δ`` in the ledger's own column header
+and the ``▲``/``▼`` marks the stylesheet injects — are absent from Fraunces and
+IBM Plex Mono upstream, so the browser resolves those per glyph down the stack.
+That is a browser feature, not a gap: the alternative to a fallback stack there
+is a missing-glyph box.
 
 Deliberately importing nothing but the ledger. ``board_report`` is consumed and
 never modified; ``reports``, ``sheets_source`` and ``pdf_export`` are not
@@ -86,6 +92,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Sequence
 
+from .board_report_fonts import FACES as _FONT_FACES
 from .board_report import (
     CAC_KEY,
     INT,
@@ -104,7 +111,7 @@ from .board_report import (
 
 #: Bumped when the rendered document changes shape for the same ledger. The
 #: ledger's own ``cache_key`` covers the numbers; this covers the page.
-RENDERER_VERSION = "mr-board-report-render/2"
+RENDERER_VERSION = "mr-board-report-render/3"
 
 # --- palette and type --------------------------------------------------------
 # Fixed by the marketing team's templates and kept as data so the CSS and the
@@ -138,6 +145,54 @@ PANEL_BG = "#ffffff"
 #: Column A / column B, the one colour that differed between the two
 #: single-period templates.
 SERIES_A, SERIES_B = SLATE, GOLD
+
+def _licence_note(copyright_line: str) -> str:
+    """A font's own copyright string, made safe to paste into this stylesheet.
+
+    Two edits, both about the document rather than the licence:
+
+    * ``*/`` would end the CSS comment early and dump the rest of the stylesheet
+      into the page as visible text. None of the three families contains it
+      today, but this string comes from a font's name table, not from here.
+    * ``https://`` is dropped, leaving the bare domain. Inter's notice reads
+      "(https://github.com/rsms/inter)", and this module's whole contract is
+      that the file contains no ``http`` of any kind — a URL in a comment fetches
+      nothing, but the guard that proves it is a flat text search, and a guard
+      with an exception for comments is a guard somebody will widen again. The
+      attribution survives intact: Fraunces' own notice is already written that
+      way, as "(github.com/undercasetype/Fraunces)".
+
+    Nothing the OFL requires is removed — the copyright notice itself is kept
+    verbatim, and the full licence text ships beside the binaries.
+    """
+    return (copyright_line.replace("*/", "* /")
+            .replace("https://", "").replace("http://", ""))
+
+
+def _font_face_css() -> str:
+    """The embedded faces, each behind its own licence notice.
+
+    The SIL Open Font License requires the licence to travel with a
+    redistribution, and this document IS the redistribution — it is emailed as
+    one file with nothing attached — so each family's copyright line and a
+    pointer to its full OFL text ride in a CSS comment on the block. The full
+    texts are in ``fonts/<Family>-OFL.txt`` beside the binaries.
+
+    See :func:`_licence_note` for what is done to the copyright string first.
+    """
+    out: list[str] = []
+    for family, style, weight, copyright_line, licence, b64 in _FONT_FACES:
+        note = _licence_note(copyright_line)
+        styled = "" if style == "normal" else f" {style}"
+        out.append(
+            f"/* {family} {weight}{styled} — {note} "
+            f"SIL Open Font License 1.1, full text in fonts/{licence} */"
+            f"@font-face{{font-family:'{family}';font-style:{style};"
+            f"font-weight:{weight};"
+            f"src:url(data:font/woff2;base64,{b64}) format('woff2')}}"
+        )
+    return "".join(out)
+
 
 SERIF = ("Fraunces,'Iowan Old Style','Palatino Linotype',Palatino,"
          "'Book Antiqua',Georgia,'Times New Roman',serif")
@@ -736,6 +791,9 @@ table.cmp thead th{background:var(--ink);color:var(--paper);font-family:__MONO__
  letter-spacing:.04em;text-transform:uppercase;font-weight:500}
 table.cmp thead th.ac{background:var(--ink-soft)}
 table.cmp thead th.bc{background:var(--gold);color:var(--ink);font-weight:600}
+/* (0,2,3) - outranks the sticky first-column white above, which outranked the
+   header ink and left this cell unreadable. Colour only; sticky is untouched. */
+table.cmp thead th:first-child{background:var(--ink);color:var(--paper)}
 table.cmp tbody td:not(:first-child){font-family:__MONO__}
 table.cmp td.ac{color:var(--slate)}
 table.cmp td.bc{background:rgba(201,162,39,.08);font-weight:600}
@@ -811,11 +869,24 @@ footer b{color:var(--paper)}
  .kicker,.sublabel{break-after:avoid}
  .panel{break-inside:auto}
  .chart-box,.score{break-inside:avoid}
+ /* A4 content width is 210mm - 2x11mm = 188mm ~ 711px, which is UNDER the
+    900px breakpoint above, so print inherited the phone layout: the scorecard
+    fell to two columns, roughly tripled in height, and with break-inside:avoid
+    left page one ~60% empty. Five across is the designed strip and it is the
+    first thing a reader looks at, so it is restored here rather than reduced -
+    scaled to fit 711px instead, which one column of five cannot do at screen
+    sizes. The one-column .chart-grid and .ins are left alone: those genuinely
+    do read better stacked on A4. */
+ .score{grid-template-columns:repeat(5,1fr);gap:9px}
+ .card{padding:12px}
+ .card .t{font-size:8.5px;min-height:22px}
+ .card .v{font-size:20px}
 }
 """
 
 CSS = (
-    ":root{"
+    _font_face_css()
+    + ":root{"
     + ";".join(f"--{k}:{v}" for k, v in PALETTE.items())
     + ";--shadow:0 1px 2px rgba(20,33,58,.06),0 8px 30px rgba(20,33,58,.06)}"
     + _CSS_BODY.replace("__SANS__", SANS).replace("__SERIF__", SERIF).replace("__MONO__", MONO)
