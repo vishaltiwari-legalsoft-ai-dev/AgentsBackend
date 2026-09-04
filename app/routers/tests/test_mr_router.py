@@ -1061,3 +1061,73 @@ def test_there_is_no_pdf_for_a_board_run_yet(board_on):
     pdf = client.get(f"/api/mr/runs/{run_id}/pdf")
     assert pdf.status_code == 404
     assert "board report" in pdf.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# The run store has a lifecycle — see marketing_research_agent/runs.py
+# --------------------------------------------------------------------------- #
+
+def test_the_report_route_no_longer_grows_without_bound(monkeypatch):
+    """``POST /mr/reports/{kind}`` mints a fresh uuid run per call — no dedup,
+    no cache key, and it has been live far longer than any guard. It is not the
+    route that bounds it: retention sits at ``runs.save_run``, the one choke
+    point every kind and every route goes through, so this pre-existing route
+    is covered without being touched.
+
+    Asserted through ``GET /mr/runs`` — the Reports panel's own list — because
+    the number that matters is what a workspace actually accumulates."""
+    monkeypatch.setenv("MR_RUN_RETENTION_PER_KIND", "3")
+    client.post("/api/mr/ingest",
+                files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+                data={"platform": "google_ads"})
+
+    built = []
+    for _ in range(8):
+        r = client.post("/api/mr/reports/daily_summary")
+        assert r.status_code == 200, r.text
+        built.append(r.json()["id"])
+
+    listed = client.get("/api/mr/runs")
+    assert listed.status_code == 200, listed.text
+    daily = [r for r in listed.json() if r["kind"] == "daily_summary"]
+    assert len(daily) == 3, f"{len(daily)} daily_summary runs kept, expected 3"
+    assert {r["id"] for r in daily} == set(built[-3:])
+    # The newest is still readable end to end, which is what the panel does next.
+    assert client.get(f"/api/mr/runs/{built[-1]}").status_code == 200
+    assert client.get(f"/api/mr/runs/{built[0]}").status_code == 404
+
+
+def test_report_churn_never_costs_the_workspace_its_data(monkeypatch):
+    """The hard constraint, at the surface it would break: the ingested dataset
+    IS the workspace's numbers (``mr_runs`` is the only copy of parsed tracker
+    state), so it is exempt from the cap. A user building report after report
+    must still see their data afterwards."""
+    monkeypatch.setenv("MR_RUN_RETENTION_PER_KIND", "1")
+    up = client.post("/api/mr/ingest",
+                     files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+                     data={"platform": "google_ads"})
+    dataset_id = up.json()["dataset_id"]
+
+    for kind in ("daily_summary", "weekly_summary", "monthly_summary",
+                 "daily_summary", "daily_summary"):
+        assert client.post(f"/api/mr/reports/{kind}").status_code == 200
+
+    datasets = client.get("/api/mr/datasets")
+    assert [d["id"] for d in datasets.json()] == [dataset_id], (
+        "the ingested dataset was evicted — the workspace just lost its numbers")
+    overview = client.get("/api/mr/overview")
+    assert overview.status_code == 200, overview.text
+    assert overview.json()["has_data"] is True
+
+
+def test_several_uploads_all_survive_the_cap(monkeypatch):
+    """More datasets than the cap, on purpose: a tracker pull writes one run per
+    tab (eleven, live) and ``_load_dataset`` reads every one of them. A cap that
+    applied here would silently drop vendors from every report."""
+    monkeypatch.setenv("MR_RUN_RETENTION_PER_KIND", "2")
+    for n in range(5):
+        r = client.post("/api/mr/ingest",
+                        files={"file": (f"g{n}.csv", io.BytesIO(CSV), "text/csv")},
+                        data={"platform": "google_ads"})
+        assert r.status_code == 200, r.text
+    assert len(client.get("/api/mr/datasets").json()) == 5
