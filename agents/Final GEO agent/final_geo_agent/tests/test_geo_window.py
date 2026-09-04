@@ -218,7 +218,7 @@ def test_strategy_generate_opens_the_window_once(reads, fake_engine, monkeypatch
     reports = []
     real_report = geo_metrics.engine_report
     monkeypatch.setattr(geo_metrics, "engine_report",
-                        lambda *a: (reports.append(1), real_report(*a))[1])
+                        lambda *a, **k: (reports.append(1), real_report(*a, **k))[1])
 
     reads.reset()
     geo_strategy.generate_strategy(BRAND)
@@ -394,3 +394,89 @@ def test_the_counter_survives_a_retry_that_replaces_an_error_record(monkeypatch)
     cfg = geo_poll.ensure_config(BRAND)
     assert geo_poll.recent_answer_count(BRAND, cfg) == 1
     assert len(geo_poll.recent_answers(BRAND["id"], days=7)) == 1
+
+
+# ------------------------------------- the report prices the CURRENT questions
+# `n_expected` is what makes a per-engine answer count readable. It has to
+# follow the question list as it stands now, not the one that happened to be
+# enabled when the answers were polled — the panel is asked "why does AI
+# Overview return fewer answers than ChatGPT" about today's universe.
+
+
+def test_the_report_prices_each_engine_off_the_enabled_prompts(reads, fake_engine):
+    from final_geo_agent import geo_prompts
+
+    seed(3, runs=1)
+    chat_runs = geo_poll.DEFAULT_RUNS
+
+    window = geo_window.open_window(BRAND, 7)
+    assert window.report["engines"]["perplexity"]["n_expected"] == 3 * chat_runs
+    # the engines are priced apart: AI Overview is fetched once per discovery
+    # question where a chat engine is sampled three times over everything
+    assert window.expected["aio"] == 3
+
+    universe = geo_prompts.load_universe(BRAND["id"])
+    universe["prompts"][0]["enabled"] = False
+    geo_prompts.save_universe(BRAND["id"], universe["prompts"])
+
+    fresh = geo_window.open_window(BRAND, 7)
+    # a disabled question stops being owed immediately, with nothing re-polled
+    assert fresh.report["engines"]["perplexity"]["n_expected"] == 2 * chat_runs
+    assert fresh.report["engines"]["perplexity"]["n_answers"] == 3
+
+
+def test_the_window_counts_the_checks_its_expectation_scales_by(reads, fake_engine):
+    """`n_expected` is one check's worth; `n_sweeps` is how many checks ran.
+
+    The invariant that makes the two safe to multiply: a day-doc holds one
+    record per (prompt, run) per engine, so no day can contribute more than one
+    check's worth of answers — `n_answers <= n_expected x n_sweeps`, always.
+    """
+    from final_geo_agent import geo_runlog
+
+    seed(3, runs=geo_poll.DEFAULT_RUNS)          # one full check, at the cadence
+
+    window = geo_window.open_window(BRAND, 7)
+    block = window.report["engines"]["perplexity"]
+    assert window.n_sweeps == 1
+    assert block["n_answers"] == block["n_expected"] * window.n_sweeps == 9
+
+    # a check that ran earlier in the window and measured nothing on this engine
+    yesterday = geo_window.day_ids(2)[1]
+    geo_runlog.record_run(BRAND["id"], {"day": yesterday, "trigger": "cron"})
+
+    wider = geo_window.open_window(BRAND, 7)
+    assert wider.n_sweeps == 2
+    # the shortfall is now visible instead of being absorbed into the average
+    assert wider.report["engines"]["perplexity"]["n_answers"] < 9 * 2
+
+
+def test_a_window_with_no_checks_in_it_counts_zero_checks(reads, fake_engine):
+    """Zero is the panel's cue to say "no checks in this period" — never a
+    denominator. A brand polled before the run log existed lands here too, and
+    must still get a readable report."""
+    from final_geo_agent import geo_runlog
+
+    seed(2)
+    state.save(geo_runlog.runlog_doc_id(BRAND["id"]),
+               {"brand_id": BRAND["id"], "runs": []})
+
+    window = geo_window.open_window(BRAND, 7)
+
+    assert window.n_sweeps == 0
+    assert window.report["engines"]["perplexity"]["n_expected"] > 0
+
+
+def test_opening_a_window_still_costs_nothing_until_it_is_scored(reads, fake_engine):
+    """Pricing the question list is one more document read, and it belongs to
+    the report — a caller that only wants the answers must not pay for it."""
+    seed(2)
+    reads.reset()
+
+    window = geo_window.open_window(BRAND, 7)
+    assert reads.batches == [] and reads.solo == []
+    assert window.answers
+    assert not [d for d in reads.solo if d.startswith("geo-prompts-")]
+
+    assert window.report["engines"]["perplexity"]["n_expected"]
+    assert [d for d in reads.solo if d.startswith("geo-prompts-")]

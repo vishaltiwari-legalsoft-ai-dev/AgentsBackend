@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app as fastapi_app
 from app.routers.geo import MIN_BRAND_SECONDS
-from final_geo_agent import geo_poll
+from final_geo_agent import geo_engines, geo_poll
 from seo_geo_agent import insights
 from seo_geo_agent.sources import CredentialMissing
 
@@ -91,6 +91,48 @@ def test_cron_skips_a_brand_that_is_not_due_yet(client, monkeypatch):
     assert "legalsoft" in body["skipped"]
     assert body["ok"] == 0 and body["failed"] == 0
     assert body["status"] == "ok"                       # not due is not a failure
+
+
+def test_a_brand_with_the_scheduled_check_switched_off_costs_nothing(client, monkeypatch):
+    """The whole point of the per-brand switch: an un-watched brand is free.
+
+    Runs the REAL ``ensure_config``/``poll_due`` rather than a stub, because the
+    claim being made is about the scheduler's own decision, not about a fixture.
+    A brand created self-serve starts exactly like this (``init_config`` with
+    ``auto_poll=False``), so this is the state twelve new brands sit in until
+    somebody switches them on: one config read each, no sweep, no engine call,
+    and a skip reason a human debugging "why did it not run" can read.
+    """
+    calls: list = []
+    _sweeps(monkeypatch, calls)
+    engine_calls: list = []
+    monkeypatch.setattr(geo_engines, "poll_engine",
+                        lambda *a, **k: engine_calls.append(a) or None)
+    geo_poll.init_config(BRANDS[0], auto_poll=False,
+                         poll_interval_days=geo_poll.SELF_SERVE_POLL_INTERVAL_DAYS)
+
+    body = client.post("/api/geo/cron/poll", headers={"x-cron-key": CRON_KEY}).json()
+
+    assert calls == [], "a switched-off brand was swept"
+    assert engine_calls == [], "a switched-off brand reached a paid engine"
+    assert body["skipped"]["legalsoft"] == "auto-poll is off for this brand"
+    assert body["ok"] == 0 and body["failed"] == 0
+    assert body["status"] == "ok"          # off is not a failure
+
+
+def test_switching_the_scheduled_check_back_on_makes_the_brand_due(client, monkeypatch):
+    """...and off is not one-way. A brand that has never completed a sweep is
+    due the moment it is switched on, rather than waiting out an interval it
+    was never measured against."""
+    calls: list = []
+    _sweeps(monkeypatch, calls)
+    geo_poll.init_config(BRANDS[0], auto_poll=False, poll_interval_days=7)
+    geo_poll.save_config(BRANDS[0]["id"], {"auto_poll": True})
+
+    body = client.post("/api/geo/cron/poll", headers={"x-cron-key": CRON_KEY}).json()
+
+    assert [c[0] for c in calls] == ["legalsoft"]
+    assert body["ok"] == 1
 
 
 def test_a_brand_without_engine_keys_is_skipped_not_failed(client, monkeypatch):

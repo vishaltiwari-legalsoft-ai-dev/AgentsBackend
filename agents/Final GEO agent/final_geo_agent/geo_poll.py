@@ -12,6 +12,12 @@ Cost control: a per-brand daily engine-call counter with a hard cap lives in
 does nothing. Calls are RESERVED against that counter before they are made and
 the unspent remainder is handed back afterwards — see ``_reserve_calls``.
 
+Work assignment is a SEPARATE guarantee from budget, and the two are claimed
+together. The reservation protects the spend; it does not stop two overlapping
+sweeps from being handed the same tasks. A sweep therefore also takes a LEASE
+on the brand in the same transaction — see ``POLL_LEASE_TTL_SECONDS`` and
+``_reserve_calls``.
+
 Termination: a step that cannot make progress says so. ``terminal`` /
 ``terminal_reason`` in the result are the UI's stop signal — without them a
 dead key or a 5xx-ing provider keeps every task pending forever (errored runs
@@ -25,9 +31,10 @@ import json
 import logging
 import re
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from itertools import zip_longest
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 from seo_geo_agent import state
 from final_geo_agent import (
@@ -58,6 +65,12 @@ POLL_CONCURRENCY = 10
 # across month boundaries (31st -> 1st); an interval measured from the last
 # completed sweep does not.
 DEFAULT_POLL_INTERVAL_DAYS = 2
+# The cadence a SELF-SERVE brand is created with — see ``init_config``. Weekly,
+# not the 2 days above: that number was chosen for two hand-picked brands whose
+# spend somebody watches, and a panel where anyone can add a brand needs a
+# default that is cheap to leave switched on. It is only a starting value; the
+# switch is off at creation and the interval is editable from the config route.
+SELF_SERVE_POLL_INTERVAL_DAYS = 7
 # Wall clock one cron invocation may spend, across every brand it sweeps. Must
 # stay under the service's request timeout (900s in production) — Cloud Run
 # kills the request at that point, and because a day-doc is keyed by TODAY a
@@ -77,12 +90,52 @@ AIO_MONTHLY_CAP = SERP_MONTHLY_CAP
 # the same engine is a dead key or an outage, and its tasks can never complete,
 # so the loop can never end on its own — stop and name the engine.
 FAIL_STREAK_LIMIT = 3
+# How long one sweep owns a brand. ``_reserve_calls`` is transactional and
+# protects the daily BUDGET; it does not assign WORK. Two overlapping steps
+# both read the same day-docs, both build the same ordered task list, both
+# reserve ten calls against a cap with room for twenty, and both then execute
+# ``tasks[:granted]`` -- the SAME ten (engine, prompt, run) triples. Twenty
+# paid provider calls for ten measurements, and the day's mention rate then
+# averaged over a doubled sample.
+#
+# So a sweep also claims a lease on the brand, INSIDE the same transaction as
+# the reservation -- a second transaction to claim it would simply move the
+# race rather than close it. 120s because a batch is bounded by
+# ``geo_engines.REQUEST_TIMEOUT`` (45s), so this covers a slow batch without
+# stranding the brand for long if a holder dies mid-sweep.
+POLL_LEASE_TTL_SECONDS = 120
+#: The ``trigger`` value that means "the scheduler drove this, not a person".
+#: The once-a-day manual gate keys off THIS, never off who the holder is: an
+#: email is a label, and a spend guard must not depend on how a label is spelt.
+SCHEDULED_TRIGGER = "cron"
 # Firestore hard-caps docs at 1 MB; day-docs are trimmed to this.
 DOC_TRIM_BYTES = 900_000
 
 
+#: Why a step stopped, as a value rather than a sentence. Four refusals now
+#: exist and the console has to word all four differently, so each one is
+#: identifiable without matching on prose that translation or a reword breaks.
+STOP_DAILY_CAP = "daily_cap"                    # today's engine-call budget is spent
+STOP_LEASE_HELD = "lease_held"                  # a check is running right now
+STOP_CHECKED_TODAY = "already_checked_today"    # this brand's manual check is used
+STOP_ENGINE_FAILED = "engine_failed"            # the providers are not answering
+#: The fifth refusal, the joint SERP monthly cap, never reaches this shape: it
+#: raises and the router answers 409. Recorded here so the set reads as complete.
+
+
 def _now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def _next_day_boundary() -> str:
+    """When the day-keyed guards reset — the next UTC midnight.
+
+    The same boundary :func:`_today` draws, derived from it rather than stated
+    again: a refusal that says "unlocks at" and a counter that rolls over must
+    never disagree about when the day ends.
+    """
+    today = dt.datetime.strptime(_today(), "%Y%m%d").replace(tzinfo=dt.timezone.utc)
+    return (today + dt.timedelta(days=1)).isoformat()
 
 
 def _today() -> str:
@@ -111,6 +164,27 @@ def _default_aliases(brand: dict) -> list[str]:
     return [a for a in aliases if a]
 
 
+def _default_config(brand: dict) -> dict:
+    """The config document a brand starts life with.
+
+    One definition, two entry points: :func:`ensure_config` (a brand that exists
+    but has never had a config) and :func:`init_config` (a brand being created
+    right now, which gets to choose its schedule). A second literal here is how
+    a brand created one way ends up with a field a brand created the other way
+    does not have.
+    """
+    return {
+        "brand_id": brand["id"],
+        "aliases": {"self": _default_aliases(brand)},
+        "competitors": [],  # [{key, name, aliases: [...]}]
+        "daily_cap": DEFAULT_DAILY_CAP,
+        "poll_interval_days": DEFAULT_POLL_INTERVAL_DAYS,
+        "auto_poll": True,
+        "counters": {},
+        "updated_at": _now(),
+    }
+
+
 def ensure_config(brand: dict) -> dict:
     """Load the brand's GEO config, creating a sensible default on first use.
 
@@ -126,15 +200,45 @@ def ensure_config(brand: dict) -> dict:
     def change(cfg: dict) -> tuple[dict, dict]:
         if cfg:  # created between the read above and this transaction
             return cfg, cfg
-        fresh = {
-            "brand_id": brand["id"],
-            "aliases": {"self": _default_aliases(brand)},
-            "competitors": [],  # [{key, name, aliases: [...]}]
-            "daily_cap": DEFAULT_DAILY_CAP,
-            "poll_interval_days": DEFAULT_POLL_INTERVAL_DAYS,
-            "auto_poll": True,
-            "counters": {},
-            "updated_at": _now(),
+        fresh = _default_config(brand)
+        return fresh, fresh
+
+    return _mutate(config_doc_id(brand["id"]), change)
+
+
+def init_config(
+    brand: dict, *, auto_poll: bool, poll_interval_days: int
+) -> dict:
+    """Seed a brand-new brand's config, with its schedule chosen by the creator.
+
+    Two things this does that :func:`ensure_config` deliberately does not.
+
+    **The schedule is an argument.** ``ensure_config``'s default is ``auto_poll:
+    True`` every 2 days, which is right for the brands that predate the flag and
+    wrong for one somebody just typed in: a brand created self-serve starts
+    un-watched and costs nothing until a human turns it on.
+
+    **``answer_counts_at`` is stamped.** The listing calls
+    :func:`recent_answer_count`, which treats a missing stamp as "this brand
+    polled before the counter existed" and runs :func:`_rebuild_answer_counts` —
+    a 30-day x 5-engine window read, ~150 document fetches, landing on whoever
+    opens the panel first. For a brand created seconds ago the reconstruction is
+    guaranteed to find nothing, so it is pure cost: twelve new brands is ~1,800
+    reads to compute twelve zeroes. An empty counter with today's stamp is the
+    same answer, honestly, for free.
+
+    Refuses (``ValueError``) if a config already exists — a brand id that has
+    been used before still owns its spend counters and its measured history, and
+    stamping a fresh document over them would hand back budget and erase counts.
+    """
+    def change(cfg: dict) -> tuple[dict, dict]:
+        if cfg:
+            raise ValueError(f"GEO config already exists for '{brand['id']}'")
+        fresh = _default_config(brand) | {
+            "auto_poll": bool(auto_poll),
+            "poll_interval_days": max(1, min(int(poll_interval_days), 30)),
+            "answer_counts": {},
+            "answer_counts_at": _now(),
         }
         return fresh, fresh
 
@@ -320,6 +424,58 @@ def _engine_runs(engine: str, runs: int) -> int:
     return runs
 
 
+def search_credit_state(cfg: dict, engines: list[str] | None = None) -> dict:
+    """The billed-Google-engine budget, as any READ surface reports it.
+
+    One shape, so the cold-open report and the status poll cannot describe the
+    same brand differently. Names say what the fact is rather than which engine
+    it started life attached to: the guard has covered both Google engines
+    since AI Mode arrived, and ``aio_capped`` reads as though AI Mode were fine.
+    The STORED keys keep their old names (``counters_aio`` /
+    ``aio_monthly_cap`` / the ``aio_*`` fields ``poll_step`` has always
+    returned) — renaming those is a document migration, and this is not it.
+
+    ``serp_capped_since`` is gated on the live condition on purpose: raising the
+    cap un-pauses the engines with no poll at all, and a date that outlived its
+    own condition is worse than no date.
+    """
+    usable = _usable_engines(engines)
+    spent = serp_capped(cfg, usable)
+    return {
+        "search_credit_spent": spent,
+        "search_credit_used": aio_used_month(cfg),
+        "search_credit_limit": serp_monthly_cap(cfg),
+        "serp_capped_since": cfg.get("serp_capped_since") if spent else None,
+    }
+
+
+def expected_answers(
+    prompts: list[dict],
+    engines: list[str] | tuple[str, ...],
+    runs: int = DEFAULT_RUNS,
+) -> dict[str, int]:
+    """``engine -> answers ONE complete sweep of that engine should produce``.
+
+    Per sweep, not per report window: it is prompts x runs for this engine and
+    nothing else, so it is the same number whether the window is one day or
+    thirty, and a reader may divide a window's stored count by it.
+
+    The whole reason it exists is that the two halves are engine-specific and
+    the product never said so. The team filed "different engines return
+    different numbers of answers" as a bug; it is
+    :func:`_engine_prompts` (a billed SERP engine is asked only the discovery
+    questions -- the ones that do not already name the brand) composed with
+    :func:`_engine_runs` (a SERP snapshot is fetched once, a chat engine is
+    sampled three times to measure variance). Composed, never restated: this is
+    also what :func:`_total_tasks` sums, so a report that says an engine owes 41
+    answers and a sweep that plans 41 calls can never disagree.
+    """
+    return {
+        engine: len(_engine_prompts(engine, prompts)) * _engine_runs(engine, runs)
+        for engine in engines
+    }
+
+
 def representative_order(prompts: list[dict]) -> list[dict]:
     """Round-robin the universe across intents so a TRUNCATED sweep still
     samples every question kind.
@@ -395,6 +551,32 @@ def aio_used_month(cfg: dict) -> int:
     return int((cfg.get("counters_aio") or {}).get(_month(), 0))
 
 
+def serp_monthly_cap(cfg: dict) -> int:
+    """This brand's billed-SERP ceiling for the month.
+
+    Stored under ``aio_monthly_cap`` because that is the key the AIO-only guard
+    already wrote; it governs every SERP engine jointly. Read through here so
+    the poll step, the status endpoint and the settle transaction cannot end up
+    comparing the counter against three different numbers.
+    """
+    return int(cfg.get("aio_monthly_cap") or SERP_MONTHLY_CAP)
+
+
+def serp_capped(cfg: dict, engines: list[str] | tuple[str, ...]) -> bool:
+    """Are the billed Google engines out of budget for this month?
+
+    ``engines`` is the list we may actually call: a brand with no DataForSEO
+    credential is not "capped", it is unconfigured, and the panel words those
+    two differently. The condition is stated ONCE here because a sweep drops the
+    engines on it and a status read explains the drop with it — two copies is
+    how a panel ends up saying "paused" while the sweep keeps polling.
+    """
+    return (
+        any(engine in geo_engines.SERP_ENGINES for engine in engines)
+        and aio_used_month(cfg) >= serp_monthly_cap(cfg)
+    )
+
+
 # --------------------------------------------------------------- atomicity ----
 # The transactional primitive lives in ``geo_store`` so modules this one imports
 # (``geo_prompts``) can share it. Kept under the private name here because the
@@ -407,6 +589,12 @@ def _trim_counters(cfg: dict) -> dict:
     """Trailing 30 day-counters / 3 month-counters, so the config never grows."""
     if cfg.get("counters"):
         cfg["counters"] = dict(sorted(cfg["counters"].items())[-30:])
+    # Same window as the spend counters, and keyed by the same ``_today()``
+    # string, so "one manual check per day" rolls over on exactly the boundary
+    # the budget does. A second notion of "today" is a second thing to get
+    # wrong at midnight UTC.
+    if cfg.get("manual_checks"):
+        cfg["manual_checks"] = dict(sorted(cfg["manual_checks"].items())[-30:])
     if cfg.get("counters_aio"):
         cfg["counters_aio"] = dict(sorted(cfg["counters_aio"].items())[-3:])
     if cfg.get("answer_counts"):
@@ -416,21 +604,217 @@ def _trim_counters(cfg: dict) -> dict:
     return cfg
 
 
-def _reserve_calls(brand_id: str, day: str, want: int) -> tuple[int, int, int]:
-    """Claim up to ``want`` engine calls against the daily cap, atomically.
+# ------------------------------------------------------------ sweep lease ----
+# ``poll_lease`` on ``geo-config-{brand}`` is ``{holder, run_id, expires_at}``.
+# ``run_id`` identifies one SWEEP (the cron's whole loop, or a single manual
+# step); ``holder`` is the human label the console shows when it has to say who
+# already has the brand.
 
-    Returns ``(granted, used_before, cap)``. The claim happens BEFORE the calls
-    are made on purpose: counting them afterwards — however atomically — still
-    lets two concurrent steps both decide there is room and both spend it.
+
+def _new_run_id() -> str:
+    return uuid.uuid4().hex
+
+
+#: Longest client loop token we will use. Longer is truncated, never rejected.
+POLL_TOKEN_MAX = 64
+#: Everything outside this is dropped from a client token. The value ends up in
+#: a Firestore document and in a refusal message shown to another person, so it
+#: is reduced to characters that cannot be mistaken for either.
+_TOKEN_UNSAFE = re.compile(r"[^A-Za-z0-9_.:-]")
+
+
+def loop_run_id(scope: str, token: Any) -> str | None:
+    """A caller's loop token turned into a lease run id, or ``None``.
+
+    ``None`` means "this caller named no loop", and the step then holds the
+    lease for its own duration only — today's behaviour, unchanged. A token
+    that survives cleaning holds the lease across the WHOLE loop instead, which
+    is what makes "a check is already running for this brand" a stable answer
+    rather than something two callers trade back and forth between batches.
+
+    Never raises and never rejects. A malformed, oversized or hostile token
+    degrades to ``None`` — a client that sends nonsense gets the old behaviour,
+    not a 422 in the middle of somebody's poll loop.
+
+    ``scope`` is the authenticated caller, and it is PREFIXED rather than
+    trusted alongside: a token is a plain string chosen by a client, so without
+    this two people who both send ``"1"`` would share one lease and both drive
+    the same sweep — the exact collision this closes.
+    """
+    if not isinstance(token, str):
+        return None
+    cleaned = _TOKEN_UNSAFE.sub("", token.strip())[:POLL_TOKEN_MAX]
+    if not cleaned:
+        return None
+    return f"{_TOKEN_UNSAFE.sub('', scope)[:POLL_TOKEN_MAX]}:{cleaned}"
+
+
+def _live_lease(cfg: dict, now: dt.datetime) -> dict | None:
+    """The brand's poll lease if it is still live, else ``None``.
+
+    An absent, malformed or undateable ``expires_at`` reads as EXPIRED on
+    purpose. This is a cost guard, not a correctness lock: a lease nobody can
+    date would be a brand nobody could ever poll again, which is a worse
+    outcome than the duplicate batch it was protecting against.
+    """
+    lease = cfg.get("poll_lease")
+    if not isinstance(lease, dict):
+        return None
+    expires = _parse_at(lease.get("expires_at"))
+    if expires is None or expires <= now:
+        return None
+    return lease
+
+
+def _lease_doc(holder: str, run_id: str, now: dt.datetime) -> dict:
+    return {
+        "holder": holder or "another sweep",
+        "run_id": run_id,
+        "expires_at": (
+            now + dt.timedelta(seconds=POLL_LEASE_TTL_SECONDS)
+        ).isoformat(),
+    }
+
+
+def _release_lease(brand_id: str, run_id: str) -> None:
+    """Hand the brand back — but only if the lease is still OURS.
+
+    Run-id matched because release is called from more than one place (the step
+    that ends a sweep, the cron loop's ``finally``) and because a lease that
+    expired and was re-claimed now belongs to somebody else. Clearing it blindly
+    would hand a second caller's sweep to a third.
+
+    Best-effort, in the manner of ``_record_history``: the answers are already
+    paid for and stored, so a failed release must not turn a finished sweep into
+    an error. It is logged with its traceback, and the TTL is the backstop.
     """
 
-    def change(cfg: dict) -> tuple[dict, tuple[int, int, int]]:
+    def change(cfg: dict) -> tuple[dict, None]:
+        lease = cfg.get("poll_lease")
+        if not isinstance(lease, dict) or lease.get("run_id") != run_id:
+            return cfg, None
+        cfg = dict(cfg)
+        cfg.pop("poll_lease", None)
+        return cfg, None
+
+    try:
+        _mutate(config_doc_id(brand_id), change)
+    except Exception:  # noqa: BLE001 — the TTL expires it anyway
+        logger.exception("geo: could not release the poll lease for %s", brand_id)
+
+
+class Reservation(NamedTuple):
+    """What one claim attempt got, and if it got nothing, precisely why.
+
+    ``stop_code`` is the machine-readable half of a refusal, ``refused_by``
+    names the person or sweep responsible where there is one, and
+    ``unlocks_at`` is when the caller may try again.
+    """
+
+    granted: int
+    used: int
+    cap: int
+    stop_code: str | None = None
+    refused_by: str | None = None
+    unlocks_at: str | None = None
+
+
+def _release_manual_check(brand_id: str, day: str, run_id: str) -> None:
+    """Give today's manual check back, if it is ours and it measured nothing.
+
+    A dead provider key must not cost somebody their one check for the day: the
+    sweep was claimed, it stored no answer, so nothing was measured and there is
+    nothing to have used up. Run-id matched like every other release, so a
+    later, genuine check by somebody else is never handed back on their behalf.
+    """
+
+    def change(cfg: dict) -> tuple[dict, None]:
+        checks = cfg.get("manual_checks") or {}
+        mine = checks.get(day)
+        if not isinstance(mine, dict) or mine.get("run_id") != run_id:
+            return cfg, None
+        cfg = dict(cfg)
+        cfg["manual_checks"] = {k: v for k, v in checks.items() if k != day}
+        return cfg, None
+
+    try:
+        _mutate(config_doc_id(brand_id), change)
+    except Exception:  # noqa: BLE001 — the day rolls over anyway
+        logger.exception("geo: could not release the manual check for %s", brand_id)
+
+
+def _reserve_calls(
+    brand_id: str, day: str, want: int, *, run_id: str, holder: str,
+    manual: bool = False,
+) -> Reservation:
+    """Claim up to ``want`` engine calls AND the brand's sweep lease, atomically.
+
+Three guards, one transaction, in the order a caller needs to hear them:
+    a check already RUNNING (the lease), a check already RUN today (``manual``),
+    then the budget. Each refuses with its own ``stop_code`` and an
+    ``unlocks_at``, because "somebody is running this, try in a minute",
+    "today's check is done, back tomorrow" and "the budget is spent" are three
+    different situations with three different answers, and a caller that cannot
+    tell them apart gives the wrong one.
+
+    ``manual`` marks a person-driven check, which is limited to once per brand
+    per day. The scheduler passes ``False``: it is metered by its own interval
+    and must neither be blocked by a manual check nor consume one.
+
+    Budget and lease are claimed in ONE transaction on purpose. Reserving first
+    and claiming second leaves exactly the window this exists to close — both
+    callers reserve, both then find the lease free in turn, and the second bills
+    a batch of work the first is already doing.
+
+    The claim happens BEFORE the calls are made, for the reason it always did:
+    counting them afterwards — however atomically — still lets two concurrent
+    steps both decide there is room and both spend it.
+    """
+
+    def change(cfg: dict) -> tuple[dict, Reservation]:
+        now = dt.datetime.now(dt.timezone.utc)
         cap = int(cfg.get("daily_cap") or DEFAULT_DAILY_CAP)
         used = int((cfg.get("counters") or {}).get(day, 0))
+
+        held = _live_lease(cfg, now)
+        if held is not None and held.get("run_id") != run_id:
+            # Somebody else has the brand right now. Reserve nothing.
+            return cfg, Reservation(
+                0, used, cap, STOP_LEASE_HELD,
+                str(held.get("holder") or "another sweep"),
+                str(held.get("expires_at") or "") or None,
+            )
+
+        check = (cfg.get("manual_checks") or {}).get(day)
+        checked_by_someone_else = (
+            manual and isinstance(check, dict) and check.get("run_id") != run_id
+        )
+        if checked_by_someone_else:
+            # One manual check per brand per day, whoever clicks. A fresh UTC
+            # day buys ONE ~440-call sweep, not one per person per click.
+            return cfg, Reservation(
+                0, used, cap, STOP_CHECKED_TODAY,
+                str(check.get("by") or "somebody in this workspace"),
+                _next_day_boundary(),
+            )
+
         granted = max(0, min(want, cap - used))
         cfg = dict(cfg)
         cfg["counters"] = dict(cfg.get("counters") or {}) | {day: used + granted}
-        return _trim_counters(cfg), (granted, used, cap)
+        if granted:
+            # Only a step that will actually execute takes the lease or spends
+            # the day's check: a step the budget grants nothing to polls
+            # nothing, so it must not lock anyone out of anything.
+            cfg["poll_lease"] = _lease_doc(holder, run_id, now)
+            if manual and not isinstance(check, dict):
+                # Claimed HERE, inside the transaction that reserves the calls,
+                # for the reason the lease is: two people clicking together
+                # would otherwise both find the day unclaimed and both start a
+                # full sweep.
+                cfg["manual_checks"] = dict(cfg.get("manual_checks") or {}) | {
+                    day: {"at": _now(), "by": holder or "a console", "run_id": run_id},
+                }
+        return _trim_counters(cfg), Reservation(granted, used, cap)
 
     return _mutate(config_doc_id(brand_id), change)
 
@@ -444,6 +828,7 @@ def _settle_calls(
     engine_failed: dict[str, bool],
     engine_stored: dict[str, int] | None = None,
     engine_totals: dict[str, int] | None = None,
+    lease_run_id: str = "",
 ) -> dict:
     """Hand back the unspent reservation, bank SERP credits, update fail streaks.
 
@@ -457,10 +842,29 @@ def _settle_calls(
     nothing — this write was happening anyway — and it is what lets the brand
     listing answer "how many answers this week" without fetching a week of
     answer text to take a ``len``.
+
+    It is also where the sweep lease is REFRESHED, for the same reason: the step
+    just finished a batch, this write was happening anyway, and a lease that
+    only ever expired would drop a long cron sweep on the floor mid-run.
     """
 
     def change(cfg: dict) -> tuple[dict, dict]:
         cfg = dict(cfg)
+        # ONE instant for everything this transaction stamps. Two `_now()` calls
+        # in the same write are microseconds apart, and the panel reads two of
+        # these as one sentence — "AI Overview last measured X, paused since Y".
+        # Y landing before X on the very step that did both is a sentence that
+        # reads as a bug in the clock.
+        stamp = _now()
+        if lease_run_id:
+            # Only if the lease is still ours. A step slow enough to have lost
+            # it must not steal it back from whoever legitimately claimed it.
+            lease = cfg.get("poll_lease")
+            if isinstance(lease, dict) and lease.get("run_id") == lease_run_id:
+                cfg["poll_lease"] = _lease_doc(
+                    str(lease.get("holder") or ""), lease_run_id,
+                    dt.datetime.now(dt.timezone.utc),
+                )
         counters = dict(cfg.get("counters") or {})
         counters[day] = max(0, int(counters.get(day, 0)) - (granted - spent))
         cfg["counters"] = counters
@@ -468,6 +872,19 @@ def _settle_calls(
             aio = dict(cfg.get("counters_aio") or {})
             aio[_month()] = int(aio.get(_month(), 0)) + aio_credits
             cfg["counters_aio"] = aio
+        # WHEN the billed Google engines ran out of month, stamped once at the
+        # transition. The step already recomputes "capped" from the counter, and
+        # that is enough to DROP the engines from the sweep -- it is not enough
+        # to say when they stopped, because nothing anywhere records the moment.
+        # Their counts then simply freeze, and a frozen number with no date on
+        # it reads as a measurement bug rather than a spent budget. Evaluated on
+        # every settle, not only a SERP one, so the month rolling over clears it
+        # on the next chat-only step instead of leaving last month's date up.
+        if aio_used_month(cfg) >= serp_monthly_cap(cfg):
+            if not cfg.get("serp_capped_since"):
+                cfg["serp_capped_since"] = stamp
+        else:
+            cfg.pop("serp_capped_since", None)
         health = cfg.get("poll_health") or {}
         # streaks and the step count are per-day: a new day starts clean
         same_day = health.get("day") == day
@@ -484,7 +901,7 @@ def _settle_calls(
         seen = dict(cfg.get("engine_last_seen") or {})
         for engine, stored in (engine_stored or {}).items():
             if stored:
-                seen[engine] = _now()
+                seen[engine] = stamp
         if seen:
             cfg["engine_last_seen"] = seen
         if engine_totals:
@@ -531,14 +948,25 @@ def _merge_answers(
         doc.setdefault("date", day)
         answers = list(doc.get("answers") or [])
         for record in records:
-            # a retry replaces the task's earlier error record — the doc keeps
-            # one honest latest attempt per (prompt, run), not a pile of 429s
+            # ONE record per (prompt_id, run), unconditionally. The rule used to
+            # be "a retry replaces the task's earlier ERROR record", which kept
+            # the doc free of 429 piles but let two successful answers for the
+            # same task both land — and ``geo_metrics.mention_stats`` counts
+            # ``n_answers`` per record while grouping by prompt, so the day's
+            # rate was then averaged over a doubled sample and the banked
+            # ``answer_counts`` were permanently wrong.
+            #
+            # The sweep lease is what stops a task being executed twice; this is
+            # the defence in depth that stops a duplicate that slips through
+            # from corrupting the measurement. No legitimate caller is affected:
+            # ``poll_step`` is the only writer here and it only ever polls tasks
+            # ``_pending_tasks`` reports as still owed, so a second successful
+            # record for one (prompt_id, run) has no honest way to exist.
             answers = [
                 a for a in answers
                 if not (
                     a.get("prompt_id") == record["prompt_id"]
                     and a.get("run") == record["run"]
-                    and a.get("error")
                 )
             ]
             answers.append(record)
@@ -606,11 +1034,25 @@ def _progress(
     capped: bool = False,
     terminal: bool = False,
     terminal_reason: str | None = None,
+    lease_held_by: str | None = None,
+    stop_code: str | None = None,
+    unlocks_at: str | None = None,
 ) -> dict:
     """The one response shape ``poll_step`` returns, on every path.
 
     ``terminal``/``terminal_reason`` are a cross-agent contract with the console
     poll loop — always present, never renamed.
+
+``stop_code`` says WHICH refusal this is (``STOP_*``), ``unlocks_at`` when
+    it clears, and ``lease_held_by`` who is responsible where somebody is. All
+    ``None`` on a healthy step. They are fields rather than something to parse
+    out of ``terminal_reason`` because the console has to word four refusals
+    differently — a check running, a check already done today, the daily budget,
+    a dead engine — and prose is not an API.
+
+    They describe the REFUSAL, not the sweep that caused it: nothing here
+    exposes a running sweep's state. ``done``/``total`` are the day's stored
+    progress, the same numbers ``poll_status`` gives any reader.
     """
     return {
         "done": done,
@@ -624,6 +1066,9 @@ def _progress(
         "aio_credits_month": aio_credits_month,
         "terminal": terminal,
         "terminal_reason": terminal_reason,
+        "lease_held_by": lease_held_by,
+        "stop_code": stop_code,
+        "unlocks_at": unlocks_at,
     }
 
 
@@ -643,9 +1088,7 @@ def _total_tasks(prompts: list[dict], usable: list[str], runs: int) -> int:
     sampled ``runs`` times over everything. This MUST agree with
     :func:`_pending_tasks`, or a sweep can never report itself finished.
     """
-    return sum(
-        len(_engine_prompts(e, prompts)) * _engine_runs(e, runs) for e in usable
-    )
+    return sum(expected_answers(prompts, usable, runs).values())
 
 
 def _answers_for(batch: list[tuple[str, dict, int]]) -> list[Any]:
@@ -668,21 +1111,51 @@ def _answers_for(batch: list[tuple[str, dict, int]]) -> list[Any]:
 def poll_status(brand: dict, *, engines: list[str] | None = None,
                 runs: int = DEFAULT_RUNS) -> dict:
     """What the panel needs to say when nobody is watching a progress bar:
-    how much of today's sweep is done, and when the next one is due."""
+    how much of today's sweep is done, when the next one is due, and whether
+    the billed Google engines are paused on a spent budget."""
     cfg = ensure_config(brand)
     usable = _usable_engines(engines)
+    credit = search_credit_state(cfg, engines)
     prompts = geo_prompts.enabled_prompts(brand["id"])
     docs = _load_day_docs(brand["id"], usable, _today())
     pending = _pending_tasks(prompts, docs, runs)
     total = _total_tasks(prompts, usable, runs)
     due, reason = poll_due(cfg)
+    check = (cfg.get("manual_checks") or {}).get(_today())
     return {
         "brand_id": brand["id"],
         "pending": len(pending),
         "done": max(total - len(pending), 0),
         "total": total,
+        # What "Check now" may do right now. Without these the button can only
+        # discover it is blocked by being pressed, which is the dead-button
+        # experience this exists to avoid.
+        "manual_check_used": isinstance(check, dict),
+        "manual_check_by": (check or {}).get("by") if isinstance(check, dict) else None,
+        "manual_check_unlocks_at": _next_day_boundary() if isinstance(check, dict) else None,
+        # Why the two Google engines stopped moving, WITHOUT pressing anything.
+        # ``poll_step`` has always returned this, so a spent SERP budget was
+        # discoverable only by STARTING a check -- meanwhile the panel showed
+        # frozen AI Overview counts beside live chat counts, which is
+        # indistinguishable from the engine being broken. The limit rides along
+        # so the copy can read "2,000 of 2,000" rather than a bare number the
+        # reader has to already know the budget to interpret, and the date joins
+        # to ``engine_last_seen[engine]`` on the report: "AI Overview last
+        # measured 31 Aug, paused since 1 Sep".
+        **credit,
+        # The same three facts under the names ``poll_step`` has always used.
+        # Duplicated rather than renamed: the console's poll loop reads the
+        # ``aio_*`` vocabulary today and the stored keys are ``counters_aio`` /
+        # ``aio_monthly_cap``, so the honest names cannot replace them without a
+        # document migration. ``search_credit_*`` above is the name to build
+        # against; these are the compatibility half, and the whole reason they
+        # are computed once above is that two spellings must never be able to
+        # disagree about one brand.
+        "aio_capped": credit["search_credit_spent"],
+        "aio_credits_month": credit["search_credit_used"],
+        "aio_monthly_cap": credit["search_credit_limit"],
         "auto_poll": bool(cfg.get("auto_poll", True)),
-        "interval_days": _interval_days(cfg),
+        "interval_days": interval_days(cfg),
         "last_completed_at": cfg.get("last_poll_completed_at"),
         "next_due_at": next_due_at(cfg),
         "due_now": due,
@@ -690,12 +1163,16 @@ def poll_status(brand: dict, *, engines: list[str] | None = None,
     }
 
 
-def _interval_days(cfg: dict) -> int:
+def interval_days(cfg: dict) -> int:
     """Days between scheduled sweeps for this brand.
 
     NOT ``geo_window.clamp_days``, despite sharing its 1..30 bounds — this is a
     cadence, that is a measured window, and the day they need different ceilings
     is the day a shared helper silently breaks one of them.
+
+    Public (it was ``_interval_days``) because the brand listing shows the
+    cadence next to the scheduled-check switch, and a router reaching into a
+    private name is how a second, drifting copy of this clamp gets written.
     """
     # `or DEFAULT` would be wrong here: an explicit 0 is out of range and must
     # clamp to "every day", not silently become the two-day default
@@ -725,7 +1202,7 @@ def next_due_at(cfg: dict) -> str | None:
     last = _parse_at(cfg.get("last_poll_completed_at"))
     if last is None:
         return None
-    return (last + dt.timedelta(days=_interval_days(cfg))).isoformat(timespec="seconds")
+    return (last + dt.timedelta(days=interval_days(cfg))).isoformat(timespec="seconds")
 
 
 def staleness_rank(cfg: dict) -> float:
@@ -753,7 +1230,7 @@ def poll_due(cfg: dict, *, now: dt.datetime | None = None) -> tuple[bool, str]:
     if last is None:
         return True, "never polled"
     now = now or dt.datetime.now(dt.timezone.utc)
-    due_at = last + dt.timedelta(days=_interval_days(cfg))
+    due_at = last + dt.timedelta(days=interval_days(cfg))
     if now >= due_at:
         return True, f"last completed {last.date().isoformat()}, due {due_at.date().isoformat()}"
     return False, f"next due {due_at.date().isoformat()}"
@@ -785,47 +1262,73 @@ def poll_until_done(
     """Run steps back-to-back until the sweep finishes or the budget runs out.
 
     This is the unattended path: no browser, no progress bar. It stops for the
-    same honest reasons a step does — terminal engine failure, daily cap — and
-    otherwise for the wall clock, leaving the remainder pending for the next
-    fire. Only a genuinely finished sweep stamps the schedule.
+    same honest reasons a step does — terminal engine failure, daily cap, a
+    sweep somebody else is already running — and otherwise for the wall clock,
+    leaving the remainder pending for the next fire. Only a genuinely finished
+    sweep stamps the schedule.
+
+    It holds ONE sweep lease across every step (see :func:`_reserve_calls`), so
+    its own steps never lock each other out and a console poll that arrives
+    mid-sweep is refused instead of re-billing the batch this loop is running.
     """
+    run_id = _new_run_id()
+    holder = f"scheduled sweep {run_id[:8]}"
     deadline = clock() + budget_seconds
     steps = 0
     progress: dict | None = None
     stop = "completed"
-    while True:
-        if clock() >= deadline:
-            stop = "budget exhausted — remaining tasks resume on the next run"
-            break
-        progress = poll_step(
-            brand, engines=engines, runs=runs, batch_size=batch_size, trigger="cron",
+    try:
+        while True:
+            if clock() >= deadline:
+                stop = "budget exhausted — remaining tasks resume on the next run"
+                break
+            progress = poll_step(
+                brand, engines=engines, runs=runs, batch_size=batch_size,
+                trigger="cron", holder=holder, lease_run_id=run_id,
+            )
+            steps += 1
+            if progress.get("terminal"):
+                stop = progress.get("terminal_reason") or "terminal"
+                break
+            if progress.get("done", 0) >= progress.get("total", 0):
+                break
+        if progress is None:  # budget was zero or negative — nothing was attempted
+            progress = poll_status(brand, engines=engines, runs=runs)
+            stop = "no time budget"
+        finished = (
+            progress.get("done", 0) >= progress.get("total", 0)
+            and not progress.get("terminal")
         )
-        steps += 1
-        if progress.get("terminal"):
-            stop = progress.get("terminal_reason") or "terminal"
-            break
-        if progress.get("done", 0) >= progress.get("total", 0):
-            break
-    if progress is None:  # budget was zero or negative — nothing was attempted
-        progress = poll_status(brand, engines=engines, runs=runs)
-        stop = "no time budget"
-    finished = progress.get("done", 0) >= progress.get("total", 0) and not progress.get("terminal")
-    if finished:
-        mark_poll_completed(brand["id"])
-    elif steps:
-        # ran out of wall clock rather than work: the answers collected are
-        # still today's measurement, so the chart gets its point either way
-        _record_history(brand, ensure_config(brand), _today())
-    return {
-        "brand_id": brand["id"],
-        "steps": steps,
-        "done": progress.get("done", 0),
-        "total": progress.get("total", 0),
-        "completed": finished,
-        "stopped_because": stop,
-        "terminal_reason": progress.get("terminal_reason"),
-        "calls_used_today": progress.get("calls_used_today"),
-    }
+        if finished:
+            mark_poll_completed(brand["id"])
+        elif steps and not progress.get("lease_held_by"):
+            # ran out of wall clock rather than work: the answers collected are
+            # still today's measurement, so the chart gets its point either way.
+            # A refused sweep polled nothing, so it has nothing to bank — the
+            # sweep that holds the lease will record the day's point itself.
+            _record_history(brand, ensure_config(brand), _today())
+        return {
+            "brand_id": brand["id"],
+            "steps": steps,
+            "done": progress.get("done", 0),
+            "total": progress.get("total", 0),
+            "completed": finished,
+            "stopped_because": stop,
+            "terminal_reason": progress.get("terminal_reason"),
+            "lease_held_by": progress.get("lease_held_by"),
+            "stop_code": progress.get("stop_code"),
+            "unlocks_at": progress.get("unlocks_at"),
+            "calls_used_today": progress.get("calls_used_today"),
+        }
+    finally:
+        # Whatever stopped this loop — a finished sweep, the wall clock, a dead
+        # engine, an exception on the way out — the brand goes back on the shelf
+        # HERE. An unreleased cron lease blocks every poll of this brand until
+        # the TTL expires, and one leaked at the end of an 800s budget run is
+        # precisely the failure that gets discovered by the morning being wrong.
+        # Run-id matched, so refusing to claim somebody else's lease above does
+        # not release it here either.
+        _release_lease(brand["id"], run_id)
 
 
 def poll_step(
@@ -835,12 +1338,37 @@ def poll_step(
     batch_size: int = DEFAULT_BATCH,
     *,
     trigger: str = "manual",
+    holder: str = "",
+    lease_run_id: str | None = None,
 ) -> dict:
     """Execute up to ``batch_size`` engine calls; return progress for the UI loop.
 
     ``trigger`` names who is driving the loop — ``"manual"`` from the console,
     ``"cron"`` from :func:`poll_until_done` — and is recorded on the run log
     entry when this step turns out to be the one that ends the sweep.
+
+    ``holder`` is the human label another caller sees if it collides with this
+    one — the signed-in account for a console poll, the sweep id for the cron.
+
+    ``trigger`` also decides whether the once-a-day manual gate applies:
+    anything but :data:`SCHEDULED_TRIGGER`, driven by a NAMED loop, is a
+    person-driven check, and a brand allows one per UTC day whoever clicks. The
+    scheduler is metered by its own interval instead, so a manual check neither
+    blocks it nor uses up its turn.
+
+    ``lease_run_id`` names the LOOP this step belongs to, and it is what makes
+    "a check is already running for this brand" a stable answer. A caller that
+    names its loop — the cron via :func:`poll_until_done`, a console via the
+    client token :func:`loop_run_id` builds — holds the brand from its first
+    step to its last, so a second person is refused consistently every time
+    they try. A caller that names no loop holds the lease for the duration of
+    one step: still no duplicated work, but two such callers interleave
+    batch-by-batch and neither can be told who is running the check.
+
+    Held across a loop the lease is still bounded by ``POLL_LEASE_TTL_SECONDS``
+    — it is only ever refreshed by a step that actually ran, so a client that
+    walks away frees the brand on the TTL and a token buys nobody a longer
+    hold than a sweep that is genuinely in progress.
     """
     cfg = ensure_config(brand)
     usable = _usable_engines(engines)
@@ -857,11 +1385,7 @@ def poll_step(
     # joint monthly spend guard for the billed SERP engines: when the month's
     # budget is spent they simply leave the panel until next month — honestly
     # reported, never a surprise bill or a silent hole
-    serp_cap = int(cfg.get("aio_monthly_cap") or SERP_MONTHLY_CAP)
-    aio_capped = (
-        any(e in geo_engines.SERP_ENGINES for e in usable)
-        and aio_used_month(cfg) >= serp_cap
-    )
+    aio_capped = serp_capped(cfg, usable)
     if aio_capped:
         usable = [e for e in usable if e not in geo_engines.SERP_ENGINES]
         if not usable:
@@ -875,20 +1399,72 @@ def poll_step(
     cap = int(cfg.get("daily_cap") or DEFAULT_DAILY_CAP)
 
     if not tasks:  # the day is complete — nothing to reserve, nothing to spend
+        if lease_run_id:
+            # A named loop reaching a finished day IS that loop finishing, and
+            # the brand must not stay locked until the TTL over a step that
+            # found nothing left to do.
+            _release_lease(brand["id"], lease_run_id)
         return _progress(
             done=done_before, total=total, used=used_today(cfg), cap=cap,
             engines=usable, day=day, aio_capped=aio_capped,
             aio_credits_month=aio_used_month(cfg),
         )
 
-    # Claim the budget before spending it, so overlapping steps cannot both
-    # decide there is room for a full batch. ``granted`` is what we may bill.
-    granted, used, cap = _reserve_calls(brand["id"], day, min(batch_size, len(tasks)))
-    if granted <= 0:
+    # Claim the budget AND the brand, in one transaction, before spending
+    # anything — so overlapping steps can neither both decide there is room for
+    # a full batch nor both be handed the same batch. ``granted`` is what we may
+    # bill; ``lease_held_by`` is set only when somebody else already has this
+    # brand.
+    owns_lease = lease_run_id is None
+    run_id = lease_run_id or _new_run_id()
+    # The once-a-day gate needs a loop it can recognise across steps, or a
+    # caller would refuse its own second batch. The router ALWAYS names one
+    # (client token, else the session, else the account), so every Check Now
+    # arrives gated; a direct library call from a script or a test names none
+    # and is not what this limit is about.
+    manual = trigger != SCHEDULED_TRIGGER and lease_run_id is not None
+    res = _reserve_calls(
+        brand["id"], day, min(batch_size, len(tasks)),
+        run_id=run_id, holder=holder or f"{trigger} poll", manual=manual,
+    )
+    used, cap = res.used, res.cap
+    if res.stop_code == STOP_LEASE_HELD:
+        # Refused, plainly. Nothing was reserved, nothing was billed, and the
+        # caller is told a check is already running, by whom, and when it frees
+        # up. Terminal so the caller stops rather than spinning on an endpoint
+        # that will keep refusing it.
         return _progress(
             done=done_before, total=total, used=used, cap=cap, engines=usable,
             day=day, aio_capped=aio_capped, aio_credits_month=aio_used_month(cfg),
-            capped=True, terminal=True,
+            terminal=True, stop_code=res.stop_code, unlocks_at=res.unlocks_at,
+            lease_held_by=res.refused_by,
+            terminal_reason=(
+                f"a check is already running for this brand ({res.refused_by})"
+                f" — you cannot start another one until it finishes"
+            ),
+        )
+    if res.stop_code == STOP_CHECKED_TODAY:
+        return _progress(
+            done=done_before, total=total, used=used, cap=cap, engines=usable,
+            day=day, aio_capped=aio_capped, aio_credits_month=aio_used_month(cfg),
+            terminal=True, stop_code=res.stop_code, unlocks_at=res.unlocks_at,
+            terminal_reason=(
+                f"this brand has already been checked today (started by "
+                f"{res.refused_by}) — one check per brand per day; the next one "
+                f"unlocks at {res.unlocks_at}"
+            ),
+        )
+    granted = res.granted
+    if granted <= 0:
+        if lease_run_id:
+            # Out of budget ends this loop, so hand the brand back now instead
+            # of holding it for a TTL over a sweep that cannot continue.
+            _release_lease(brand["id"], lease_run_id)
+        return _progress(
+            done=done_before, total=total, used=used, cap=cap, engines=usable,
+            day=day, aio_capped=aio_capped, aio_credits_month=aio_used_month(cfg),
+            capped=True, terminal=True, stop_code=STOP_DAILY_CAP,
+            unlocks_at=_next_day_boundary(),
             terminal_reason=(
                 f"daily engine-call cap reached — {used} of {cap} calls used "
                 f"today; polling resumes tomorrow or after raising the cap"
@@ -947,16 +1523,25 @@ def poll_step(
         # Whatever happened, store the answers we already paid for and hand
         # back the part of the reservation we never spent — an exception must
         # not leave the day's budget charged for calls that never went out.
-        for engine, engine_records in records.items():
-            stored[engine] = _merge_answers(brand["id"], engine, day, engine_records)
-        settled = _settle_calls(
-            brand["id"], day, granted, spent, serp_credits,
-            {e: len(failures.get(e, [])) == n for e, n in attempts.items()},
-            # "no AI Overview shown" is a successful observation, so it counts
-            # as the engine having been measured
-            {e: sum(1 for r in recs if not r.get("error")) for e, recs in records.items()},
-            engine_totals={e: len(answers) for e, answers in stored.items()},
-        )
+        try:
+            for engine, engine_records in records.items():
+                stored[engine] = _merge_answers(brand["id"], engine, day, engine_records)
+            settled = _settle_calls(
+                brand["id"], day, granted, spent, serp_credits,
+                {e: len(failures.get(e, [])) == n for e, n in attempts.items()},
+                # "no AI Overview shown" is a successful observation, so it counts
+                # as the engine having been measured
+                {e: sum(1 for r in recs if not r.get("error")) for e, recs in records.items()},
+                engine_totals={e: len(answers) for e, answers in stored.items()},
+                lease_run_id=run_id,
+            )
+        finally:
+            # Nested so the brand is handed back even if the bookkeeping above
+            # raises: a lease leaked here blocks every poll of this brand until
+            # the TTL expires, which is a far worse failure than the one that
+            # caused it.
+            if owns_lease:
+                _release_lease(brand["id"], run_id)
 
     terminal, terminal_reason = _terminal_signal(
         len(batch), failures, settled["streaks"]
@@ -969,7 +1554,20 @@ def poll_step(
     # smaller than a full sweep, so the chart would only ever hold reconstructed
     # points. A truncated day is a real measurement of a smaller sample, and it
     # is already marked `partial` on the chart.
+    day_answers_now = [
+        a for e in docs
+        for a in (stored[e] if e in stored else docs[e].get("answers") or [])
+    ]
     if done_now >= total or terminal:
+        if not owns_lease:
+            # The sweep is over. Hand the brand back now rather than making the
+            # next caller wait out a TTL for a holder that has already stopped.
+            _release_lease(brand["id"], run_id)
+        if manual and not any(not a.get("error") for a in day_answers_now):
+            # Claimed the day's check, measured nothing at all — a dead key or
+            # an outage must not cost somebody their one check. Give it back and
+            # say so; the terminal reason already names the engine that failed.
+            _release_manual_check(brand["id"], day, run_id)
         _record_history(brand, cfg, day)
         # A sweep the console drove to the end is as complete as one the cron
         # drove; the schedule moves on either, or the brand stays "due" and
@@ -977,8 +1575,7 @@ def poll_step(
         if completed:
             mark_poll_completed(brand["id"])
         _record_run(
-            brand, day,
-            [a for e in docs for a in (stored[e] if e in stored else docs[e].get("answers") or [])],
+            brand, day, day_answers_now,
             trigger=trigger, steps=settled["steps"], done=done_now, total=total,
             completed=completed, terminal_reason=terminal_reason,
         )
@@ -987,6 +1584,7 @@ def poll_step(
         engines=usable, day=day, aio_capped=aio_capped,
         aio_credits_month=settled["aio_month"],
         terminal=terminal, terminal_reason=terminal_reason,
+        stop_code=STOP_ENGINE_FAILED if terminal else None,
     )
 
 

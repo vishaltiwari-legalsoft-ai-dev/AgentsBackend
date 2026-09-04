@@ -240,7 +240,7 @@ def via_mix(answers: list[dict]) -> dict[str, int]:
 
     Every rate in the report is only as trustworthy as the surface it was
     measured on: "native" is the engine's own API, "openrouter" is a stand-in
-    model, "serpapi" is Google's live SERP. Counted, never assumed — so the
+    model, "dataforseo" is Google's live SERP. Counted, never assumed — so the
     panel can label a number instead of implying it came from the real product.
     """
     counts: dict[str, int] = defaultdict(int)
@@ -249,13 +249,28 @@ def via_mix(answers: list[dict]) -> dict[str, int]:
     return dict(counts)
 
 
-def engine_report(answers: list[dict], entities: list[str], own_domain: str) -> dict:
-    """Full per-engine + blended report over one set of answer records."""
+def engine_report(
+    answers: list[dict],
+    entities: list[str],
+    own_domain: str,
+    *,
+    expected: dict[str, int] | None = None,
+) -> dict:
+    """Full per-engine + blended report over one set of answer records.
+
+    ``expected`` is ``{engine: answers one complete sweep of that engine should
+    produce}`` -- built by ``geo_poll.expected_answers`` from the brand's
+    current question list, and passed IN because this module does no I/O and
+    knows nothing about prompts. Omit it and every block reports
+    ``n_expected: None``: "nobody told us", which is the honest answer for a
+    caller (``geo_history``) that scores stored answers and has no question list
+    in hand.
+    """
     by_engine: dict[str, list[dict]] = defaultdict(list)
     for a in answers:
         by_engine[a.get("engine", "unknown")].append(a)
 
-    def block(subset: list[dict]) -> dict:
+    def block(subset: list[dict], n_expected: int | None) -> dict:
         errors = [a for a in subset if a.get("error")]
         no_aio = [a for a in subset if a.get("no_aio")]
         return {
@@ -272,12 +287,39 @@ def engine_report(answers: list[dict], entities: list[str], own_domain: str) -> 
             "n_measured": len(_ok(subset)),
             "n_errors": len(errors),
             "n_no_aio": len(no_aio),
+            # What ONE sweep of this engine owes, so the panel can say why the
+            # engines do not return the same number of answers. They are not
+            # supposed to: a chat engine is asked every question three times to
+            # measure variance, a billed Google engine is asked the discovery
+            # questions once. Reported as an engine's own denominator was the
+            # missing half -- the team filed the difference as a bug.
+            #
+            # Per SWEEP, where ``n_answers`` above is per WINDOW: they are the
+            # same number only on a single-day window. Deliberately not scaled
+            # by the days in the window, because the scaling factor would have
+            # to be "sweeps that actually ran", and a paused engine ran none --
+            # which would make its expectation zero and hide the exact hole this
+            # was added to show.
+            "n_expected": n_expected,
             "via_mix": via_mix(subset),
         }
 
+    expected = expected or {}
     return {
-        "blended": block(answers),
-        "engines": {engine: block(subset) for engine, subset in by_engine.items()},
+        # the engines that produced answers here, one full sweep of each: the
+        # blended row is a blend of the engines actually measured, never of
+        # engines that have never written a document
+        "blended": block(
+            answers,
+            sum(expected.get(e, 0) for e in by_engine) if expected else None,
+        ),
+        "engines": {
+            # ``.get``: an engine with stored answers and no entry -- a retired
+            # engine, or the "unknown" bucket -- reports None rather than a
+            # fabricated 0 that would read as "owed nothing, delivered 40"
+            engine: block(subset, expected.get(engine))
+            for engine, subset in by_engine.items()
+        },
         "source_gap": source_gap(answers, own_domain),
         "competitors": {
             e: mention_stats(answers, e) for e in entities if e != "self"

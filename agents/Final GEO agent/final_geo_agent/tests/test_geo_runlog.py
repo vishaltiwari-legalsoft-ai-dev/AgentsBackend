@@ -74,6 +74,48 @@ def test_concurrent_records_are_all_kept():
 # ---------------------------------------------------------- plan progress ----
 
 
+# ------------------------------------------- sweeps inside a report window
+# The report scales its per-engine `n_expected` (one sweep's worth) by this.
+# Getting it wrong invents a shortfall, or hides one.
+
+
+def test_sweep_days_counts_days_inside_the_window_only():
+    for day in ("20260828", "20260830", "20260901"):
+        geo_runlog.record_run(BRAND_ID, {"day": day, "trigger": "cron"})
+
+    window = ["20260830", "20260831", "20260901"]
+    assert geo_runlog.sweep_days(BRAND_ID, window) == {"20260830", "20260901"}
+
+
+def test_two_sweeps_on_one_day_are_one_day_not_two():
+    """A cron sweep truncated by the wall clock and continued by a manual check
+    the same day writes TWO entries for ONE day's answers — a day-doc holds one
+    record per (prompt, run) however many sweeps touched it. Counting entries
+    would price that day twice and invent a shortfall out of arithmetic."""
+    geo_runlog.record_run(BRAND_ID, {"day": "20260901", "trigger": "cron"})
+    geo_runlog.record_run(BRAND_ID, {"day": "20260901", "trigger": "manual"})
+
+    assert len(geo_runlog.recent_runs(BRAND_ID)) == 2
+    assert geo_runlog.sweep_days(BRAND_ID, ["20260901"]) == {"20260901"}
+
+
+def test_a_brand_with_no_sweeps_in_the_window_counts_zero():
+    """Zero is a real answer — "no checks in this period" — and the panel says
+    that rather than dividing by it."""
+    geo_runlog.record_run(BRAND_ID, {"day": "20260701", "trigger": "cron"})
+
+    assert geo_runlog.sweep_days(BRAND_ID, ["20260901", "20260902"]) == set()
+    assert geo_runlog.sweep_days("never-swept", ["20260901"]) == set()
+
+
+def test_an_entry_with_no_day_is_skipped_not_counted():
+    """A malformed entry must not add a phantom check to the denominator."""
+    geo_runlog.record_run(BRAND_ID, {"trigger": "cron"})
+    geo_runlog.record_run(BRAND_ID, {"day": None, "trigger": "cron"})
+
+    assert geo_runlog.sweep_days(BRAND_ID, ["20260901"]) == set()
+
+
 def test_plan_progress_is_none_without_a_plan():
     assert geo_runlog.plan_progress(BRAND_ID) is None
 

@@ -246,6 +246,53 @@ class MeasuredWindow:
     # --------------------------------------------------------------- report
 
     @cached_property
+    def expected(self) -> dict[str, int]:
+        """``engine -> answers one complete sweep of that engine owes``.
+
+        The brand's CURRENT question list, priced per engine by
+        ``geo_poll.expected_answers`` — so it answers "why does AI Overview
+        return fewer answers than ChatGPT" for the questions being asked now,
+        which is the question the panel is asked. One extra document read (the
+        prompt universe), taken lazily by ``report`` and never by a caller that
+        only wants the answers.
+
+        Over :data:`ENGINES`, the reader's list, not the engines that happen to
+        hold a key: an engine that is off has no stored answers and therefore no
+        block in the report, and gating this on availability as well would only
+        hide the number on the day a key is pulled.
+
+        ``geo_poll.DEFAULT_RUNS`` is the sample size, because it is the one the
+        schedule polls at. A caller that hand-drove a sweep at ``runs=1`` will
+        see a window that owes more than it bought — correctly: it bought a
+        smaller sample.
+        """
+        from final_geo_agent import geo_poll, geo_prompts
+
+        return geo_poll.expected_answers(
+            geo_prompts.enabled_prompts(self.brand_id), ENGINES,
+        )
+
+    @cached_property
+    def n_sweeps(self) -> int:
+        """How many of this window's days the brand actually ran a check on.
+
+        The multiplier that turns the report's per-sweep ``n_expected`` into a
+        window figure — and the reason it is per BRAND rather than per engine.
+        A per-engine count would collapse to zero for an engine that was paused
+        on a spent search budget, so its expectation would collapse too and the
+        shortfall this window exists to show would vanish into "owed nothing,
+        delivered nothing". The brand's count keeps the hole visible and
+        attributable: five checks x 34 owed = 170, AI Overview answered on two
+        of them = 68, and ``serp_capped_since`` says when it stopped.
+
+        Zero is a real answer — a brand with no checks in this period — and it
+        is the panel's cue to say so rather than to divide by it.
+        """
+        from final_geo_agent import geo_runlog
+
+        return len(geo_runlog.sweep_days(self.brand_id, self.day_ids))
+
+    @cached_property
     def report(self) -> dict:
         """The full per-engine + blended report over this window.
 
@@ -253,7 +300,9 @@ class MeasuredWindow:
         request over identical data; asking the window means it cannot.
         Callers that add keys must copy first — ``dict(window.report) | {...}``.
         """
-        return geo_metrics.engine_report(self.answers, self.entities, self.own_domain)
+        return geo_metrics.engine_report(
+            self.answers, self.entities, self.own_domain, expected=self.expected,
+        )
 
 
 def open_window(

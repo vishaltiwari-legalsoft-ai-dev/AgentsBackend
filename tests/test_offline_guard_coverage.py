@@ -1,10 +1,12 @@
 """The suite's own guards, asserted instead of assumed.
 
-``backend/conftest.py`` claims four protections and every one of them exists
+``backend/conftest.py`` claims five protections and every one of them exists
 because a test run once reached production: a targets test wrote into the live
-``mr_config/targets`` doc, a GD test uploaded fixtures to the live bucket, and a
+``mr_config/targets`` doc, a GD test uploaded fixtures to the live bucket, a
 wave-1 agent in this very pass burned real OpenRouter credit with a script that
-went around them. Nothing asserted the guards themselves, so a refactor that
+went around them, and moving the DataForSEO credential onto ``Settings`` put a
+developer's ``.env`` within reach of every test — which promptly bought two
+live Google SERP calls. Nothing asserted the guards themselves, so a refactor that
 quietly neutered one would show up as a production write, not a red test.
 
 Everything here is inert: the guards are observed, never exercised against a
@@ -18,7 +20,7 @@ import pytest
 
 
 # --------------------------------------------------------------------------- #
-# The four guards conftest.py documents
+# The five guards conftest.py documents
 # --------------------------------------------------------------------------- #
 
 def test_the_agent_offline_flags_are_on_for_every_test():
@@ -48,6 +50,37 @@ def test_cloud_storage_reports_itself_unconfigured():
     from app.services import storage
 
     assert storage.is_configured() is False
+
+
+def test_the_dataforseo_credential_reads_empty_so_no_serp_call_can_bill():
+    """A developer's real credential in .env must not turn a test run into a
+    bill. Both halves, and the environment the process was started with."""
+    from app.config import settings
+
+    assert not settings.dataforseo_login
+    assert not settings.dataforseo_password
+    assert not os.environ.get("DATAFORSEO_LOGIN")
+    assert not os.environ.get("DATAFORSEO_PASSWORD")
+
+
+def test_the_serp_engines_refuse_rather_than_calling_out(monkeypatch):
+    """The guard's mechanism, not its symptom: with no credential the GEO
+    agent's Google engines error before a socket is opened — and error, not
+    ``no_aio``, so a blocked test can never be mistaken for "Google showed no
+    AI answer"."""
+    import httpx
+
+    from final_geo_agent import geo_engines
+
+    def never(*a, **kw):
+        raise AssertionError("a live DataForSEO call was attempted in tests")
+
+    monkeypatch.setattr(httpx, "post", never)
+    assert geo_engines.dataforseo_creds() == ("", "")
+    for engine in geo_engines.SERP_ENGINES:
+        answer = geo_engines.poll_engine(engine, "best legal intake service")
+        assert answer.no_aio is False
+        assert "DATAFORSEO_LOGIN" in (answer.error or "")
 
 
 def test_the_llm_entry_point_refuses_rather_than_calling_out(monkeypatch):

@@ -28,7 +28,7 @@ The ledger is also documentation with teeth. ``WORKSPACE_SHARED`` is not a
 euphemism for "insecure" — it is a checked-in, counted statement that these
 routes serve the same rows to every signed-in caller, which is *correct* for a
 single shared team workspace and *wrong* the moment a second client is added.
-Today that count is 48. When the workspace boundary lands, the number moves,
+Today that count is 49. When the workspace boundary lands, the number moves,
 and :func:`test_workspace_shared_surface_has_not_grown_silently` makes anyone
 who grows it say so on purpose.
 """
@@ -39,7 +39,9 @@ from fastapi.routing import APIRoute
 
 from app.main import app as fastapi_app
 from app.routers.tests.conftest import client
-from app.security import get_current_user, require_admin, require_creator
+from app.security import (
+    get_current_user, require_admin, require_creator, require_geo_editor,
+)
 
 # --------------------------------------------------------------------------- #
 # Classifications
@@ -64,6 +66,21 @@ SHARED_CATALOG = "SHARED_CATALOG"
 ADMIN_ONLY = "ADMIN_ONLY"
 CREATOR_ONLY = "CREATOR_ONLY"
 
+#: Behind ``require_geo_editor``: the GEO agent's registry-shaping routes, open
+#: to a role that grants those and nothing else.
+#:
+#: This is the first PER-AGENT role in the service, and it needs its own label
+#: for a specific reason. Eight of these nine routes were ``CREATOR_ONLY``. Dropping
+#: them into ``WORKSPACE_SHARED`` — which is what happens by default, since
+#: they still have an auth dependency and are no longer creator-gated — would
+#: have moved :data:`WORKSPACE_SHARED_BASELINE` from 49 to 57 and read, in the
+#: diff, as "eight more routes every signed-in caller can reach". They are the
+#: opposite: eight routes that got NARROWER for everyone except six named
+#: people. The ratchet exists to make permission growth loud, so the answer is
+#: a classification that describes what actually happened, not the nearest
+#: existing label with room in it.
+GEO_EDITOR_ONLY = "GEO_EDITOR_ONLY"
+
 #: No FastAPI auth dependency, but guarded *inside the handler* by a shared
 #: secret compared with :func:`hmac.compare_digest`. A dependency-graph scan
 #: alone would call these unauthenticated, which is why
@@ -82,6 +99,7 @@ _AUTHENTICATED = {
     SHARED_CATALOG,
     ADMIN_ONLY,
     CREATOR_ONLY,
+    GEO_EDITOR_ONLY,
 }
 
 # --------------------------------------------------------------------------- #
@@ -112,19 +130,33 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     ("POST", "/api/admin/settings"): CREATOR_ONLY,
     ("POST", "/api/admin/settings/test"): CREATOR_ONLY,
     ("GET", "/api/cron/jobs"): CREATOR_ONLY,
-    ("PUT", "/api/geo/brands/{brand_id}/config"): CREATOR_ONLY,
-    ("PUT", "/api/geo/brands/{brand_id}/personas"): CREATOR_ONLY,
-    ("PUT", "/api/geo/brands/{brand_id}/prompts"): CREATOR_ONLY,
-    ("POST", "/api/geo/brands/{brand_id}/prompts/bulk"): CREATOR_ONLY,
-    ("POST", "/api/geo/brands/{brand_id}/prompts/custom"): CREATOR_ONLY,
-    ("POST", "/api/geo/brands/{brand_id}/prompts/generate"): CREATOR_ONLY,
-    ("POST", "/api/geo/brands/{brand_id}/rescan"): CREATOR_ONLY,
-    ("POST", "/api/geo/brands/{brand_id}/strategy/generate"): CREATOR_ONLY,
     ("POST", "/api/news"): CREATOR_ONLY,
     ("POST", "/api/seo-geo/brands"): CREATOR_ONLY,
     ("DELETE", "/api/seo-geo/brands/{brand_id}"): CREATOR_ONLY,
     ("PUT", "/api/seo-geo/competitors/{brand_id}"): CREATOR_ONLY,
     ("POST", "/api/seo-geo/oauth/disconnect/{brand_id}"): CREATOR_ONLY,
+    # --- the GEO agent's registry, open to the GEO editor role -------------- #
+    # Was CREATOR_ONLY until 2026-09-04. Same handlers, same rows, narrower
+    # role: ``require_geo_editor`` instead of ``require_creator``. Pinned by
+    # name in GEO_EDITOR_ROUTES below.
+    #
+    # ``POST /api/geo/brands`` is the ninth and the only one that was not a
+    # relabelling: it is a NEW route, and it writes the shared brand registry
+    # (``state.load("brands")``, one global document — the same rows every
+    # WORKSPACE_SHARED GEO read below serves). It is GEO_EDITOR_ONLY rather
+    # than WORKSPACE_SHARED because it is gated: an ordinary signed-in caller
+    # gets 403, so it does not grow the un-gated surface the baseline counts.
+    # It sits alongside the Creator-only ``POST /api/seo-geo/brands``, which
+    # keeps its own guard — this one creates, that one also overwrites.
+    ("POST", "/api/geo/brands"): GEO_EDITOR_ONLY,
+    ("PUT", "/api/geo/brands/{brand_id}/config"): GEO_EDITOR_ONLY,
+    ("PUT", "/api/geo/brands/{brand_id}/personas"): GEO_EDITOR_ONLY,
+    ("PUT", "/api/geo/brands/{brand_id}/prompts"): GEO_EDITOR_ONLY,
+    ("POST", "/api/geo/brands/{brand_id}/prompts/bulk"): GEO_EDITOR_ONLY,
+    ("POST", "/api/geo/brands/{brand_id}/prompts/custom"): GEO_EDITOR_ONLY,
+    ("POST", "/api/geo/brands/{brand_id}/prompts/generate"): GEO_EDITOR_ONLY,
+    ("POST", "/api/geo/brands/{brand_id}/rescan"): GEO_EDITOR_ONLY,
+    ("POST", "/api/geo/brands/{brand_id}/strategy/generate"): GEO_EDITOR_ONLY,
     # --- scheduled jobs, guarded by a shared secret in the handler --------- #
     ("POST", "/api/geo/cron/poll"): CRON_SECRET,
     ("POST", "/api/mr/cron/refresh"): CRON_SECRET,
@@ -228,6 +260,11 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     ("GET", "/api/runs"): TENANT_SCOPED,
     ("GET", "/api/usage"): TENANT_SCOPED,
     # --- shared across the whole workspace, with no boundary object -------- #
+    # Agents health: the hub's per-agent rollup deliberately aggregates the
+    # WHOLE workspace's run trail — every caller's runs and who ran each agent
+    # — the same cross-user rows the admin Database panel browses raw and
+    # ``/api/issues`` composes for the same single-team workspace.
+    ("GET", "/api/agents/health"): WORKSPACE_SHARED,
     # Canva: one module-level ``_active_token`` in ``routers/canva.py`` holds
     # the most recent OAuth grant, so every caller imports into whichever
     # account authorised last. The file says so itself.
@@ -303,7 +340,38 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
 #: replaced one-for-one by the four brand-scoped ``/geo/brands/{id}/page-check*``
 #: routes (net zero), and ``GET /api/issues`` was added — a read over the same
 #: shared brand registry every other GEO/SEO read already composes.
-WORKSPACE_SHARED_BASELINE = 48
+#:
+#: 48 → 49 on 2026-09-02: ``GET /api/agents/health`` — the hub's per-agent
+#: health rollup. Workspace-wide by design: it reads every caller's run rows
+#: and names who used each agent, which is the panel's whole point for one
+#: shared team and a per-caller filter the day a second tenant signs in.
+WORKSPACE_SHARED_BASELINE = 49
+
+#: The GEO editor surface, BY NAME. Not a count — a count would let a future
+#: route join the role while another left it and say nothing, and the thing
+#: worth knowing about a per-agent role is exactly *which* routes it opens.
+#:
+#: :func:`test_the_geo_editor_surface_is_exactly_the_pinned_set` asserts this
+#: equals the GEO_EDITOR_ONLY entries in the ledger, so adding a ninth route to
+#: the role means editing this set in the same commit. That is the whole
+#: intent: the role was introduced to be narrow, and "narrow" is a claim that
+#: decays silently unless something holds it.
+GEO_EDITOR_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    {
+        # 8 -> 9 on 2026-09-04: self-serve brand creation. Deliberate, and the
+        # reason the role exists — adding a brand was the last thing in this
+        # panel that still required a Creator.
+        ("POST", "/api/geo/brands"),
+        ("PUT", "/api/geo/brands/{brand_id}/config"),
+        ("PUT", "/api/geo/brands/{brand_id}/personas"),
+        ("PUT", "/api/geo/brands/{brand_id}/prompts"),
+        ("POST", "/api/geo/brands/{brand_id}/prompts/bulk"),
+        ("POST", "/api/geo/brands/{brand_id}/prompts/custom"),
+        ("POST", "/api/geo/brands/{brand_id}/prompts/generate"),
+        ("POST", "/api/geo/brands/{brand_id}/rescan"),
+        ("POST", "/api/geo/brands/{brand_id}/strategy/generate"),
+    }
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -329,6 +397,11 @@ _AUTH_GUARDS = {
     get_current_user: "user",
     require_admin: "admin",
     require_creator: "creator",
+    # Without this entry a ``require_geo_editor`` route would walk out as
+    # ``{"user"}`` — indistinguishable from an unguarded signed-in route — and
+    # the GEO_EDITOR_ONLY label below would be an unchecked assertion about a
+    # guard nothing could see.
+    require_geo_editor: "geo_editor",
 }
 
 
@@ -413,6 +486,19 @@ def test_classifications_match_the_real_dependency_graph() -> None:
                 wrong.append(f"{method} {route.path}: ADMIN_ONLY but no require_admin")
             elif label == CREATOR_ONLY and "creator" not in guards:
                 wrong.append(f"{method} {route.path}: CREATOR_ONLY but no require_creator")
+            elif label == GEO_EDITOR_ONLY and "geo_editor" not in guards:
+                wrong.append(
+                    f"{method} {route.path}: GEO_EDITOR_ONLY but no require_geo_editor"
+                )
+            # The reverse, and the one that actually bites: a route wearing the
+            # narrow guard while the ledger still calls it something broader is
+            # a silent DOWNGRADE — the label promises Creator, the code accepts
+            # any GEO editor. Caught in both directions or not at all.
+            elif label != GEO_EDITOR_ONLY and "geo_editor" in guards:
+                wrong.append(
+                    f"{method} {route.path}: {label} but sits behind "
+                    "require_geo_editor — classify it GEO_EDITOR_ONLY"
+                )
     assert not wrong, "Ledger disagrees with the dependency graph:\n  " + "\n  ".join(wrong)
 
 
@@ -432,6 +518,59 @@ def test_workspace_shared_surface_has_not_grown_silently() -> None:
         f"WORKSPACE_SHARED is down to {actual} from {WORKSPACE_SHARED_BASELINE} — "
         "nice. Lower WORKSPACE_SHARED_BASELINE to lock the win in."
     )
+
+
+def test_the_geo_editor_surface_is_exactly_the_pinned_set() -> None:
+    """The per-agent role opens these nine routes and no others.
+
+    Two-sided, like the WORKSPACE_SHARED ratchet above and for the same reason:
+    a role introduced as "narrow" stays narrow only while something refuses to
+    let it widen quietly. Granting a tenth route to the GEO editors is a real
+    permission change and has to be typed into GEO_EDITOR_ROUTES to ship, where
+    it is one line in a diff a reviewer reads. That is exactly what the ninth
+    (``POST /api/geo/brands``) did.
+
+    The set is checked against the ledger AND against the live dependency
+    graph, so it cannot be satisfied by relabelling alone: a route the ledger
+    calls GEO_EDITOR_ONLY that does not actually resolve through
+    ``require_geo_editor`` fails
+    :func:`test_classifications_match_the_real_dependency_graph`, and a route
+    that resolves through it without the label fails there too.
+    """
+    labelled = {mp for mp, label in ROUTE_LEDGER.items() if label == GEO_EDITOR_ONLY}
+    assert labelled == set(GEO_EDITOR_ROUTES), (
+        "The GEO editor surface changed. Added routes:\n  "
+        + "\n  ".join(f"{m} {p}" for m, p in sorted(labelled - GEO_EDITOR_ROUTES))
+        + "\nRemoved routes:\n  "
+        + "\n  ".join(f"{m} {p}" for m, p in sorted(GEO_EDITOR_ROUTES - labelled))
+        + "\nIf that is deliberate, edit GEO_EDITOR_ROUTES and say why in the commit."
+    )
+
+    live = {
+        (method, route.path)
+        for route in fastapi_app.routes
+        if isinstance(route, APIRoute) and "geo_editor" in _guards_of(route)
+        for method in route.methods - {"HEAD", "OPTIONS"}
+    }
+    assert live == set(GEO_EDITOR_ROUTES), (
+        "routes actually behind require_geo_editor do not match the pinned set: "
+        f"unexpected={sorted(live - GEO_EDITOR_ROUTES)} "
+        f"missing={sorted(GEO_EDITOR_ROUTES - live)}"
+    )
+
+
+def test_the_geo_editor_role_did_not_widen_the_shared_surface() -> None:
+    """The narrowing must not have leaked out as growth somewhere else.
+
+    Reclassifying the eight routes as WORKSPACE_SHARED would have been the
+    path of least resistance and would have moved the baseline 49 → 57 —
+    "eight more routes every signed-in caller can reach", which is the precise
+    thing the ratchet was built to catch and the precise opposite of what this
+    change did. Asserting the two sets are disjoint states that in one line.
+    """
+    shared = {mp for mp, label in ROUTE_LEDGER.items() if label == WORKSPACE_SHARED}
+    assert not (shared & GEO_EDITOR_ROUTES), sorted(shared & GEO_EDITOR_ROUTES)
+    assert len(shared) == WORKSPACE_SHARED_BASELINE
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,7 @@ is labelled an estimate; the goal is ranking the work, not forecasting revenue.
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import date, timedelta
 
 from . import competitors, gsc_oauth, pages as pages_mod, site_brain, state, topics
@@ -45,26 +46,147 @@ def ctr_at(position: float) -> float:
 
 
 # ------------------------------- brand registry -------------------------------
+#
+# ONE Firestore document, ``seo_geo/brands``, holding the whole list — read by
+# a2, a9 (Blog Writer), a10 (GEO) and the Issues rail. It is not per-tenant, and
+# the tenancy ledger records that at
+# ``app/routers/tests/test_route_tenancy_conformance.py``.
+#
+# Every write goes through ``state.mutate``. It used to be load-then-save, which
+# on a shared list is a lost update: two people adding a brand at the same time
+# both read the same list, both append their own, and the second save overwrites
+# the first — one brand gone, nothing anywhere saying so. Harmless while a
+# Creator added a brand every few months; not harmless now that any GEO editor
+# can add one and twelve go in during a single sitting.
 
-def list_brands() -> list[dict]:
-    doc = state.load("brands")
+#: The registry document id. Written down once so a reader and a writer cannot
+#: drift onto two different documents.
+BRANDS_DOC = "brands"
+
+
+def _brands_of(doc: dict | None) -> list[dict]:
+    """The brand list a registry document holds, defaulting the empty case.
+
+    An absent or empty document reads as :data:`DEFAULT_BRANDS` — the behaviour
+    ``list_brands`` has always had, kept in one place because it now has to hold
+    identically INSIDE a transaction: a first-ever write must build on the same
+    list every reader has been seeing, not on an empty one.
+    """
     return doc["brands"] if doc and doc.get("brands") else [dict(b) for b in DEFAULT_BRANDS]
 
 
+def _sorted(brands: list[dict]) -> list[dict]:
+    return sorted(brands, key=lambda b: str(b.get("name") or b.get("id") or "").lower())
+
+
+def list_brands() -> list[dict]:
+    return _brands_of(state.load(BRANDS_DOC))
+
+
 def upsert_brand(brand: dict) -> list[dict]:
-    brands = list_brands()
-    brands = [b for b in brands if b["id"] != brand["id"]] + [brand]
-    brands.sort(key=lambda b: b["name"].lower())
-    state.save("brands", {"brands": brands})
-    return brands
+    """Create or replace one brand record. Last writer wins on THIS brand only —
+    concurrent edits to other brands in the list are no longer lost."""
+
+    def change(doc: dict) -> tuple[dict, list[dict]]:
+        brands = _sorted([b for b in _brands_of(doc) if b["id"] != brand["id"]] + [brand])
+        return {"brands": brands}, brands
+
+    return state.mutate(BRANDS_DOC, change)
+
+
+def create_brand(brand: dict) -> dict:
+    """Add a brand that does not exist yet; raise ``ValueError`` if it does.
+
+    Separate from :func:`upsert_brand` because self-serve creation must never
+    silently overwrite a brand somebody else already set up — same slug, same
+    ``geo-config-*`` and ``gsc-auth-*`` documents underneath it, a year of
+    measurement now attached to a different name. The existence check runs
+    INSIDE the transaction, so two people typing the same brand name at once end
+    with one brand and one honest 409, not with a coin toss.
+    """
+
+    def change(doc: dict) -> tuple[dict, dict]:
+        brands = _brands_of(doc)
+        if any(b["id"] == brand["id"] for b in brands):
+            raise ValueError(f"A brand with the id '{brand['id']}' already exists")
+        return {"brands": _sorted(brands + [brand])}, dict(brand)
+
+    return state.mutate(BRANDS_DOC, change)
+
+
+def set_brand_enabled(brand_id: str, enabled: bool) -> dict:
+    """Flip one brand's ``enabled`` flag; raise ``KeyError`` if it is not there.
+
+    This is what a self-serve "remove" does. ``enabled`` is already the filter
+    every consumer applies (``geo._enabled_brands``, ``blog_writer._brand``,
+    ``issues``), so switching it off takes the brand out of GEO, SEO, Blog Writer
+    and Issues in one write — and switching it back on restores it, with every
+    stored measurement, prompt universe and Search Console grant untouched.
+    """
+
+    def change(doc: dict) -> tuple[dict, dict]:
+        brands = _brands_of(doc)
+        if not any(b["id"] == brand_id for b in brands):
+            raise KeyError(brand_id)
+        out = [dict(b, enabled=enabled) if b["id"] == brand_id else b for b in brands]
+        return {"brands": out}, next(b for b in out if b["id"] == brand_id)
+
+    return state.mutate(BRANDS_DOC, change)
 
 
 def delete_brand(brand_id: str) -> list[dict]:
-    brands = [b for b in list_brands() if b["id"] != brand_id]
-    state.save("brands", {"brands": brands})
+    """HARD delete: drop the registry entry and this brand's SEO run + to-dos.
+
+    It leaves every other ``…-{brand_id}`` document behind — including
+    ``gsc-auth-{brand_id}``, which holds a live Google Search Console refresh
+    token. That is why it stays Creator-only and why the self-serve path is
+    :func:`set_brand_enabled` instead.
+    """
+
+    def change(doc: dict) -> tuple[dict, list[dict]]:
+        brands = [b for b in _brands_of(doc) if b["id"] != brand_id]
+        return {"brands": brands}, brands
+
+    brands = state.mutate(BRANDS_DOC, change)
     state.delete(f"run-{brand_id}")
     state.delete(f"todos-{brand_id}")
     return brands
+
+
+# ---------------------------- brand record shaping ----------------------------
+#
+# Both the Creator upsert (``POST /api/seo-geo/brands``) and the GEO editor's
+# self-serve create (``POST /api/geo/brands``) turn typed text into the same
+# record, so the rules live here rather than in whichever router was written
+# first. Two copies of "what is a valid brand id" is two answers to it.
+
+def slugify_brand_id(value: str) -> str:
+    """The brand id derived from a name. Raises ``ValueError`` when nothing is
+    left — a brand of punctuation has no id and must not get an empty one, which
+    would collide with every other brand of punctuation."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
+    if not slug:
+        raise ValueError("Brand needs a name")
+    return slug
+
+
+def normalize_domain(value: str) -> str:
+    """The bare host from anything a human types: a domain, or a full URL.
+
+    ``https://www.Acme.com/pricing?x=1`` and ``acme.com`` must land on the same
+    string, because that string is the brand's identity in Search Console
+    (``sc-domain:{domain}``), in citation matching and in the GEO alias set. The
+    path is dropped rather than kept: a domain with a ``/`` in it silently broke
+    every one of those.
+    """
+    raw = (value or "").strip()
+    host = re.sub(r"^[a-z][a-z0-9+.-]*://", "", raw, flags=re.I)  # scheme
+    host = host.split("/")[0].split("?")[0].split("#")[0]          # path/query
+    host = host.rsplit("@", 1)[-1].split(":")[0]                   # userinfo, port
+    host = host.strip().lower().removeprefix("www.").rstrip(".")
+    if "." not in host or not re.fullmatch(r"[a-z0-9.-]+", host):
+        raise ValueError("Enter the site domain, e.g. brand.com")
+    return host
 
 
 # ------------------------------- to-do building -------------------------------

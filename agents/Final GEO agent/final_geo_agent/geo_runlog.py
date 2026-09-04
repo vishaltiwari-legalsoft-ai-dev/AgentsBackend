@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections.abc import Iterable
 
 from final_geo_agent import geo_store
 from seo_geo_agent import state
@@ -59,6 +60,39 @@ def recent_runs(brand_id: str, n: int = 30) -> list[dict]:
     """The last ``n`` sweeps, newest first."""
     doc = state.load(runlog_doc_id(brand_id)) or {}
     return list(doc.get("runs") or [])[: max(0, n)]
+
+
+def sweep_days(brand_id: str, days: Iterable[str]) -> set[str]:
+    """The UTC days inside ``days`` on which this brand actually ran a sweep.
+
+    DAYS, not log entries, and the difference is load-bearing. It is what the
+    report's per-engine ``n_expected`` scales by, and the invariant it has to
+    preserve is::
+
+        n_answers <= n_expected x len(sweep_days(...))
+
+    A day-doc holds exactly one record per ``(prompt_id, run)`` per engine
+    (``geo_poll._merge_answers``), so a day can never contain more than one
+    sweep's worth of answers however many sweeps touched it — and a truncated
+    cron sweep continued by a manual check later the same day writes TWO log
+    entries for one day's answers. Counting entries would price that day twice
+    and invent a shortfall out of arithmetic.
+
+    Sourced from the run log because that is the record of sweeps that ended;
+    ``geo_history`` looks similar and is not, because a sweep under
+    ``MIN_POINT_ANSWERS`` earns no point and would silently go uncounted.
+
+    Bounded by :data:`MAX_RUNS`: at up to two sweeps a day that covers ~60 days,
+    comfortably past ``geo_window.MAX_DAYS``. A brand polled far harder than
+    that would undercount its oldest days — it would take four sweeps a day for
+    a month to reach.
+    """
+    doc = state.load(runlog_doc_id(brand_id)) or {}
+    wanted = set(days)
+    return {
+        day for run in doc.get("runs") or []
+        if (day := run.get("day")) in wanted
+    }
 
 
 def plan_progress(brand_id: str) -> dict | None:

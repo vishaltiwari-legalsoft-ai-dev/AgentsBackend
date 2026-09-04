@@ -2,8 +2,9 @@
 
 Mounted under ``/api``. Conventions follow the a2 SEO router: any signed-in
 user can read and poll; registry-shaping mutations (prompts, personas, config)
-are Creator-only; ``CredentialMissing`` surfaces as 503 with the real message
-(never fabricated data); unknown brand → 404; bad state → 409/422.
+need the GEO editor role (``require_geo_editor`` — Creators included);
+``CredentialMissing`` surfaces as 503 with the real message (never fabricated
+data); unknown brand → 404; bad state → 409/422.
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response
 from pydantic import BaseModel, Field
 
-from app.security import get_current_user, require_creator
+from app.security import get_current_user, require_geo_editor
 from app.services.run_tracking import CHANGE, CRON, JOB, Activity, ActivityTrail
 from final_geo_agent import (
     geo_compare, geo_engines, geo_history, geo_poll, geo_prompts, geo_runlog,
@@ -92,10 +93,38 @@ def reader_brand(brand_id: str, user: dict = Depends(get_current_user)) -> dict:
     return _brand_or_404(brand_id)
 
 
-def creator_brand(brand_id: str, _creator: dict = Depends(require_creator)) -> dict:
-    """The brand named in the path, for a Creator. Same ordering guarantee: 403
-    before 404."""
+def geo_editor_brand(brand_id: str, _editor: dict = Depends(require_geo_editor)) -> dict:
+    """The brand named in the path, for a GEO editor. Same ordering guarantee:
+    403 before 404.
+
+    This used to be ``creator_brand``. The eight routes behind it shape the GEO
+    registry — prompt universes, personas, brand config, rescans, strategy —
+    and Creator was the only elevated role in the service, so administering
+    this one agent meant handing out Settings → Secrets, the admin database
+    viewer, model config and every other agent along with it. The narrower role
+    grants the eight routes and nothing else; Creators still pass, because
+    ``is_geo_editor`` includes them.
+    """
     return _brand_or_404(brand_id)
+
+
+def geo_editor_registry_brand(
+    brand_id: str, _editor: dict = Depends(require_geo_editor)
+) -> dict:
+    """The brand named in the path, found in the registry whether or not it is
+    switched on. Same guard, same 403-before-404 ordering as
+    :func:`geo_editor_brand`.
+
+    Exists for exactly one reason: ``PUT config`` is where a brand is switched
+    OFF, so it has to be reachable for the brand that is currently off, or the
+    removal would be one-way and "reversible" would be a claim nothing backs.
+    Every other route keeps the enabled-only resolver — a switched-off brand is
+    invisible to reads, polls and the scheduler, which is the whole point.
+    """
+    for brand in insights.list_brands():
+        if brand["id"] == brand_id:
+            return brand
+    raise HTTPException(status_code=404, detail="Unknown brand")
 
 
 class PromptItem(BaseModel):
@@ -112,9 +141,35 @@ class PromptItem(BaseModel):
     persona: str | None = Field(default=None, max_length=geo_prompts.PERSONA_KEY_MAX)
 
 
+#: What a hand-written question costs to measure, as a choice the author has to
+#: make rather than a default they never see.
+#:
+#: ``geo_engines.SERP_INTENTS`` decides which prompts a BILLED Google SERP call
+#: (AI Overview + AI Mode) is spent on; ``"category"`` is in it, ``"brand"`` is
+#: not. Both endpoints below used to default ``intent`` to ``"category"``, so
+#: every question the team typed — including "is Legal Soft any good", where
+#: the buyer already has the name and a SERP call buys nothing — was billed
+#: paid search on top of the free chat engines.
+#:
+#: The values are the store's own (``geo_prompts.INTENTS``), so nothing
+#: downstream needs to learn a new vocabulary and existing rows stay readable.
+#: The third stored intent, ``"problem"``, is still written by the AI generator
+#: and still round-trips through ``PromptItem``; it is simply not one of the
+#: two choices a human is asked to make here.
+PromptIntent = Literal["category", "brand"]
+
+
 class CustomPromptIn(BaseModel):
     text: str = Field(min_length=5, max_length=400)
-    intent: str = "category"
+    # Required, no default: the caller must say which of the two this is.
+    intent: PromptIntent = Field(
+        description=(
+            "'category' — the question does NOT name the brand (discovery; "
+            "measured on the paid Google SERP engines as well as chat). "
+            "'brand' — the question already names the brand (chat engines only, "
+            "no billed search call)."
+        ),
+    )
     stage: str = "consideration"
 
 
@@ -123,7 +178,16 @@ class BulkPromptsIn(BaseModel):
     # reports per line, so the bound here is only a body-size ceiling
     text: str = Field(min_length=1, max_length=20_000)
     persona: str = Field(default="", max_length=geo_prompts.PERSONA_KEY_MAX)
-    intent: str = "category"
+    # Required, and it applies to EVERY line in the paste — which is why it
+    # matters more here than on the single-prompt endpoint: a 60-line paste
+    # silently defaulted to "category" was 60 billed SERP calls per sweep.
+    intent: PromptIntent = Field(
+        description=(
+            "Applied to every line in this paste. 'category' — the questions do "
+            "NOT name the brand (measured on the paid Google SERP engines too). "
+            "'brand' — they already name the brand (chat engines only)."
+        ),
+    )
     stage: str = "consideration"
 
 
@@ -165,6 +229,18 @@ class ConfigIn(BaseModel):
     # may run this brand at all
     poll_interval_days: int | None = Field(default=None, ge=1, le=30)
     auto_poll: bool | None = None
+    #: The brand's registry ``enabled`` flag — NOT part of the GEO config
+    #: document, and the only field here that writes the shared brand registry.
+    #:
+    #: It rides on this route because it is the same decision, made by the same
+    #: role, in the same panel: "this brand is one we watch". ``false`` is the
+    #: self-serve remove — the brand leaves GEO, SEO, Blog Writer and Issues at
+    #: once (they all filter on ``enabled``) and every stored measurement,
+    #: prompt universe and Search Console grant stays exactly where it is.
+    #: ``true`` puts it back. The destructive delete stays
+    #: ``DELETE /api/seo-geo/brands/{id}``, Creator-only, for the reasons in
+    #: ``insights.delete_brand``.
+    enabled: bool | None = None
 
 
 class RescanIn(BaseModel):
@@ -181,6 +257,16 @@ class PollIn(BaseModel):
     engines: list[str] | None = None
     runs: int = Field(default=geo_poll.DEFAULT_RUNS, ge=1, le=5)
     batch_size: int = Field(default=geo_poll.DEFAULT_BATCH, ge=1, le=50)
+    #: One id for one console poll LOOP, so every step of the same "Check now"
+    #: holds the brand from start to finish and a second person gets the same
+    #: honest refusal each time they try, rather than the two of them trading
+    #: the brand between batches.
+    #:
+    #: Deliberately unconstrained: ``geo_poll.loop_run_id`` cleans it and falls
+    #: back to per-step leasing when there is nothing usable left. A ``Field``
+    #: constraint here would 422 a poll loop over a cosmetic detail of a value
+    #: whose only job is to be different from everybody else's.
+    poll_token: str | None = None
 
 
 @router.get("/geo/config")
@@ -191,10 +277,26 @@ def geo_config(user: dict = Depends(get_current_user)) -> dict:
         # answer actually came from an OpenRouter stand-in
         "engine_status": geo_engines.engine_status(),
         "engine_labels": geo_engines.ENGINE_LABELS,
+        # How each engine is ASKED — kind, sample size, and which prompt intents
+        # it is spent on. Published because the console was mirroring
+        # ``SERP_ENGINES`` and ``CHAT_RUNS_PER_PROMPT`` as its own constants to
+        # explain why the engines return different answer counts, and a mirrored
+        # fact starts lying the day the real one changes.
+        "engine_specs": geo_engines.engine_shapes(),
         "default_runs": geo_poll.DEFAULT_RUNS,
         "default_daily_cap": geo_poll.DEFAULT_DAILY_CAP,
         "default_aio_monthly_cap": geo_poll.AIO_MONTHLY_CAP,
     }
+
+
+class BrandIn(BaseModel):
+    """A brand somebody typed into the panel: a name and the site's address."""
+
+    name: str = Field(min_length=1, max_length=80)
+    #: Accepts a bare domain or a pasted URL — ``insights.normalize_domain``
+    #: reduces both to the host, which is the brand's identity in Search
+    #: Console, in citation matching and in the GEO alias set.
+    url: str = Field(min_length=3, max_length=300)
 
 
 @router.get("/geo/brands")
@@ -220,9 +322,101 @@ def geo_brands(user: dict = Depends(get_current_user)) -> dict:
                 "recent_answers": geo_poll.recent_answer_count(brand, cfg),
                 "calls_used_today": geo_poll.used_today(cfg) if cfg else 0,
                 "competitors": len((cfg or {}).get("competitors") or []),
+                # The scheduled-check switch, per brand, off the config document
+                # already in hand — so the panel can render a row's toggle
+                # without a second request per brand. ``poll/status`` still
+                # serves the full picture for one open brand; this is the three
+                # facts a list row needs.
+                "auto_poll": bool((cfg or {}).get("auto_poll", True)),
+                "poll_interval_days": geo_poll.interval_days(cfg or {}),
+                "next_due_at": geo_poll.next_due_at(cfg or {}),
             }
         )
     return {"brands": brands}
+
+
+@router.post("/geo/brands", status_code=201)
+def create_geo_brand(
+    body: BrandIn,
+    _editor: dict = Depends(require_geo_editor),
+    act: Activity = trail.records("brand_created", "Added a brand", unit=CHANGE),
+) -> dict:
+    """Add a brand to the shared registry, self-serve, without a Creator.
+
+    Deliberately does the minimum and nothing else:
+
+    * **No questions.** The prompt universe starts empty and stays empty until
+      the team writes their own. Nothing here calls ``generate_universe`` — an
+      auto-generated universe is a paid model call the creator did not ask for,
+      followed by a measurement of questions nobody chose.
+    * **The scheduled check starts OFF**, at a 7-day interval for when it is
+      switched on (``PUT config`` with ``auto_poll: true``). A brand nobody has
+      switched on costs nothing: ``cron_poll`` reads its config, ``poll_due``
+      answers "auto-poll is off for this brand", and it is reported under
+      ``skipped`` without a single engine call.
+    * **``answer_counts_at`` is stamped at creation**, which is what keeps the
+      first listing after this cheap — see ``geo_poll.init_config``.
+
+    The registry entry lands first and the config second, both transactionally.
+    That order is the safe one: a registry entry whose config write failed is
+    just a brand ``ensure_config`` will seed on first read (the pre-existing
+    path, with its own defaults), whereas a config with no registry entry would
+    be a document no route can ever reach.
+    """
+    try:
+        brand = {
+            "id": insights.slugify_brand_id(body.name),
+            "name": body.name.strip(),
+            "domain": insights.normalize_domain(body.url),
+            "seeds": [],
+            "enabled": True,
+        }
+        brand["gsc_property"] = f"sc-domain:{brand['domain']}"
+        created = insights.create_brand(brand)
+    except ValueError as exc:
+        # 422 for "that is not a brand", 409 for "that brand is already here" —
+        # the panel words them differently and the second is not a bad request.
+        status = 409 if "already exists" in str(exc) else 422
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+    _for(act, created)
+    cfg: dict | None = None
+    warning: str | None = None
+    try:
+        cfg = geo_poll.init_config(
+            created,
+            auto_poll=False,
+            poll_interval_days=geo_poll.SELF_SERVE_POLL_INTERVAL_DAYS,
+        )
+    except Exception:  # noqa: BLE001 — the brand exists; seeding is recoverable
+        # Not re-raised: the registry entry has already landed, so a 500 here
+        # would tell the caller the brand does not exist and their retry would
+        # answer 409. ``ensure_config`` seeds this brand on its next read, with
+        # the older defaults.
+        logger.exception("geo: could not seed the config for new brand %s", created["id"])
+        warning = ("The brand was created, but its GEO settings could not be "
+                   "saved. Open the brand and set the scheduled check before "
+                   "relying on it.")
+
+    act.note(f"Brand added — {created['name']} ({created['domain']}); "
+             + ("no questions yet, scheduled check off" if cfg else "GEO settings NOT saved"))
+    return {
+        "brand": created,
+        "prompts": 0,
+        # Read back off the document that was actually written. ``None`` when
+        # the seed failed — reporting the schedule we INTENDED would be a lie
+        # about a brand whose stored schedule is now whatever
+        # ``ensure_config`` writes next (auto-poll on, every 2 days).
+        "auto_poll": cfg.get("auto_poll") if cfg else None,
+        "poll_interval_days": cfg.get("poll_interval_days") if cfg else None,
+        "warning": warning,
+        # Said out loud rather than left to the panel to infer: the two things
+        # this brand still needs before it measures anything.
+        "next_steps": [
+            "Write the questions this brand should be measured on",
+            "Switch the scheduled check on when you want it watched",
+        ],
+    }
 
 
 @router.get("/geo/brands/{brand_id}/prompts")
@@ -235,7 +429,7 @@ def get_prompts(brand: dict = Depends(reader_brand)) -> dict:
 
 @router.post("/geo/brands/{brand_id}/prompts/generate")
 def generate_prompts(
-    brand: dict = Depends(creator_brand),
+    brand: dict = Depends(geo_editor_brand),
     act: Activity = trail.records("prompts_generate", "Generated a prompt universe"),
 ) -> dict:
     _for(act, brand)
@@ -252,7 +446,7 @@ def generate_prompts(
 @router.post("/geo/brands/{brand_id}/prompts/custom")
 def add_custom_prompt(
     body: CustomPromptIn,
-    brand: dict = Depends(creator_brand),
+    brand: dict = Depends(geo_editor_brand),
     act: Activity = trail.records("prompt_custom_add", "Added a custom prompt"),
 ) -> dict:
     _for(act, brand)
@@ -269,7 +463,7 @@ def add_custom_prompt(
 @router.post("/geo/brands/{brand_id}/prompts/bulk")
 def add_prompts_bulk(
     body: BulkPromptsIn,
-    brand: dict = Depends(creator_brand),
+    brand: dict = Depends(geo_editor_brand),
     act: Activity = trail.records("prompts_bulk_add", "Pasted prompts into the universe"),
 ) -> dict:
     """A pasted list, one prompt per line. Partial acceptance is the normal
@@ -290,11 +484,20 @@ def add_prompts_bulk(
 
 @router.put("/geo/brands/{brand_id}/prompts")
 def put_prompts(
-    body: PromptsIn, brand: dict = Depends(creator_brand),
+    body: PromptsIn, brand: dict = Depends(geo_editor_brand),
     act: Activity = trail.records("prompts_saved", "Edited the prompt universe", unit=CHANGE),
 ) -> dict:
-    if not body.prompts:
-        raise HTTPException(status_code=422, detail="At least one prompt is required")
+    # An empty list clears the universe, and is accepted — the team asked for
+    # it. It used to 422, which meant the only way to empty a universe was to
+    # delete prompts one at a time, and a 422 on a request that says exactly
+    # what it wants is the API arguing with its user.
+    #
+    # This does NOT make an empty universe a working state, and nothing here
+    # papers over it: ``geo_poll.poll_step`` raises on an empty universe and
+    # the poll route answers 409 "No enabled prompts — generate the prompt
+    # universe first". Clearing is allowed; checking a cleared brand still
+    # fails, loudly, at the point where the answer would otherwise be a
+    # measurement of nothing reported as a score.
     _for(act, brand)
     try:
         universe = geo_prompts.save_universe(
@@ -305,13 +508,18 @@ def put_prompts(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    act.note(f"Prompt universe saved — {len(body.prompts)} prompts")
+    act.note(
+        "Prompt universe cleared — 0 prompts; checks on this brand will fail "
+        "until it is repopulated"
+        if not body.prompts
+        else f"Prompt universe saved — {len(body.prompts)} prompts"
+    )
     return universe
 
 
 @router.put("/geo/brands/{brand_id}/personas")
 def put_personas(
-    body: PersonasIn, brand: dict = Depends(creator_brand),
+    body: PersonasIn, brand: dict = Depends(geo_editor_brand),
     act: Activity = trail.records("personas_saved", "Edited the prompt personas", unit=CHANGE),
 ) -> dict:
     """Replace the persona list; an empty list clears it. Prompts tagged with a
@@ -335,7 +543,7 @@ def get_geo_brand_config(brand: dict = Depends(reader_brand)) -> dict:
 
 @router.put("/geo/brands/{brand_id}/config")
 def put_geo_brand_config(
-    body: ConfigIn, brand: dict = Depends(creator_brand),
+    body: ConfigIn, brand: dict = Depends(geo_editor_registry_brand),
     act: Activity = trail.records("config_saved", "Edited the GEO brand config", unit=CHANGE),
 ) -> dict:
     # Seed the defaults first. ``save_config`` patches whatever document it
@@ -343,33 +551,85 @@ def put_geo_brand_config(
     # before anything has read the config) would exist WITHOUT the brand's own
     # aliases — and a poll against it would then find the brand in none of its
     # own answers.
-    geo_poll.ensure_config(brand)
+    current = geo_poll.ensure_config(brand)
     # exclude_none serves both levels: an omitted top-level field is left
     # untouched, and a competitor without a domain is stored without one rather
     # than with ``"domain": null`` for the alias derivation to trip over
     patch = body.model_dump(exclude_none=True)
     _for(act, brand)
-    act.note(f"GEO config saved — {', '.join(sorted(patch)) or 'no fields'}")
-    return geo_poll.save_config(brand["id"], patch)
+    # ``enabled`` belongs to the brand REGISTRY, not to this config document, so
+    # it is lifted out before the patch goes anywhere near ``save_config``.
+    # Written first: if the registry write fails the caller gets an honest error
+    # and nothing changed, whereas a config saved against a brand that was never
+    # switched off is a panel showing a state the data does not have.
+    enabled = patch.pop("enabled", None)
+    if enabled is not None and bool(enabled) != bool(brand.get("enabled", True)):
+        try:
+            brand = insights.set_brand_enabled(brand["id"], bool(enabled))
+        except KeyError as exc:  # deleted between the resolver and here
+            raise HTTPException(status_code=404, detail="Unknown brand") from exc
+        act.note(
+            f"Brand switched {'on' if enabled else 'off'} — {brand.get('name')}"
+            + ("" if enabled else "; it leaves GEO, SEO, Blog Writer and Issues, "
+                                 "and every stored measurement is kept")
+        )
+    # No config fields left after the pop = an enabled-only request; writing the
+    # config document anyway would be a transaction that changes nothing but
+    # ``updated_at``.
+    saved = geo_poll.save_config(brand["id"], patch) if patch else current
+    if patch:
+        act.note(f"GEO config saved — {', '.join(sorted(patch))}")
+    # ``enabled`` lives on the registry record, so it is echoed here rather than
+    # read back off the config document, which does not carry it.
+    return saved | {"enabled": bool(brand.get("enabled", True))}
 
 
 @router.post("/geo/brands/{brand_id}/poll/step")
 def poll_step(
     body: PollIn,
     brand: dict = Depends(reader_brand),
+    user: dict = Depends(get_current_user),
     act: Activity = trail.records("poll_step", "AI answer poll"),
 ) -> dict:
     _for(act, brand)
     try:
         result = geo_poll.poll_step(
-            brand, engines=body.engines, runs=body.runs, batch_size=body.batch_size
+            brand, engines=body.engines, runs=body.runs, batch_size=body.batch_size,
+            # Who to name if this step collides with a check already running —
+            # another console in this workspace, or the 02:00 cron. "A check is
+            # already running" is only actionable if it says who.
+            holder=str(user.get("email") or "another console"),
+            # ALWAYS a named loop. The client token is the good case — one
+            # id per "Check now", so the check is one check across its steps.
+            # Falling back to the session and then the account keeps a client
+            # that sends nothing working, and keeps the once-a-day gate
+            # enforceable, which needs a loop it can recognise across steps.
+            #
+            # Scoped to the signed-in account, because the token is a plain
+            # string the client picks: unscoped, two people who both send "1"
+            # would share one lease and both drive the same sweep.
+            lease_run_id=geo_poll.loop_run_id(
+                str(user.get("id") or ""),
+                body.poll_token or user.get("session_id") or user.get("id"),
+            ),
         )
     except CredentialMissing as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     engines = ", ".join(body.engines) if body.engines else "all engines"
-    act.note(f"AI answer poll ({engines}, batch {body.batch_size})")
+    # 200 on a refusal, not an error: the request was valid and the honest
+    # answer is "not now". ``stop_code`` says which refusal, ``unlocks_at`` when
+    # it clears, so the console words each one properly and stops rather than
+    # looping against something that will keep refusing it.
+    if result.get("stop_code") == geo_poll.STOP_LEASE_HELD:
+        act.note(f"AI answer poll refused — a check by {result['lease_held_by']} "
+                 f"is already running for this brand")
+    elif result.get("stop_code") == geo_poll.STOP_CHECKED_TODAY:
+        act.note("AI answer poll refused — this brand has already been checked "
+                 f"today; next check unlocks at {result['unlocks_at']}")
+    else:
+        act.note(f"AI answer poll ({engines}, batch {body.batch_size})")
     return result
 
 
@@ -397,9 +657,20 @@ def report(
         # the CLAMPED window — the number in the response is the number that
         # was actually measured, never the one the query string asked for
         "days": window.days,
+        # Checks the brand ran inside that window. The per-engine ``n_expected``
+        # is what ONE check owes, so this is what scales it: 0 means no checks
+        # in this period — say that, never divide by it.
+        "n_sweeps": window.n_sweeps,
         # so an engine whose last measurement fell outside the window can say
         # when it was measured instead of disappearing from the panel
         "engine_last_seen": cfg.get("engine_last_seen") or {},
+        # ... and, on the same surface, WHY it stopped. This is the cold-open
+        # read: a spent search budget was only ever reported by ``poll/step``,
+        # so the "AI Overview paused" notice lived exactly as long as one
+        # browser tab driving one check. A brand whose credit ran out three
+        # weeks ago opened as a normal-looking stale number, which is the
+        # failure this pair of facts exists to prevent.
+        **geo_poll.search_credit_state(cfg),
         "competitor_names": {
             geo_compare.entity_key(c): c.get("name", "")
             for c in cfg.get("competitors") or []
@@ -444,7 +715,7 @@ def comparison(
 @router.post("/geo/brands/{brand_id}/rescan")
 def rescan(
     body: RescanIn,
-    brand: dict = Depends(creator_brand),
+    brand: dict = Depends(geo_editor_brand),
     act: Activity = trail.records("rescan_mentions", "Rescanned stored answers", unit=CHANGE),
 ) -> dict:
     """Re-read stored answers with the current competitor list.
@@ -622,7 +893,7 @@ class ActionUpdateIn(BaseModel):
 
 @router.post("/geo/brands/{brand_id}/strategy/generate")
 def strategy_generate(
-    brand: dict = Depends(creator_brand),
+    brand: dict = Depends(geo_editor_brand),
     act: Activity = trail.records("strategy_generate", "Generated an Action Plan"),
 ) -> dict:
     """Full-model GEO strategy grounded in this week's measured numbers; the

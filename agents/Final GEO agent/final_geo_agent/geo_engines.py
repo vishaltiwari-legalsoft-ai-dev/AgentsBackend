@@ -11,10 +11,12 @@ Two kinds of engine live behind one interface, :class:`EngineSpec`:
 * **chat** engines (Perplexity, Gemini, ChatGPT) are sampled — the same prompt
   asked several times, native key first, OpenRouter stand-in as fallback;
 * **serp** engines (Google AI Overview, Google AI Mode) are snapshots of the
-  live Google surface, one call per prompt, billed per call, with a vendor
-  seam *below* the engine id: DataForSEO when its credentials exist, SerpAPI
-  for AI Overview when only that key exists. The engine id is what the product
-  measures; the vendor is how it was fetched, disclosed on ``via``.
+  live Google surface, one call per prompt, billed per call, and both served
+  by DataForSEO — the one search provider. There is no vendor selection left
+  to make: SerpAPI was removed on 2026-09-04 because it has no AI Mode
+  endpoint at all, so ``ai_mode`` could only ever read a permanent zero next
+  to four working engines. The engine id is what the product measures; the
+  vendor is how it was fetched, disclosed on ``via``.
 
 Adapters never raise — any HTTP/parse failure comes back as
 ``EngineAnswer(error=...)`` so one bad engine degrades instead of killing a
@@ -24,7 +26,6 @@ override, else env); a missing key just makes the engine unavailable.
 from __future__ import annotations
 
 import base64
-import os
 import time
 from dataclasses import dataclass, field
 from functools import partial
@@ -34,7 +35,6 @@ import httpx
 
 from app.services import runtime_config
 
-from seo_geo_agent import state
 from seo_geo_agent.sources import domain_of
 
 # One place to change engine targets. Answer text AND citations are capped in
@@ -84,7 +84,6 @@ _NEEDS_WEB_PLUGIN = {"gemini", "chatgpt"}  # sonar searches on its own
 # geo_poll. "No AI Overview shown" is a completed observation, never an error.
 AIO_ENGINE = "aio"
 AI_MODE_ENGINE = "ai_mode"
-SERPAPI_URL = "https://serpapi.com/search.json"
 DATAFORSEO_URL = "https://api.dataforseo.com/v3"
 DATAFORSEO_LOCATION_CODE = 2840  # United States
 DATAFORSEO_LANGUAGE_CODE = "en"
@@ -106,9 +105,13 @@ class EngineAnswer:
     citations: list[dict] = field(default_factory=list)  # {url, domain, title}
     latency_ms: int = 0
     error: str | None = None
-    via: str = ""  # "native" | "openrouter" | "serpapi" | "dataforseo" — the measurement surface
+    via: str = ""  # "native" | "openrouter" | "dataforseo" — the measurement surface
     no_aio: bool = False   # Google showed no AI answer for this query (not an error)
-    credits: int = 1       # provider credits this answer cost (page_token AIO = 2)
+    # Billed SERP calls this answer cost, banked into the monthly SERP counter
+    # by geo_poll. One DataForSEO live request = one credit today; the field
+    # stays because the counter is the guard on a prepaid pool, and a future
+    # two-step fetch (a deferred overview re-requested) would cost two.
+    credits: int = 1
 
     def to_dict(self) -> dict:
         return {
@@ -159,37 +162,19 @@ def openrouter_key() -> str:
     return runtime_config.get("openrouter_api_key")
 
 
-def _cloud_app_config() -> dict:
-    """Admin app config, only ever read in cloud mode; offline never touches
-    Firestore, and an unreachable config is honestly ``{}``."""
-    if not state.use_cloud():
-        return {}
-    try:
-        from app.services.firestore_repo import get_app_config
-
-        return get_app_config() or {}
-    except Exception:  # noqa: BLE001 — config unreachable = no key, honestly
-        return {}
-
-
-def serpapi_key() -> str:
-    """Env first; in cloud mode fall back to admin app config (same pattern
-    as the Serper key)."""
-    key = os.environ.get("SERPAPI_API_KEY", "")
-    if key:
-        return key
-    return str(_cloud_app_config().get("serpapi_api_key") or "")
-
-
 def dataforseo_creds() -> tuple[str, str]:
     """``(login, password)`` for DataForSEO, or ``("", "")`` when either half
-    is missing — a login without a password is not half a credential."""
-    login = os.environ.get("DATAFORSEO_LOGIN", "")
-    password = os.environ.get("DATAFORSEO_PASSWORD", "")
-    if not (login and password):
-        cfg = _cloud_app_config()
-        login = login or str(cfg.get("dataforseo_login") or "")
-        password = password or str(cfg.get("dataforseo_password") or "")
+    is missing — a login without a password is not half a credential.
+
+    Both halves resolve through ``runtime_config`` like every other provider
+    key in this module: a Settings → Secrets override in ``app_config/global``
+    wins, otherwise the environment (``DATAFORSEO_LOGIN`` /
+    ``DATAFORSEO_PASSWORD``, real ``Settings`` fields). The pair is Basic-auth
+    material — base64 of ``login:password`` — assembled only inside
+    :func:`poll_dataforseo` and never logged or returned to a client.
+    """
+    login = runtime_config.get("dataforseo_login")
+    password = runtime_config.get("dataforseo_password")
     return (login, password) if login and password else ("", "")
 
 
@@ -198,7 +183,6 @@ def dataforseo_creds() -> tuple[str, str]:
 MODE_MEANING: dict[str, str] = {
     "native": "the engine's own official API",
     "proxy": "measured with a similar model through OpenRouter — tracks the official engine closely; add the engine's own key for exact readings",
-    "serpapi": "Google's live SERP via SerpAPI — the real consumer surface",
     "dataforseo": "Google's live SERP via DataForSEO — the real consumer surface",
     "off": "no key configured — nothing is measured",
 }
@@ -318,74 +302,24 @@ def poll_openai(prompt: str, key: str) -> EngineAnswer:
     return answer
 
 
-def _aio_flatten(blocks: list) -> list[str]:
-    """SerpAPI ai_overview text_blocks → plain lines (paragraphs, lists,
-    headings, nested blocks — coded defensively against shape drift)."""
-    lines: list[str] = []
-    for block in blocks or []:
-        if not isinstance(block, dict):
-            continue
-        if block.get("snippet"):
-            lines.append(str(block["snippet"]))
-        for item in block.get("list") or []:
-            if isinstance(item, dict):
-                text = " — ".join(filter(None, [item.get("title", ""), item.get("snippet", "")]))
-                if text:
-                    lines.append(f"- {text}")
-        if block.get("text_blocks"):
-            lines.extend(_aio_flatten(block["text_blocks"]))
-    return lines
-
-
-def poll_aio(prompt: str, key: str) -> EngineAnswer:
-    """One Google AI Overview snapshot via SerpAPI. Two-step when Google
-    defers the content behind a page_token (costs a second credit)."""
-    started = time.monotonic()
-    answer = EngineAnswer(engine=AIO_ENGINE, model="google-ai-overview", via="serpapi")
-    try:
-        resp = httpx.get(
-            SERPAPI_URL,
-            params={"engine": "google", "q": prompt, "hl": "en", "gl": "us", "api_key": key},
-            timeout=REQUEST_TIMEOUT,
-        )
-        answer.latency_ms = int((time.monotonic() - started) * 1000)
-        if resp.status_code != 200:
-            answer.error = f"HTTP {resp.status_code}: {resp.text[:200]}"
-            return answer
-        aio = resp.json().get("ai_overview") or {}
-        if aio.get("page_token") and not aio.get("text_blocks"):
-            resp2 = httpx.get(
-                SERPAPI_URL,
-                params={"engine": "google_ai_overview", "page_token": aio["page_token"], "api_key": key},
-                timeout=REQUEST_TIMEOUT,
-            )
-            answer.credits = 2
-            answer.latency_ms = int((time.monotonic() - started) * 1000)
-            if resp2.status_code != 200:
-                answer.error = f"HTTP {resp2.status_code} on AIO page fetch: {resp2.text[:150]}"
-                return answer
-            aio = resp2.json().get("ai_overview") or {}
-        lines = _aio_flatten(aio.get("text_blocks") or [])
-        if not lines:
-            answer.no_aio = True   # honest observation: the AIO slot is empty here
-            return answer
-        answer.text = "\n".join(lines)
-        for ref in aio.get("references") or []:
-            if ref.get("link"):
-                answer.citations.append(_citation(ref["link"], ref.get("title", "")))
-    except Exception as exc:  # noqa: BLE001 — adapters must degrade, never raise
-        answer.latency_ms = int((time.monotonic() - started) * 1000)
-        answer.error = f"{type(exc).__name__}: {exc}"
-    return answer
-
-
 # DataForSEO: engine id -> (endpoint under /serp/google, task body). Both
-# endpoints answer in the same envelope and both put the AI answer in an item
-# whose ``type`` is the literal "ai_overview" — the AI Mode endpoint included.
+# endpoints answer in the same envelope, with the AI answer as one item in
+# ``result[0].items``.
 _DATAFORSEO_MODELS: dict[str, str] = {
     AIO_ENGINE: "google-ai-overview",
     AI_MODE_ENGINE: "google-ai-mode",
 }
+
+# Which item carries the AI answer. DataForSEO documents "ai_overview" for
+# BOTH endpoints — the AI Mode result reuses the AI Overview element shape —
+# but AI Mode is the newest surface on a vendor that ships shape changes, and
+# their own writing also names an ``ai_mode_message`` item. So every plausible
+# spelling is accepted: matching the wrong name does not raise, it silently
+# records "Google showed no AI answer" forever, which is exactly the failure
+# mode that let ai_mode read zero for two months.
+_DATAFORSEO_ANSWER_TYPES: frozenset[str] = frozenset(
+    {"ai_overview", "ai_mode", "ai_mode_message", "ai_mode_answer"}
+)
 
 
 def _dataforseo_task(engine: str, prompt: str) -> tuple[str, dict]:
@@ -413,15 +347,79 @@ def _dataforseo_reference(ref: dict) -> dict | None:
     return cit
 
 
+def _dataforseo_answer_item(items: list) -> dict | None:
+    """The AI answer item in a result's ``items``, whatever it is called."""
+    return next(
+        (
+            item
+            for item in items or []
+            if isinstance(item, dict)
+            and str(item.get("type") or "") in _DATAFORSEO_ANSWER_TYPES
+        ),
+        None,
+    )
+
+
+def _dataforseo_text(block: dict) -> str:
+    """The answer text of one AI item.
+
+    ``markdown`` on the item is the whole answer and is what we want. When it
+    is missing, the nested elements' own ``markdown``/``text`` are joined
+    instead — on a surface this new, an unexpected shape must degrade into a
+    partial reading, not into "Google said nothing", which is a measurement.
+    """
+    markdown = str(block.get("markdown") or "").strip()
+    if markdown:
+        return markdown
+    lines: list[str] = []
+    for element in block.get("items") or []:
+        if not isinstance(element, dict):
+            continue
+        text = str(element.get("markdown") or element.get("text") or "").strip()
+        text = text or _dataforseo_text(element)   # expanded elements nest deeper
+        if text:
+            lines.append(text)
+    return "\n\n".join(lines).strip()
+
+
+def _dataforseo_citations(block: dict) -> list[dict]:
+    """Citations for one AI item: its own ``references`` plus any the nested
+    elements carry (AI Mode attributes sources per section), de-duplicated on
+    URL so a source quoted three times is still one citation."""
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def walk(node: dict) -> None:
+        for ref in node.get("references") or []:
+            if not isinstance(ref, dict):
+                continue
+            cit = _dataforseo_reference(ref)
+            if cit and cit["url"] not in seen:
+                seen.add(cit["url"])
+                out.append(cit)
+        for element in node.get("items") or []:
+            if isinstance(element, dict):
+                walk(element)
+
+    walk(block)
+    return out
+
+
 def poll_dataforseo(engine: str, prompt: str, login: str, password: str) -> EngineAnswer:
     """One live Google snapshot via DataForSEO — AI Overview off the organic
-    SERP, or the AI Mode answer.
+    SERP, or the AI Mode answer off its own endpoint.
 
-    Google sometimes defers the overview: the item is present with
-    ``asynchronous_ai_overview: true`` and an empty ``markdown``. That is the
-    same observation as no overview at all — the slot was empty when we looked
-    — and is reported as ``no_aio``, never as an empty answer with zero
-    citations and never as an error.
+    Three outcomes, kept apart on purpose:
+
+    * an **answer** — text, and the sources Google credited;
+    * **no AI answer** (``no_aio``) — we reached the surface and Google put no
+      AI block on it. Google also defers overviews (the item is present with
+      ``asynchronous_ai_overview: true`` and nothing in it); the slot was empty
+      when we looked, so that reads the same way. A completed observation,
+      never an error, never an empty answer with zero citations;
+    * an **error** — HTTP failure, a DataForSEO status code, or a task that
+      reported success and carried no result at all. Nothing was measured, and
+      it must never be banked as a zero.
     """
     url, task = _dataforseo_task(engine, prompt)
     started = time.monotonic()
@@ -446,19 +444,22 @@ def poll_dataforseo(engine: str, prompt: str, login: str, password: str) -> Engi
         if job.get("status_code") != 20000:
             answer.error = f"DataForSEO {job.get('status_code')}: {job.get('status_message', '')}"
             return answer
-        result = (job.get("result") or [{}])[0] or {}
-        block = next(
-            (i for i in result.get("items") or [] if isinstance(i, dict) and i.get("type") == "ai_overview"),
-            None,
-        )
-        markdown = str((block or {}).get("markdown") or "").strip()
-        if not markdown:
-            answer.no_aio = True
+        rows = job.get("result") or []
+        if not rows or not isinstance(rows[0], dict):
+            # Success status, no observation. A failed call — collapsing it
+            # into no_aio would bank a missing measurement as a real zero.
+            answer.error = "DataForSEO returned no result for the task"
             return answer
-        answer.text = markdown
-        for ref in (block or {}).get("references") or []:
-            if isinstance(ref, dict) and (cit := _dataforseo_reference(ref)):
-                answer.citations.append(cit)
+        block = _dataforseo_answer_item(rows[0].get("items") or [])
+        if block is None:
+            answer.no_aio = True    # we saw the surface; Google put no AI answer on it
+            return answer
+        text = _dataforseo_text(block)
+        if not text:
+            answer.no_aio = True    # deferred or empty: the slot was empty when we looked
+            return answer
+        answer.text = text
+        answer.citations = _dataforseo_citations(block)
     except Exception as exc:  # noqa: BLE001 — adapters must degrade, never raise
         answer.latency_ms = int((time.monotonic() - started) * 1000)
         answer.error = f"{type(exc).__name__}: {exc}"
@@ -546,24 +547,29 @@ def _chat_status(engine: str) -> dict:
 
 
 def serp_vendor(engine: str) -> str:
-    """Which vendor fetches this SERP engine right now: ``"dataforseo"`` |
-    ``"serpapi"`` | ``"off"``. DataForSEO serves both engines and wins when
-    configured; SerpAPI has no AI Mode endpoint, so it only ever backs AIO."""
-    if dataforseo_creds() != ("", ""):
-        return "dataforseo"
-    if engine == AIO_ENGINE and serpapi_key():
-        return "serpapi"
-    return "off"
+    """Which vendor fetches the SERP engines right now: ``"dataforseo"`` |
+    ``"off"``. DataForSEO is the only search provider and serves both AI
+    Overview and AI Mode, so there is nothing left to select between — the
+    argument stays because the spec seam passes one, and because a future
+    second vendor would be per-engine again."""
+    return "dataforseo" if dataforseo_creds() != ("", "") else "off"
 
 
 def _poll_serp(engine: str, prompt: str) -> EngineAnswer:
-    vendor = serp_vendor(engine)
-    if vendor == "dataforseo":
-        login, password = dataforseo_creds()
-        return poll_dataforseo(engine, prompt, login, password)
-    if vendor == "serpapi":
-        return poll_aio(prompt, serpapi_key())
-    return EngineAnswer(engine=engine, error="no API key configured")
+    login, password = dataforseo_creds()
+    if not (login and password):
+        # Loud and honest: no credential means nothing was measured. Not an
+        # empty answer, and explicitly not ``no_aio`` — that would file a
+        # missing key as "Google showed no AI answer" and average it into the
+        # brand's score.
+        return EngineAnswer(
+            engine=engine,
+            error=(
+                "DataForSEO credentials are not configured — set "
+                "DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD"
+            ),
+        )
+    return poll_dataforseo(engine, prompt, login, password)
 
 
 def _serp_status(engine: str) -> dict:
@@ -620,6 +626,36 @@ def engine_status() -> dict[str, dict]:
     surface a number was actually measured on.
     """
     return {engine: spec.status() for engine, spec in ENGINE_SPECS.items()}
+
+
+def engine_shapes() -> dict[str, dict]:
+    """What each engine IS, for a reader that has to explain its numbers.
+
+    ``engine_status`` says whether an engine is reachable; this says how it is
+    asked, which is what makes two engines' answer counts differ:
+
+    * ``kind`` — ``"chat"`` is sampled, ``"serp"`` is a billed snapshot;
+    * ``runs_per_prompt`` — the sample size (3) or the pinned snapshot (1);
+    * ``intents`` — the prompt intents this engine is spent on, ``None`` for
+      every prompt. The billed engines skip the brand-intent questions, which
+      already name the brand.
+
+    Published because the console was otherwise mirroring
+    ``SERP_ENGINES = ["aio", "ai_mode"]`` and ``CHAT_RUNS_PER_PROMPT = 3`` as
+    frontend constants to write that explanation. A copy of a fact is a copy
+    that starts lying the day the fact changes here — the same failure as the
+    "four AI engines" line that was wrong for months. ``ENGINE_SPECS`` is the
+    one definition; this is a read of it, not a second one.
+    """
+    return {
+        engine: {
+            "label": spec.label,
+            "kind": spec.kind,
+            "runs_per_prompt": spec.runs_per_prompt,
+            "intents": list(spec.intents) if spec.intents is not None else None,
+        }
+        for engine, spec in ENGINE_SPECS.items()
+    }
 
 
 def available_engines() -> dict[str, bool]:

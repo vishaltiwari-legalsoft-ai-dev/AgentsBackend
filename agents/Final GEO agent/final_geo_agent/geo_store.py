@@ -10,18 +10,25 @@ zero counted, repeatable forever.
 Lives in its own module so ``geo_prompts`` (which ``geo_poll`` imports) can use
 it without a circular import; ``geo_poll.mutate`` stays as a re-export for the
 callers that already spell it that way.
+
+The implementation moved to ``seo_geo_agent.state`` on 2026-09-04, unchanged.
+It always transacted over a2's collection through a2's document-ref builder, and
+a2's own brand registry — ``state.load("brands")``, one global document that
+self-serve brand creation now writes — needed the same guarantee. Two copies of
+"read-modify-write, atomically" is one copy too many, and the one that drifts is
+the one that stops being atomic. This module keeps the name, the lock object and
+the function-shaped seam, so every existing caller, re-export
+(``geo_poll._mutate``) and monkeypatch keeps working exactly as before.
 """
 from __future__ import annotations
 
-import json
-import threading
 from typing import Any, Callable
 
 from seo_geo_agent import state
 
-# Offline state is plain JSON files, so a process-local lock is the whole
-# guarantee there; that is enough for tests and single-process local dev.
-LOCAL_LOCK = threading.Lock()
+#: The same lock object ``state.mutate`` takes offline — ``geo_poll._LOCAL_LOCK``
+#: is an alias of this, and a second lock would guard nothing.
+LOCAL_LOCK = state.LOCAL_LOCK
 
 
 def mutate(doc_id: str, change: Callable[[dict], tuple[dict, Any]]) -> Any:
@@ -29,29 +36,9 @@ def mutate(doc_id: str, change: Callable[[dict], tuple[dict, Any]]) -> Any:
 
     ``change(current) -> (new_doc, result)`` runs INSIDE the transaction and may
     be retried on contention, so it must be a pure function of ``current``.
+
+    A thin function rather than ``mutate = state.mutate``: the indirection is
+    resolved per call, so a test that patches ``state.mutate`` (or ``state.load``
+    on the offline path) still reaches callers that hold this name.
     """
-    if state.use_cloud():
-        from google.cloud import firestore
-
-        from app.services import firestore_repo
-
-        # state owns the collection naming — reuse its ref builder rather than
-        # keep a second copy of it here. Same cached client the txn runs on.
-        ref = state._firestore_doc(doc_id)
-        transaction = firestore_repo._db().transaction()
-
-        @firestore.transactional
-        def _apply(txn) -> Any:
-            snap = ref.get(transaction=txn)
-            current = snap.to_dict() if snap.exists else {}
-            new_doc, result = change(current or {})
-            # same JSON round-trip state.save uses: no dataclasses/dates/sets
-            txn.set(ref, json.loads(json.dumps(new_doc, default=str)))
-            return result
-
-        return _apply(transaction)
-
-    with LOCAL_LOCK:
-        new_doc, result = change(state.load(doc_id) or {})
-        state.save(doc_id, new_doc)
-        return result
+    return state.mutate(doc_id, change)

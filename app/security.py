@@ -109,6 +109,21 @@ def is_admin(email: str) -> bool:
     return email.lower() in settings.admin_email_set or is_creator(email)
 
 
+def is_geo_editor(email: str) -> bool:
+    """May shape the GEO agent's registry — prompts, personas, brand config.
+
+    A NARROW role, and the first per-agent one here: it unlocks the eight
+    registry-shaping GEO routes and nothing else. It is not a step on the
+    admin ladder — a GEO editor is not an admin and cannot read Secrets, the
+    admin database viewer or any other agent's writes.
+
+    Creators are included the same way they are in ``is_admin``: the people who
+    could already do this keep doing it, and the implication is stated once
+    here rather than re-derived at each guard.
+    """
+    return email.lower() in settings.geo_editor_email_set or is_creator(email)
+
+
 def create_token(
     user_id: str, email: str, session_id: str | None = None, timezone: str = "UTC"
 ) -> str:
@@ -196,8 +211,16 @@ def get_current_user(
     # the same kind of set-membership lookup as the allowlist above, so there is
     # no cost argument for trusting the stale copy. The claims stay in the
     # payload; they simply stop being authoritative.
+    #
+    # ``is_geo_editor`` joins them rather than being stamped into the token at
+    # mint time: a claim minted today would still be honoured for the rest of
+    # its 7-day life after the address left GEO_EDITOR_EMAILS, which is the
+    # exact defect the two flags above were moved here to close. It is
+    # deliberately absent from ``create_token`` for the same reason — a claim
+    # nothing reads cannot drift.
     try:
         admin, creator = is_admin(email), is_creator(email)
+        geo_editor = is_geo_editor(email)
     except Exception as exc:  # noqa: BLE001 — cannot evaluate the role config
         # Fail closed, exactly as above: a role check that cannot run is not a
         # grant. 503 because the token may be fine; the server is not.
@@ -212,6 +235,7 @@ def get_current_user(
         "email": payload["email"],
         "is_admin": admin,
         "is_creator": creator,
+        "is_geo_editor": geo_editor,
         "session_id": payload.get("sid") or "",
         "timezone": payload.get("tz") or "UTC",
     }
@@ -232,5 +256,28 @@ def require_creator(
     if not user.get("is_creator"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Creator only"
+        )
+    return user
+
+
+def require_geo_editor(
+    user: dict[str, object] = Depends(get_current_user),
+) -> dict[str, object]:
+    """GEO editor guard — the registry-shaping routes of the GEO agent.
+
+    Reads the ONE flag ``get_current_user`` derived, exactly as
+    ``require_admin`` does. It deliberately does not also check ``is_creator``:
+    that implication already lives in ``is_geo_editor``, and a second copy of
+    an access rule is a second thing to drift — with the drifting copy being
+    the one that grants what it should not.
+
+    Delegating to ``get_current_user`` rather than decoding the JWT here is
+    load-bearing, not stylistic: it is what keeps the per-request sign-in
+    allowlist in front of the role check, so a de-provisioned account is
+    refused with 401 before this ever runs.
+    """
+    if not user.get("is_geo_editor"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="GEO editor only"
         )
     return user

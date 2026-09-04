@@ -2,14 +2,27 @@
 
 Doc ids use ``-`` separators only (``run-{brand}``, ``todos-{brand}``, ``brands``)
 so the local fallback can map them 1:1 to Windows-safe filenames.
+
+Three primitives: :func:`load` / :func:`save` / :func:`delete` for documents only
+one writer ever touches, and :func:`mutate` for the ones two callers can write at
+the same time. ``mutate`` lives here, next to the collection it transacts over,
+because a second implementation of "read-modify-write, atomically" is how one of
+the two ends up non-transactional; ``final_geo_agent.geo_store`` — which is where
+this code was written, for the GEO spend counters — now forwards to it.
 """
 from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
+from typing import Any, Callable
 
 _COLLECTION = "seo_geo"
+
+# Offline state is plain JSON files, so a process-local lock is the whole
+# guarantee there; that is enough for tests and single-process local dev.
+LOCAL_LOCK = threading.Lock()
 
 
 def _load_local_env() -> None:
@@ -80,3 +93,43 @@ def delete(doc_id: str) -> None:
         path = _local_dir() / f"{doc_id}.json"
         if path.is_file():
             path.unlink()
+
+
+def mutate(doc_id: str, change: Callable[[dict], tuple[dict, Any]]) -> Any:
+    """Atomic read-modify-write of one state doc; returns ``change``'s result.
+
+    ``change(current) -> (new_doc, result)`` runs INSIDE the transaction and may
+    be retried on contention, so it must be a pure function of ``current``.
+    Raising from it aborts the write and propagates — that is how a caller says
+    "this document is not in a state I may write over" (an id that already
+    exists, a record that is gone) without a read-then-write race in front of
+    the check.
+
+    ``load`` + ``save`` around a shared document is a lost update: two people
+    adding a brand to ``brands`` at the same time both read the same list, both
+    append their own, and the second ``save`` overwrites the first — one brand
+    silently gone, with nothing anywhere saying so.
+    """
+    if use_cloud():
+        from google.cloud import firestore
+
+        from app.services import firestore_repo
+
+        ref = _firestore_doc(doc_id)
+        transaction = firestore_repo._db().transaction()
+
+        @firestore.transactional
+        def _apply(txn) -> Any:
+            snap = ref.get(transaction=txn)
+            current = snap.to_dict() if snap.exists else {}
+            new_doc, result = change(current or {})
+            # same JSON round-trip ``save`` uses: no dataclasses/dates/sets
+            txn.set(ref, json.loads(json.dumps(new_doc, default=str)))
+            return result
+
+        return _apply(transaction)
+
+    with LOCAL_LOCK:
+        new_doc, result = change(load(doc_id) or {})
+        save(doc_id, new_doc)
+        return result

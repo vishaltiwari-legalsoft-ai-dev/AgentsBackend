@@ -4,7 +4,9 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.security import create_token, is_admin, is_creator, verify_google_id_token
+from app.security import (
+    create_token, is_admin, is_creator, is_geo_editor, verify_google_id_token,
+)
 from app.services import firestore_repo
 
 router = APIRouter()
@@ -83,5 +85,15 @@ def google_login(body: GoogleLogin) -> dict:
             "picture": user.get("picture", ""),
             "is_admin": is_admin(user["email"]),
             "is_creator": is_creator(user["email"]),
+            # Derived from config here, exactly like the two above, and NOT
+            # read back out of the token — the token carries no such claim on
+            # purpose (see get_current_user), because a claim minted at sign-in
+            # outlives its own revocation by the 7-day token life.
+            #
+            # This is a display hint, never the enforcement. The server decides
+            # again on every request in ``require_geo_editor``; all this does is
+            # let the console show a non-editor the read-only view instead of
+            # buttons that answer 403 when pressed.
+            "is_geo_editor": is_geo_editor(user["email"]),
         },
     }

@@ -39,7 +39,7 @@ def test_model_ids_stay_readable():
 
 def test_keys_written_outside_runtime_config_are_masked():
     # Agent code writes these straight into app_config/global.
-    for field in ("seo_serper_api_key", "serpapi_api_key", "canva_client_secret",
+    for field in ("seo_serper_api_key", "dataforseo_password", "canva_client_secret",
                   "refresh_token", "google_sub", "jwt_secret"):
         assert admin._is_sensitive_key(field), f"{field} is rendered in full"
 

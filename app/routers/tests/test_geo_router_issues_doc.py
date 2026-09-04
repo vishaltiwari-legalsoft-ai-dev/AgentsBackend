@@ -30,10 +30,19 @@ BRAND = {"id": "legalsoft", "name": "Legal Soft", "domain": "legalsoft.com",
          "seeds": ["legal virtual assistant"], "enabled": True}
 B = f"/api/geo/brands/{BRAND['id']}"
 
+# ``is_geo_editor`` is spelled out because these dicts stand in for the payload
+# ``get_current_user`` builds, and that payload always carries the flag. A
+# Creator is one implicitly (``security.is_geo_editor``); the VIEWER is neither.
 OWNER = {"id": "u1", "email": "owner@legalsoft.com", "is_admin": False,
-         "is_creator": True, "session_id": "", "timezone": "UTC"}
+         "is_creator": True, "is_geo_editor": True, "session_id": "",
+         "timezone": "UTC"}
 VIEWER = {"id": "u2", "email": "viewer@legalsoft.com", "is_admin": False,
-          "is_creator": False, "session_id": "", "timezone": "UTC"}
+          "is_creator": False, "is_geo_editor": False, "session_id": "",
+          "timezone": "UTC"}
+#: A GEO editor who is NOT a Creator — the role this gate exists to admit.
+GEO_EDITOR = {"id": "u3", "email": "marian.p@legalsoft.com", "is_admin": False,
+              "is_creator": False, "is_geo_editor": True, "session_id": "",
+              "timezone": "UTC"}
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +52,6 @@ def _harness(monkeypatch, tmp_path, as_caller):
     # a real key in local .env must never turn an offline test into a paid poll
     monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "")
     monkeypatch.setattr(geo_engines, "dataforseo_creds", lambda: ("", ""))
-    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "")
     monkeypatch.setattr(insights, "list_brands", lambda: [dict(BRAND)])
     as_caller(OWNER)
 
@@ -80,14 +88,14 @@ def test_bulk_paste_answers_200_with_partial_acceptance(monkeypatch):
     monkeypatch.setattr(geo_prompts, "add_prompts", fake_add)
     resp = client.post(f"{B}/prompts/bulk", json={
         "text": "best legal va for solo firms\nhi", "persona": "solo-attorney",
-        "intent": "problem", "stage": "awareness",
+        "intent": "brand", "stage": "awareness",
     })
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert [s["reason"] for s in body["skipped"]] == [geo_prompts.REASON_TOO_SHORT]
     assert len(body["added"]) == 1 and body["total"] == 1
     assert seen == {"brand_id": "legalsoft", "raw": "best legal va for solo firms\nhi",
-                    "persona": "solo-attorney", "intent": "problem", "stage": "awareness"}
+                    "persona": "solo-attorney", "intent": "brand", "stage": "awareness"}
 
 
 def test_bulk_paste_maps_a_store_refusal_to_422(monkeypatch):
@@ -95,27 +103,33 @@ def test_bulk_paste_maps_a_store_refusal_to_422(monkeypatch):
         raise ValueError("universe is full (250)")
 
     monkeypatch.setattr(geo_prompts, "add_prompts", refuse)
-    resp = client.post(f"{B}/prompts/bulk", json={"text": "one more prompt please"})
+    resp = client.post(f"{B}/prompts/bulk",
+                       json={"text": "one more prompt please", "intent": "category"})
     assert resp.status_code == 422
     assert resp.json()["detail"] == "universe is full (250)"
 
 
-def test_bulk_paste_is_creator_only(monkeypatch, as_caller):
+def test_bulk_paste_needs_the_geo_editor_role(monkeypatch, as_caller):
     monkeypatch.setattr(geo_prompts, "add_prompts",
                         lambda *a, **k: pytest.fail("the store must not be reached"))
     as_caller(VIEWER)
-    assert client.post(f"{B}/prompts/bulk", json={"text": "best legal va"}).status_code == 403
+    assert client.post(
+        f"{B}/prompts/bulk", json={"text": "best legal va", "intent": "category"},
+    ).status_code == 403
 
 
 def test_bulk_paste_body_bounds():
-    assert client.post(f"{B}/prompts/bulk", json={"text": ""}).status_code == 422
-    assert client.post(f"{B}/prompts/bulk", json={"text": "x" * 20_001}).status_code == 422
+    for text in ("", "x" * 20_001):
+        assert client.post(
+            f"{B}/prompts/bulk", json={"text": text, "intent": "category"},
+        ).status_code == 422
 
 
 def test_bulk_paste_through_the_real_store_lands_and_reports_per_line():
     """No seam faked: the router's dump reaches the store as the store expects."""
     resp = client.post(f"{B}/prompts/bulk", json={
         "text": "- best legal virtual assistant\n- best legal virtual assistant\n- hi",
+        "intent": "category",
     })
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -140,9 +154,13 @@ def test_personas_invalid_input_is_422_with_the_store_reason(monkeypatch):
     assert resp.json()["detail"] == "Persona label must be 2-60 characters"
 
 
-def test_personas_is_creator_only(as_caller):
+def test_personas_needs_the_geo_editor_role(as_caller):
     as_caller(VIEWER)
     assert client.put(f"{B}/personas", json={"personas": []}).status_code == 403
+
+    # ...and the role on its own is enough — no Creator anywhere in this caller.
+    as_caller(GEO_EDITOR)
+    assert client.put(f"{B}/personas", json={"personas": []}).status_code == 200
 
 
 def test_personas_more_than_the_cap_is_422():
@@ -161,6 +179,7 @@ def test_personas_roundtrip_through_the_real_store_and_tag_a_paste():
 
     pasted = client.post(f"{B}/prompts/bulk", json={
         "text": "how do solo attorneys handle intake calls", "persona": "solo-attorney",
+        "intent": "category",
     }).json()
     assert pasted["added"][0]["persona"] == "solo-attorney"
 
@@ -181,6 +200,7 @@ def test_put_prompts_without_persona_keeps_the_stored_tag():
     client.put(f"{B}/personas", json={"personas": [{"label": "Solo attorney"}]})
     added = client.post(f"{B}/prompts/bulk", json={
         "text": "best intake service for solo attorneys", "persona": "solo-attorney",
+        "intent": "category",
     }).json()["added"][0]
     legacy = {k: v for k, v in added.items() if k != "persona"}
     saved = client.put(f"{B}/prompts", json={"prompts": [legacy]}).json()
@@ -279,8 +299,10 @@ def test_report_carries_the_persona_rollup(fake_engines):
     client.put(f"{B}/personas", json={"personas": [{"label": "Solo attorney"}]})
     client.post(f"{B}/prompts/bulk", json={
         "text": "best legal va for a solo practice", "persona": "solo-attorney",
+        "intent": "category",
     })
-    client.post(f"{B}/prompts/bulk", json={"text": "best legal va for a large firm"})
+    client.post(f"{B}/prompts/bulk",
+                json={"text": "best legal va for a large firm", "intent": "category"})
     client.post(f"{B}/poll/step", json={"runs": 1, "batch_size": 10})
 
     report = client.get(f"{B}/report").json()

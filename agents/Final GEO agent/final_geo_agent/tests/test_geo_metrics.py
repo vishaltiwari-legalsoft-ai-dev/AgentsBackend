@@ -195,7 +195,7 @@ def test_via_mix_excludes_errored_and_missing_answers():
     answers = [
         _answer("gemini", "native"),
         _answer("gemini", "native", error="HTTP 429", pid="p2"),
-        _answer("aio", "serpapi", no_aio=True, pid="p3"),
+        _answer("aio", "dataforseo", no_aio=True, pid="p3"),
     ]
 
     # an errored run and a "no AI Overview shown" observation are already out of
@@ -231,10 +231,10 @@ def test_engine_report_blocks_carry_via_mix():
 
 def test_block_separates_answers_seen_from_answers_a_brand_could_appear_in():
     answers = [
-        _answer("aio", "serpapi", mentions={"self": 1}),
-        _answer("aio", "serpapi", no_aio=True, pid="p2"),
-        _answer("aio", "serpapi", no_aio=True, pid="p3"),
-        _answer("aio", "serpapi", error="HTTP 429", pid="p4"),
+        _answer("aio", "dataforseo", mentions={"self": 1}),
+        _answer("aio", "dataforseo", no_aio=True, pid="p2"),
+        _answer("aio", "dataforseo", no_aio=True, pid="p3"),
+        _answer("aio", "dataforseo", error="HTTP 429", pid="p4"),
     ]
 
     block = geo_metrics.engine_report(answers, ["self"], "example.com")["engines"]["aio"]
@@ -248,10 +248,88 @@ def test_block_separates_answers_seen_from_answers_a_brand_could_appear_in():
 
 
 def test_an_engine_that_only_ever_showed_empty_slots_reports_no_rate():
-    answers = [_answer("aio", "serpapi", no_aio=True, pid=f"p{i}") for i in range(3)]
+    answers = [_answer("aio", "dataforseo", no_aio=True, pid=f"p{i}") for i in range(3)]
 
     block = geo_metrics.engine_report(answers, ["self"], "example.com")["engines"]["aio"]
 
     # None, not 0.0 — nobody was named because there was nothing to be named in
     assert block["mention"]["rate"] is None
     assert (block["n_answers"], block["n_measured"], block["n_no_aio"]) == (3, 0, 3)
+
+
+# --------------------------------------------- what an engine OWES this brand
+# "Different engines return different numbers of answers" was filed as a bug.
+# It is the design — a chat engine is sampled three times per question, a billed
+# Google engine is fetched once and only on the questions that do not already
+# name the brand — but nothing in the report said so, so the numbers looked
+# broken. `n_expected` is the missing denominator.
+
+
+def test_a_block_says_how_many_answers_that_engine_owes_a_sweep():
+    answers = [
+        _answer("chatgpt", "openrouter", mentions={"self": 1}),
+        _answer("chatgpt", "openrouter", pid="p2"),
+        _answer("aio", "dataforseo", pid="p1"),
+    ]
+
+    report = geo_metrics.engine_report(
+        answers, ["self"], "example.com", expected={"chatgpt": 60, "aio": 12},
+    )
+
+    assert report["engines"]["chatgpt"]["n_expected"] == 60
+    assert report["engines"]["aio"]["n_expected"] == 12
+    # and the two are DIFFERENT numbers, which is the whole point: a panel that
+    # printed one expectation for every engine would restate the bug report
+    assert (
+        report["engines"]["chatgpt"]["n_expected"]
+        != report["engines"]["aio"]["n_expected"]
+    )
+    # blended owes one full sweep of the engines that actually measured
+    assert report["blended"]["n_expected"] == 72
+
+
+def test_the_expectation_is_per_sweep_not_per_window():
+    """Five days of stored answers do not multiply what one sweep owes.
+
+    `n_answers` is per window and `n_expected` is per sweep, so the ratio is
+    what the panel reads. Scaling the expectation by the window would have to
+    scale it by sweeps that RAN, and a paused engine ran none — its expectation
+    would collapse to zero and hide exactly the hole this exists to show.
+    """
+    one_day = [_answer("aio", "dataforseo", pid=f"p{i}") for i in range(3)]
+    five_days = one_day * 5
+
+    def owed(answers):
+        report = geo_metrics.engine_report(
+            answers, ["self"], "example.com", expected={"aio": 3},
+        )
+        return report["engines"]["aio"]
+
+    assert owed(one_day)["n_expected"] == owed(five_days)["n_expected"] == 3
+    assert owed(five_days)["n_answers"] == 15
+
+
+def test_an_engine_nobody_priced_reports_none_rather_than_zero():
+    """A retired engine's stored answers, and the `unknown` bucket, have no
+    entry in the question list. Zero would read as "owed nothing, delivered
+    40" — a fabricated denominator is worse than an absent one."""
+    answers = [_answer("aio", "dataforseo"), {"prompt_id": "p9", "run": 1}]
+
+    report = geo_metrics.engine_report(
+        answers, ["self"], "example.com", expected={"chatgpt": 60},
+    )
+
+    assert report["engines"]["aio"]["n_expected"] is None
+    assert report["engines"]["unknown"]["n_expected"] is None
+    # nothing measured here was priced, so the blend has no expectation either
+    assert report["blended"]["n_expected"] == 0
+
+
+def test_a_caller_that_passes_no_question_list_gets_none_not_a_guess():
+    """`geo_history` scores stored answers with no prompt universe in hand."""
+    report = geo_metrics.engine_report(
+        [_answer("chatgpt", "openrouter")], ["self"], "example.com",
+    )
+
+    assert report["engines"]["chatgpt"]["n_expected"] is None
+    assert report["blended"]["n_expected"] is None

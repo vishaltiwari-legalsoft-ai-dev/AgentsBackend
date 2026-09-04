@@ -50,6 +50,28 @@ class Settings(BaseSettings):
     # integration management). The CREATOR_EMAILS_DEFAULT owners are always
     # Creators even when this is empty.
     creator_emails: str = ""
+    # Comma-separated emails granted the GEO editor role: the eight
+    # registry-shaping GEO routes (prompts, personas, brand config, rescan,
+    # strategy generation) and nothing else.
+    #
+    # This is the first per-agent role in the service, and it exists because
+    # the alternative was worse. Six people need to administer the GEO agent;
+    # the only elevated role was Creator, which also unlocks Settings →
+    # Secrets, the admin database viewer, model config and every other agent.
+    # Granting six people that to let them edit prompt universes would have
+    # been a far larger permission change than this one.
+    #
+    # Creators are GEO editors implicitly (see ``security.is_geo_editor``), so
+    # they are not repeated here. Emptying this leaves GEO editing exactly
+    # where it was before the role existed: Creator-only.
+    geo_editor_emails: str = (
+        "nino.b@legalsoft.com,"
+        "marian.p@legalsoft.com,"
+        "mahmoud.e@legalsoft.com,"
+        "lynie.t@aivirtual.com,"
+        "miguel@usimmigration.ai,"
+        "yans.suarez@medvirtual.ai"
+    )
 
     # --- Sign-in allowlist -------------------------------------------------
     # Cloud Run runs --allow-unauthenticated, so /api/auth/google is the ONLY
@@ -60,7 +82,19 @@ class Settings(BaseSettings):
     allowed_email_domains: str = "legalsoft.com"
     # Comma-separated individual addresses allowed regardless of domain — the
     # exception list for contractors/clients. Fillable via env, no code change.
-    allowed_emails: str = ""
+    #
+    # The three entries below are the GEO editors on outside domains. They are
+    # listed ONE ADDRESS AT A TIME on purpose. Putting aivirtual.com,
+    # usimmigration.ai and medvirtual.ai into ``allowed_email_domains`` would
+    # have been three shorter lines and would have admitted every mailbox at
+    # three other companies — including ones nobody here provisions or
+    # de-provisions — to a service Cloud Run serves --allow-unauthenticated,
+    # where this list is the only door. Named addresses only.
+    allowed_emails: str = (
+        "lynie.t@aivirtual.com,"
+        "miguel@usimmigration.ai,"
+        "yans.suarez@medvirtual.ai"
+    )
 
     # OpenRouter (agent LLM + image generation)
     openrouter_api_key: str = ""
@@ -105,6 +139,14 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     openai_api_key: str = ""
 
+    # GEO agent (a10) — DataForSEO, the agent's only search provider: it serves
+    # both Google AI Overview and Google AI Mode (SerpAPI, removed 2026-09-04,
+    # had no AI Mode endpoint). One Basic-auth credential in two halves; the
+    # base64 of "login:password" is assembled at call time in geo_engines and
+    # never stored. Either half missing leaves both Google engines honestly off.
+    dataforseo_login: str = ""
+    dataforseo_password: str = ""
+
     # Google Cloud
     gcp_project_id: str = ""
     google_application_credentials: str = ""
@@ -141,6 +183,17 @@ class Settings(BaseSettings):
     def creator_email_set(self) -> set[str]:
         env = {e.strip().lower() for e in self.creator_emails.split(",") if e.strip()}
         return set(CREATOR_EMAILS_DEFAULT) | env
+
+    @property
+    def geo_editor_email_set(self) -> set[str]:
+        """Addresses granted the GEO editor role by config.
+
+        Parsed exactly like ``admin_email_set``. The Creator implication is NOT
+        folded in here — it belongs in ``security.is_geo_editor``, beside the
+        same implication for ``is_admin``, so there is one place that decides
+        who holds the role and one place to read when asking why.
+        """
+        return {e.strip().lower() for e in self.geo_editor_emails.split(",") if e.strip()}
 
     @property
     def allowed_email_domain_set(self) -> set[str]:

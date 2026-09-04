@@ -28,7 +28,10 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app as fastapi_app
-from app.security import create_token, get_current_user, require_admin, require_creator
+from app.security import (
+    create_token, get_current_user, require_admin, require_creator,
+    require_geo_editor,
+)
 
 SECRET = "test-only-signing-key-" + "0" * 32
 
@@ -84,6 +87,10 @@ def _allowlist(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "allowed_emails", "")
     monkeypatch.setattr(settings, "creator_emails", "")
     monkeypatch.setattr(settings, "admin_emails", "")
+    # Blanked like the other two: this file asserts what the guards do, so the
+    # six real GEO editors shipped as the default must not silently satisfy a
+    # role check a test meant to see refused.
+    monkeypatch.setattr(settings, "geo_editor_emails", "")
     monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setenv("SEO_LOCAL_DIR", str(tmp_path / "seo"))
     # No dependency override: enforcing the real dependency is the point.
@@ -192,7 +199,7 @@ def test_the_role_guards_delegate_rather_than_re_implement(client):
     account — the exact bug wave 1 closed, one layer up."""
     import inspect
 
-    for guard in (require_admin, require_creator):
+    for guard in (require_admin, require_creator, require_geo_editor):
         defaults = [
             param.default for param in inspect.signature(guard).parameters.values()
         ]
@@ -271,3 +278,95 @@ def test_a_forged_role_claim_is_ignored(client, monkeypatch):
     )
     headers = {"Authorization": f"Bearer {forged}"}
     assert client.get("/api/admin/settings", headers=headers).status_code == 403
+
+
+# --------------------------------------------------------------------------- #
+# The GEO editor role — same three properties as the two flags above, asserted
+# on the same terms. It is the newest role and the one most likely to be
+# reached for next, so pinning it here rather than trusting the pattern held is
+# the cheap half of the work.
+# --------------------------------------------------------------------------- #
+
+GEO_EDITOR_ROUTE = "/api/geo/brands/legalsoft/rescan"
+
+
+def _rescan(client, headers):
+    return client.post(GEO_EDITOR_ROUTE, headers=headers, json={"days": 7})
+
+
+def test_revoking_a_geo_editor_takes_effect_on_the_next_request(client, monkeypatch):
+    monkeypatch.setattr(settings, "geo_editor_emails", "editor@legalsoft.com")
+    token = create_token("u-ed", "editor@legalsoft.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    assert _rescan(client, headers).status_code != 403
+
+    monkeypatch.setattr(settings, "geo_editor_emails", "")   # role revoked
+    assert _rescan(client, headers).status_code == 403, (
+        "a revoked GEO editor still holds the role for the life of the token"
+    )
+
+
+def test_granting_the_geo_editor_role_needs_no_new_sign_in(client, monkeypatch):
+    monkeypatch.setattr(settings, "geo_editor_emails", "")
+    token = create_token("u-ed", "editor@legalsoft.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    assert _rescan(client, headers).status_code == 403
+
+    monkeypatch.setattr(settings, "geo_editor_emails", "editor@legalsoft.com")
+    assert _rescan(client, headers).status_code != 403
+
+
+def test_a_forged_geo_editor_claim_is_ignored(client, monkeypatch):
+    """``create_token`` stamps no ``geo_editor`` claim, and nothing reads one.
+
+    Asserted rather than assumed: a token carrying the claim anyway — which is
+    what a future "just add it to the JWT like the others" change would mint —
+    must buy nothing, because the flag is derived from config per request.
+    """
+    import jwt as pyjwt
+
+    monkeypatch.setattr(settings, "geo_editor_emails", "")
+    monkeypatch.setattr(settings, "creator_emails", "")
+    forged = pyjwt.encode(
+        {"sub": "u-1", "email": "nobody@legalsoft.com", "geo_editor": True,
+         "is_geo_editor": True, "creator": True,
+         "exp": int(time.time()) + 3600},
+        SECRET, algorithm="HS256",
+    )
+    assert _rescan(client, {"Authorization": f"Bearer {forged}"}).status_code == 403
+
+
+def test_a_geo_editor_gets_no_creator_or_admin_reach(client, monkeypatch):
+    """The role's entire justification: it is NOT a step onto the admin ladder.
+
+    Six people needed to administer one agent. Making them Creators would have
+    handed over Settings → Secrets, the admin database viewer, model config and
+    every other agent — so if the narrow role carried any of that, the change
+    would have bought nothing and cost the same.
+    """
+    monkeypatch.setattr(settings, "geo_editor_emails", "editor@legalsoft.com")
+    monkeypatch.setattr(settings, "creator_emails", "")
+    monkeypatch.setattr(settings, "admin_emails", "")
+    headers = {"Authorization": f"Bearer {create_token('u-ed', 'editor@legalsoft.com')}"}
+
+    assert _rescan(client, headers).status_code != 403        # its own agent: yes
+    for path in ("/api/admin/settings", "/api/admin/users", "/api/admin/analytics",
+                 "/api/admin/db/collections", "/api/cron/jobs"):
+        assert client.get(path, headers=headers).status_code == 403, path
+
+
+def test_a_de_provisioned_geo_editor_is_refused_at_the_allowlist_first(client, monkeypatch):
+    """Role and membership are separate revocations, and membership wins.
+
+    One of the six is on an outside domain. Dropping them from ALLOWED_EMAILS
+    must lock them out entirely — 401, at the door — even while their address
+    is still sitting in GEO_EDITOR_EMAILS, which is the state a half-finished
+    off-boarding leaves behind.
+    """
+    monkeypatch.setattr(settings, "geo_editor_emails", "outsider@aivirtual.com")
+    monkeypatch.setattr(settings, "allowed_emails", "outsider@aivirtual.com")
+    headers = {"Authorization": f"Bearer {create_token('u-x', 'outsider@aivirtual.com')}"}
+    assert _rescan(client, headers).status_code != 403
+
+    monkeypatch.setattr(settings, "allowed_emails", "")   # off-boarded
+    assert _rescan(client, headers).status_code == 401

@@ -1,7 +1,10 @@
 """Engine tests: estimate math, to-do rules, status persistence, topic ranking."""
+import threading
 from datetime import date
 
-from seo_geo_agent import insights, keywords, topics
+import pytest
+
+from seo_geo_agent import insights, keywords, state, topics
 from seo_geo_agent.sources import QueryStat
 
 
@@ -70,6 +73,184 @@ def test_brand_upsert_and_delete_roundtrip():
     assert any(b["id"] == "acme" for b in insights.list_brands())
     insights.delete_brand("acme")
     assert not any(b["id"] == "acme" for b in insights.list_brands())
+
+
+def test_a_brand_added_while_another_is_being_added_is_not_lost():
+    """The lost update the transactional registry exists to stop.
+
+    ``brands`` is ONE document holding the whole list. The old write was
+    ``list_brands()`` -> append -> ``state.save``: two people adding a brand at
+    the same time both read the same list, both append their own, and the second
+    save overwrites the first — one brand silently gone. Harmless at one brand a
+    quarter; not harmless now that any GEO editor can add one and twelve go in
+    during a single sitting.
+
+    Driven by holding the FIRST writer inside its write while the second one
+    runs, which is the real window: the fix is that the read and the write are
+    one indivisible step, so the second writer cannot read a list the first has
+    already added to. Run this against ``load`` + ``save`` and "first" is gone.
+    """
+    inside = threading.Event()
+    proceed = threading.Event()
+    real_save = state.save
+
+    def blocking_save(doc_id, data):
+        if doc_id == insights.BRANDS_DOC and not inside.is_set():
+            inside.set()
+            proceed.wait(5)          # still mid-write, with the doc unchanged
+        return real_save(doc_id, data)
+
+    monkeypatch_save(blocking_save)
+    try:
+        first = threading.Thread(target=insights.create_brand, args=(
+            {"id": "first", "name": "First", "domain": "first.com", "enabled": True},))
+        first.start()
+        assert inside.wait(5), "the first add never reached its write"
+
+        second = threading.Thread(target=insights.create_brand, args=(
+            {"id": "second", "name": "Second", "domain": "second.com", "enabled": True},))
+        second.start()
+        second.join(0.5)             # a transactional write makes it wait its turn
+        proceed.set()
+        first.join(5)
+        second.join(5)
+    finally:
+        monkeypatch_save(real_save)
+        proceed.set()
+
+    ids = {b["id"] for b in insights.list_brands()}
+    assert {"first", "second"} <= ids, (
+        "a concurrent add overwrote the other one — the registry write is not "
+        f"transactional; registry holds {sorted(ids)}"
+    )
+
+
+def monkeypatch_save(fn):
+    """Swap ``state.save`` for the duration of a threaded test.
+
+    Not ``monkeypatch``: pytest's fixture is not thread-safe to install from,
+    and this has to be visible to a thread that is already running.
+    """
+    state.save = fn
+
+
+@pytest.mark.parametrize(
+    ("call", "args"),
+    [
+        (lambda b: insights.create_brand(b), ({"id": "z", "name": "Z", "domain": "z.com"},)),
+        (lambda b: insights.upsert_brand(b), ({"id": "z", "name": "Z", "domain": "z.com"},)),
+        (lambda b: insights.set_brand_enabled("legalsoft", False), (None,)),
+        (lambda b: insights.delete_brand("legalsoft"), (None,)),
+    ],
+)
+def test_every_registry_write_goes_through_the_transaction(call, args, monkeypatch):
+    """Structural, and the one that survives a rewrite of the code above.
+
+    The threaded test proves TODAY's implementation holds; this refuses the
+    shape that cannot hold at all. A bare ``state.save`` on the registry
+    document is a lost update in Firestore no matter how carefully the code
+    around it reads, so nothing may write that document except ``mutate``.
+    """
+    seen: list[str] = []
+    depth: list[int] = []
+    real_mutate, real_save = state.mutate, state.save
+
+    def traced_mutate(doc_id, change):
+        seen.append(doc_id)
+        depth.append(1)
+        try:
+            return real_mutate(doc_id, change)
+        finally:
+            depth.pop()
+
+    def guarded_save(doc_id, data):
+        # ``mutate`` writes through ``save`` on the offline path, which is fine —
+        # it is inside the lock/transaction. A save that reaches the registry
+        # document from OUTSIDE one is the defect.
+        if doc_id == insights.BRANDS_DOC and not depth:
+            raise AssertionError(
+                f"{doc_id!r} was written with a bare state.save — the brand "
+                "registry is one shared document and every write to it must go "
+                "through state.mutate"
+            )
+        return real_save(doc_id, data)
+
+    monkeypatch.setattr(state, "mutate", traced_mutate)
+    monkeypatch.setattr(state, "save", guarded_save)
+    call(args[0])
+    assert insights.BRANDS_DOC in seen
+
+
+def test_creating_a_brand_that_already_exists_is_refused():
+    """A slug collision must not silently adopt somebody else's brand: the same
+    id owns the same ``geo-config-*`` and ``gsc-auth-*`` documents underneath."""
+    insights.create_brand({"id": "acme", "name": "Acme", "domain": "acme.com",
+                           "enabled": True})
+    with pytest.raises(ValueError, match="already exists"):
+        insights.create_brand({"id": "acme", "name": "Acme Legal",
+                               "domain": "acmelegal.com", "enabled": True})
+    acme = next(b for b in insights.list_brands() if b["id"] == "acme")
+    assert acme["domain"] == "acme.com"   # the original, untouched
+
+
+def test_switching_a_brand_off_keeps_every_document_it_owns():
+    """The self-serve remove. It flips one flag; it destroys nothing.
+
+    ``delete_brand`` is the contrast this pins against: it drops the registry
+    entry and takes ``run-`` and ``todos-`` with it, leaving eighteen other
+    ``…-{brand_id}`` families — ``gsc-auth-{id}`` and its live Search Console
+    refresh token among them — with no route left that can reach them.
+    """
+    insights.create_brand({"id": "acme", "name": "Acme", "domain": "acme.com",
+                           "enabled": True})
+    state.save("gsc-auth-acme", {"refresh_token": "x", "property": "sc-domain:acme.com"})
+    insights.run_brand({"id": "acme", "name": "Acme", "domain": "acme.com"},
+                       trigger="test")
+
+    off = insights.set_brand_enabled("acme", False)
+    assert off["enabled"] is False
+    assert [b["id"] for b in insights.list_brands() if b.get("enabled", True)] != []
+    assert "acme" not in {b["id"] for b in insights.list_brands() if b.get("enabled", True)}
+    # nothing was destroyed, and the flip goes back
+    assert state.load("gsc-auth-acme")["refresh_token"] == "x"
+    assert insights.latest_run("acme") is not None
+    assert insights.set_brand_enabled("acme", True)["enabled"] is True
+    assert "acme" in {b["id"] for b in insights.list_brands() if b.get("enabled", True)}
+
+
+def test_switching_an_unknown_brand_is_a_lookup_failure_not_a_silent_write():
+    with pytest.raises(KeyError):
+        insights.set_brand_enabled("never-existed", False)
+
+
+@pytest.mark.parametrize(
+    ("typed", "expected"),
+    [
+        ("acme.com", "acme.com"),
+        ("ACME.com", "acme.com"),
+        ("https://www.acme.com/", "acme.com"),
+        # the case the old inline copy got wrong: a pasted URL kept its path,
+        # so the brand's domain became "acme.com/pricing" and every
+        # ``sc-domain:`` lookup and alias derived from it was nonsense
+        ("https://acme.com/pricing?utm=x#top", "acme.com"),
+        ("http://acme.com:8080/a", "acme.com"),
+        ("  www.Acme.COM  ", "acme.com"),
+    ],
+)
+def test_a_pasted_url_reduces_to_the_host(typed, expected):
+    assert insights.normalize_domain(typed) == expected
+
+
+@pytest.mark.parametrize("typed", ["", "   ", "not-a-domain", "https://", "/", "a b.com"])
+def test_something_that_is_not_a_site_is_refused(typed):
+    with pytest.raises(ValueError):
+        insights.normalize_domain(typed)
+
+
+def test_a_brand_id_is_a_slug_and_punctuation_alone_has_none():
+    assert insights.slugify_brand_id("Acme Legal, Inc.") == "acme-legal-inc"
+    with pytest.raises(ValueError, match="name"):
+        insights.slugify_brand_id("!!!")
 
 
 def test_run_brand_offline_degrades_and_persists(monkeypatch):

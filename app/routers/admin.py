@@ -480,7 +480,7 @@ _SENSITIVE_FIELDS = {
 }
 
 # Catch-all for secrets written by agent code straight into a document (e.g.
-# app_config/global.seo_serper_api_key, .serpapi_api_key, Canva OAuth tokens),
+# app_config/global.seo_serper_api_key, .dataforseo_password, Canva OAuth tokens),
 # which no central list knows about.
 _SENSITIVE_SUFFIXES = (
     "_api_key",

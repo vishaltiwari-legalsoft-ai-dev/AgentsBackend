@@ -17,9 +17,9 @@ _real_dataforseo_creds = geo_engines.dataforseo_creds
 
 @pytest.fixture(autouse=True)
 def _no_dataforseo(monkeypatch):
-    # a developer's exported DATAFORSEO_* pair must not flip the SERP vendor
-    # under tests that stub only the SerpAPI key; tests of the DataForSEO path
-    # re-patch this seam themselves
+    # a developer's real DATAFORSEO_* pair (local .env, exported env) must never
+    # turn an offline test into a billed live SERP call; tests of the DataForSEO
+    # path re-patch this seam themselves
     monkeypatch.setattr(geo_engines, "dataforseo_creds", lambda: ("", ""))
 
 
@@ -179,10 +179,9 @@ def test_native_quota_error_falls_back_to_openrouter(monkeypatch):
 def test_available_engines_lights_up_with_openrouter_only(monkeypatch):
     monkeypatch.setattr(geo_engines, "engine_key", lambda e: "")
     monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "or-key")
-    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "")
     engines = geo_engines.available_engines()
     assert engines["perplexity"] and engines["gemini"] and engines["chatgpt"]
-    # SERP engines need a SERP vendor — a chat fallback can't fake a SERP
+    # SERP engines need DataForSEO — a chat fallback can't fake a SERP
     assert engines["aio"] is False
     assert engines["ai_mode"] is False
 
@@ -210,70 +209,11 @@ def test_to_dict_caps_citations_and_lengths():
     assert len(d["citations"][0]["title"]) == geo_engines.CITATION_TITLE_CAP
 
 
-# ------------------------------------------------ Google AIO via SerpAPI ----
-
-AIO_OK = {
-    "ai_overview": {
-        "text_blocks": [
-            {"type": "paragraph", "snippet": "Legal Soft and Ruby lead the intake space."},
-            {"type": "list", "list": [
-                {"title": "Answer calls 24/7", "snippet": "after-hours coverage"},
-            ]},
-        ],
-        "references": [
-            {"title": "Lawyerist review", "link": "https://lawyerist.com/reviews/x"},
-        ],
-    }
-}
-
-
-def patch_get(monkeypatch, resp):
-    monkeypatch.setattr(geo_engines.httpx, "get", lambda *a, **k: resp)
-
-
-def test_poll_aio_parses_blocks_and_references(monkeypatch):
-    patch_get(monkeypatch, FakeResp(200, AIO_OK))
-    ans = geo_engines.poll_aio("best legal intake", "serp-key")
-    assert ans.error is None and not ans.no_aio and ans.via == "serpapi"
-    assert "Legal Soft and Ruby" in ans.text and "Answer calls 24/7" in ans.text
-    assert ans.citations[0]["domain"] == "lawyerist.com"
-    assert ans.credits == 1
-
-
-def test_poll_aio_no_overview_is_completed_not_error(monkeypatch):
-    patch_get(monkeypatch, FakeResp(200, {"organic": []}))
-    ans = geo_engines.poll_aio("some query", "serp-key")
-    assert ans.no_aio is True and ans.error is None
-    assert ans.to_dict()["no_aio"] is True
-
-
-def test_poll_aio_page_token_second_call_costs_two(monkeypatch):
-    calls = []
-
-    def get(url, params=None, **kw):
-        calls.append(params.get("engine"))
-        if params.get("engine") == "google":
-            return FakeResp(200, {"ai_overview": {"page_token": "tok123"}})
-        return FakeResp(200, AIO_OK)
-
-    monkeypatch.setattr(geo_engines.httpx, "get", get)
-    ans = geo_engines.poll_aio("q", "serp-key")
-    assert calls == ["google", "google_ai_overview"]
-    assert ans.credits == 2 and "Legal Soft" in ans.text
-
-
-def test_available_engines_includes_aio_with_serpapi_key(monkeypatch):
-    monkeypatch.setattr(geo_engines, "engine_key", lambda e: "")
-    monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "")
-    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "serp-key")
-    engines = geo_engines.available_engines()
-    assert engines["aio"] is True
-    assert engines["perplexity"] is False
-
-
 # --------------------------------------------- Google SERP via DataForSEO ----
-# Verified live on 2026-08-30: both endpoints answer in one envelope and both
-# put the AI answer in an item typed "ai_overview" — the AI Mode endpoint too.
+# The only search provider. Both endpoints answer in one envelope and put the
+# AI answer in one item of ``result[0].items``; the parser accepts every
+# spelling of that item's ``type`` the vendor has used, because guessing wrong
+# does not raise — it files "Google showed no AI answer" forever.
 
 
 def test_dataforseo_aio_parses_markdown_and_references(monkeypatch):
@@ -318,6 +258,40 @@ def test_dataforseo_deferred_overview_is_no_aio_not_an_empty_answer(monkeypatch)
     assert ans.to_dict()["no_aio"] is True
 
 
+def test_a_deferred_overview_and_a_genuine_absence_store_identically(monkeypatch):
+    """RECORDED, NOT FIXED — deliberately.
+
+    Google defers an overview (the item is present, ``asynchronous_ai_overview:
+    true``, empty) and Google publishing none at all are DIFFERENT events, and
+    the stored record cannot tell them apart: same ``no_aio``, same empty text,
+    same empty citations, byte-identical. Resolving a deferred overview means a
+    second, separately billed DataForSEO fetch, which is a spend decision and
+    not one this layer makes.
+
+    What that costs, precisely, so the choice is made with the number in view:
+    ``no_aio`` rows sit OUTSIDE every rate denominator (``geo_metrics.
+    measurable``), so a deferred overview does not drag the mention rate down —
+    it is `n_no_aio` that over-counts, and the panel labels that "Google
+    published no AI Overview", which for this subset is not what happened.
+
+    If the follow-up fetch is ever bought, this test is the list of what has to
+    change with it.
+    """
+    deferred = fixture("dataforseo_aio_async_stub")
+    absent = fixture("dataforseo_aio_ok")
+    result = absent["tasks"][0]["result"][0]
+    result["items"] = [i for i in result["items"] if i["type"] != "ai_overview"]
+
+    patch_post(monkeypatch, FakeResp(200, deferred))
+    one = geo_engines.poll_dataforseo("aio", "q", "l", "p").to_dict()
+    patch_post(monkeypatch, FakeResp(200, absent))
+    other = geo_engines.poll_dataforseo("aio", "q", "l", "p").to_dict()
+
+    one.pop("latency_ms"), other.pop("latency_ms")   # timing, not measurement
+    assert one == other
+    assert one["no_aio"] is True and one["error"] is None
+
+
 def test_dataforseo_serp_without_an_overview_item_is_no_aio(monkeypatch):
     payload = fixture("dataforseo_aio_ok")
     result = payload["tasks"][0]["result"][0]
@@ -344,14 +318,98 @@ def test_dataforseo_ai_mode_parses_and_hits_its_own_endpoint(monkeypatch):
     assert "device" not in sent["body"][0]
 
 
-def test_dataforseo_ai_mode_with_empty_markdown_is_no_aio(monkeypatch):
+def test_dataforseo_ai_mode_with_nothing_at_all_is_no_aio(monkeypatch):
+    """Empty item, empty everything = Google put no AI answer on the surface.
+    A completed observation, not an error and not a blank answer."""
     payload = fixture("dataforseo_ai_mode_ok")
-    payload["tasks"][0]["result"][0]["items"][0]["markdown"] = ""
+    block = payload["tasks"][0]["result"][0]["items"][0]
+    block["markdown"], block["items"], block["references"] = "", [], []
     patch_post(monkeypatch, FakeResp(200, payload))
 
     ans = geo_engines.poll_dataforseo("ai_mode", "q", "l", "p")
 
-    assert ans.no_aio is True and ans.error is None and ans.citations == []
+    assert ans.no_aio is True and ans.error is None
+    assert ans.text == "" and ans.citations == []
+
+
+def test_dataforseo_ai_mode_reads_nested_elements_when_markdown_is_missing(monkeypatch):
+    """Shape drift, not silence: the top-level ``markdown`` is gone but the
+    nested elements still carry the answer. Reporting ``no_aio`` here would
+    file a real Google answer as "Google said nothing" — the exact lie this
+    engine is being rebuilt to stop telling."""
+    payload = fixture("dataforseo_ai_mode_ok")
+    block = payload["tasks"][0]["result"][0]["items"][0]
+    del block["markdown"]
+    patch_post(monkeypatch, FakeResp(200, payload))
+
+    ans = geo_engines.poll_dataforseo("ai_mode", "q", "l", "p")
+
+    assert ans.no_aio is False and ans.error is None
+    assert "Legal Soft" in ans.text and "Smith.ai" in ans.text
+    assert [c["domain"] for c in ans.citations][:1] == ["mycase.com"]
+
+
+@pytest.mark.parametrize("item_type", ["ai_overview", "ai_mode", "ai_mode_message"])
+def test_dataforseo_ai_mode_accepts_every_spelling_of_the_answer_item(
+    monkeypatch, item_type
+):
+    """DataForSEO documents ``ai_overview`` on the AI Mode endpoint and its own
+    writing also names ``ai_mode_message``. An unrecognised type does not raise
+    — it reads as "no AI answer" forever — so every spelling is accepted."""
+    payload = fixture("dataforseo_ai_mode_ok")
+    payload["tasks"][0]["result"][0]["items"][0]["type"] = item_type
+    patch_post(monkeypatch, FakeResp(200, payload))
+
+    ans = geo_engines.poll_dataforseo("ai_mode", "q", "l", "p")
+
+    assert ans.no_aio is False and ans.error is None and "Legal Soft" in ans.text
+
+
+def test_dataforseo_ai_mode_unknown_item_type_is_no_aio_not_a_crash(monkeypatch):
+    """The floor under the guess above: a type nobody has seen degrades to the
+    honest observation, never an exception out of an adapter."""
+    payload = fixture("dataforseo_ai_mode_ok")
+    payload["tasks"][0]["result"][0]["items"][0]["type"] = "ai_something_new"
+    patch_post(monkeypatch, FakeResp(200, payload))
+
+    ans = geo_engines.poll_dataforseo("ai_mode", "q", "l", "p")
+
+    assert ans.no_aio is True and ans.error is None and ans.text == ""
+
+
+def test_dataforseo_ai_mode_collects_per_section_references_deduped(monkeypatch):
+    """AI Mode attributes sources per section as well as at the top. Every
+    source Google credited counts once — a citation list that misses the
+    nested ones under-reports the brands the answer actually linked."""
+    payload = fixture("dataforseo_ai_mode_ok")
+    block = payload["tasks"][0]["result"][0]["items"][0]
+    block["items"][0]["references"] = [
+        {"type": "ai_overview_reference", "domain": "www.legalsoft.com",
+         "url": "https://www.legalsoft.com/intake", "title": "dupe of a top-level ref"},
+        {"type": "ai_overview_reference", "domain": "lawyerist.com",
+         "url": "https://lawyerist.com/reviews/x", "title": "Lawyerist"},
+    ]
+    patch_post(monkeypatch, FakeResp(200, payload))
+
+    ans = geo_engines.poll_dataforseo("ai_mode", "q", "l", "p")
+
+    domains = [c["domain"] for c in ans.citations]
+    assert domains == ["mycase.com", "getperspective.ai", "smith.ai",
+                       "legalsoft.com", "lawyerist.com"]
+    assert domains.count("legalsoft.com") == 1
+
+
+def test_dataforseo_success_with_no_result_payload_is_an_error(monkeypatch):
+    """20000 with nothing in it measured NOTHING. Banking that as ``no_aio``
+    would write a permanent zero into the brand's score from a failed call."""
+    payload = fixture("dataforseo_ai_mode_ok")
+    payload["tasks"][0]["result"] = None
+    patch_post(monkeypatch, FakeResp(200, payload))
+
+    ans = geo_engines.poll_dataforseo("ai_mode", "q", "l", "p")
+
+    assert ans.error == "DataForSEO returned no result for the task"
+    assert ans.no_aio is False and ans.text == ""
 
 
 def test_dataforseo_task_level_error_is_an_error_with_code_and_message(monkeypatch):
@@ -389,57 +447,73 @@ def test_dataforseo_transport_exception_is_captured(monkeypatch):
 
 
 def test_dataforseo_creds_need_both_halves(monkeypatch):
-    # offline mode: env only, Firestore is never consulted
-    monkeypatch.setenv("DATAFORSEO_LOGIN", "me")
-    monkeypatch.delenv("DATAFORSEO_PASSWORD", raising=False)
+    """Half a Basic-auth credential is no credential: the engines stay off
+    rather than sending an auth header that cannot work."""
+    values = {"dataforseo_login": "me@example.com", "dataforseo_password": ""}
+    monkeypatch.setattr(geo_engines.runtime_config, "get",
+                        lambda field: values.get(field, ""))
     assert _real_dataforseo_creds() == ("", "")
-    monkeypatch.setenv("DATAFORSEO_PASSWORD", "pw")
-    assert _real_dataforseo_creds() == ("me", "pw")
+    values["dataforseo_password"] = "pw"
+    assert _real_dataforseo_creds() == ("me@example.com", "pw")
+
+
+def test_dataforseo_creds_are_real_settings_fields_with_an_admin_override():
+    """The resolution the docstring advertises has to exist, or ``get`` returns
+    "" forever and the admin layer is unreachable dead code (the
+    ``gd_polish_image_model`` defect, one agent over)."""
+    from app.config import settings
+    from app.services import runtime_config
+
+    for field in ("dataforseo_login", "dataforseo_password"):
+        assert isinstance(getattr(settings, field, None), str)
+        assert field in runtime_config.OVERRIDE_FIELDS
 
 
 # ------------------------------------------------------- the vendor seam ----
 # The engine id is what the product measures; the vendor is how it was fetched.
-# AIO: DataForSEO when its creds exist, else SerpAPI, else honestly nothing.
-# AI Mode: DataForSEO only — SerpAPI has no endpoint for it.
+# There is one search vendor now: DataForSEO serves both SERP engines, and no
+# credential means no measurement — never a quiet zero.
 
 
-def test_aio_prefers_dataforseo_when_its_credentials_exist(monkeypatch):
+def test_both_serp_engines_are_served_by_dataforseo(monkeypatch):
     monkeypatch.setattr(geo_engines, "dataforseo_creds", lambda: ("l", "p"))
-    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "serp-key")
     patch_post(monkeypatch, FakeResp(200, fixture("dataforseo_aio_ok")))
+    assert geo_engines.poll_engine("aio", "q").via == "dataforseo"
 
-    def never(*a, **k):
-        raise AssertionError("SerpAPI was called although DataForSEO is configured")
-    monkeypatch.setattr(geo_engines.httpx, "get", never)
-
-    ans = geo_engines.poll_engine("aio", "q")
-    assert ans.via == "dataforseo" and ans.error is None
-    assert geo_engines.serp_vendor("aio") == "dataforseo"
-
-
-def test_aio_falls_back_to_serpapi_without_dataforseo(monkeypatch):
-    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "serp-key")
-    patch_get(monkeypatch, FakeResp(200, AIO_OK))
-
-    ans = geo_engines.poll_engine("aio", "q")
-    assert ans.via == "serpapi" and ans.error is None
-    assert geo_engines.serp_vendor("aio") == "serpapi"
-
-
-def test_aio_with_no_serp_vendor_is_an_honest_error(monkeypatch):
-    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "")
-    ans = geo_engines.poll_engine("aio", "q")
-    assert ans.error == "no API key configured" and ans.no_aio is False
-
-
-def test_ai_mode_is_dataforseo_only(monkeypatch):
-    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "serp-key")
-    assert geo_engines.poll_engine("ai_mode", "q").error == "no API key configured"
-    assert geo_engines.serp_vendor("ai_mode") == "off"
-
-    monkeypatch.setattr(geo_engines, "dataforseo_creds", lambda: ("l", "p"))
     patch_post(monkeypatch, FakeResp(200, fixture("dataforseo_ai_mode_ok")))
     assert geo_engines.poll_engine("ai_mode", "q").via == "dataforseo"
+
+    assert geo_engines.serp_vendor("aio") == "dataforseo"
+    assert geo_engines.serp_vendor("ai_mode") == "dataforseo"
+
+
+@pytest.mark.parametrize("engine", ["aio", "ai_mode"])
+def test_serp_engine_without_credentials_fails_loudly(monkeypatch, engine):
+    """No credential is an ERROR, and the message names the env vars to set.
+    It is emphatically not ``no_aio``: that would average a missing key into
+    the brand's visibility score as if Google had stayed silent."""
+    def never(*a, **k):
+        raise AssertionError("a SERP call was attempted with no credentials")
+    monkeypatch.setattr(geo_engines.httpx, "post", never)
+
+    ans = geo_engines.poll_engine(engine, "q")
+
+    assert ans.no_aio is False and ans.text == ""
+    assert ans.error == (
+        "DataForSEO credentials are not configured — set "
+        "DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD"
+    )
+    assert geo_engines.serp_vendor(engine) == "off"
+
+
+def test_no_provider_is_selected_behind_a_flag(monkeypatch):
+    """One provider, no fallback selection: nothing in the module still knows
+    how to reach a second search vendor."""
+    monkeypatch.setattr(geo_engines, "dataforseo_creds", lambda: ("l", "p"))
+    assert set(geo_engines.MODE_MEANING) == {"native", "proxy", "dataforseo", "off"}
+    assert not hasattr(geo_engines, "serpapi_key")
+    assert not hasattr(geo_engines, "poll_aio")
+    assert {geo_engines.serp_vendor(e) for e in geo_engines.SERP_ENGINES} == {"dataforseo"}
 
 
 # ------------------------------------------------------------- the specs ----
@@ -492,7 +566,6 @@ def test_human_labels():
 def test_engine_status_marks_openrouter_fallback_as_proxy(monkeypatch):
     monkeypatch.setattr(geo_engines, "engine_key", lambda e: "")
     monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "or-key")
-    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "")
 
     status = geo_engines.engine_status()
 
@@ -508,7 +581,6 @@ def test_engine_status_marks_openrouter_fallback_as_proxy(monkeypatch):
 def test_engine_status_marks_native_key_as_native(monkeypatch):
     monkeypatch.setattr(geo_engines, "engine_key", lambda e: "native-key")
     monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "or-key")
-    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "")
 
     status = geo_engines.engine_status()
 
@@ -519,7 +591,6 @@ def test_engine_status_marks_native_key_as_native(monkeypatch):
 def test_engine_status_reports_off_when_no_key_at_all(monkeypatch):
     monkeypatch.setattr(geo_engines, "engine_key", lambda e: "")
     monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "")
-    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "")
 
     status = geo_engines.engine_status()
 
@@ -534,24 +605,9 @@ def test_engine_status_reports_off_when_no_key_at_all(monkeypatch):
     assert set(status) == set(geo_engines.ALL_ENGINES)
 
 
-def test_engine_status_serpapi_only_backs_aio_but_not_ai_mode(monkeypatch):
-    monkeypatch.setattr(geo_engines, "engine_key", lambda e: "")
-    monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "or-key")
-    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "serp-key")
-
-    status = geo_engines.engine_status()
-
-    assert status[geo_engines.AIO_ENGINE]["mode"] == "serpapi"
-    assert status[geo_engines.AIO_ENGINE]["connected"] is True
-    assert status[geo_engines.AIO_ENGINE]["model"] == "google-ai-overview"
-    assert status[geo_engines.AI_MODE_ENGINE]["mode"] == "off"
-    assert status[geo_engines.AI_MODE_ENGINE]["connected"] is False
-
-
 def test_engine_status_reports_dataforseo_for_both_serp_engines(monkeypatch):
     monkeypatch.setattr(geo_engines, "engine_key", lambda e: "")
     monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "")
-    monkeypatch.setattr(geo_engines, "serpapi_key", lambda: "serp-key")   # loses to DataForSEO
     monkeypatch.setattr(geo_engines, "dataforseo_creds", lambda: ("l", "p"))
 
     status = geo_engines.engine_status()
@@ -569,3 +625,45 @@ def test_engine_status_reports_dataforseo_for_both_serp_engines(monkeypatch):
     engines = geo_engines.available_engines()
     assert engines["aio"] is True and engines["ai_mode"] is True
     assert engines["perplexity"] is False
+
+
+# ------------------------------------------- how each engine is ASKED, published
+# The console mirrored `SERP_ENGINES = ["aio", "ai_mode"]` and
+# `CHAT_RUNS_PER_PROMPT = 3` as frontend constants so it could explain why the
+# engines return different numbers of answers. `engine_shapes` publishes the
+# fact instead, so there is one definition rather than a copy that starts lying
+# the day the real one changes.
+
+
+def test_engine_shapes_is_a_read_of_the_specs_not_a_second_copy():
+    shapes = geo_engines.engine_shapes()
+
+    assert set(shapes) == set(geo_engines.ENGINE_SPECS)
+    for engine, spec in geo_engines.ENGINE_SPECS.items():
+        assert shapes[engine]["label"] == spec.label
+        assert shapes[engine]["kind"] == spec.kind
+        assert shapes[engine]["runs_per_prompt"] == spec.runs_per_prompt
+
+
+def test_engine_shapes_carries_both_halves_of_the_count_difference():
+    """A chat engine is sampled three times over every question; a billed SERP
+    engine is fetched once and only on the discovery questions. Publishing the
+    sample size without the intents explains half the gap and mis-explains the
+    rest."""
+    shapes = geo_engines.engine_shapes()
+
+    assert shapes["chatgpt"]["runs_per_prompt"] == geo_engines.CHAT_RUNS_PER_PROMPT
+    assert shapes["chatgpt"]["intents"] is None           # every question
+    assert shapes["aio"]["runs_per_prompt"] == geo_engines.SERP_RUNS_PER_PROMPT
+    assert shapes["aio"]["intents"] == list(geo_engines.SERP_INTENTS)
+    # `intents: None` must survive JSON as null, not as an empty list that would
+    # read as "this engine is asked no questions at all"
+    assert json.loads(json.dumps(shapes))["chatgpt"]["intents"] is None
+
+
+def test_the_serp_engine_set_is_derivable_from_what_is_published():
+    """The exact constant the frontend was mirroring."""
+    shapes = geo_engines.engine_shapes()
+    assert [e for e, s in shapes.items() if s["kind"] == "serp"] == list(
+        geo_engines.SERP_ENGINES
+    )

@@ -7,7 +7,7 @@ author intended, and nothing at all about whether the two halves meet.
 
   C-2  ``geo_poll.poll_step`` emits ``terminal`` / ``terminal_reason``  →
        ``app/routers/geo.py`` puts them on the wire  →
-       ``components/console/geo/pollLoop.ts`` stops the loop on them.
+       ``components/hub/work/geo/pollLoop.ts`` stops the loop on them.
        Covered separately: geo_poll's unit tests (the values), pollLoop's unit
        tests (the decisions). Uncovered: that the HTTP response in between
        actually carries the fields, under the names the console reads.
@@ -41,8 +41,14 @@ from app.security import get_current_user
 
 client = TestClient(fastapi_app)
 
+# ``is_geo_editor`` mirrors the payload ``get_current_user`` builds: this file
+# drives PUT /prompts and PUT /config, which moved from require_creator to
+# require_geo_editor. A Creator is a GEO editor implicitly, so the flag is True
+# for the same caller as before — the dict just has to say so, because the
+# override replaces the real dependency that would have derived it.
 USER = {"id": "u-contract", "email": "t@legalsoft.com", "is_admin": False,
-        "is_creator": True, "session_id": "", "timezone": "UTC"}
+        "is_creator": True, "is_geo_editor": True, "session_id": "",
+        "timezone": "UTC"}
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FRONTEND = REPO_ROOT / "newfrontend"
@@ -220,8 +226,12 @@ def ts_types():
         pytest.skip(f"newfrontend/ not present next to backend/ ({FRONTEND})")
     return (
         _ts_interface_fields(FRONTEND / "lib" / "api.ts", "GeoPollProgress"),
+        # Moved by the AgentHub revamp: components/console/geo/ →
+        # components/hub/work/geo/. The old path errored at fixture setup, which
+        # is the right behaviour for a contract whose other half has vanished —
+        # it just needed following rather than silencing.
         _ts_interface_fields(
-            FRONTEND / "components" / "console" / "geo" / "pollLoop.ts",
+            FRONTEND / "components" / "hub" / "work" / "geo" / "pollLoop.ts",
             "PollStepProgress",
         ),
     )
@@ -257,17 +267,33 @@ def test_every_field_the_console_reads_is_a_field_the_backend_sends(ts_types, ge
 # The reverse direction, which the assertion above cannot see: fields the
 # backend sends that the console has no type for, and therefore cannot read.
 #
-# RECORDED GAP. ``aio_capped`` is how poll_step says "Google AIO spent its
-# monthly SerpAPI credit and dropped out of this poll" — geo_poll's own
-# docstring calls that "honestly reported, never a surprise". It is reported all
-# the way to the wire and then falls on the floor: GeoPollProgress declares
-# neither field, so the panel just shows AIO's numbers quietly going stale.
-# Owner: senior-frontend (see the matching block in
-# newfrontend/components/console/geo/pollContract.test.ts).
+# CLOSED 2026-09-04, and empty is the strongest form this can take: the backend
+# now sends the console nothing the console has no type for.
 #
-# Equality ratchet: a THIRD undeclared field fails this, and declaring these two
-# also fails it — which is the signal to empty the set.
-KNOWN_UNDECLARED_BY_THE_CONSOLE = {"aio_capped", "aio_credits_month"}
+# This set existed because five fields reached the wire and fell on the floor —
+# reported honestly by the backend, unreadable by any console code:
+#
+#   stop_code / unlocks_at / lease_held_by
+#       WHICH of four refusals this is, when it clears, and who is responsible
+#       where somebody is: a check already running, this brand already checked
+#       today, the daily engine-call budget, dead providers. Four situations
+#       needing four sentences and four different offers, all of which the panel
+#       rendered as one generic terminal string — the only alternative being to
+#       match on prose, which a reword or a translation breaks.
+#   aio_capped / aio_credits_month
+#       How poll_step says "the Google engines spent the month's DataForSEO
+#       credit and dropped out of this check" — what geo_poll's own docstring
+#       calls "honestly reported, never a surprise". The panel simply showed
+#       their numbers going quietly stale.
+#
+# All five are declared on ``GeoPollProgress`` now. The matching record lives in
+# newfrontend/components/hub/work/geo/pollContract.test.ts.
+#
+# Equality ratchet, and it must stay equality: the FIRST backend field that
+# appears on the wire without a console type fails this test. That is the whole
+# point — do not soften it to a subset check to get a green run, and do not add
+# a field here without an owner and a date for taking it back out.
+KNOWN_UNDECLARED_BY_THE_CONSOLE: set[str] = set()
 
 
 def test_the_only_fields_the_console_cannot_read_are_the_known_two(ts_types, geo, monkeypatch):

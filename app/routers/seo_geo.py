@@ -10,7 +10,6 @@ import hmac
 import html
 import logging
 import os
-import re
 import secrets
 
 from datetime import date, timedelta
@@ -143,12 +142,16 @@ def overview(user=Depends(get_current_user)):
 @router.post("/seo-geo/brands")
 def save_brand(payload: BrandIn, user=Depends(require_creator),
                act: Activity = trail.records("brand_saved", "Saved a brand", unit=CHANGE)):
-    slug = re.sub(r"[^a-z0-9]+", "-", (payload.id or payload.name).lower()).strip("-")
-    if not slug:
-        raise HTTPException(status_code=422, detail="Brand needs a name")
-    domain = re.sub(r"^https?://", "", payload.domain.lower()).strip("/ ").removeprefix("www.")
-    if "." not in domain:
-        raise HTTPException(status_code=422, detail="Enter the site domain, e.g. brand.com")
+    # Shared with the GEO editor's self-serve create route: one answer to "what
+    # is a valid brand id / domain", in the module that owns brand records. The
+    # copy that used to live here also kept the path when a full URL was pasted
+    # ("brand.com/pricing"), which broke ``sc-domain:`` and every alias derived
+    # from the domain.
+    try:
+        slug = insights.slugify_brand_id(payload.id or payload.name)
+        domain = insights.normalize_domain(payload.domain)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     brand = {
         "id": slug,
         "name": payload.name.strip() or slug,

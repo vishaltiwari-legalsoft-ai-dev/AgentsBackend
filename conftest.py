@@ -1,7 +1,7 @@
 # backend/conftest.py
 """Repo-root test guards — apply to EVERY test in this repo.
 
-Four protections, born from real incidents. The MR suite's conftest records the
+Five protections, born from real incidents. The MR suite's conftest records the
 first one (a targets test wrote its fixture into the live ``mr_config/targets``
 doc); the GD suite supplied the second (``test_mirror_to_gcs_noop_without_gcs``
 asserts "no GCS in tests" but was uploading its fixtures to the live
@@ -19,8 +19,11 @@ reference-library bucket, because nothing stopped it):
    latency — on whoever happens to run the suite.
 4. Cloud Storage reports itself unconfigured, so nothing mirrors to the live
    bucket.
+5. The DataForSEO credential reads empty, so the GEO agent's two Google SERP
+   engines report themselves unconfigured instead of buying live, billed SERP
+   calls.
 
-3 and 4 follow the same rule as 2: a test that legitimately exercises those
+3, 4 and 5 follow the same rule as 2: a test that legitimately exercises those
 paths monkeypatches its own module-level seam (``suggestions._get_llm``,
 ``qa_brain._analyze``, ``storage.is_configured``, …) and that override wins.
 """
@@ -85,6 +88,35 @@ def _no_live_openrouter(monkeypatch):
         return
 
     monkeypatch.setattr(settings, "openrouter_api_key", "", raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_live_dataforseo(monkeypatch):
+    """Both halves of the DataForSEO credential read empty — half a Basic-auth
+    credential is no credential, so the SERP engines go honestly "off".
+
+    Guard #3's shape, and it exists for guard #3's reason. On 2026-09-04 the
+    credential moved from ``os.environ`` (which only ``start-backend.ps1``
+    populates) to a real ``Settings`` field, so an admin could rotate it
+    without a redeploy — which also meant pydantic read it straight out of a
+    developer's ``.env`` for every test. ``app/routers/tests`` has no conftest
+    of its own and immediately made two live, billed calls to
+    api.dataforseo.com on a plain suite run.
+
+    A test that legitimately exercises the adapter stubs
+    ``geo_engines.dataforseo_creds`` or ``httpx`` itself; that override wins.
+    """
+    for var in ("DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD"):
+        monkeypatch.delenv(var, raising=False)
+    try:
+        from app.config import settings
+    except ImportError:
+        yield
+        return
+
+    monkeypatch.setattr(settings, "dataforseo_login", "", raising=False)
+    monkeypatch.setattr(settings, "dataforseo_password", "", raising=False)
     yield
 
 
