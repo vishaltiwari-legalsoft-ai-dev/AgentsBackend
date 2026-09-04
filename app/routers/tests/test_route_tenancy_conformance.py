@@ -241,6 +241,15 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     # (``MR_BOARD_REPORT``), and the kill switch sits INSIDE the handler, so the
     # auth dependency still runs first and an anonymous caller gets 401, not 404.
     ("POST", "/api/mr/board-report"): TENANT_SCOPED,
+    # The board report as a document. Both load the run through the same
+    # ``run.get("user_id") != user["id"]`` check the sibling readers use and
+    # answer 404 - not 403 - to anyone else, so an id belonging to another
+    # workspace is indistinguishable from one that does not exist. The PDF
+    # route hands the rendered HTML to the renderer service and carries no
+    # tenancy of its own: it renders what the ownership check already let
+    # through, and nothing else.
+    ("GET", "/api/mr/board-report/{run_id}/html"): TENANT_SCOPED,
+    ("GET", "/api/mr/board-report/{run_id}/pdf"): TENANT_SCOPED,
     ("GET", "/api/mr/datasets"): TENANT_SCOPED,
     ("DELETE", "/api/mr/datasets/{dataset_id}"): TENANT_SCOPED,
     ("POST", "/api/mr/ingest"): TENANT_SCOPED,

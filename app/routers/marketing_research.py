@@ -14,15 +14,19 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from datetime import date, datetime, timezone
 
+import httpx
 from fastapi import (
     APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile,
 )
 from fastapi.responses import StreamingResponse
 
 from app.security import get_current_user
-from app.services.run_tracking import CHANGE, CRON, JOB, Activity, ActivityTrail
+from app.services.run_tracking import (
+    CHANGE, CRON, JOB, Activity, ActivityTrail, silent,
+)
 
 from dataclasses import asdict
 
@@ -1269,11 +1273,40 @@ def board_report(body: dict | None = None, user=Depends(get_current_user),
     return report
 
 
+def _listed_period(structured: dict) -> str | None:
+    """The Period column for one stored run, whatever kind wrote it.
+
+    The campaign kinds carry one window as ``period.label``. The board kinds
+    carry ``periods`` instead - one entry, or two, because a board report is a
+    comparison of two windows and one label cannot say so. Reading only the
+    first shape listed every board run with an em-dash under Period, and in this
+    UI an em-dash means "not reported": the absent-vs-unknown confusion the board
+    report exists to refuse, showing up in the list of board reports.
+
+    Derived here rather than written into the stored run: the runs are already
+    persisted, so a stored field would only be true for the ones built after it,
+    and the label is a presentation of ``periods``, not a new fact about them.
+    """
+    single = (structured.get("period") or {}).get("label")
+    if single:
+        return str(single)
+    labels = [str(p.get("label") or p.get("key") or "").strip()
+              for p in (structured.get("periods") or [])
+              if isinstance(p, dict)]
+    labels = [label for label in labels if label]
+    if not labels:
+        return None
+    # Both windows, in the order the document prints them. Deduplicated because
+    # a ledger CAN name the same period twice (``single_period`` is a period
+    # against itself) and "Q1 vs Q1" would read as a comparison nobody asked for.
+    return " vs ".join(dict.fromkeys(labels))
+
+
 @router.get("/mr/runs")
 def list_report_runs(user=Depends(get_current_user)):
     return [
         {"id": r["id"], "kind": r.get("kind"), "generated_at": r.get("generated_at"),
-         "period": ((r.get("structured") or {}).get("period") or {}).get("label")}
+         "period": _listed_period(r.get("structured") or {})}
         for r in runs.list_runs(user["id"], kind=tuple(reports.KINDS))
     ]
 
@@ -1308,11 +1341,434 @@ def report_run_pdf(run_id: str, user=Depends(get_current_user),
     if run.get("kind") in reports.BOARD_KINDS:
         # ``mr_pdf.report_pdf`` renders the campaign report's sections from a
         # narrative this kind does not have. A board PDF is a different document
-        # and lands with its own renderer; until then there is no such file.
-        raise HTTPException(404, "no PDF export exists for a board report yet")
+        # with its own renderer, and now has its own route - name it, the way
+        # ``make_report`` names where a board report is built.
+        raise HTTPException(
+            404, "a board report's PDF is at "
+                 f"GET /api/mr/board-report/{run_id}/pdf, not here.")
     stamp = str(run.get("generated_at", ""))[:10] or date.today().isoformat()
     act.note(f"Downloaded the {run['kind']} report as PDF ({stamp})", run_id=run_id)
     return _pdf_response(mr_pdf.report_pdf(run), f"mr-{run['kind']}-{stamp}.pdf")
+
+
+# --------------------------------------------------------------------------- #
+# The board report as a DOCUMENT - the HTML, and the PDF rendered from it
+# --------------------------------------------------------------------------- #
+# ``POST /mr/board-report`` persists the ledger as JSON and deliberately returns
+# no document. These two routes ARE the document, and they read the stored run
+# rather than re-deriving it. Re-deriving would pick up whatever capture has
+# landed since, so the PDF a client is emailed could quietly disagree with the
+# JSON the panel is showing. One stored run in, one page out.
+#
+# Both sit behind the same kill switch as the POST, and the switch sits INSIDE
+# the handler, after ``Depends(get_current_user)``, for the reason spelled out
+# there: an anonymous caller gets 401 whether the feature is on or off and never
+# learns which it was.
+
+
+#: Whose report this is. ``board_report_render.render`` prints "Brand not set"
+#: when nobody names the brand - the right default for a library function whose
+#: caller might forget, and the wrong thing to email a client. So the call site
+#: names it. This deployment is one shared workspace reading one tracker
+#: (``mr_config.SHEETS_SPREADSHEET_ID`` defaults to Legal Soft's workbook), so
+#: there is one brand today; ``MR_BOARD_REPORT_BRAND`` moves it without a
+#: redeploy, and the workspace record supplies it when the workspace boundary
+#: lands.
+_DEFAULT_BOARD_BRAND = "Legal Soft"
+
+
+def _board_brand() -> str:
+    return os.environ.get("MR_BOARD_REPORT_BRAND", "").strip() or _DEFAULT_BOARD_BRAND
+
+
+def _board_run(run_id: str, user_id: str) -> dict:
+    """This caller's own board run, or 404.
+
+    The same ownership check as ``get_report_run`` and ``report_run_pdf`` above,
+    and the same answer for the same reason: a run another workspace owns is
+    *not found*, never 403 - a 403 would confirm the id exists.
+    """
+    run = runs.get_run(run_id)
+    if (not run or run.get("user_id") != user_id
+            or run.get("kind") not in reports.BOARD_KINDS):
+        raise HTTPException(404, "board report not found")
+    return run
+
+
+def _untracked_of(stored: dict | None):
+    from marketing_research_agent import board_report as br
+
+    if not stored:
+        return None
+    return br.Untracked(**{k: stored.get(k) for k in
+                           ("spend", "spend_pct", "revenue", "revenue_pct",
+                            "clients", "clients_pct")})
+
+
+def _month_cell_of(stored: dict):
+    from marketing_research_agent import board_report as br
+
+    return br.MonthCell(month=stored["month"], values=dict(stored.get("values") or {}))
+
+
+def _channel_totals_of(stored: dict):
+    """A stored ``ChannelTotals.as_dict()`` back as the dataclass.
+
+    ``roas_pct`` and ``cac`` are recomputed properties, not fields, so they read
+    back from ``spend``/``revenue``/``clients`` exactly as they were written.
+    """
+    from marketing_research_agent import board_report as br
+
+    return br.ChannelTotals(channel=stored["channel"], spend=stored.get("spend"),
+                            revenue=stored.get("revenue"), clients=stored.get("clients"))
+
+
+def _channel_side_of(stored: dict, suffix: str):
+    """One side of a stored ``ChannelRow.as_dict()``.
+
+    That shape is FLATTENED - ``spend_a``/``revenue_a``/``roas_a``/``cac_a`` per
+    side - and it drops ``clients``, which ``cac`` is a property of. ``clients``
+    is therefore recovered as ``spend / cac``, and that is exact for everything
+    this branch renders: ``cac`` is stored already rounded to 2dp, so
+    ``round(spend / (spend / cac), 2) == cac``, and ``clients`` itself is only
+    ever printed by the ONE-period channel table, which is stored unflattened
+    (``_channel_totals_of``) and never reaches here. ``roas_pct`` recomputes from
+    spend and revenue, both of which survive the flattening intact.
+
+    All four fields absent means the channel had no figures on this side at all,
+    which is an absent side and not a zeroed one.
+    """
+    from marketing_research_agent import board_report as br
+
+    got = {f: stored.get(f"{f}_{suffix}") for f in ("spend", "revenue", "roas", "cac")}
+    if all(v is None for v in got.values()):
+        return None
+    spend, cac = got["spend"], got["cac"]
+    return br.ChannelTotals(
+        channel=stored["channel"], spend=spend, revenue=got["revenue"],
+        clients=(spend / cac) if (spend is not None and cac) else None)
+
+
+def _board_ledger(structured: dict):
+    """A stored run's ``structured`` block back as a ``ReportLedger``.
+
+    The renderer takes the dataclass; the store holds its ``as_dict()``; nothing
+    in the agent walks back the other way. It lives here, at the one call site
+    that needs it, rather than as a new seam in modules another change is in
+    flight on.
+
+    Two stored shapes, because ``reports.build_board_report`` writes two:
+
+    * the comparison is ``ReportLedger.as_dict()`` verbatim - rebuilt field for
+      field, including the "Other / untracked" row ``compare()`` already
+      appended to ``channels`` (so this must NOT re-run ``compare``, which would
+      append it a second time);
+    * the one-period report is ``reports._single_column`` - a ``PeriodRollup``
+      flattened, with ONE ``columns`` entry and rows carrying ``value`` instead
+      of ``a``/``b``. It is rebuilt as the rollup it came from and handed to
+      ``single_period()``, which is exactly what the POST path built.
+
+    Raises ``ValueError`` with a caller-safe message when the run was written by
+    a different generator; anything else structural comes out as the raw
+    ``KeyError``/``TypeError``/``IndexError`` and is logged, not echoed.
+    """
+    from marketing_research_agent import board_report as br
+    from marketing_research_agent import board_report_render as br_render
+
+    generator = str(structured.get("generator") or "")
+    if generator != br.GENERATOR_VERSION:
+        raise ValueError(
+            f"this run was written by generator '{generator or 'unknown'}' and this "
+            f"service renders '{br.GENERATOR_VERSION}' - rebuild it at "
+            "POST /api/mr/board-report")
+
+    periods = [br.PeriodSpec(key=p["key"], label=p["label"], months=tuple(p["months"]))
+               for p in structured["periods"]]
+    columns = list(structured["columns"])
+    channels = list(structured.get("channels") or [])
+    untracked = list(structured.get("untracked") or [])
+    monthly = list(structured.get("monthly") or [])
+    gaps = tuple(structured.get("gaps") or ())
+
+    if len(columns) == 1:
+        rollup = br.PeriodRollup(
+            period=periods[0],
+            components=dict(structured.get("components") or {}),
+            # Absent is not zero, one level down too: a metric the period could
+            # not fill is simply not a key, which is what ``PeriodRollup.value``
+            # reads and what makes the em-dash rather than a $0.
+            values={r["key"]: r["value"] for r in structured["rows"]
+                    if r.get("value") is not None},
+            channels=tuple(_channel_totals_of(c) for c in channels),
+            untracked=_untracked_of(untracked[0] if untracked else None),
+            gaps=gaps,
+            monthly=tuple(_month_cell_of(c) for c in monthly),
+        )
+        return br_render.single_period(rollup)
+
+    sides = (untracked + [None, None])[:2]
+    return br.ReportLedger(
+        columns=(columns[0], columns[1]),
+        periods=(periods[0], periods[1]),
+        rows=tuple(br.LedgerRow(key=r["key"], label=r["label"], group=r["group"],
+                                format=r["format"], polarity=r["polarity"],
+                                a=r.get("a"), b=r.get("b"), basis=r.get("basis"))
+                   for r in structured["rows"]),
+        channels=tuple(br.ChannelRow(c["channel"], _channel_side_of(c, "a"),
+                                     _channel_side_of(c, "b"))
+                       for c in channels),
+        untracked=(_untracked_of(sides[0]), _untracked_of(sides[1])),
+        gaps=gaps,
+        cache_key=str(structured.get("cache_key") or ""),
+        monthly=tuple(tuple(_month_cell_of(c) for c in side)
+                      for side in (monthly + [[], []])[:2]),
+    )
+
+
+def _board_document(run: dict) -> str:
+    """The run as one self-contained HTML document, or a 422 that says why not.
+
+    ``board_report_render`` is imported HERE and not at module scope on purpose:
+    it carries the embedded font faces, which every other route in this file
+    would otherwise pay to import, and a fault in that generated module must not
+    take the whole router down at import time.
+    """
+    from marketing_research_agent import board_report_render as br_render
+
+    structured = run.get("structured") or {}
+    try:
+        ledger = _board_ledger(structured)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except (KeyError, TypeError, IndexError):
+        # The shape is ours, not the caller's, so the caller gets the action and
+        # the log gets the field. Echoing the KeyError would publish the store's
+        # internal schema to anyone who can reach the route.
+        logger.exception("mr board report %s: stored ledger could not be rebuilt",
+                         run.get("id"))
+        raise HTTPException(
+            422, "this board run's stored ledger cannot be rendered by this service "
+                 "- rebuild it at POST /api/mr/board-report")
+
+    captured = str(structured.get("captured_on") or "")
+    try:
+        captured_on = date.fromisoformat(captured) if captured else None
+    except ValueError:
+        # The footer's date line is not worth a 500. A run with an unparseable
+        # capture stamp renders without it rather than not at all.
+        logger.warning("mr board report %s: unparseable captured_on %r",
+                       run.get("id"), captured)
+        captured_on = None
+    return br_render.render(ledger, brand=_board_brand(), captured_on=captured_on)
+
+
+def _board_stamp(run: dict) -> str:
+    return str(run.get("generated_at", ""))[:10] or date.today().isoformat()
+
+
+@router.get("/mr/board-report/{run_id}/html")
+@silent("an inline preview the console re-renders on every view of the report - "
+        "the PDF beside it is the recorded unit, and a row per view would grow "
+        "the trail faster than the reports it describes")
+def board_report_html(run_id: str, user=Depends(get_current_user)):
+    """One stored board run as a complete, self-contained HTML document.
+
+    No script, no stylesheet link, no remote image and no ``http`` of any kind -
+    the charts are inline SVG and the fonts are embedded, so the file survives
+    being emailed to a client behind a corporate proxy. Served ``inline`` so the
+    console can preview it, and ``nosniff`` so nothing renders it as anything
+    else.
+    """
+    if not reports.board_report_enabled():
+        raise HTTPException(404, "Not Found")
+    run = _board_run(run_id, user["id"])
+    html = _board_document(run)
+    return Response(
+        content=html,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "Content-Disposition":
+                f'inline; filename="mr-board-report-{_board_stamp(run)}.html"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+# --- the PDF renderer, which is another service ------------------------------
+# Every call below is treated as hostile: an explicit timeout, a retry policy
+# that only retries what a retry can fix, and one defined answer per failure.
+# There is no fallback path and there must never be one. ``pdf_export.py``
+# renders a DIFFERENT report in a different visual identity, and an HTML file
+# under a ``.pdf`` name is not a PDF - a missing renderer is a loud failure, not
+# a substitution.
+
+#: The request contract ``renderer/src/app.js`` checks (its ``v`` field).
+_RENDERER_CONTRACT_VERSION = 1
+
+#: Attempts for one document. The render is a pure function of the HTML and the
+#: renderer holds no state, so a retry is safe. It is also expensive - a
+#: Chromium page load - so only the failures a retry can actually fix are
+#: retried: a refused or dropped connection, and the 502/504 a Cloud Run
+#: instance answers while it is still coming up at ``min-instances=0``.
+#:
+#: NOT retried: a read timeout (the same render times out again and doubles the
+#: caller's wait), any 4xx, and 503 - the renderer uses 503 to mean "fail closed,
+#: my RENDERER_TOKEN is unset", and hammering a deliberate refusal is noise.
+_RENDERER_ATTEMPTS = 2
+_RENDERER_BACKOFF_SECONDS = 1.0
+_RENDERER_RETRY_STATUS = frozenset({502, 504})
+
+
+def _renderer_read_timeout() -> float:
+    """Seconds to wait for the render itself.
+
+    Generous on purpose. The renderer's own budget is ``PDF_TIMEOUT_MS`` per
+    phase (60s laying the page out, 60s writing the PDF) on top of a cold start
+    that launches Chromium, so a short read timeout turns a slow-but-working
+    render into a 504 nobody can act on.
+    """
+    try:
+        return max(1.0, float(os.environ.get("RENDERER_TIMEOUT_SECONDS", "150")))
+    except ValueError:
+        return 150.0
+
+
+def _renderer_config() -> tuple[str, str]:
+    """``(url, token)`` for the PDF renderer, or a 503 naming what is unset.
+
+    By env var NAME, never by value - here, in the error the caller reads, and
+    in every log line below.
+    """
+    url = os.environ.get("RENDERER_URL", "").strip().rstrip("/")
+    token = os.environ.get("RENDERER_TOKEN", "").strip()
+    missing = [name for name, value in (("RENDERER_URL", url), ("RENDERER_TOKEN", token))
+               if not value]
+    if missing:
+        raise HTTPException(
+            503,
+            "PDF rendering is not configured on this service: "
+            + " and ".join(missing)
+            + (" is unset." if len(missing) == 1 else " are unset.")
+            + " The board report is available as HTML at "
+              "GET /api/mr/board-report/{run_id}/html.")
+    return url, token
+
+
+def _render_pdf_via_service(html: str, *, run_id: str) -> tuple[bytes, str]:
+    """The HTML rendered to PDF bytes by the renderer service.
+
+    Returns ``(pdf_bytes, blocked_subresource_count)``. Raises ``HTTPException``
+    - never returns a substitute - on every failure path.
+    """
+    url, token = _renderer_config()
+    endpoint = f"{url}/pdf"
+    payload = {"v": _RENDERER_CONTRACT_VERSION, "html": html}
+    # The shared secret goes in this header and nowhere else: not a query
+    # string, not a log line, not an error body.
+    headers = {"X-Renderer-Token": token}
+    timeout = httpx.Timeout(_renderer_read_timeout(), connect=10.0)
+
+    for attempt in range(1, _RENDERER_ATTEMPTS + 1):
+        unreachable: str | None = None
+        try:
+            resp = httpx.post(endpoint, json=payload, headers=headers, timeout=timeout)
+        except (httpx.ConnectError, httpx.ConnectTimeout,
+                httpx.RemoteProtocolError) as exc:
+            unreachable = type(exc).__name__
+            logger.warning("mr board pdf %s: attempt %d/%d could not reach the "
+                           "renderer (RENDERER_URL) - %s",
+                           run_id, attempt, _RENDERER_ATTEMPTS, exc)
+            if attempt >= _RENDERER_ATTEMPTS:
+                raise HTTPException(
+                    502, f"could not reach the PDF renderer ({unreachable}) after "
+                         f"{_RENDERER_ATTEMPTS} attempts - RENDERER_URL points at a "
+                         "service this deployment cannot connect to.")
+        except httpx.TimeoutException as exc:
+            logger.error("mr board pdf %s: the renderer did not answer in %.0fs - %s",
+                         run_id, _renderer_read_timeout(), exc)
+            raise HTTPException(
+                504, "the PDF renderer did not answer within "
+                     f"{_renderer_read_timeout():.0f}s (RENDERER_TIMEOUT_SECONDS). "
+                     "The report was not rendered.")
+        except httpx.HTTPError as exc:
+            logger.error("mr board pdf %s: renderer transport failure - %s", run_id, exc)
+            raise HTTPException(
+                502, f"the PDF renderer call failed ({type(exc).__name__}).")
+
+        if unreachable is not None:
+            time.sleep(_RENDERER_BACKOFF_SECONDS * attempt)
+            continue
+
+        if resp.status_code == 200:
+            body = resp.content
+            if not body.startswith(b"%PDF"):
+                # 200 carrying something that is not a PDF is exactly the shape
+                # of a fake success - a proxy's error page streamed under
+                # application/pdf. Refuse it rather than hand it over.
+                logger.error("mr board pdf %s: renderer answered 200 with %d bytes that "
+                             "are not a PDF", run_id, len(body))
+                raise HTTPException(
+                    502, "the PDF renderer answered 200 with something that is not a "
+                         "PDF; nothing was rendered.")
+            return body, resp.headers.get("x-blocked-subresources", "0")
+
+        if resp.status_code == 401:
+            logger.error("mr board pdf %s: the renderer rejected this service's "
+                         "RENDERER_TOKEN", run_id)
+            raise HTTPException(
+                502, "the PDF renderer rejected this service's credentials - the "
+                     "RENDERER_TOKEN here does not match the renderer's.")
+        if resp.status_code == 503:
+            logger.error("mr board pdf %s: the renderer answered 503 (its own "
+                         "RENDERER_TOKEN is unset, or it is unavailable)", run_id)
+            raise HTTPException(
+                503, "the PDF renderer is unavailable: it answered 503, which is what "
+                     "it returns when its own RENDERER_TOKEN is unset.")
+        if resp.status_code in _RENDERER_RETRY_STATUS and attempt < _RENDERER_ATTEMPTS:
+            logger.warning("mr board pdf %s: renderer answered %d on attempt %d/%d",
+                           run_id, resp.status_code, attempt, _RENDERER_ATTEMPTS)
+            time.sleep(_RENDERER_BACKOFF_SECONDS * attempt)
+            continue
+
+        logger.error("mr board pdf %s: renderer answered %d", run_id, resp.status_code)
+        raise HTTPException(
+            502, f"the PDF renderer answered {resp.status_code}; the report was not "
+                 "rendered.")
+
+    # Unreachable: the loop either returns or raises on its last attempt.
+    raise HTTPException(502, "the PDF renderer could not be reached.")
+
+
+@router.get("/mr/board-report/{run_id}/pdf")
+def board_report_pdf(run_id: str, user=Depends(get_current_user),
+                     act: Activity = trail.records("export:board_pdf",
+                                                   "Downloaded a board report PDF")):
+    """One stored board run as a PDF - the same document as ``/html``, laid out
+    by the renderer service's headless Chromium.
+
+    There is no local fallback. With ``RENDERER_URL`` or ``RENDERER_TOKEN``
+    unset this answers 503 naming the variable; if the renderer is unreachable,
+    slow or unhappy it answers 502/504 saying so. It never returns the reportlab
+    export (a different report in a different visual identity), and never HTML
+    under a ``.pdf`` name.
+    """
+    if not reports.board_report_enabled():
+        raise HTTPException(404, "Not Found")
+    run = _board_run(run_id, user["id"])
+    html = _board_document(run)
+    pdf, blocked = _render_pdf_via_service(html, run_id=run_id)
+    if blocked not in ("", "0"):
+        # The document's whole contract is that it is self-contained. A non-zero
+        # count means it grew an external dependency the renderer refused to
+        # fetch, so the PDF is missing something. Loud in the log and stated on
+        # the response rather than swallowed.
+        logger.error("mr board pdf %s: the renderer blocked %s subresource(s) - the "
+                     "board document is no longer self-contained", run_id, blocked)
+    stamp = _board_stamp(run)
+    act.note(f"Downloaded the {run['kind']} as PDF ({stamp})", run_id=run_id)
+    response = _pdf_response(pdf, f"mr-board-report-{stamp}.pdf")
+    response.headers["X-Blocked-Subresources"] = blocked
+    return response
 
 
 @router.get("/mr/lead-analysis/pdf")

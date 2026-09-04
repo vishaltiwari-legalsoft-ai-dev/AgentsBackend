@@ -476,6 +476,57 @@ def test_another_tenant_cannot_read_a_board_run(board_on, as_caller):
     assert run_id not in [r["id"] for r in client.get("/api/mr/runs").json()]
 
 
+def test_another_tenant_cannot_read_a_board_report_as_a_document(board_on, as_caller):
+    """The JSON is scoped; the document must be scoped by the same check.
+
+    A board report is the most sensitive thing this agent produces — one page
+    carrying a quarter's spend, revenue and client counts — and it now has two
+    more routes that hand it over. Both take a run id straight off the URL, so
+    both are IDOR surfaces until this asserts they are not. 404, not 403: a 403
+    would confirm to a stranger that the id exists.
+    """
+    _seed_official_for(OWNER["id"])
+    as_caller(OWNER)
+    run_id = client.post("/api/mr/board-report",
+                         json={"period": "2026-Q1"}).json()["id"]
+    assert client.get(f"/api/mr/board-report/{run_id}/html").status_code == 200
+
+    as_caller(STRANGER)
+    for suffix in ("html", "pdf"):
+        resp = client.get(f"/api/mr/board-report/{run_id}/{suffix}")
+        assert resp.status_code == 404, suffix
+        assert resp.json()["detail"] == "board report not found", suffix
+
+
+def test_another_tenants_board_report_never_reaches_the_renderer(
+        board_on, as_caller, monkeypatch):
+    """Ownership is checked BEFORE the document is built, so a stranger's request
+    costs nothing and — more to the point — never puts another workspace's
+    figures into an outbound HTTP body. A configured renderer is installed here
+    precisely so the test would notice if the order were the other way round.
+    """
+    from app.routers import marketing_research as mr_router
+
+    monkeypatch.setenv("RENDERER_URL", "http://renderer.invalid")
+    monkeypatch.setenv("RENDERER_TOKEN", "test-token-not-a-real-secret")
+    sent: list[dict] = []
+    monkeypatch.setattr(mr_router.httpx, "post",
+                        lambda url, **kw: sent.append(kw) or _never_called())
+
+    _seed_official_for(OWNER["id"])
+    as_caller(OWNER)
+    run_id = client.post("/api/mr/board-report",
+                         json={"period": "2026-Q1"}).json()["id"]
+
+    as_caller(STRANGER)
+    assert client.get(f"/api/mr/board-report/{run_id}/pdf").status_code == 404
+    assert sent == [], "another tenant's ledger was sent to the renderer"
+
+
+def _never_called():
+    raise AssertionError("the renderer was called for a run the caller does not own")
+
+
 # --------------------------------------------------------------------------- #
 # The sheet-sources registry — shared reads, owned deletes
 # --------------------------------------------------------------------------- #

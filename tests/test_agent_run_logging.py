@@ -333,6 +333,7 @@ def test_the_gets_that_hand_the_user_a_file_are_recorded():
     declared = {route.path for route in agent_routes() if trail_marker(route)}
     for path in (
         "/api/blog/runs/{run_id}/export",
+        "/api/mr/board-report/{run_id}/pdf",
         "/api/mr/runs/{run_id}/pdf",
         "/api/mr/lead-analysis/pdf",
         "/api/mr/snapshots/vendor/{slug}/pdf",
@@ -349,6 +350,11 @@ def test_the_reads_that_render_a_panel_stay_out_of_the_trail():
     )
     assert recorded_reads == [
         "/api/blog/runs/{run_id}/export",
+        # 2026-09-05: the board report's PDF export. A click-driven download of
+        # a quarter's spend, revenue and client counts — the exact class the
+        # list above exists to keep answerable. The HTML route beside it is an
+        # inline preview and carries ``silent()`` instead.
+        "/api/mr/board-report/{run_id}/pdf",
         "/api/mr/lead-analysis/pdf",
         "/api/mr/runs/{run_id}/pdf",
         "/api/mr/snapshots/vendor/{slug}/pdf",

@@ -13,10 +13,13 @@ scoped to.
 import io
 import os
 
+import httpx
+
 os.environ["MR_OFFLINE"] = "1"
 
 import pytest
 
+from app.routers import marketing_research as mr_router
 from app.routers.tests.conftest import DEFAULT_CALLER, client
 
 USER = dict(DEFAULT_CALLER)
@@ -1051,16 +1054,425 @@ def test_the_board_kinds_are_not_buildable_through_the_narrated_report_route():
         assert "/api/mr/board-report" in r.json()["detail"]
 
 
-def test_there_is_no_pdf_for_a_board_run_yet(board_on):
-    """``mr_pdf.report_pdf`` renders a narrative this kind does not have. Until
-    the board renderer lands there is no such document, and saying so beats
-    streaming a broken one."""
+def test_the_narrated_pdf_route_hands_a_board_run_on_rather_than_rendering_it(board_on):
+    """``mr_pdf.report_pdf`` renders a narrative this kind does not have, and a
+    board report is a different document by a different renderer. The refusal
+    names the route that does have it — the same courtesy ``make_report`` pays
+    for the build — instead of leaving the caller to guess."""
     _seed_official()
     run_id = client.post("/api/mr/board-report", json={"period": "2026-Q1"}).json()["id"]
     assert client.get(f"/api/mr/runs/{run_id}").status_code == 200
     pdf = client.get(f"/api/mr/runs/{run_id}/pdf")
     assert pdf.status_code == 404
     assert "board report" in pdf.json()["detail"]
+    assert f"/api/mr/board-report/{run_id}/pdf" in pdf.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# The board report as a DOCUMENT
+# (GET /api/mr/board-report/{run_id}/html and .../pdf)
+# --------------------------------------------------------------------------- #
+# The HTML route is pure and local. The PDF route is a call to another service,
+# and everything below it is about that call failing: unconfigured, unreachable,
+# slow, unauthorised, or answering 200 with something that is not a PDF. Every
+# one of those must be a loud, specific refusal — there is no local fallback and
+# there must never be one, because the only thing available to fall back to is
+# ``pdf_export.py``, which renders a different report in a different visual
+# identity, and a report that is silently the wrong report is worse than an
+# error the user can read.
+
+
+@pytest.fixture(autouse=True)
+def _no_live_renderer(monkeypatch):
+    """No test in this module holds a renderer address.
+
+    Unstubbed, ``_render_pdf_via_service`` therefore refuses at
+    ``_renderer_config`` and opens no socket at all — which is what makes
+    "this suite cannot reach a real renderer" structural rather than a promise
+    each test has to keep. ``renderer_on`` opts a test back in, and every test
+    that does also stubs ``httpx.post``.
+    """
+    monkeypatch.delenv("RENDERER_URL", raising=False)
+    monkeypatch.delenv("RENDERER_TOKEN", raising=False)
+
+
+@pytest.fixture()
+def renderer_on(monkeypatch):
+    """A configured renderer, at an address that cannot resolve.
+
+    ``.invalid`` is reserved by RFC 2606 and never resolves, so even a stub that
+    fails to install cannot reach anything real. The backoff goes to zero
+    because the retry policy is what is under test, not the wall clock.
+    """
+    monkeypatch.setenv("RENDERER_URL", "http://renderer.invalid")
+    monkeypatch.setenv("RENDERER_TOKEN", "test-token-not-a-real-secret")
+    monkeypatch.setattr(mr_router, "_RENDERER_BACKOFF_SECONDS", 0)
+
+
+def _board_run_id(period: str = "2026-Q1", compare_to: str | None = None) -> str:
+    """One stored board run, built through the real route."""
+    _seed_official()
+    body: dict = {"period": period}
+    if compare_to:
+        body["compare_to"] = compare_to
+    r = client.post("/api/mr/board-report", json=body)
+    assert r.status_code == 200, r.text
+    return r.json()["id"]
+
+
+def _stub_renderer(monkeypatch, *responses):
+    """Install ``httpx.post`` returning/raising ``responses`` in order.
+
+    Returns the list the stub records each call into, so a test can assert how
+    many attempts were made and exactly what was sent.
+    """
+    calls: list[dict] = []
+    queue = list(responses)
+
+    def post(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        answer = queue.pop(0) if len(queue) > 1 else queue[0]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(mr_router.httpx, "post", post)
+    return calls
+
+
+def _pdf_bytes(size: int = 400) -> bytes:
+    return b"%PDF-1.7\n" + b"0" * size + b"\n%%EOF"
+
+
+def test_the_board_document_routes_are_dark_until_a_deployment_enables_it(monkeypatch):
+    """Same kill switch as the POST, and the same 404 an unrouted path gives.
+
+    Asserted against a run that really exists and really is the caller's, so the
+    404 can only be the switch.
+    """
+    monkeypatch.setenv("MR_BOARD_REPORT", "1")
+    run_id = _board_run_id()
+    monkeypatch.delenv("MR_BOARD_REPORT")
+
+    for suffix in ("html", "pdf"):
+        resp = client.get(f"/api/mr/board-report/{run_id}/{suffix}")
+        assert resp.status_code == 404, suffix
+        assert resp.json()["detail"] == "Not Found", suffix
+
+
+def test_the_board_document_is_one_self_contained_html_file(board_on):
+    """The contract the renderer module exists to hold, asserted at the route.
+
+    No script, no stylesheet link, no remote image, no ``http`` of any kind —
+    these files are emailed to clients and the templates this replaces collapsed
+    to unstyled text behind a corporate proxy.
+    """
+    resp = client.get(f"/api/mr/board-report/{_board_run_id()}/html")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("text/html")
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["content-disposition"].startswith("inline;")
+
+    body = resp.text
+    assert body.startswith("<!DOCTYPE html>")
+    for forbidden in ("<script", "<link", "http://", "https://", "http"):
+        assert forbidden not in body, forbidden
+
+
+def test_the_board_document_names_the_brand_rather_than_shipping_the_placeholder(board_on):
+    """``render()`` defaults to "Brand not set" so a caller that forgets is
+    visible on the page. This is the call site, so it is the one that must not
+    forget."""
+    from marketing_research_agent import board_report_render as br_render
+
+    body = client.get(f"/api/mr/board-report/{_board_run_id()}/html").text
+    assert br_render.UNNAMED_BRAND not in body
+    assert "Legal Soft" in body
+
+
+def test_the_brand_moves_without_a_redeploy(board_on, monkeypatch):
+    monkeypatch.setenv("MR_BOARD_REPORT_BRAND", "Acme Legal")
+    body = client.get(f"/api/mr/board-report/{_board_run_id()}/html").text
+    assert "Acme Legal" in body
+
+
+def test_the_one_period_and_two_period_documents_are_different_compositions(board_on):
+    """The two stored shapes are not the same shape — ``_single_column`` flattens
+    a ``PeriodRollup`` and the comparison stores ``ReportLedger.as_dict()`` — so
+    both round trips are pinned, and pinned as producing DIFFERENT pages. A
+    reconstruction that quietly rendered every run as one period would otherwise
+    pass a "it returned 200" test.
+    """
+    one = client.get(f"/api/mr/board-report/{_board_run_id('2026-01')}/html")
+    two = client.get(
+        f"/api/mr/board-report/{_board_run_id('2026-Q1', compare_to='2026-02')}/html")
+
+    assert one.status_code == 200 and two.status_code == 200, (one.text, two.text)
+    assert "vs" not in one.text.split("<footer>")[-1]
+    assert "comparison" in two.text and "vs" in two.text
+    assert one.text != two.text
+
+
+def test_a_board_run_lists_with_its_period_and_not_an_em_dash(board_on):
+    """The Reports panel's "Already written" table reads ``period`` per row, and
+    a blank there renders as an em-dash — which everywhere else in this UI means
+    "not reported". A board run's period is known; it is simply stored under a
+    different key, and the list must say so."""
+    run_id = _board_run_id("2026-Q1")
+    listed = {r["id"]: r for r in client.get("/api/mr/runs").json()}
+
+    assert run_id in listed
+    assert listed[run_id]["period"] == "Q1"
+
+
+def test_a_board_comparison_lists_both_of_its_windows(board_on):
+    """One label cannot describe a two-column report, so the row names both — in
+    the order the document itself prints them."""
+    run_id = _board_run_id("2026-Q1", compare_to="2026-02")
+    listed = {r["id"]: r for r in client.get("/api/mr/runs").json()}
+
+    assert listed[run_id]["period"] == "Q1 vs 2026-02"
+
+
+def test_the_campaign_kinds_period_column_is_untouched(board_on):
+    """The board fix reads a second shape; it must not reinterpret the first.
+
+    A monthly summary carries ``period.label`` and has since long before any of
+    this, so its row is asserted here beside the board rows rather than trusted
+    to stay put.
+    """
+    client.post(
+        "/api/mr/ingest",
+        files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+        data={"platform": "google_ads"},
+    )
+    monthly = client.post("/api/mr/reports/monthly_summary")
+    assert monthly.status_code == 200, monthly.text
+    listed = {r["id"]: r for r in client.get("/api/mr/runs").json()}
+
+    row = listed[monthly.json()["id"]]
+    assert row["period"] == monthly.json()["structured"]["period"]["label"]
+    assert row["period"]
+
+
+def test_a_run_that_is_not_a_board_run_has_no_board_document(board_on):
+    """The board routes read board kinds. A campaign report's id is not one, and
+    the answer is the same 404 an unknown id gets — not a 500 in the renderer."""
+    client.post(
+        "/api/mr/ingest",
+        files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+        data={"platform": "google_ads"},
+    )
+    other = client.post("/api/mr/reports/daily_summary").json()["id"]
+    for suffix in ("html", "pdf"):
+        resp = client.get(f"/api/mr/board-report/{other}/{suffix}")
+        assert resp.status_code == 404, suffix
+        assert resp.json()["detail"] == "board report not found"
+
+
+def test_an_unknown_run_id_is_a_404_not_a_500(board_on):
+    assert client.get("/api/mr/board-report/nope/html").status_code == 404
+    assert client.get("/api/mr/board-report/nope/pdf").status_code == 404
+
+
+def test_a_ledger_written_by_another_generator_is_refused_not_half_rendered(board_on):
+    """``GENERATOR_VERSION`` is a cache invalidation for the builder and a shape
+    warning for the renderer: a run stored by an older generator may not carry
+    the fields this reconstruction reads. Refuse it and say to rebuild, rather
+    than render whichever half survived."""
+    from marketing_research_agent import runs as mr_runs
+
+    run_id = _board_run_id()
+    stored = mr_runs.get_run(run_id)
+    stored["structured"]["generator"] = "mr-board-report/1"
+    mr_runs.save_run(stored)
+
+    resp = client.get(f"/api/mr/board-report/{run_id}/html")
+    assert resp.status_code == 422, resp.text
+    assert "mr-board-report/1" in resp.json()["detail"]
+    assert "POST /api/mr/board-report" in resp.json()["detail"]
+
+
+def test_a_structurally_broken_ledger_does_not_publish_the_stores_schema(board_on):
+    """The stored shape is ours, not the caller's. A missing field is a 422 the
+    caller can act on and a stack trace in the log — never the ``KeyError``'s
+    field name echoed into the response body."""
+    from marketing_research_agent import runs as mr_runs
+
+    run_id = _board_run_id()
+    stored = mr_runs.get_run(run_id)
+    del stored["structured"]["periods"]
+    mr_runs.save_run(stored)
+
+    resp = client.get(f"/api/mr/board-report/{run_id}/html")
+    assert resp.status_code == 422, resp.text
+    assert "periods" not in resp.json()["detail"]
+    assert "rebuild it at POST /api/mr/board-report" in resp.json()["detail"]
+
+
+# --- the renderer is another service, and it is treated as hostile -----------
+
+def test_this_suite_cannot_reach_a_real_renderer(board_on):
+    """Offline, proven from inside pytest rather than assumed.
+
+    The repo-root guard is fixture-ordering-dependent and has leaked twice, so
+    the three things this section rests on are asserted here, in a running test:
+    the process holds no renderer address, live Firestore is blocked, and an
+    unstubbed PDF request therefore refuses at the config check before any
+    socket is opened.
+    """
+    from app.services import firestore_repo
+
+    assert os.environ.get("RENDERER_URL") is None
+    assert os.environ.get("RENDERER_TOKEN") is None
+    with pytest.raises(RuntimeError, match="blocked in tests"):
+        firestore_repo._db()
+
+    resp = client.get(f"/api/mr/board-report/{_board_run_id()}/pdf")
+    assert resp.status_code == 503, resp.text
+
+
+def test_an_unconfigured_renderer_is_a_503_naming_both_variables(board_on):
+    resp = client.get(f"/api/mr/board-report/{_board_run_id()}/pdf")
+
+    assert resp.status_code == 503, resp.text
+    detail = resp.json()["detail"]
+    assert "RENDERER_URL" in detail and "RENDERER_TOKEN" in detail
+    assert "are unset" in detail
+    # And it points at the document that IS available without the renderer.
+    assert "/html" in detail
+
+
+def test_it_names_the_half_of_the_configuration_that_is_missing(board_on, monkeypatch):
+    """Half-configured is the case that actually happens — a URL set in one
+    deploy and the secret forgotten. Naming both would send someone to check a
+    variable that is fine."""
+    monkeypatch.setenv("RENDERER_URL", "http://renderer.invalid")
+    detail = client.get(
+        f"/api/mr/board-report/{_board_run_id()}/pdf").json()["detail"]
+
+    assert "RENDERER_TOKEN is unset" in detail
+    assert "RENDERER_URL" not in detail
+
+
+def test_the_pdf_is_exactly_what_the_renderer_returned(board_on, renderer_on, monkeypatch):
+    """And the request it was sent is the contract the renderer checks: ``v: 1``,
+    the document verbatim, and the shared secret in the header and nowhere
+    else."""
+    pdf = _pdf_bytes()
+    calls = _stub_renderer(monkeypatch, httpx.Response(200, content=pdf))
+
+    run_id = _board_run_id()
+    html = client.get(f"/api/mr/board-report/{run_id}/html").text
+    resp = client.get(f"/api/mr/board-report/{run_id}/pdf")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.content == pdf
+    assert resp.headers["content-type"] == "application/pdf"
+    assert "attachment" in resp.headers["content-disposition"]
+
+    assert len(calls) == 1
+    assert calls[0]["url"] == "http://renderer.invalid/pdf"
+    assert calls[0]["json"] == {"v": 1, "html": html}
+    assert calls[0]["headers"] == {"X-Renderer-Token": "test-token-not-a-real-secret"}
+    assert calls[0]["timeout"] is not None, "an external call with no timeout"
+
+
+def test_an_unreachable_renderer_is_a_loud_502_and_never_a_substitute_document(
+        board_on, renderer_on, monkeypatch):
+    """The whole point of this route's failure path. No reportlab export, no
+    HTML under a ``.pdf`` name, no empty 200 — a 502 that says the renderer
+    could not be reached."""
+    calls = _stub_renderer(monkeypatch, httpx.ConnectError("no route to host"))
+
+    resp = client.get(f"/api/mr/board-report/{_board_run_id()}/pdf")
+
+    assert resp.status_code == 502, resp.text
+    assert not resp.content.startswith(b"%PDF")
+    assert "RENDERER_URL" in resp.json()["detail"]
+    assert len(calls) == 2, "a connection failure is retried exactly once"
+
+
+def test_a_cold_renderer_is_retried_once_and_then_serves_the_document(
+        board_on, renderer_on, monkeypatch):
+    """min-instances=0 plus a Chromium launch means the first request of the day
+    can legitimately be refused while the instance comes up."""
+    pdf = _pdf_bytes()
+    calls = _stub_renderer(
+        monkeypatch, httpx.ConnectError("connection refused"),
+        httpx.Response(200, content=pdf))
+
+    resp = client.get(f"/api/mr/board-report/{_board_run_id()}/pdf")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.content == pdf
+    assert len(calls) == 2
+
+
+def test_a_read_timeout_is_a_504_and_is_not_retried_into_a_double_wait(
+        board_on, renderer_on, monkeypatch):
+    """A render that ran out of time will run out of time again. Retrying it
+    only doubles what the caller waits before hearing the same answer."""
+    calls = _stub_renderer(monkeypatch, httpx.ReadTimeout("too slow"))
+
+    resp = client.get(f"/api/mr/board-report/{_board_run_id()}/pdf")
+
+    assert resp.status_code == 504, resp.text
+    assert "RENDERER_TIMEOUT_SECONDS" in resp.json()["detail"]
+    assert len(calls) == 1
+
+
+def test_the_renderer_rejecting_our_token_never_echoes_it(
+        board_on, renderer_on, monkeypatch):
+    _stub_renderer(monkeypatch, httpx.Response(401, json={"error": "unauthorized"}))
+
+    resp = client.get(f"/api/mr/board-report/{_board_run_id()}/pdf")
+
+    assert resp.status_code == 502, resp.text
+    assert "RENDERER_TOKEN" in resp.json()["detail"]
+    assert "test-token-not-a-real-secret" not in resp.text
+
+
+def test_the_renderers_own_fail_closed_503_stays_a_503(
+        board_on, renderer_on, monkeypatch):
+    """The renderer answers 503 when its OWN ``RENDERER_TOKEN`` is unset. That is
+    a configuration answer, not a transport one, so it is passed through as 503
+    and — being a deliberate refusal — is not retried."""
+    calls = _stub_renderer(
+        monkeypatch, httpx.Response(503, json={"error": "pdf rendering unconfigured"}))
+
+    resp = client.get(f"/api/mr/board-report/{_board_run_id()}/pdf")
+
+    assert resp.status_code == 503, resp.text
+    assert "RENDERER_TOKEN" in resp.json()["detail"]
+    assert len(calls) == 1
+
+
+def test_a_200_carrying_something_that_is_not_a_pdf_is_refused(
+        board_on, renderer_on, monkeypatch):
+    """The fake-success shape: a proxy's error page streamed back under
+    ``application/pdf``. A 200 is not a PDF; ``%PDF`` is."""
+    _stub_renderer(monkeypatch, httpx.Response(200, content=b"<html>gateway error</html>"))
+
+    resp = client.get(f"/api/mr/board-report/{_board_run_id()}/pdf")
+
+    assert resp.status_code == 502, resp.text
+    assert "not a PDF" in resp.json()["detail"]
+
+
+def test_a_document_that_lost_its_self_containment_says_so_on_the_response(
+        board_on, renderer_on, monkeypatch):
+    """The renderer blocks every subresource and reports how many it blocked.
+    Non-zero means the document grew an external dependency and is rendering
+    wrong — visible on the response and loud in the log, never swallowed."""
+    _stub_renderer(monkeypatch, httpx.Response(
+        200, content=_pdf_bytes(), headers={"x-blocked-subresources": "3"}))
+
+    resp = client.get(f"/api/mr/board-report/{_board_run_id()}/pdf")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["x-blocked-subresources"] == "3"
 
 
 # --------------------------------------------------------------------------- #
