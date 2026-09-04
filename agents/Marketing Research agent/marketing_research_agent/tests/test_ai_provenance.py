@@ -166,10 +166,28 @@ def test_offline_report_payload_admits_it_is_not_ai(monkeypatch, tmp_path):
 
 def test_every_report_kind_carries_the_pair(monkeypatch, tmp_path):
     monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
-    for kind in reports.KINDS:
+    for kind in reports.NARRATED_KINDS:
         r = reports.build(kind, _dataset(), user_id="u1")
         assert "ai" in r and "fallback_reason" in r, f"{kind} lost the pair"
         _assert_honest(r)
+
+
+def test_the_board_report_carries_the_pair_too_and_never_claims_a_model(
+        monkeypatch, tmp_path):
+    """The board kinds are the only two nothing narrates, and the pair still has
+    to hold — ``ai: True`` on a deliverable no model touched would be the lie
+    this contract exists to catch. The stated reason names the DESIGN rather
+    than a failure, which is the honest shape for a deterministic report.
+    """
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    r = reports.build_board_report(
+        {"official_totals": {"2026-01": {"spend": 100.0, "leads": 10}},
+         "official_captured_at": "2026-02-01T00:00:00+00:00"},
+        user_id="u1", period="2026-01")
+    assert r["kind"] in reports.BOARD_KINDS
+    assert r["ai"] is False
+    assert "no model" in r["fallback_reason"]
+    _assert_honest(r)
 
 
 def test_report_claims_ai_only_when_the_model_wrote_it(online, monkeypatch, tmp_path):

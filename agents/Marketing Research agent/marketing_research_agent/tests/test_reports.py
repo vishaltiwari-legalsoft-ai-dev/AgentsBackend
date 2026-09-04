@@ -34,7 +34,10 @@ def test_daily_summary_builds(monkeypatch, tmp_path):
 def test_all_kinds_build_without_error(monkeypatch, tmp_path):
     monkeypatch.setenv("MR_OFFLINE", "1")
     monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
-    for kind in reports.KINDS:
+    # NARRATED_KINDS, not KINDS: the two board kinds are real report kinds that
+    # this builder deliberately refuses (they take two periods and have no
+    # narrative). The refusal is asserted in the board section below.
+    for kind in reports.NARRATED_KINDS:
         r = reports.build(kind, _dataset(), user_id="u1")
         assert r["markdown"]
 
@@ -929,3 +932,944 @@ def test_board_report_runs_offline_and_reaches_no_store():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add("." * node.level + node.module.split(".")[0])
     assert imported == {"__future__", "hashlib", "json", "dataclasses", "datetime", "typing"}
+
+
+# =============================================================================
+# Board report — wired to the parser, the run store and the kill switch
+# =============================================================================
+# The section above proves the catalog and the roll-up in isolation, on
+# hand-built dicts. This one proves the JOIN, which is where step 3's risk
+# actually lives:
+#
+#   sheets_source.parse_official_totals -> _load_dataset()["official_totals"]
+#     -> board_report.roll_up -> compare -> a run in mr_runs, keyed on
+#        cache_key() so the second identical request re-reads instead of
+#        re-deriving.
+#
+# Both halves were green and unconnected: board_report.py had no importer at
+# all, and the field NAMES the two sides use had never been compared. A rename
+# on either side would surface as a metric that is quietly, permanently absent —
+# which on a board slide is indistinguishable from a month the sheet did not
+# report.
+
+_BOARD_CAPTURE = "2026-07-01T09:00:00+00:00"
+
+
+def _board_dataset(*, months=None, **kw) -> dict:
+    """A dataset in the exact shape ``_load_dataset`` hands the builder.
+
+    ``official_totals`` is the parser's own output shape and is built from
+    ``_monthly`` above, so these figures are still the template's published
+    column totals and cannot drift from them.
+    """
+    cells = {**_monthly(0, _Q1_MONTHS, **kw), **_monthly(1, _Q2_MONTHS, **kw)}
+    if months is not None:
+        cells = {k: v for k, v in cells.items() if k in months}
+    return {
+        "official_totals": cells,
+        "official_captured_at": _BOARD_CAPTURE,
+        "sources": [{"platform": "sheets:Marketing 2026 Overall Report"}],
+    }
+
+
+def _rollup_grid(cells: dict) -> list[list[str]]:
+    """A miniature roll-up tab carrying ``cells``, laid out the way the live one
+    is: a title/month header, the plain rows, then the two repeated blocks each
+    behind its own anchor header.
+
+    Rows are labelled from ``sheets_source._OFFICIAL_FIELD_LABELS`` rather than
+    hand-typed, so this stays a test of the JOIN — catalog key to sheet field to
+    sheet row to period total — and never becomes a second copy of the parser's
+    label fixtures, which live in test_sheets_source.py and are that module's to
+    maintain.
+    """
+    from marketing_research_agent.sources import sheets_source as ss
+
+    months = sorted({int(mk.split("-")[1]) for mk in cells})
+    header = ["All"]
+    col_of: dict[int, int] = {}
+    for mo in months:
+        # The three-letter form, because that is what ``sheets_source._MONTHS``
+        # knows — a header reading "January (Performance)" scans as no month at
+        # all and the whole grid parses empty.
+        name = ss._MONTH_NAMES[mo][:3]
+        col_of[mo] = len(header)
+        header += [f"{name} (Performance)", f"{name} (Investment)"]
+
+    def row(label: str, field: str | None) -> list[str]:
+        out = [label] + [""] * (len(header) - 1)
+        if field is not None:
+            for mk, fields in cells.items():
+                if field in fields:
+                    out[col_of[int(mk.split("-")[1])]] = str(fields[field])
+        return out
+
+    fields = sorted(br.ADDITIVE_FIELDS)
+    anchors = (ss._ANCHOR_PROJECTED_NA, ss._ANCHOR_PAYING_NA)
+    plain, anchored = [], {a: [] for a in anchors}
+    for f in fields:
+        labels, where = ss._OFFICIAL_FIELD_LABELS[f]
+        (anchored[where] if isinstance(where, str) else plain).append((labels[0], f))
+
+    rows = [header]
+    rows += [row(lab, f) for lab, f in plain if lab not in anchors]
+    for anchor in anchors:
+        # The anchor row is itself a published field, and it opens its window.
+        own = next((f for lab, f in plain if lab == anchor), None)
+        rows.append(row(anchor, own))
+        rows += [row(lab, f) for lab, f in anchored[anchor]]
+    rows.append(row(ss._ANCHOR_INBOUND, None))  # boundary only, no field
+    return rows
+
+
+# --- the join between the two halves -----------------------------------------
+
+def test_board_report_reads_only_fields_the_roll_up_parser_can_produce():
+    """Every field the catalog names is a field the parser knows how to fill.
+
+    The cheapest possible guard on the seam, and the one nothing had: the two
+    modules were written against the same sheet but never against each other. A
+    catalog row pointing at a field the parser does not emit is not an error
+    anywhere — it is a permanently blank row that looks like missing data.
+    """
+    from marketing_research_agent.sources import sheets_source as ss
+
+    unreachable = sorted(br.ADDITIVE_FIELDS - set(ss._OFFICIAL_FIELD_LABELS))
+    assert not unreachable, (
+        "these board-report fields have no row in the roll-up parser, so the "
+        f"metrics reading them can never fill: {unreachable}")
+
+
+def test_board_report_fills_the_whole_catalog_from_a_parsed_roll_up_grid():
+    """End to end on the real parser: grid -> parse_official_totals -> roll_up.
+
+    Not a re-run of the fixture tests above. Those hand ``roll_up`` a dict; this
+    hands the PARSER a sheet and checks the catalog comes out the other side
+    with the template's own Q1 figures, which is the only way a label the parser
+    resolves differently than the catalog expects shows up as a failure.
+    """
+    from marketing_research_agent.sources import sheets_source as ss
+
+    cells = _monthly(0, _Q1_MONTHS)
+    official = ss.parse_official_totals(_rollup_grid(cells), 2026)
+    assert set(official) == set(_Q1_MONTHS), "the grid did not parse as three months"
+
+    rolled = br.roll_up(br.quarter_period(2026, 1), official)
+    absent = [m.key for m in br.CATALOG if rolled.value(m.key) is None]
+    assert not absent, f"parsed from a real grid, these rows still came back absent: {absent}"
+    for key, (q1, _q2) in _PUBLISHED.items():
+        assert rolled.value(key) == pytest.approx(q1, abs=0.02), key
+
+
+def test_board_report_absent_stays_absent_through_the_parser_too():
+    """A row the sheet does not carry arrives as absent, not as 0.00.
+
+    The same rule the roll-up already keeps, asserted one layer down: the row is
+    removed from the GRID, so the parser never emits the field at all. This is
+    the production case — the capture in the store on 2026-09-05 carries 8 of
+    the 43 fields, because it was pulled before the parser learned the rest.
+    """
+    from marketing_research_agent.sources import sheets_source as ss
+
+    cells = _monthly(0, _Q1_MONTHS)
+    grid = [r for r in _rollup_grid(cells)
+            if r[0] != ss._OFFICIAL_FIELD_LABELS["revenue_clients"][0][0]]
+    rolled = br.roll_up(br.quarter_period(2026, 1),
+                        ss.parse_official_totals(grid, 2026))
+    assert rolled.value("revenue_clients") is None
+    assert br.CAC_KEY not in rolled.values, "CAC published without its denominator"
+    assert rolled.value("conversion_rate_pct") is None
+    assert rolled.value("spend") == pytest.approx(_PUBLISHED["spend"][0], abs=0.02)
+
+
+# --- the rail: kinds, refusal, persistence -----------------------------------
+
+def test_board_kinds_are_report_kinds_but_are_not_narrated():
+    for kind in reports.BOARD_KINDS:
+        assert kind in reports.KINDS, f"{kind} must list and read back like any run"
+        assert kind not in reports.NARRATED_KINDS
+    assert set(reports.KINDS) == set(reports.NARRATED_KINDS) | set(reports.BOARD_KINDS)
+
+
+def test_build_refuses_a_board_kind_and_names_the_builder_that_takes_it(
+        monkeypatch, tmp_path):
+    """The wrong door is locked, and it says where the right one is.
+
+    ``build`` would otherwise fall through to its non-campaign branch and emit a
+    report with an empty structured block and an LLM paragraph about it.
+    """
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    with pytest.raises(ValueError, match="build_board_report"):
+        reports.build("board_report", _dataset(), user_id="u1")
+
+
+def test_board_report_is_persisted_as_a_run_the_same_way_every_kind_is(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    r = reports.build_board_report(_board_dataset(), user_id="u1", period="2026-Q1")
+
+    assert r["kind"] == "board_report"
+    assert r["user_id"] == "u1" and r["agent_id"] == "a6"
+    assert r["reused"] is False
+    # The provenance pair, and it is a design statement rather than a failure.
+    assert r["ai"] is False and r["fallback_reason"]
+    stored = reports.runs.get_run(r["id"])
+    assert stored and stored["user_id"] == "u1"
+    assert stored["structured"]["cache_key"] == r["structured"]["cache_key"]
+
+    values = {row["key"]: row["value"] for row in r["structured"]["rows"]}
+    assert len(values) == len(br.CATALOG)
+    for key, (q1, _q2) in _PUBLISHED.items():
+        assert values[key] == pytest.approx(q1, abs=0.02), key
+
+
+def test_board_comparison_carries_the_ledger_and_the_renderer_array(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    r = reports.build_board_report(_board_dataset(), user_id="u1",
+                                   period="2026-Q1", compare_to="2026-Q2")
+    s = r["structured"]
+    assert r["kind"] == "board_report_comparison"
+    assert s["columns"] == ["Q1", "Q2"]
+    rows = {row["key"]: (row["a"], row["b"]) for row in s["rows"]}
+    for key, published in _PUBLISHED.items():
+        assert rows[key] == pytest.approx(published, abs=0.02), key
+    # The template's own R[] shape: a band row per group, then its metric rows.
+    bands = [row for row in s["r_array"] if row[0] == br.GROUP]
+    assert [b[1] for b in bands] == list(br.GROUPS)
+    assert len(s["r_array"]) == len(br.CATALOG) + len(br.GROUPS)
+
+
+def test_two_periods_of_different_shapes_compare(monkeypatch, tmp_path):
+    """Nothing on this path is quarter-shaped — a month against a month is the
+    same code, which is what keeps the columns "A" and "B" rather than Q1/Q2."""
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    r = reports.build_board_report(_board_dataset(), user_id="u1",
+                                   period="2026-01", compare_to="2026-04")
+    assert r["structured"]["columns"] == ["2026-01", "2026-04"]
+
+
+# --- idempotency --------------------------------------------------------------
+
+def test_the_same_request_is_served_from_the_store_not_re_derived(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    ds = _board_dataset()
+    first = reports.build_board_report(ds, user_id="u1", period="2026-Q1",
+                                       compare_to="2026-Q2")
+    second = reports.build_board_report(ds, user_id="u1", period="2026-Q1",
+                                        compare_to="2026-Q2")
+    assert first["reused"] is False and second["reused"] is True
+    assert second["id"] == first["id"], "a second run was written for the same key"
+    assert len(reports.runs.list_runs("u1", kind="board_report_comparison")) == 1
+
+
+def test_a_fresh_capture_re_derives_instead_of_serving_the_old_roll_up(
+        monkeypatch, tmp_path):
+    """The failure this key exists to prevent: the sheet is re-pulled, the
+    numbers move, and the report keeps answering with yesterday's."""
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    first = reports.build_board_report(_board_dataset(), user_id="u1", period="2026-Q1")
+    later = reports.build_board_report(
+        {**_board_dataset(), "official_captured_at": "2026-07-02T09:00:00+00:00"},
+        user_id="u1", period="2026-Q1")
+    assert later["reused"] is False
+    assert later["id"] != first["id"]
+    assert later["structured"]["cache_key"] != first["structured"]["cache_key"]
+
+
+def test_a_generator_bump_is_a_cache_invalidation_not_a_stale_read(
+        monkeypatch, tmp_path):
+    """A bump has to change the stored key, or the next request serves numbers
+    the new generator would not produce.
+
+    Asserted through ``cache_key`` rather than by monkeypatching
+    ``GENERATOR_VERSION``: the constant is a DEFAULT ARGUMENT of that function,
+    bound once at import, so patching the module attribute moves nothing. In
+    production the bump is a source edit and the default rebinds — but the test
+    that patches the attribute would pass for the wrong reason, and then keep
+    passing if the version ever dropped out of the key entirely.
+    """
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    r = reports.build_board_report(_board_dataset(), user_id="u1", period="2026-Q1")
+    s = r["structured"]
+    assert s["generator"] == br.GENERATOR_VERSION, "the store does not record the generator"
+
+    spec = reports.board_period("2026-Q1")
+    captured = date.fromisoformat(s["captured_on"])
+    assert br.cache_key([spec], captured) == s["cache_key"], "the key is not reproducible"
+    assert br.cache_key([spec], captured, version="mr-board-report/next") != s["cache_key"]
+
+
+def test_one_workspaces_board_run_is_never_served_to_another(monkeypatch, tmp_path):
+    """The cache key deliberately does not carry the workspace — the LOOKUP is
+    scoped instead. Two tenants asking for the same quarter of the same capture
+    therefore hash identically, which is exactly the case worth pinning."""
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    ds = _board_dataset()
+    mine = reports.build_board_report(ds, user_id="tenant-a", period="2026-Q1")
+    theirs = reports.build_board_report(ds, user_id="tenant-b", period="2026-Q1")
+    assert theirs["reused"] is False, "another tenant's run was served as a cache hit"
+    assert theirs["id"] != mine["id"]
+    assert mine["structured"]["cache_key"] == theirs["structured"]["cache_key"]
+    assert [r["id"] for r in reports.runs.list_runs("tenant-a", kind="board_report")] \
+        == [mine["id"]]
+
+
+# --- honest degradation -------------------------------------------------------
+
+def test_coverage_names_every_absent_metric_and_why(monkeypatch, tmp_path):
+    """The block that keeps a thin CAPTURE from reading as a thin quarter.
+
+    Production's stored capture on 2026-09-05 carries 8 fields, so 25 of the 38
+    rows are absent; the run has to say which and why, or the report looks like
+    a quarter where nothing sold.
+    """
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    thin = _board_dataset(drop=frozenset({"revenue_clients", "revenue_amount_sold"}))
+    r = reports.build_board_report(thin, user_id="u1", period="2026-Q1")
+    col = r["structured"]["coverage"]["columns"][0]
+
+    assert col["metric_count"] == len(br.CATALOG)
+    assert col["filled_count"] == len(col["filled"])
+    assert col["filled_count"] + len(col["absent"]) == len(br.CATALOG)
+    # Both the rows that read the dropped fields and the ratios built on them.
+    for key in ("revenue_clients", "revenue_amount_sold", "roas_pct",
+                "conversion_rate_pct", br.CAC_KEY):
+        assert key in col["absent"], key
+        assert col["absent_reasons"][key], f"{key} absent with no stated cause"
+    assert "revenue_clients" in col["absent_reasons"][br.CAC_KEY]
+    values = {row["key"]: row["value"] for row in r["structured"]["rows"]}
+    assert values["revenue_clients"] is None, "an absent metric came back as a number"
+    assert values["spend"] == pytest.approx(_PUBLISHED["spend"][0], abs=0.02)
+
+
+def test_the_untracked_row_is_absent_rather_than_zero_with_no_channel_feed(
+        monkeypatch, tmp_path):
+    """a6 has no per-channel revenue/client source this path can read, so the
+    channel table and the "Other / untracked" row are ABSENT.
+
+    Zeroing them would publish "0% untracked" — a reconciliation nobody
+    computed — and the one channel block that does exist would publish "100%
+    untracked" against a documented 7%. Both are the plausible wrong number.
+    """
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    r = reports.build_board_report(_board_dataset(), user_id="u1",
+                                   period="2026-Q1", compare_to="2026-Q2")
+    s = r["structured"]
+    assert s["channels"] == []
+    assert s["untracked"] == [None, None]
+    status = s["coverage"]["channel_reconciliation"]
+    assert status and status.startswith("absent"), status
+    assert "0" != status
+
+
+def test_a_period_a_month_is_missing_withholds_the_total_and_names_the_month(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    partial = _board_dataset(months={"2026-01", "2026-02"})
+    r = reports.build_board_report(partial, user_id="u1", period="2026-Q1")
+    values = {row["key"]: row["value"] for row in r["structured"]["rows"]}
+    assert values["spend"] is None, "two thirds of a quarter published as the quarter"
+    assert any("2026-03" in g for g in r["structured"]["gaps"]), r["structured"]["gaps"]
+
+
+def test_no_capture_at_all_is_an_error_not_a_report_full_of_zeros(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    with pytest.raises(reports.PeriodError, match="sheet pull"):
+        reports.build_board_report({"official_totals": {}}, user_id="u1",
+                                   period="2026-Q1")
+
+
+# --- period vocabulary --------------------------------------------------------
+
+@pytest.mark.parametrize(("text", "key", "n_months"), [
+    ("2026-07", "2026-07", 1),
+    ("2026-Q2", "2026-Q2", 3),
+    ("2026-q2", "2026-Q2", 3),
+    ("2026", "2026", 12),
+])
+def test_board_period_accepts_month_quarter_and_year(text, key, n_months):
+    spec = reports.board_period(text)
+    assert spec.key == key and len(spec.months) == n_months
+
+
+@pytest.mark.parametrize("text", ["", "2026-13", "2026-Q5", "Q2", "last quarter",
+                                  "2026-7", "26-07", "2026-00"])
+def test_board_period_refuses_anything_it_cannot_read(text):
+    with pytest.raises(reports.PeriodError):
+        reports.board_period(text)
+
+
+def test_a_comparison_needs_two_different_periods(monkeypatch, tmp_path):
+    """A period against itself renders a delta column of zeros, which is a
+    claim — "nothing moved" — that nobody made."""
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    with pytest.raises(reports.PeriodError, match="two different periods"):
+        reports.build_board_report(_board_dataset(), user_id="u1",
+                                   period="2026-Q1", compare_to="2026-Q1")
+
+
+# --- the kill switch ----------------------------------------------------------
+
+def test_the_board_report_is_off_unless_a_deployment_turns_it_on(monkeypatch):
+    """Default OFF. The inverse of MR_MULTI_SHEET, which defaults on."""
+    monkeypatch.delenv("MR_BOARD_REPORT", raising=False)
+    assert reports.board_report_enabled() is False
+    for off in ("0", "false", "off", "", "no", "maybe"):
+        monkeypatch.setenv("MR_BOARD_REPORT", off)
+        assert reports.board_report_enabled() is False, off
+    for on in ("1", "true", "TRUE", "on"):
+        monkeypatch.setenv("MR_BOARD_REPORT", on)
+        assert reports.board_report_enabled() is True, on
+
+
+# =============================================================================
+# Board report renderer — the ledger as one self-contained file
+# (board_report_render.py)
+# =============================================================================
+# The contract is the same three marketing templates, minus their defects. Each
+# test below pins one, because every one of them shipped a page that looked
+# entirely finished:
+#
+#   1. Chart.js from a CDN and three families from Google Fonts, so behind a
+#      corporate proxy the emailed file rendered as unstyled text with four
+#      blank canvases.
+#   2. "-21.8%" on Spend carrying a green UP arrow, because one CSS class
+#      encoded both "favourable" and "rising".
+#   3. Website's 543%/787% ROAS flattening Meta and Google to slivers on a
+#      linear axis — the three channels the reallocation decision is about.
+#   4. print-color-adjust absent, so a PDF of a design made of background
+#      colours prints blank; and break-inside:avoid on the table WRAPPER, so a
+#      45-row table gets clipped at one page instead of paginating.
+#   5. A single-period insight card in green carrying "thin 110% ROAS" and
+#      "CAC high at $4,991".
+#
+# The renderer is a pure function, so every test here is: build a ledger, render
+# it, read the bytes. No fixture files and no golden HTML — a golden file makes
+# every layout change a diff review instead of an assertion.
+
+import re
+from html.parser import HTMLParser
+
+from marketing_research_agent import board_report_render as brr
+
+#: Tags that never close. SVG shapes are emitted self-closing, so the balance
+#: check must not expect an end tag for them either.
+_VOID_TAGS = frozenset({
+    "meta", "br", "hr", "img", "input", "link", "source", "area", "base", "col",
+    "embed", "param", "track", "wbr",
+    "rect", "line", "path", "circle", "use", "stop", "polyline", "polygon",
+})
+
+
+class _TagBalance(HTMLParser):
+    """A PDF pass gets one shot at the markup; an unclosed ``<td>`` silently
+    swallows a section."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stack: list[str] = []
+        self.bad: list[tuple[str, list[str]]] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in _VOID_TAGS:
+            self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        if tag in _VOID_TAGS:
+            return
+        if not self.stack or self.stack[-1] != tag:
+            self.bad.append((tag, list(self.stack[-3:])))
+            return
+        self.stack.pop()
+
+
+def _q1_ch() -> br.PeriodRollup:
+    return br.roll_up(br.quarter_period(2026, 1), _monthly(0, _Q1_MONTHS),
+                      channels=_channels(0, _Q1_MONTHS))
+
+
+def _q2_ch() -> br.PeriodRollup:
+    return br.roll_up(br.quarter_period(2026, 2), _monthly(1, _Q2_MONTHS),
+                      channels=_channels(1, _Q2_MONTHS))
+
+
+def _comparison(**kw) -> str:
+    return brr.render(br.compare(_q1_ch(), _q2_ch()), brand="Legal Soft", **kw)
+
+
+def _standalone(**kw) -> str:
+    return brr.render(brr.single_period(_q1_ch()), brand="Legal Soft", **kw)
+
+
+def _between(page: str, start: str, end: str) -> str:
+    i = page.index(start)
+    return page[i:page.index(end, i)]
+
+
+def _rows_of(table: str) -> list[str]:
+    """The metric rows of a rendered table, in print order, group bands out."""
+    return [f for f in table.split("<tr")
+            if "<td" in f and 'class="group"' not in f]
+
+
+def _tr_with(page: str, label: str) -> str:
+    for frag in page.split("<tr"):
+        if ">" + label + "<" in frag:
+            return frag[:frag.index("</tr>") + 5] if "</tr>" in frag else frag
+    raise AssertionError(f"no row labelled {label!r}")
+
+
+def _svg_named(page: str, title: str) -> str:
+    i = page.index("<title>" + title + "</title>")
+    return page[page.rindex("<svg", 0, i):page.index("</svg>", i) + 6]
+
+
+def _kickers(page: str) -> list[str]:
+    return re.findall(r'<span class="num">(\d+)</span>', page)
+
+
+# --- self-contained, which is the whole point --------------------------------
+
+def test_board_report_render_reaches_the_network_nowhere_at_all():
+    """The marketing team emails these files to clients. The templates pulled
+    Chart.js from cdnjs and three families from Google Fonts, so behind a
+    corporate proxy the whole visual identity collapsed. Proven mechanically
+    rather than by reading the source: one ``<link>`` added later is invisible
+    in review and total in effect."""
+    for page in (_comparison(), _standalone()):
+        for token in ("http://", "https://", "<script", "<link", "@import",
+                      "<iframe", "<img", "<object", "<embed", "srcset", "url("):
+            assert token not in page, token
+        assert page.startswith('<!DOCTYPE html><html lang="en">')
+        assert page.rstrip().endswith("</html>")
+        # Charts are markup, not a library.
+        assert page.count('<svg class="chart"') >= 3
+        assert "<canvas" not in page
+
+        parser = _TagBalance()
+        parser.feed(page)
+        assert not parser.bad and not parser.stack, (parser.bad, parser.stack)
+
+
+def test_board_report_render_is_pure_and_imports_nothing_that_could_do_io():
+    """No clock, no store, no network — the same ledger renders the same bytes,
+    which is what lets step 3 cache the document instead of re-deriving it.
+    Checked structurally so an import added later fails here, not in a cron
+    fire."""
+    assert os.environ.get("MR_OFFLINE") == "1"
+    from app.services import firestore_repo
+
+    with pytest.raises(RuntimeError, match="Firestore access blocked in tests"):
+        firestore_repo._db()
+
+    source = pathlib.Path(brr.__file__).read_text(encoding="utf-8")
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported |= {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add("." * node.level + node.module.split(".")[0])
+    assert imported == {"__future__", "html", "math", "dataclasses", "datetime",
+                        "typing", ".board_report"}
+    assert "today()" not in source        # a date is passed in, never read
+
+    assert _comparison() == _comparison()
+    assert _standalone() == _standalone()
+
+
+# --- one shell, two compositions ---------------------------------------------
+
+def test_board_report_render_section_list_is_chosen_by_period_count():
+    """Q1 and Q2 standalone are structurally identical and differ only in
+    numbers; the comparison is a different section list off the same shell. The
+    switch is the period count and nothing else."""
+    assert brr.is_single_period(brr.single_period(_q1_ch())) is True
+    assert brr.is_single_period(br.compare(_q1_ch(), _q2_ch())) is False
+
+    two = _comparison()
+    assert _kickers(two) == ["00", "01", "02", "03", "04"]
+    assert "At a glance" in two and "Biggest movers" in two
+    assert "Full comparison ledger" in two and "Channel shift" in two
+
+    one = _standalone()
+    assert _kickers(one) == ["01", "02", "03"]
+    # The cover names the window a client can read, and the year once.
+    assert "<b>Jan – Mar 2026</b>" in one
+    fiscal = br.PeriodSpec("f", "F", ("2025-11", "2026-02"))
+    assert brr._months_label(fiscal) == "Nov 2025 \u2013 Feb 2026"
+    assert brr._months_label(br.PeriodSpec("w", "W", ("wk-01",))) == "wk-01"
+    assert "At a glance" not in one and "Biggest movers" not in one
+
+    # Exactly one highlighted card, in the report that has cards.
+    assert one.count('class="card hl"') == 1
+    assert one.count('<div class="card') == 20
+    assert two.count('<div class="card') == 0
+
+    # Same head, same palette, same component classes across compositions.
+    assert two[two.index("<style>"):two.index("</style>")] == \
+        one[one.index("<style>"):one.index("</style>")]
+
+
+def test_board_report_render_prints_every_catalog_row_in_catalog_order():
+    """38 rows under seven bands, labelled and ordered by the catalog and never
+    by a copy kept in the renderer — including ``Cost / Qualified Demo
+    Completed``, which the template mislabels and the catalog names against its
+    real denominator (239,581.57 / 880.81 = 272, the all-in count)."""
+    page = _comparison()
+    table = _between(page, "Full comparison ledger", "</section>")
+    for group in br.GROUPS:
+        band = group.replace("&", "&amp;")
+        assert '<tr class="group"><td colspan="5">' + band + "</td></tr>" in table
+    assert table.count('<tr class="group">') == 7
+
+    rows = _rows_of(table)
+    assert len(rows) == 38
+    for metric, frag in zip(br.CATALOG, rows):
+        assert ">" + metric.label + "<" in frag, metric.key
+        a, b = _PUBLISHED[metric.key]
+        for value in (a, b):
+            printed = ("$" + format(round(value), ",") if metric.format == br.MONEY
+                       else format(value, ".2f") + "%" if metric.format == br.PCT
+                       else format(round(value), ","))
+            assert printed in frag, (metric.key, printed)
+    assert "Cost / Qualified Demo Completed (SDR+VAPI+Direct)" in table
+    # The printf escape the templates never unescaped: 544%%, 40%%, 95%%.
+    assert "%%" not in page
+
+
+# --- absent is not zero ------------------------------------------------------
+
+def test_board_report_render_absent_is_an_em_dash_and_a_named_gap_never_zero():
+    """Two metrics are absent in production right now, and two more derive from
+    them. A blank cell reads as zero and a ``$0`` states one, so absence gets
+    its own mark AND its own entry in the basis panel — while a genuine zero
+    still prints as a zero, or the distinction is decorative."""
+    zeroed = "lost_dnc_bad_lead"          # a real 0 in column B, uniquely labelled
+    cells_a = _monthly(0, _Q1_MONTHS, drop=_ABSENT_IN_PROD)
+    cells_b = _monthly(1, _Q2_MONTHS, drop=_ABSENT_IN_PROD)
+    for mk in _Q2_MONTHS:
+        cells_b[mk][zeroed] = 0
+    ledger = br.compare(
+        br.roll_up(br.quarter_period(2026, 1), cells_a, channels=_channels(0, _Q1_MONTHS)),
+        br.roll_up(br.quarter_period(2026, 2), cells_b, channels=_channels(1, _Q2_MONTHS)))
+    page = brr.render(ledger)
+    table = _between(page, "Full comparison ledger", "</section>")
+
+    gone = _ABSENT_IN_PROD | {"roas_not_actualized_pct", "revenue_target_pct"}
+    for key in sorted(gone):
+        label = br.BY_KEY[key].label
+        frag = _tr_with(table, label)
+        assert frag.count('class="absent"') == 4, (key, frag)   # A, B, delta, %
+        assert "$0" not in frag and ">0<" not in frag and "0.00%" not in frag
+        assert label + " — not reported" in page, key
+
+    zero_row = _tr_with(table, br.BY_KEY[zeroed].label)
+    assert 'class="absent"' not in zero_row
+    assert ">0<" in zero_row and ">124<" in zero_row
+
+    assert "Absent figures in this report" in page
+    assert "not reported</b> for that column. It is not zero" in page
+
+
+def test_board_report_render_says_so_when_nothing_is_absent():
+    """The honesty panel is not conditional decoration — a complete report says
+    it is complete, so a reader never has to wonder whether the panel was
+    dropped or the data was clean."""
+    page = _comparison()
+    assert "None — every published row reported a figure in every column." in page
+    assert 'class="absent"' not in _between(page, "Full comparison ledger", "</section>")
+
+
+# --- colour and glyph are two different questions ----------------------------
+
+def test_board_report_render_colour_is_goodness_and_the_arrow_is_direction():
+    """At a glance gave ``-21.8%`` and ``-34.2%`` the ``up`` class and printed a
+    green triangle pointing UP beside a falling number. One class encoded two
+    orthogonal things; here colour comes from ``LedgerRow.improved`` and the
+    arrow from the sign of the delta, chosen by two different functions."""
+    page = _comparison()
+    glance = _between(page, "At a glance", "</table>")
+
+    def cls_of(label):
+        return re.search(r'class="(dcell[^"]*)"', _tr_with(glance, label)).group(1)
+
+    # Spend and CAC fell, which is favourable: green, arrow DOWN.
+    assert cls_of("Spend") == "dcell up fall"
+    assert cls_of("CAC (Spend / Revenue Client)") == "dcell up fall"
+    # Qualified leads fell, which is not: red, arrow DOWN.
+    assert cls_of("Qualified Leads") == "dcell down fall"
+    # Revenue rose and that is favourable: green, arrow UP.
+    assert cls_of("Revenue Amount Sold (Actualized)") == "dcell up rise"
+
+    # No cell anywhere pairs a rising glyph with a falling number.
+    for cls, text in re.findall(r'class="(dcell[^"]*)">([^<]*)<', glance):
+        if text.startswith("-") or text.startswith("−"):
+            assert "rise" not in cls, (cls, text)
+        elif text.startswith("+"):
+            assert "fall" not in cls, (cls, text)
+
+    # Budget moved, but it is an input the team chose: never coloured, still
+    # given its direction.
+    budget = _tr_with(_between(page, "Full comparison ledger", "</section>"), "Budget")
+    assert 'class="dc neu"' in budget and "neu" in budget
+    assert brr._tone(None) == "neu" and brr._glyph(-1.0) == "fall"
+    assert brr._tone(True) == "up" and brr._glyph(1.0) == "rise"
+
+
+def test_board_report_render_win_column_can_never_carry_a_deterioration():
+    """The single-period card was ``.win`` — green ``+`` bullets — and carried
+    "thin 110% ROAS" and "CAC high at $4,991". With no prose supplied the two
+    columns are filled from the ledger, and membership is decided by
+    ``improved``, so the defect is structurally unreachable."""
+    ledger = br.compare(_q1_ch(), _q2_ch())
+    page = brr.render(ledger)
+    section = _between(page, "What improved, what dropped", "</section>")
+    wins = _between(section, 'class="col win"', "</div>")
+    misses = _between(section, 'class="col miss"', "</div>")
+
+    def labels(block):
+        return [m.split(":")[0] for m in re.findall(r"<li>(.*?)</li>", block)]
+
+    # Bullet labels are group-qualified for the same reason the charts are.
+    names = brr._disambiguated(ledger)
+    improved = {names[r.key] for r in ledger.rows if r.improved is True}
+    dropped = {names[r.key] for r in ledger.rows if r.improved is False}
+    assert labels(wins) and labels(misses)
+    for label in labels(wins):
+        assert label in improved, label
+    for label in labels(misses):
+        assert label in dropped, label
+    assert "derived from the ledger" in section
+
+
+def test_board_report_render_is_complete_and_honest_with_no_prose_at_all():
+    """The thesis sentence and the win/miss bullets are step 8's problem. With
+    the slot empty the report still has every section, every number and the
+    basis panel, and it invents no narrative to fill the hole."""
+    page = _comparison()
+    assert 'class="sub"' not in page              # no thesis, and no empty line
+    assert _kickers(page) == ["00", "01", "02", "03", "04"]
+    assert "Basis &amp; data gaps" in page
+
+    prose = brr.ReportProse(
+        thesis="Q2 traded volume for productivity.",
+        wins=("Revenue efficiency flipped.",), misses=("Top of funnel shrank.",))
+    with_prose = _comparison(prose=prose)
+    # The thesis appears once. The templates printed the cover .sub again,
+    # verbatim, as the section-01 lead.
+    assert with_prose.count("Q2 traded volume for productivity.") == 1
+    assert "Revenue efficiency flipped." in with_prose
+    assert "derived from the ledger" not in with_prose
+
+    # One column of bullets is one column of layout, not half a dead panel.
+    one_sided = _comparison(prose=brr.ReportProse(wins=("Only a win.",)))
+    assert '<div class="ins one">' in one_sided
+    assert '<div class="ins">' in with_prose
+
+
+def test_board_report_render_treats_prose_and_labels_as_text_not_markup():
+    """Prose will be LLM-written and this page goes to clients. Everything that
+    reaches the document is escaped, so injected markup is shown, not run."""
+    prose = brr.ReportProse(
+        thesis='<script>alert(1)</script> & "quoted"',
+        wins=("<b>bold</b> attempt",), misses=("<img src=x onerror=y>",))
+    page = brr.render(br.compare(_q1_ch(), _q2_ch()), prose=prose,
+                      brand="<em>Acme</em> & Co", title="</title><script>x</script>")
+    assert "<script" not in page and "<img" not in page and "<b>bold" not in page
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
+    assert "&lt;em&gt;Acme&lt;/em&gt; &amp; Co" in page
+    # The catalog's own ampersands survive as entities, not as raw markup.
+    assert "Goal &amp; Blended Financials" in page
+
+
+# --- the two reconciliations a reader is entitled to -------------------------
+
+def test_board_report_render_conversion_rate_shows_the_denominator_it_uses():
+    """Conversion Rate divides by Total Demos Completed (Direct) — 248/212 —
+    not by the all-in 272/238 printed one card away. Two adjacent cards a reader
+    cannot reconcile will not ship, so the card and the ledger row both print
+    the basis the catalog carries."""
+    basis = br.BY_KEY["conversion_rate_pct"].basis
+    assert basis and br.BY_KEY[br.CAC_KEY].basis      # the catalog is where it lives
+    for page in (_comparison(), _standalone()):
+        assert basis in page
+        assert br.BY_KEY[br.CAC_KEY].basis in page
+        assert "Denominators worth stating" in page
+
+    core = _between(_standalone(), "Actualized &amp; core", "Not actualized")
+    assert ">272<" in core and ">248<" in core and ">19.4%<" in core
+    assert core.index("Total Demos Completed (Direct)") < core.index("Conversion Rate (%)")
+    assert basis in core
+
+
+def test_board_report_render_untracked_is_a_row_in_the_table_not_a_footnote():
+    """Q1 leaves $16,881 (7.0%) and 8 clients unattributed, Q2 $22,512 (12.0%)
+    and 12, and the gap is growing. A reader who cannot see it infers the
+    channel table IS the total."""
+    for page in (_comparison(), _standalone()):
+        assert page.count('<tr class="untracked">') == 1
+        row = _tr_with(page, br.UNTRACKED_LABEL)
+        assert br.UNTRACKED_LABEL in row and "$16,881" in row
+        assert "not a footnote" in page
+
+    two = _comparison()
+    untracked = _tr_with(two, br.UNTRACKED_LABEL)
+    assert "$16,881" in untracked and "$22,512" in untracked
+    assert "7.0% of spend" in two and "12.0% of spend" in two
+    assert "widening" in two and "7.0% → 12.0%" in two
+    # Its revenue is charted, so the money is visible rather than footnoted.
+    assert br.UNTRACKED_LABEL in _svg_named(two, "Revenue sold by channel")
+
+
+def test_board_report_render_untracked_columns_may_be_absent_and_render_absent():
+    """The reconciliation is per measure: a channel month missing its spend
+    leaves that one measure unknown while the others still stand. Unknown prints
+    as an em-dash in the row, not as a zero share."""
+    channels = _channels(0, _Q1_MONTHS)
+    del channels["Meta"]["2026-02"]["spend"]
+    rollup = br.roll_up(br.quarter_period(2026, 1), _monthly(0, _Q1_MONTHS),
+                        channels=channels)
+    page = brr.render(brr.single_period(rollup))
+    row = _tr_with(page, br.UNTRACKED_LABEL)
+    assert 'class="absent"' in row       # spend, and the two ratios built on it
+    assert "$0" not in row
+    assert ">8<" in row                  # the measures that ARE complete stand
+    assert "Roll-up warnings" in page
+
+
+# --- no invisible bars -------------------------------------------------------
+
+def test_board_report_render_roas_chart_keeps_the_small_channels_visible():
+    """Website returns 543%/787% against Meta and Google near 40%/95%. On a
+    linear axis scaled to Website, Meta's bar is 5% of the plot, so the three
+    channels the reallocation decision is about are invisible. The axis is
+    capped off the median instead, the outlier is drawn torn with its true value
+    printed, and break-even lands where a reader can use it."""
+    page = _comparison()
+    svg = _svg_named(page, "ROAS by channel against break-even")
+    heights = sorted(float(h) for h in re.findall(r'height="([\d.]+)"', svg)
+                     if float(h) > 12)
+    assert heights, svg[:200]
+    # Uncapped, the ratio would be 40.46 / 787.35 = 0.051.
+    assert heights[0] / heights[-1] > 0.15, heights
+
+    assert "Axis capped at 250%" in page
+    assert "Website Q1 543.5%" in page and "Website Q2 787.4%" in page
+    assert "torn top" in page
+    # Break-even is drawn dark at 100%, not as one more grey gridline.
+    assert 'stroke="' + brr.INK + '" stroke-width="1.6"' in svg
+    assert "break-even 100%" in svg
+    # Bars carry the benchmark colours, so above/below reads without the axis.
+    assert brr.POS in svg and brr.NEG in svg
+
+
+def test_board_report_render_draws_three_bar_charts_and_nothing_else():
+    """Grouped vertical (spend vs revenue), horizontal (revenue by channel, and
+    the sorted movers), and vertical against a benchmark (ROAS). No line, no
+    pie, no doughnut — and no monthly series, because the ledger carries period
+    totals and the renderer does not invent months it never received."""
+    page = _comparison()
+    for title in ("Spend against revenue sold", "Percent change Q1 to Q2",
+                  "Revenue sold by channel", "ROAS by channel against break-even"):
+        svg = _svg_named(page, title)
+        assert "<rect" in svg and "<circle" not in svg and "<polyline" not in svg
+    assert "Monthly detail is not part of the ledger" in page
+
+    movers = _svg_named(page, "Percent change Q1 to Q2")
+    assert 'stroke="' + brr.INK + '" stroke-width="1.5"' in movers      # zero line
+    # Bar direction is the sign; bar colour is whether the move helped — so CAC
+    # falling is a left-pointing GREEN bar.
+    assert brr.POS in movers and brr.NEG in movers
+    assert "8 largest improvements and 7 largest deteriorations of 36 comparable" in page
+    # Ranked by size alone this chart is sixteen green bars, because on this data
+    # every large move is a revenue increase. Both directions are drawn, so the
+    # seven rows that got worse cannot fall off the bottom.
+    assert movers.count(brr.NEG) == 7 and movers.count(brr.POS) == 8
+
+
+def test_board_report_render_chart_labels_stay_distinct_without_group_bands():
+    """Two catalog labels appear twice — the Projected and Paying not-actualized
+    blocks publish identically-named rows, and the ledger tells them apart by
+    the band above. A chart has no bands, so the group qualifies the label
+    there; otherwise different rows share one bar name."""
+    joined = " ".join(re.findall(r"<text[^>]*>(.*?)</text>",
+                                 _svg_named(_comparison(), "Percent change Q1 to Q2")))
+    assert "· Paying" in joined and "· Projected" in joined
+    labels = brr._disambiguated(br.compare(_q1_ch(), _q2_ch()))
+    assert len(set(labels.values())) == len(br.CATALOG)
+
+
+# --- print / PDF correctness, all of it absent from the templates ------------
+
+def test_board_report_render_carries_the_print_rules_the_templates_lacked():
+    """A headless-Chromium PDF pass follows in step 5. Each rule below is zero
+    occurrences in the supplied files and each has a specific failure: a blank
+    PDF, a 45-row table with no headers after page 1, and a 9-column table
+    clipped at A4."""
+    page = _comparison()
+    css = _between(page, "<style>", "</style>")
+
+    # The whole identity is background colour — navy cover, gold cells, navy
+    # group bands. Without this the PDF prints them white.
+    assert "print-color-adjust:exact" in css
+    assert "-webkit-print-color-adjust:exact" in css
+    assert "@page{" in css
+
+    # 45 rows cannot fit one page, so the header has to repeat.
+    assert "thead{display:table-header-group}" in css
+
+    print_block = css[css.index("@media print"):]
+    # break-inside on the WRAPPER clips a table that cannot fit a page; it
+    # belongs on the row.
+    assert "tr{break-inside:avoid" in print_block
+    assert not re.search(r"\.twrap[^{]*\{[^}]*break-inside:avoid", css), \
+        "break-inside:avoid on .twrap clips the ledger instead of paginating it"
+    assert re.search(r"\.twrap\{[^}]*overflow:visible", print_block)
+
+    # The 9-column channel table relies on overflow-x + min-width, neither of
+    # which paginates, so print gets its own variant.
+    assert 'class="twrap wide"' in page
+    assert "table.cmp{min-width:0" in print_block
+    assert ".twrap.wide table.cmp{font-size" in print_block
+    assert re.search(r"table\.cmp th:first-child,table\.cmp td:first-child\{position:static",
+                     print_block)
+
+
+def test_board_report_render_keeps_the_typography_decision_the_user_made():
+    """Fraunces / Inter / IBM Plex Mono with tabular figures — a client-facing
+    document, deliberately not the console's Archivo. The faces are named first
+    and then fall back through what a Windows, macOS or headless-Chromium box
+    actually has, because embedding them would add roughly a megabyte of base64
+    to every file the team emails."""
+    css = _between(_comparison(), "<style>", "</style>")
+    assert css.index("Fraunces") < css.index("Georgia")
+    assert "Inter," in css and "'IBM Plex Mono'" in css
+    assert "font-variant-numeric:tabular-nums" in css
+    assert 'font-feature-settings:"tnum" 1' in css
+    for fallback in ("Georgia", "'Segoe UI'", "Consolas", "'DejaVu Sans Mono'"):
+        assert fallback in css, fallback
+    # Fallbacks, not @font-face blobs, and not a remote stylesheet.
+    assert "@font-face" not in css and "data:font" not in css
+    for name, value in brr.PALETTE.items():
+        assert "--" + name + ":" + value in css
+
+
+def test_board_report_render_refuses_a_ledger_that_is_not_two_columns():
+    with pytest.raises(ValueError, match="two columns"):
+        brr.render(br.ReportLedger(columns=("only",), periods=(), rows=()))

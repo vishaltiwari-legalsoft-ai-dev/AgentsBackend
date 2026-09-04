@@ -379,3 +379,83 @@ def test_the_overview_traffic_lights_use_the_readers_own_targets(
                 data={"platform": "google_ads"})
     theirs = client.get("/api/mr/overview").json()
     assert [f for f in theirs["flag_summary"] if f["metric"] == "cost_per_booking"]
+
+
+# --------------------------------------------------------------------------- #
+# The board report
+# --------------------------------------------------------------------------- #
+# Its idempotency key is a hash of (periods, capture date, generator version)
+# and deliberately does NOT carry the workspace — the LOOKUP is scoped instead.
+# That makes "two tenants ask for the same quarter of the same capture" the
+# interesting case rather than an unlikely one: they hash identically by
+# construction, so a lookup that ever stops filtering on user_id serves one
+# tenant's revenue figures to the other with a cache hit and no error anywhere.
+
+_BOARD_MONTHS = {
+    "2026-01": {"spend": 80000.0, "leads": 430, "revenue_clients": 16,
+                "revenue_amount_sold": 88000.0},
+    "2026-02": {"spend": 79000.0, "leads": 425, "revenue_clients": 15,
+                "revenue_amount_sold": 86000.0},
+    "2026-03": {"spend": 80581.57, "leads": 426, "revenue_clients": 17,
+                "revenue_amount_sold": 88947.7},
+}
+
+
+def _seed_official_for(user_id: str) -> None:
+    from marketing_research_agent import runs as mr_runs
+
+    mr_runs.save_run({
+        "id": mr_runs.new_run_id(), "kind": "official_spend", "user_id": user_id,
+        "agent_id": "a6", "platform": "sheets-official",
+        "generated_at": "2026-04-01T00:00:00+00:00",
+        "months": {k: v["spend"] for k, v in _BOARD_MONTHS.items()},
+        "totals": _BOARD_MONTHS,
+    })
+
+
+@pytest.fixture()
+def board_on(monkeypatch):
+    monkeypatch.setenv("MR_BOARD_REPORT", "1")
+
+
+def test_an_identical_board_request_from_another_tenant_is_not_a_cache_hit(
+        board_on, as_caller):
+    """Same period, same capture date, same generator — so the same key. The
+    second tenant must still derive their OWN run from their OWN figures."""
+    _seed_official_for(OWNER["id"])
+    _seed_official_for(STRANGER["id"])
+
+    as_caller(OWNER)
+    mine = client.post("/api/mr/board-report", json={"period": "2026-Q1"}).json()
+    as_caller(STRANGER)
+    theirs = client.post("/api/mr/board-report", json={"period": "2026-Q1"}).json()
+
+    assert mine["structured"]["cache_key"] == theirs["structured"]["cache_key"], (
+        "the keys diverged, so this test no longer exercises the collision it exists for")
+    assert theirs["reused"] is False, "another tenant's run was served as a cache hit"
+    assert theirs["id"] != mine["id"]
+    assert theirs["user_id"] == STRANGER["id"]
+
+
+def test_a_second_tenant_with_no_capture_gets_an_error_not_the_first_tenants_figures(
+        board_on, as_caller):
+    _seed_official_for(OWNER["id"])
+    as_caller(OWNER)
+    assert client.post("/api/mr/board-report",
+                       json={"period": "2026-Q1"}).status_code == 200
+
+    as_caller(STRANGER)
+    refused = client.post("/api/mr/board-report", json={"period": "2026-Q1"})
+    assert refused.status_code == 422
+    assert "sheet pull" in refused.json()["detail"]
+
+
+def test_another_tenant_cannot_read_a_board_run(board_on, as_caller):
+    _seed_official_for(OWNER["id"])
+    as_caller(OWNER)
+    run_id = client.post("/api/mr/board-report",
+                         json={"period": "2026-Q1"}).json()["id"]
+
+    as_caller(STRANGER)
+    assert client.get(f"/api/mr/runs/{run_id}").status_code == 404
+    assert run_id not in [r["id"] for r in client.get("/api/mr/runs").json()]

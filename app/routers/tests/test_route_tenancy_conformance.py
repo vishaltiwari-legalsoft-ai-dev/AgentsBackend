@@ -231,6 +231,17 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     ("POST", "/api/gd/runs/{run_id}/text-preview"): TENANT_SCOPED,
     ("POST", "/api/gd/runs/{run_id}/tweak"): TENANT_SCOPED,
     ("POST", "/api/mr/ask"): TENANT_SCOPED,
+    # The board report. Every read it makes goes through ``_load_dataset(user["id"])``,
+    # which queries ``mr_runs`` filtered on ``user_id`` server-side; the run it
+    # writes is stamped with the same id, and the idempotency lookup that may
+    # serve it back is scoped to that id before the cache key is even compared —
+    # so two workspaces asking for the same quarter of the same capture hash
+    # identically and still cannot reach each other's run. It reads the roll-up
+    # tab through ``reports``/``board_report`` and deliberately never imports
+    # ``snapshots``, whose routes are WORKSPACE_SHARED. Dark by default
+    # (``MR_BOARD_REPORT``), and the kill switch sits INSIDE the handler, so the
+    # auth dependency still runs first and an anonymous caller gets 401, not 404.
+    ("POST", "/api/mr/board-report"): TENANT_SCOPED,
     ("GET", "/api/mr/datasets"): TENANT_SCOPED,
     ("DELETE", "/api/mr/datasets/{dataset_id}"): TENANT_SCOPED,
     ("POST", "/api/mr/ingest"): TENANT_SCOPED,

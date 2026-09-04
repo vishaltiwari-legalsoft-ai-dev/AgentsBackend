@@ -9,10 +9,11 @@ offline).
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import date, datetime, timedelta, timezone
 
-from . import analysis, config, goals, lead_analysis, runs
+from . import analysis, board_report as br, config, goals, lead_analysis, runs
 from .modules import campaign_reporting as cr
 from .modules import funnel_analysis as fa
 from .modules import opportunity_research as orr
@@ -28,6 +29,11 @@ KINDS = [
     "utm_attribution",
     "icp_signal",
     "daily_movement",
+    # The board deliverable, in two shapes. They are report kinds like any
+    # other - same run store, same ``/mr/runs`` listing, same ownership check
+    # on read back - and the only two that are not narrated. See BOARD_KINDS.
+    "board_report",
+    "board_report_comparison",
 ]
 
 # Campaign-performance kinds share the aggregation pipeline and the
@@ -534,6 +540,14 @@ def build(kind: str, dataset: dict, user_id: str, period: str | None = None) -> 
     flag campaigns nobody can explain."""
     if kind not in KINDS:
         raise ValueError(f"unknown report kind: {kind}")
+    if kind in BOARD_KINDS:
+        # Not a "not implemented": this function's contract is one period and
+        # a narrative, and the board report has two periods and no narrative.
+        # Falling through here would have produced a report carrying an empty
+        # ledger and an LLM paragraph about it.
+        raise ValueError(
+            f"'{kind}' is not built here - use build_board_report(), which takes "
+            "two periods and keys the result on board_report.cache_key()")
     targets = goals.get_targets(user_id)
     if period is not None and kind not in ("monthly_summary", "quarterly_summary"):
         raise PeriodError(f"'{kind}' reports don't take a period.")
@@ -680,3 +694,261 @@ def available_periods(dataset: dict) -> dict:
             for y, q in quarters
         ],
     }
+
+# --- board report ------------------------------------------------------------
+# Where board_report.py's catalog and roll-up meet the data the agent actually
+# holds. That module is pure and does no I/O; this is the only place that hands
+# it the sheet's parsed figures, and the only place that persists what it
+# returns.
+
+#: The two kinds :func:`build` does not narrate. They sit in :data:`KINDS` so
+#: they list, persist and read back through the one run rail, but the board
+#: report is the sheet's own arithmetic and a model sentence over it would be a
+#: second, unreconcilable account of the same numbers.
+BOARD_KINDS = ("board_report", "board_report_comparison")
+
+#: The kinds :func:`build` does narrate. A test sweeping "every report kind"
+#: wants this, not :data:`KINDS`.
+NARRATED_KINDS = tuple(k for k in KINDS if k not in BOARD_KINDS)
+
+#: Stated on every board report, because a reader who knows the template will
+#: look for its channel table and needs to know why it is not there.
+#:
+#: ``board_report.roll_up`` computes the "Other / untracked" row from a
+#: per-channel ``{spend, revenue_amount_sold, revenue_clients}`` feed. Three
+#: candidates were checked on 2026-09-05 and none can supply one:
+#:
+#: * ``schemas.CampaignMetric`` - the vendor-tab shape every report reads - has
+#:   spend and funnel counts, and no revenue or client field at all.
+#: * The roll-up tab DOES carry a channel sub-block, and exactly one: "WEBSITE",
+#:   rows 83-148, with its own revenue and revenue-client rows.
+#:   ``sheets_source.fetch_official_totals`` reads ``rows[:120]``, so the report
+#:   path never sees them.
+#: * ``snapshots.py``'s ``_CHANNEL_MAP`` already maps those rows - and that
+#:   module's routes are WORKSPACE_SHARED, so importing it would pull that
+#:   scoping into this TENANT_SCOPED path.
+#:
+#: The last is why this is a note and not a fix, but it is not the strongest
+#: reason. Wiring the one available block gives, on live Q1 data, an untracked
+#: row reading 89.19% of spend and 100.00% of revenue untracked - because
+#: Websites is a single non-media channel (``config.NON_MEDIA_CHANNELS``), not
+#: the tracked-channel set the row is the residual of. The documented figures
+#: are 7.0% and 12.0%. Publishing 100% beside a row that should read 7% is the
+#: plausible-wrong-number failure this module exists to refuse, so the row stays
+#: absent - never zero - until a real per-channel feed exists.
+CHANNEL_SOURCE_STATUS = (
+    "absent - a6 has no per-channel revenue/client feed this path can read. "
+    "CampaignMetric carries spend and funnel counts only, and the roll-up tab's "
+    "one channel sub-block (Websites) sits past the 120-row window "
+    "fetch_official_totals reads. A spend-only channel table would make the "
+    "residual read 100% untracked against a documented 7%, so the row is "
+    "withheld rather than zeroed."
+)
+
+_YEAR_RE = re.compile(r"^(\d{4})$")
+
+
+def board_report_enabled() -> bool:
+    """Kill switch, **default off** - the board report ships dark.
+
+    Mirrors ``sources_registry.multi_sheet_enabled()`` (env read on every call,
+    so a deployment flips it without a code change and a test can set it),
+    inverted: this one is opt-IN. Off, the route answers 404 - the same answer
+    an unknown path gives, so a deployment that has not enabled the feature does
+    not advertise that it exists.
+    """
+    return os.environ.get("MR_BOARD_REPORT", "0").strip().lower() in ("1", "true", "on")
+
+
+def board_period(text: str) -> br.PeriodSpec:
+    """``'2026-07'`` / ``'2026-Q2'`` / ``'2026'`` -> a :class:`PeriodSpec`.
+
+    Deliberately wider than ``_explicit_window``'s month-or-quarter vocabulary.
+    The board's two columns are only "column A" and "column B" - a month against
+    a month and a year against a year both have to be expressible, and anything
+    that hardcodes a quarter forecloses them. Anything unparseable is a
+    user-facing error; no period is ever substituted for another.
+    """
+    t = (text or "").strip().upper()
+    m = _MONTH_RE.match(t)
+    if m and 1 <= int(m.group(2)) <= 12:
+        return br.month_period(int(m.group(1)), int(m.group(2)))
+    q = _QUARTER_RE.match(t)
+    if q:
+        return br.quarter_period(int(q.group(1)), int(q.group(2)))
+    y = _YEAR_RE.match(t)
+    if y:
+        return br.year_period(int(y.group(1)))
+    raise PeriodError(
+        f"'{text}' is not a board-report period (expected YYYY-MM, YYYY-Qn or YYYY).")
+
+
+def _capture_date(ds: dict) -> date:
+    """The day ``ds``'s official figures were pulled from the sheet.
+
+    Part of the idempotency key, so a fresh pull re-derives instead of serving
+    the roll-up of a capture that has since been replaced. A run predating the
+    stamp falls back to today, which is still idempotent within the day and
+    never stale across one.
+    """
+    stamp = str(ds.get("official_captured_at") or "")[:10]
+    try:
+        return date.fromisoformat(stamp)
+    except ValueError:
+        return date.today()
+
+
+def _absent_reason(metric, rollup) -> str:
+    """Why one catalog row has no number for this period, in the reader's terms
+    - so "absent" never has to be guessed at as "zero"."""
+    if metric.formula is not None:
+        missing = sorted(c for c in metric.formula.components()
+                         if rollup.components.get(c) is None)
+        if missing:
+            return "the roll-up tab does not report " + ", ".join(missing)
+        return f"its denominator ({metric.formula.denominator}) is zero for this period"
+    return f"the roll-up tab does not report '{metric.source}' for this period"
+
+
+def _coverage(columns: list) -> dict:
+    """Which catalog rows each column could fill, and why the rest could not.
+    ``columns`` is ``[(label, PeriodRollup), ...]``.
+
+    Computed per request on purpose: "absent" is a property of the capture
+    sitting in the store right now, not of the catalog. A capture pulled before
+    the roll-up parser learned the revenue rows fills 13 of 38 - the 13 it
+    publishes are correct and the other 25 are honestly missing, and without
+    this block a thin capture reads exactly like a thin quarter.
+    """
+    out = []
+    for label, r in columns:
+        filled, reasons = [], {}
+        for m in br.CATALOG:
+            if r.value(m.key) is None:
+                reasons[m.key] = _absent_reason(m, r)
+            else:
+                filled.append(m.key)
+        out.append({
+            "column": label,
+            "period": r.period.key,
+            "months": list(r.period.months),
+            "filled": filled,
+            "absent": sorted(reasons),
+            "absent_reasons": reasons,
+            "filled_count": len(filled),
+            "metric_count": len(br.CATALOG),
+        })
+    return {"columns": out, "metric_count": len(br.CATALOG),
+            "channel_reconciliation": CHANNEL_SOURCE_STATUS}
+
+
+def _single_column(r, key: str) -> dict:
+    """One period's board report: the ledger shape with one value column.
+
+    Deliberately not ``compare(r, r)``. Comparing a period with itself prints a
+    delta column of zeros, and a zero delta is a claim - "nothing moved" - that
+    nobody made. One column is one column.
+    """
+    return {
+        "generator": br.GENERATOR_VERSION,
+        "cache_key": key,
+        "columns": [r.period.label],
+        "periods": [r.period.as_dict()],
+        "groups": [g for g in br.GROUPS if any(m.group == g for m in br.CATALOG)],
+        "rows": [
+            {"key": m.key, "label": m.label, "group": m.group, "format": m.format,
+             "polarity": m.polarity, "basis": m.basis, "value": r.value(m.key)}
+            for m in br.CATALOG
+        ],
+        "components": dict(r.components),
+        "channels": [c.as_dict() for c in r.channels],
+        "untracked": [r.untracked.as_dict() if r.untracked else None],
+        "gaps": list(r.gaps),
+    }
+
+
+def _cached_board_run(user_id: str, kind: str, key: str) -> dict | None:
+    """A board run this workspace already derived for exactly this key.
+
+    Scoped to ``user_id`` at the query, which is why the key itself does not
+    have to carry the workspace: two tenants asking for the same quarter of the
+    same capture hash identically and still cannot reach each other's run. Both
+    filters are equality, so Firestore serves them from the automatic
+    single-field indexes - no composite index, and no unbounded scan.
+    """
+    for run in runs.list_runs(user_id, kind=kind):
+        if (run.get("structured") or {}).get("cache_key") == key:
+            return run
+    return None
+
+
+def build_board_report(dataset: dict, user_id: str, *, period: str,
+                       compare_to: str | None = None) -> dict:
+    """Build - or serve from the store - one board report, persisted as a run.
+
+    Same envelope, same ``mr_runs`` collection and the same ``user_id`` stamp as
+    every other deliverable, so ``/mr/runs`` lists these and ``/mr/runs/{id}``
+    reads them back through the ownership check already in place.
+
+    The one thing the campaign kinds have no notion of, and this needs, is
+    idempotency. The report is a pure function of (periods, capture date,
+    generator version), so :func:`board_report.cache_key` is computed FIRST and
+    a run already carrying that key is returned untouched instead of re-derived.
+    A ``GENERATOR_VERSION`` bump changes the key, which makes it a cache
+    invalidation rather than a stale read.
+
+    ``compare_to`` present -> the two-column comparison; absent -> one column.
+    Nothing here is quarter-shaped: any two of month / quarter / year compare.
+    """
+    official = dataset.get("official_totals") or {}
+    if not official:
+        raise PeriodError(
+            "No official roll-up figures have been pulled yet - the board report "
+            "reads the Overall tab, so run a sheet pull first.")
+
+    spec_a = board_period(period)
+    spec_b = board_period(compare_to) if compare_to else None
+    if spec_b is not None and spec_b.key == spec_a.key:
+        raise PeriodError(
+            f"A board comparison needs two different periods (both were {spec_a.key}).")
+    kind = "board_report_comparison" if spec_b is not None else "board_report"
+
+    captured_on = _capture_date(dataset)
+    key = br.cache_key([s for s in (spec_a, spec_b) if s is not None], captured_on)
+    cached = _cached_board_run(user_id, kind, key)
+    if cached is not None:
+        return {**cached, "reused": True}
+
+    # ``channels=`` is deliberately not passed: see CHANNEL_SOURCE_STATUS. The
+    # roll-up then leaves ``untracked`` None and the channel table empty, which
+    # is the absent state and not a zeroed one.
+    rollup_a = br.roll_up(spec_a, official)
+    columns = [(spec_a.label, rollup_a)]
+    if spec_b is not None:
+        rollup_b = br.roll_up(spec_b, official)
+        columns.append((spec_b.label, rollup_b))
+        ledger = br.compare(rollup_a, rollup_b, captured_on=captured_on)
+        structured = {**ledger.as_dict(), "r_array": ledger.to_r_array()}
+    else:
+        structured = _single_column(rollup_a, key)
+    structured["captured_on"] = captured_on.isoformat()
+    structured["coverage"] = _coverage(columns)
+
+    report = {
+        "id": runs.new_run_id(),
+        "kind": kind,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "user_id": user_id,
+        "agent_id": "a6",
+        "sources": dataset.get("sources", []),
+        "structured": structured,
+        # The honest-provenance pair, and this is not a degradation: no model
+        # writes any part of this deliverable, so ai=True would be the lie. The
+        # reason names the design rather than a failure.
+        "ai": False,
+        "fallback_reason": (
+            "the board report is the roll-up tab's own figures - no model writes "
+            "any part of it"),
+    }
+    runs.save_run(report)
+    return {**report, "reused": False}

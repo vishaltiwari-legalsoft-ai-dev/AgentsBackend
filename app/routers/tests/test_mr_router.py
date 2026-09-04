@@ -740,3 +740,190 @@ def test_the_dataset_read_still_returns_every_component(monkeypatch):
     assert ds["official_spend"] == {"2026-07": 8632.0}
     assert ds["lead_summary"] is not None
     assert ds["sources"], "the dataset runs went missing"
+
+
+# --------------------------------------------------------------------------- #
+# Board report (POST /api/mr/board-report)
+# --------------------------------------------------------------------------- #
+# Two things are being pinned here and they pull in opposite directions: the
+# route has to WORK when a deployment enables it, and it has to be completely
+# invisible when one has not. Every test below therefore says explicitly which
+# state it is in — a board test that forgets to set MR_BOARD_REPORT passes for
+# the wrong reason, because 404 is also the answer to "no data yet" on most of
+# this router.
+
+#: One month of official roll-up figures, in the shape ``_load_dataset`` reads
+#: them out of an ``official_spend`` run. Written straight into the store rather
+#: than pulled: a pull needs a live Google workbook, and what this route cares
+#: about is only the parsed totals and which ``user_id`` carries them.
+BOARD_MONTHS = {
+    "2026-01": {"spend": 80000.0, "budget": 82000.0, "leads": 430,
+                "qualified_leads": 210, "revenue_clients": 16,
+                "revenue_amount_sold": 88000.0, "demos_completed": 90,
+                "demos_completed_direct": 82, "qual_demos_booked": 143},
+    "2026-02": {"spend": 79000.0, "budget": 81000.0, "leads": 425,
+                "qualified_leads": 208, "revenue_clients": 15,
+                "revenue_amount_sold": 86000.0, "demos_completed": 89,
+                "demos_completed_direct": 81, "qual_demos_booked": 141},
+    "2026-03": {"spend": 80581.57, "budget": 85446.0, "leads": 426,
+                "qualified_leads": 218, "revenue_clients": 17,
+                "revenue_amount_sold": 88947.7, "demos_completed": 93,
+                "demos_completed_direct": 85, "qual_demos_booked": 147},
+}
+
+
+def _seed_official(user_id=None, *, captured_at="2026-04-01T00:00:00+00:00",
+                   months=None) -> str:
+    from marketing_research_agent import runs as mr_runs
+
+    run_id = mr_runs.new_run_id()
+    totals = BOARD_MONTHS if months is None else months
+    mr_runs.save_run({
+        "id": run_id, "kind": "official_spend", "user_id": user_id or USER["id"],
+        "agent_id": "a6", "platform": "sheets-official",
+        "generated_at": captured_at,
+        "months": {k: v["spend"] for k, v in totals.items() if "spend" in v},
+        "totals": totals,
+    })
+    return run_id
+
+
+@pytest.fixture()
+def board_on(monkeypatch):
+    """The deployment that has turned the feature on."""
+    monkeypatch.setenv("MR_BOARD_REPORT", "1")
+
+
+def test_the_board_report_route_is_dark_until_a_deployment_enables_it(monkeypatch):
+    """Unset switch -> 404, and the SAME 404 an unknown path gives.
+
+    Asserted against a seeded, entirely buildable workspace, so the 404 can only
+    be the switch. A "no data" 404 would pass a weaker version of this test
+    while the feature was in fact live.
+    """
+    monkeypatch.delenv("MR_BOARD_REPORT", raising=False)
+    _seed_official()
+    dark = client.post("/api/mr/board-report", json={"period": "2026-Q1"})
+    assert dark.status_code == 404
+    # Byte-for-byte what an unrouted path answers. A friendlier detail here
+    # ("board reports are disabled") would confirm the feature exists to anyone
+    # probing for it, which is the one thing shipping dark is meant to avoid.
+    assert dark.json()["detail"] == "Not Found"
+
+    for off in ("0", "false", "off"):
+        monkeypatch.setenv("MR_BOARD_REPORT", off)
+        assert client.post("/api/mr/board-report",
+                           json={"period": "2026-Q1"}).status_code == 404, off
+
+
+def test_the_board_report_returns_the_ledger_as_data(board_on):
+    _seed_official()
+    r = client.post("/api/mr/board-report", json={"period": "2026-Q1"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["kind"] == "board_report"
+    assert body["user_id"] == USER["id"]
+
+    s = body["structured"]
+    assert s["columns"] == ["Q1"]
+    assert len(s["rows"]) == 38
+    values = {row["key"]: row["value"] for row in s["rows"]}
+    assert values["spend"] == 239581.57
+    assert values["revenue_clients"] == 48
+    # Recomputed from the summed components, never averaged across the months.
+    assert values["roas_pct"] == 109.75
+    assert values["cac_per_revenue_client"] == 4991.28
+    # No HTML and no PDF in this step - the renderer is a separate module.
+    assert "html" not in body and "markdown" not in body
+
+
+def test_the_board_report_names_what_it_could_not_fill_and_why(board_on):
+    """The coverage block, over HTTP. Production's stored capture carries 8 of
+    43 fields, so most of the catalog is absent; the response has to say which
+    rows and why, or a thin capture reads as a quarter where nothing sold."""
+    _seed_official()
+    body = client.post("/api/mr/board-report", json={"period": "2026-Q1"}).json()
+    col = body["structured"]["coverage"]["columns"][0]
+
+    assert col["filled_count"] + len(col["absent"]) == col["metric_count"] == 38
+    assert "projected_amount_sold" in col["absent"]
+    assert col["absent_reasons"]["projected_amount_sold"]
+    values = {row["key"]: row["value"] for row in body["structured"]["rows"]}
+    assert values["projected_amount_sold"] is None, "an absent row came back as a number"
+    # The channel table has no feed at all, so it is absent rather than zeroed.
+    assert body["structured"]["channels"] == []
+    assert body["structured"]["coverage"]["channel_reconciliation"].startswith("absent")
+
+
+def test_the_board_comparison_takes_two_periods(board_on):
+    _seed_official(months={**BOARD_MONTHS,
+                           "2026-04": dict(BOARD_MONTHS["2026-01"])})
+    r = client.post("/api/mr/board-report",
+                    json={"period": "2026-01", "compare_to": "2026-04"})
+    assert r.status_code == 200, r.text
+    s = r.json()["structured"]
+    assert r.json()["kind"] == "board_report_comparison"
+    assert s["columns"] == ["2026-01", "2026-04"]
+    assert s["r_array"][0][0] == "group"
+
+
+def test_asking_twice_serves_the_stored_report_instead_of_re_deriving(board_on):
+    _seed_official()
+    first = client.post("/api/mr/board-report", json={"period": "2026-Q1"}).json()
+    second = client.post("/api/mr/board-report", json={"period": "2026-Q1"}).json()
+    assert first["reused"] is False and second["reused"] is True
+    assert second["id"] == first["id"]
+    listed = [r for r in client.get("/api/mr/runs").json()
+              if r["kind"] == "board_report"]
+    assert len(listed) == 1, "a second run was written for an identical request"
+
+
+def test_a_fresh_sheet_pull_makes_the_next_request_re_derive(board_on):
+    """The stale-read failure the key exists to prevent: the sheet is pulled
+    again, the figures move, and the report keeps answering with the old ones."""
+    _seed_official()
+    first = client.post("/api/mr/board-report", json={"period": "2026-Q1"}).json()
+    _seed_official(captured_at="2026-04-02T00:00:00+00:00")
+    second = client.post("/api/mr/board-report", json={"period": "2026-Q1"}).json()
+    assert second["reused"] is False
+    assert second["id"] != first["id"]
+
+
+@pytest.mark.parametrize(("body", "fragment"), [
+    ({}, "needs a 'period'"),
+    ({"period": "  "}, "needs a 'period'"),
+    ({"period": "last quarter"}, "not a board-report period"),
+    ({"period": "2026-Q1", "compare_to": "2026-Q1"}, "two different periods"),
+])
+def test_a_board_request_it_cannot_honour_is_a_422_not_a_guess(board_on, body, fragment):
+    _seed_official()
+    r = client.post("/api/mr/board-report", json=body)
+    assert r.status_code == 422, r.text
+    assert fragment in r.json()["detail"], r.json()["detail"]
+
+
+def test_a_board_report_with_no_capture_says_so_rather_than_publishing_zeros(board_on):
+    r = client.post("/api/mr/board-report", json={"period": "2026-Q1"})
+    assert r.status_code == 422
+    assert "sheet pull" in r.json()["detail"]
+
+
+def test_the_board_kinds_are_not_buildable_through_the_narrated_report_route():
+    """They are real kinds, so ``/mr/reports/{kind}`` recognises them — and has
+    to hand them on rather than 500 inside a builder that refuses them."""
+    for kind in ("board_report", "board_report_comparison"):
+        r = client.post(f"/api/mr/reports/{kind}")
+        assert r.status_code == 422, r.text
+        assert "/api/mr/board-report" in r.json()["detail"]
+
+
+def test_there_is_no_pdf_for_a_board_run_yet(board_on):
+    """``mr_pdf.report_pdf`` renders a narrative this kind does not have. Until
+    the board renderer lands there is no such document, and saying so beats
+    streaming a broken one."""
+    _seed_official()
+    run_id = client.post("/api/mr/board-report", json={"period": "2026-Q1"}).json()["id"]
+    assert client.get(f"/api/mr/runs/{run_id}").status_code == 200
+    pdf = client.get(f"/api/mr/runs/{run_id}/pdf")
+    assert pdf.status_code == 404
+    assert "board report" in pdf.json()["detail"]

@@ -293,6 +293,10 @@ def _load_dataset(user_id: str) -> dict:
     return {"metrics": metrics, "leads": leads, "vendor_metrics": vendor_metrics,
             "official_spend": dict(official.get("months") or {}),
             "official_totals": dict(official.get("totals") or {}),
+            # WHEN those official figures were pulled. The board report keys its
+            # idempotency on it, so a fresh pull re-derives instead of serving
+            # the roll-up of a capture that has since been replaced.
+            "official_captured_at": official.get("generated_at"),
             "lead_summary": (lead_run or {}).get("summary"),
             "today": date.today(), "sources": sources}
 
@@ -1137,6 +1141,12 @@ def make_report(kind: str, body: dict | None = None, user=Depends(get_current_us
     data: an empty window is a 422, not a silent fallback."""
     if kind not in reports.KINDS:
         raise HTTPException(404, f"unknown report kind '{kind}' (expected one of {reports.KINDS})")
+    if kind in reports.BOARD_KINDS:
+        # The board kinds are real kinds - they list and read back here like any
+        # other - but they take two periods, so they cannot come in through this
+        # route's one-``period`` body. Say where they do rather than 500 on a
+        # builder that refuses them.
+        raise HTTPException(422, f"'{kind}' is built at POST /api/mr/board-report.")
     period = str((body or {}).get("period") or "").strip() or None
     if period and kind not in ("monthly_summary", "quarterly_summary"):
         raise HTTPException(422, f"'{kind}' reports don't take a period.")
@@ -1149,6 +1159,57 @@ def make_report(kind: str, body: dict | None = None, user=Depends(get_current_us
             raise HTTPException(422, str(exc))
     act.note(f"Built {kind} report" + (f" for {period}" if period else ""),
              action=f"report:{kind}", run_id=str(report.get("id") or "") or None)
+    return report
+
+
+@router.post("/mr/board-report")
+def board_report(body: dict | None = None, user=Depends(get_current_user),
+                 act: Activity = trail.records("report:board",
+                                               "Built a board report")):
+    """The board comparison as DATA - the ledger, as JSON.
+
+    Body: ``{"period": "2026-Q2"}`` for one column, plus ``"compare_to":
+    "2026-Q1"`` for the two-column comparison. A period is ``YYYY-MM``,
+    ``YYYY-Qn`` or ``YYYY``, and the two columns need not be the same shape.
+
+    Deliberately no HTML and no PDF. The renderer is a separate module; the
+    route that returns a document lands with it, and until then this returns the
+    ledger and nothing pretends to be a document.
+
+    **Dark by default.** With ``MR_BOARD_REPORT`` unset this answers 404 - the
+    same answer an unknown path gives - so a deployment that has not enabled the
+    feature does not advertise that it exists. The auth dependency resolves
+    first either way, so an anonymous caller still gets 401 and never learns
+    which it was.
+
+    Idempotent: the report is keyed on (periods, capture date, generator
+    version), so asking twice for the same quarter of the same capture returns
+    the run already stored rather than deriving it again. ``reused`` on the
+    response says which happened.
+    """
+    if not reports.board_report_enabled():
+        raise HTTPException(404, "Not Found")
+    period = str((body or {}).get("period") or "").strip()
+    compare_to = str((body or {}).get("compare_to") or "").strip() or None
+    if not period:
+        raise HTTPException(
+            422, "A board report needs a 'period' (YYYY-MM, YYYY-Qn or YYYY).")
+    try:
+        report = reports.build_board_report(
+            _load_dataset(user["id"]), user_id=user["id"],
+            period=period, compare_to=compare_to)
+    except reports.PeriodError as exc:
+        raise HTTPException(422, str(exc))
+    # The coverage line goes in the activity trail on purpose: "24 of 38 filled"
+    # is how anyone reading the trail later tells a thin CAPTURE from a thin
+    # quarter, and it is the number that moves when a pull lands.
+    cov = [f"{c['filled_count']}/{c['metric_count']}"
+           for c in ((report.get("structured") or {}).get("coverage") or {}).get("columns", [])]
+    act.note(f"Built the board report for {period}"
+             + (f" vs {compare_to}" if compare_to else "")
+             + (f" ({', '.join(cov)} metrics filled)" if cov else "")
+             + (" - served from the store" if report.get("reused") else ""),
+             action="report:board_report", run_id=str(report.get("id") or "") or None)
     return report
 
 
@@ -1188,6 +1249,11 @@ def report_run_pdf(run_id: str, user=Depends(get_current_user),
     run = runs.get_run(run_id)
     if not run or run.get("user_id") != user["id"] or run.get("kind") not in reports.KINDS:
         raise HTTPException(404, "run not found")
+    if run.get("kind") in reports.BOARD_KINDS:
+        # ``mr_pdf.report_pdf`` renders the campaign report's sections from a
+        # narrative this kind does not have. A board PDF is a different document
+        # and lands with its own renderer; until then there is no such file.
+        raise HTTPException(404, "no PDF export exists for a board report yet")
     stamp = str(run.get("generated_at", ""))[:10] or date.today().isoformat()
     act.note(f"Downloaded the {run['kind']} report as PDF ({stamp})", run_id=run_id)
     return _pdf_response(mr_pdf.report_pdf(run), f"mr-{run['kind']}-{stamp}.pdf")
