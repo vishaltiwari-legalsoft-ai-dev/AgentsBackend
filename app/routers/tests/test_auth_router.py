@@ -190,6 +190,7 @@ EXTERNAL_GEO_EDITORS = {
     "lynie.t@aivirtual.com",
     "miguel@usimmigration.ai",
     "yans.suarez@medvirtual.ai",
+    "franceska@aianswering.ai",
 }
 
 
@@ -202,12 +203,33 @@ def test_allowlist_defaults_are_closed(monkeypatch):
     assert defaults.allowed_email_set == EXTERNAL_GEO_EDITORS
 
 
+def test_the_geo_editor_roster_is_pinned(monkeypatch):
+    """Who can edit GEO, stated once so growth is deliberate.
+
+    ``allowed_emails`` decides who may sign in; this decides who may then
+    change prompt universes, add brands and switch the paid weekly check on.
+    They are separate lists and drift apart easily: a legalsoft.com address
+    signs in on the domain rule and needs no allowlist entry, so forgetting it
+    here is silent — the person lands on a panel with every control missing and
+    no explanation. Pinning the roster turns that into a red test instead.
+    """
+    defaults = _pristine_settings(monkeypatch)
+    assert defaults.geo_editor_email_set == {
+        "nino.b@legalsoft.com",
+        "marian.p@legalsoft.com",
+        "mahmoud.e@legalsoft.com",
+        "michael.tayco@legalsoft.com",
+    } | EXTERNAL_GEO_EDITORS
+    # Every outside-domain editor must also be able to reach the door.
+    assert EXTERNAL_GEO_EDITORS <= defaults.allowed_email_set
+
+
 def test_the_outside_domains_were_not_admitted_wholesale(monkeypatch):
     """The failure mode this change was one keystroke away from.
 
-    Three GEO editors are at aivirtual.com, usimmigration.ai and medvirtual.ai.
-    Adding those three DOMAINS would have been shorter and would have opened
-    sign-in to every mailbox at three companies whose accounts nobody here
+    Four GEO editors are at aivirtual.com, usimmigration.ai, medvirtual.ai and
+    aianswering.ai. Adding those DOMAINS would have been shorter and would have
+    opened sign-in to every mailbox at four companies whose accounts nobody here
     provisions or de-provisions — on a service Cloud Run serves
     --allow-unauthenticated, where this list is the only door.
     """
@@ -233,7 +255,8 @@ def test_a_colleague_of_an_allowlisted_external_editor_cannot_sign_in(
     assert login(_harness, "lynie.t@aivirtual.com").status_code == 200
 
     for stranger in ("someone.else@aivirtual.com", "ceo@usimmigration.ai",
-                     "intern@medvirtual.ai", "billing@aivirtual.com"):
+                     "intern@medvirtual.ai", "billing@aivirtual.com",
+                     "support@aianswering.ai"):
         assert login(_harness, stranger).status_code == 403, stranger
     # Refused before the upsert, so no junk user document either.
     assert _harness["created"] == ["lynie.t@aivirtual.com"]

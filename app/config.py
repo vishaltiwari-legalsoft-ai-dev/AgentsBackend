@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     # the alternative was worse. Six people need to administer the GEO agent;
     # the only elevated role was Creator, which also unlocks Settings →
     # Secrets, the admin database viewer, model config and every other agent.
-    # Granting six people that to let them edit prompt universes would have
+    # Granting eight people that to let them edit prompt universes would have
     # been a far larger permission change than this one.
     #
     # Creators are GEO editors implicitly (see ``security.is_geo_editor``), so
@@ -68,9 +68,11 @@ class Settings(BaseSettings):
         "nino.b@legalsoft.com,"
         "marian.p@legalsoft.com,"
         "mahmoud.e@legalsoft.com,"
+        "michael.tayco@legalsoft.com,"
         "lynie.t@aivirtual.com,"
         "miguel@usimmigration.ai,"
-        "yans.suarez@medvirtual.ai"
+        "yans.suarez@medvirtual.ai,"
+        "franceska@aianswering.ai"
     )
 
     # --- Sign-in allowlist -------------------------------------------------
@@ -83,17 +85,18 @@ class Settings(BaseSettings):
     # Comma-separated individual addresses allowed regardless of domain — the
     # exception list for contractors/clients. Fillable via env, no code change.
     #
-    # The three entries below are the GEO editors on outside domains. They are
+    # The four entries below are the GEO editors on outside domains. They are
     # listed ONE ADDRESS AT A TIME on purpose. Putting aivirtual.com,
     # usimmigration.ai and medvirtual.ai into ``allowed_email_domains`` would
-    # have been three shorter lines and would have admitted every mailbox at
-    # three other companies — including ones nobody here provisions or
+    # have been four shorter lines and would have admitted every mailbox at
+    # four other companies — including ones nobody here provisions or
     # de-provisions — to a service Cloud Run serves --allow-unauthenticated,
     # where this list is the only door. Named addresses only.
     allowed_emails: str = (
         "lynie.t@aivirtual.com,"
         "miguel@usimmigration.ai,"
-        "yans.suarez@medvirtual.ai"
+        "yans.suarez@medvirtual.ai,"
+        "franceska@aianswering.ai"
     )
 
     # OpenRouter (agent LLM + image generation)
