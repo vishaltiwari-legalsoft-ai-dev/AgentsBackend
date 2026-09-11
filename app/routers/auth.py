@@ -5,7 +5,8 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.security import (
-    create_token, is_admin, is_creator, is_geo_editor, verify_google_id_token,
+    create_token, is_admin, is_creator, is_geo_editor, is_geo_only,
+    verify_google_id_token,
 )
 from app.services import firestore_repo
 
@@ -95,5 +96,16 @@ def google_login(body: GoogleLogin) -> dict:
             # let the console show a non-editor the read-only view instead of
             # buttons that answer 403 when pressed.
             "is_geo_editor": is_geo_editor(user["email"]),
+            # The SCOPE, derived the same way and carrying the same caveat: a
+            # display hint, never the authority. ``app.scopes.deny_outside_geo``
+            # stays the wall — it re-derives this per request from the email
+            # claim, so a payload that says otherwise changes nothing about what
+            # the caller can reach.
+            #
+            # Always present, never omitted: the console reads a MISSING field
+            # as "session predates the scope wall" and a present ``false`` as
+            # "this account is not scoped". Dropping the key for the common case
+            # would collapse those two into one.
+            "is_geo_only": is_geo_only(user["email"]),
         },
     }

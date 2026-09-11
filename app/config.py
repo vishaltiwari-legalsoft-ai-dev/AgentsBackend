@@ -75,6 +75,40 @@ class Settings(BaseSettings):
         "franceska@aianswering.ai"
     )
 
+    # Comma-separated emails whose reach is LIMITED to the GEO workspace: the
+    # GEO panel, the shell that has to render before it, and nothing else. Same
+    # parsing as every list above; see ``app.scopes`` for the route table it
+    # gates and ``security.is_geo_only`` for who it applies to.
+    #
+    # This is a SCOPE, not a role, and it is the opposite direction of travel
+    # from ``geo_editor_emails`` directly above: that one ADDS nine routes to
+    # an account, this one REMOVES every route outside one workspace. The two
+    # lists carry the same eight addresses today and still mean different
+    # things — an address here with no GEO editor role gets a read-only GEO
+    # panel and nothing else; an address in both gets the editable panel and
+    # nothing else. Keeping them separate is what lets either move alone.
+    #
+    # The addresses are full addresses, never domains, because four of the
+    # eight are @legalsoft.com — the domain that ``allowed_email_domains``
+    # admits wholesale — so a domain rule here would scope the whole company
+    # to the GEO panel. The other four are outside contractors, which is the
+    # exposure that made this necessary: before it, being in ALLOWED_EMAILS
+    # meant the entire workspace, including the company marketing tracker.
+    #
+    # Creators and admins are never GEO-only regardless of what is listed here
+    # (see ``security.is_geo_only``), so an owner cannot lock themselves out of
+    # their own panel with a typo.
+    geo_only_emails: str = (
+        "nino.b@legalsoft.com,"
+        "marian.p@legalsoft.com,"
+        "mahmoud.e@legalsoft.com,"
+        "michael.tayco@legalsoft.com,"
+        "lynie.t@aivirtual.com,"
+        "miguel@usimmigration.ai,"
+        "yans.suarez@medvirtual.ai,"
+        "franceska@aianswering.ai"
+    )
+
     # --- Sign-in allowlist -------------------------------------------------
     # Cloud Run runs --allow-unauthenticated, so /api/auth/google is the ONLY
     # thing standing between the public internet and every endpoint (and the
@@ -197,6 +231,17 @@ class Settings(BaseSettings):
         who holds the role and one place to read when asking why.
         """
         return {e.strip().lower() for e in self.geo_editor_emails.split(",") if e.strip()}
+
+    @property
+    def geo_only_email_set(self) -> set[str]:
+        """Addresses scoped to the GEO workspace by config.
+
+        Parsed exactly like ``geo_editor_email_set``, and like it the
+        Creator/admin exemption is NOT folded in here — that belongs in
+        ``security.is_geo_only``, beside the same kind of implication for the
+        other roles, so one place decides and one place explains.
+        """
+        return {e.strip().lower() for e in self.geo_only_emails.split(",") if e.strip()}
 
     @property
     def allowed_email_domain_set(self) -> set[str]:

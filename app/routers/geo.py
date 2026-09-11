@@ -221,6 +221,12 @@ class ConfigIn(BaseModel):
     # list without it.
     aliases: dict[str, list[str]] | None = None
     competitors: list[CompetitorIn] | None = Field(default=None, max_length=25)
+    #: The two SPEND CEILINGS, and the only fields on this model a GEO editor
+    #: may not set — see :data:`CAP_FIELDS` and the check in
+    #: :func:`put_geo_brand_config`. Everything else here is the panel's own
+    #: configuration; these two are the budget the panel is configured inside,
+    #: and a ceiling the constrained role can raise to 20,000 is not a ceiling.
+    #: ``None`` (leave untouched) is the only value a non-Creator may send.
     daily_cap: int | None = Field(default=None, ge=10, le=20000)
     # spend ceiling for the per-call SERP engines (AI Overview + AI Mode),
     # joint across both, per calendar month
@@ -241,6 +247,12 @@ class ConfigIn(BaseModel):
     #: ``DELETE /api/seo-geo/brands/{id}``, Creator-only, for the reasons in
     #: ``insights.delete_brand``.
     enabled: bool | None = None
+
+
+#: The ``ConfigIn`` fields only a Creator may set: the GEO agent's two spend
+#: ceilings. Named once here so the guard and the error message cannot drift
+#: apart, and so adding a third budget field is one line.
+CAP_FIELDS = ("daily_cap", "aio_monthly_cap")
 
 
 class RescanIn(BaseModel):
@@ -544,8 +556,31 @@ def get_geo_brand_config(brand: dict = Depends(reader_brand)) -> dict:
 @router.put("/geo/brands/{brand_id}/config")
 def put_geo_brand_config(
     body: ConfigIn, brand: dict = Depends(geo_editor_registry_brand),
+    user: dict = Depends(get_current_user),
     act: Activity = trail.records("config_saved", "Edited the GEO brand config", unit=CHANGE),
 ) -> dict:
+    # The spend ceilings are not the constrained role's to move. ``daily_cap``
+    # and ``aio_monthly_cap`` are what stops a GEO editor's checks from running
+    # up an unbounded bill on the shared OpenRouter/DataForSEO accounts, and
+    # both accepted anything up to 20,000 from the very people they constrain —
+    # a budget whose holder can raise it is a suggestion. The fleet ceiling is
+    # the Creator's decision; everything else on this route stays the editor's.
+    #
+    # Rejected rather than silently dropped: a panel that reports "saved" for a
+    # number the server discarded is the shape of lie this codebase keeps
+    # finding, and there is no honest way to save half a request the caller
+    # believes is one change.
+    if not user.get("is_creator"):
+        sent = [f for f in CAP_FIELDS if getattr(body, f) is not None]
+        if sent:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Only a Creator can change the spend ceiling "
+                    f"({', '.join(sent)}). Everything else on this screen is "
+                    "yours to edit — resend without it."
+                ),
+            )
     # Seed the defaults first. ``save_config`` patches whatever document it
     # finds, so a config first written by this endpoint (tracking a competitor
     # before anything has read the config) would exist WITHOUT the brand's own

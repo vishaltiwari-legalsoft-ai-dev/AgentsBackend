@@ -491,7 +491,11 @@ GATED_CALLS: list[tuple[str, str, dict]] = [
     ("post", "prompts/bulk", {"text": "best legal va provider", "intent": "category"}),
     ("put", "prompts", {"prompts": []}),
     ("put", "personas", {"personas": []}),
-    ("put", "config", {"daily_cap": 100}),
+    # ``poll_interval_days`` rather than ``daily_cap``: since 2026-09-12 the two
+    # spend ceilings are Creator-only (see ``CAP_FIELDS``), so a cap in this body
+    # would make the editor's 403 ambiguous — role gate, or budget gate? This
+    # list exists to pin the ROLE, so it carries a field the role may set.
+    ("put", "config", {"poll_interval_days": 7}),
     ("post", "rescan", {"days": 7}),
     ("post", "strategy/generate", {}),
 ]
@@ -546,6 +550,71 @@ def test_the_gate_reads_the_derived_flag_not_the_creator_claim(as_caller):
     assert client.put(
         f"/api/geo/brands/{BRAND['id']}/config", json={"daily_cap": 100}
     ).status_code == 403
+
+
+# --------------------- the spend ceiling is not the role's --------------------
+#
+# ``daily_cap`` and ``aio_monthly_cap`` are what stop a GEO editor's checks from
+# running up an unbounded bill on the shared OpenRouter / DataForSEO accounts,
+# and both accepted anything up to 20,000 from the very role they constrain. A
+# budget its holder can raise is a suggestion. Everything else on the config
+# route stays the editor's.
+
+
+@pytest.mark.parametrize("field", ["daily_cap", "aio_monthly_cap"])
+def test_a_geo_editor_cannot_move_the_spend_ceiling(field, as_caller):
+    as_caller(GEO_EDITOR)
+    resp = client.put(f"/api/geo/brands/{BRAND['id']}/config", json={field: 20000})
+    assert resp.status_code == 403, resp.text
+    # The refusal has to name the field, or the panel cannot tell the user which
+    # part of the form to drop.
+    assert field in resp.json()["detail"]
+
+
+def test_a_refused_cap_writes_nothing_at_all(as_caller):
+    """Rejected, not silently dropped — and the rest of the request goes with it.
+
+    A partial save would be the worse failure: the panel reports success, the
+    competitor list moved, and the number the user actually came to change did
+    not. One request, one outcome.
+    """
+    as_caller(OWNER)
+    client.put(f"/api/geo/brands/{BRAND['id']}/config", json={"daily_cap": 100})
+
+    as_caller(GEO_EDITOR)
+    assert client.put(
+        f"/api/geo/brands/{BRAND['id']}/config",
+        json={"daily_cap": 9999, "poll_interval_days": 3},
+    ).status_code == 403
+
+    as_caller(OWNER)
+    cfg = client.get(f"/api/geo/brands/{BRAND['id']}/config").json()
+    assert cfg["daily_cap"] == 100
+    assert cfg.get("poll_interval_days") != 3
+
+
+def test_a_geo_editor_still_edits_everything_else_on_the_config(as_caller):
+    """The half that must not have been broken by the half above."""
+    as_caller(GEO_EDITOR)
+    resp = client.put(
+        f"/api/geo/brands/{BRAND['id']}/config",
+        json={"poll_interval_days": 14, "auto_poll": True,
+              "competitors": [{"key": "clio", "name": "Clio"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    cfg = client.get(f"/api/geo/brands/{BRAND['id']}/config").json()
+    assert cfg["poll_interval_days"] == 14
+    assert cfg["competitors"][0]["key"] == "clio"
+
+
+def test_a_creator_still_sets_the_ceiling(as_caller):
+    as_caller(OWNER)
+    assert client.put(
+        f"/api/geo/brands/{BRAND['id']}/config",
+        json={"daily_cap": 250, "aio_monthly_cap": 40},
+    ).status_code == 200
+    cfg = client.get(f"/api/geo/brands/{BRAND['id']}/config").json()
+    assert (cfg["daily_cap"], cfg["aio_monthly_cap"]) == (250, 40)
 
 
 # ------------------------- prompt intent is a choice --------------------------

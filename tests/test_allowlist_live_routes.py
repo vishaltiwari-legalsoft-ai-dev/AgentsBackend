@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app as fastapi_app
+from app.routers.auth import is_allowed_email
 from app.security import (
     create_token, get_current_user, require_admin, require_creator,
     require_geo_editor,
@@ -91,6 +92,13 @@ def _allowlist(monkeypatch, tmp_path):
     # six real GEO editors shipped as the default must not silently satisfy a
     # role check a test meant to see refused.
     monkeypatch.setattr(settings, "geo_editor_emails", "")
+    # And the scope list for the same reason, in the other direction: the eight
+    # addresses shipped as the default must not silently REFUSE a sweep that
+    # expects a route to be served. None of the identities below is on that
+    # list today, which is exactly the kind of thing that stops being true
+    # quietly. The scope itself is proven in
+    # ``app/routers/tests/test_route_tenancy_conformance.py``.
+    monkeypatch.setattr(settings, "geo_only_emails", "")
     monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setenv("SEO_LOCAL_DIR", str(tmp_path / "seo"))
     # No dependency override: enforcing the real dependency is the point.
@@ -353,6 +361,222 @@ def test_a_geo_editor_gets_no_creator_or_admin_reach(client, monkeypatch):
     for path in ("/api/admin/settings", "/api/admin/users", "/api/admin/analytics",
                  "/api/admin/db/collections", "/api/cron/jobs"):
         assert client.get(path, headers=headers).status_code == 403, path
+
+
+# --------------------------------------------------------------------------- #
+# The GEO-only SCOPE. The role tests above are about what an account may ADD;
+# these are about what it may not reach at all, which is the opposite direction
+# and a different failure mode. Route-by-route proof of the wall lives in
+# ``app/routers/tests/test_route_tenancy_conformance.py`` — over the whole
+# ledger, because five sampled admin routes is what let /api/mr/* through for
+# two months. What belongs HERE is the same three properties every other role
+# in this file is held to: revocable now, not mintable, and behind the door.
+# --------------------------------------------------------------------------- #
+
+#: Reached by the GEO-only journey; used as the "still works" probe.
+IN_SCOPE = "/api/geo/config"
+#: Not reached by it, and the exposure that prompted the change.
+OUT_OF_SCOPE = "/api/mr/workbook"
+
+
+def _mr(client, headers):
+    return client.get(OUT_OF_SCOPE, headers=headers)
+
+
+def test_scoping_an_account_down_takes_effect_on_the_next_request(client, monkeypatch):
+    monkeypatch.setattr(settings, "geo_only_emails", "")
+    headers = {"Authorization": f"Bearer {create_token('u-ext', 'ext@legalsoft.com')}"}
+    assert _mr(client, headers).status_code != 403
+
+    monkeypatch.setattr(settings, "geo_only_emails", "ext@legalsoft.com")
+    assert _mr(client, headers).status_code == 403, (
+        "an account scoped to GEO still reaches the marketing workbook for the "
+        "life of its token"
+    )
+    # and the workspace they WERE brought in for is untouched
+    assert client.get(IN_SCOPE, headers=headers).status_code == 200
+
+
+def test_widening_an_account_back_out_needs_no_new_sign_in(client, monkeypatch):
+    monkeypatch.setattr(settings, "geo_only_emails", "ext@legalsoft.com")
+    headers = {"Authorization": f"Bearer {create_token('u-ext', 'ext@legalsoft.com')}"}
+    assert _mr(client, headers).status_code == 403
+
+    monkeypatch.setattr(settings, "geo_only_emails", "")
+    assert _mr(client, headers).status_code != 403
+
+
+def test_a_forged_scope_claim_is_ignored(client, monkeypatch):
+    """``create_token`` stamps no scope, and nothing reads one.
+
+    The interesting forgery here is the *negative* one — a token asserting it is
+    NOT geo-only — because that is the claim that would buy reach. Derived from
+    config per request, so it buys nothing.
+    """
+    import jwt as pyjwt
+
+    monkeypatch.setattr(settings, "geo_only_emails", "ext@legalsoft.com")
+    forged = pyjwt.encode(
+        {"sub": "u-ext", "email": "ext@legalsoft.com", "is_geo_only": False,
+         "geo_only": False, "scope": "*", "exp": int(time.time()) + 3600},
+        SECRET, algorithm="HS256",
+    )
+    assert _mr(client, {"Authorization": f"Bearer {forged}"}).status_code == 403
+
+
+def test_a_creator_or_admin_is_never_scoped_down_by_the_list(client, monkeypatch):
+    """A typo in GEO_ONLY_EMAILS must not lock an owner out of their own panel.
+
+    The exemption is unconditional and checked before the list lookup
+    (``security.is_geo_only``), so being named there is simply inert for the two
+    roles that administer the deployment.
+    """
+    monkeypatch.setattr(settings, "geo_only_emails", "boss@legalsoft.com")
+    monkeypatch.setattr(settings, "creator_emails", "boss@legalsoft.com")
+    headers = {"Authorization": f"Bearer {create_token('u-boss', 'boss@legalsoft.com')}"}
+    assert _mr(client, headers).status_code != 403
+
+    monkeypatch.setattr(settings, "creator_emails", "")
+    monkeypatch.setattr(settings, "admin_emails", "boss@legalsoft.com")
+    assert _mr(client, headers).status_code != 403
+
+    # …and with neither role the same address IS scoped, so the test above is
+    # about the exemption rather than about a list that never applied.
+    monkeypatch.setattr(settings, "admin_emails", "")
+    assert _mr(client, headers).status_code == 403
+
+
+def test_a_de_provisioned_geo_only_account_is_refused_at_the_door_first(client, monkeypatch):
+    """Membership outranks scope, and says so with 401 rather than 403.
+
+    Four of the eight are on outside domains, so off-boarding one is a removal
+    from ALLOWED_EMAILS — and it has to lock them out entirely, not merely keep
+    them inside the GEO panel. 401 is also what the console's session handler
+    reads as "sign out", which is the right end state for a token that should
+    no longer exist.
+    """
+    monkeypatch.setattr(settings, "geo_only_emails", "outsider@aivirtual.com")
+    monkeypatch.setattr(settings, "allowed_emails", "outsider@aivirtual.com")
+    headers = {"Authorization": f"Bearer {create_token('u-x', 'outsider@aivirtual.com')}"}
+    assert client.get(IN_SCOPE, headers=headers).status_code == 200
+    assert _mr(client, headers).status_code == 403
+
+    monkeypatch.setattr(settings, "allowed_emails", "")   # off-boarded
+    assert client.get(IN_SCOPE, headers=headers).status_code == 401
+    assert _mr(client, headers).status_code == 401
+
+
+#: The eight people the scope was built for, by full address. Four are
+#: @legalsoft.com — the domain ALLOWED_EMAIL_DOMAINS admits wholesale — which is
+#: why the list is addresses and never domains: a domain rule would have scoped
+#: the entire company to the GEO panel.
+THE_EIGHT = (
+    "nino.b@legalsoft.com",
+    "marian.p@legalsoft.com",
+    "mahmoud.e@legalsoft.com",
+    "michael.tayco@legalsoft.com",
+    "lynie.t@aivirtual.com",
+    "miguel@usimmigration.ai",
+    "yans.suarez@medvirtual.ai",
+    "franceska@aianswering.ai",
+)
+
+
+def test_the_eight_are_scoped_by_the_shipped_default_with_no_env_change(monkeypatch):
+    """Read off the CLASS default, not off ``settings``.
+
+    A deployment that never sets GEO_ONLY_EMAILS must still scope these eight,
+    because "we will set the env var" is the step that gets skipped — and the
+    skip is silent and fails open. ``model_fields`` is the value baked into the
+    image, so a developer's ``.env`` cannot make this pass.
+    """
+    from app.config import Settings
+    from app.security import is_geo_only
+
+    # The sign-in lists come from the same place and for the same reason: the
+    # module fixture blanks them to assert guards in isolation, and this one
+    # test is specifically about what ships.
+    for field in ("geo_only_emails", "allowed_emails", "allowed_email_domains"):
+        monkeypatch.setattr(
+            settings, field, str(Settings.model_fields[field].default)
+        )
+    monkeypatch.setattr(settings, "creator_emails", "")
+    monkeypatch.setattr(settings, "admin_emails", "")
+
+    for email in THE_EIGHT:
+        assert is_geo_only(email), f"{email} is not scoped by the shipped default"
+        # …and the scope is not a substitute for the sign-in allowlist: every one
+        # of them must still be admitted at the door, or they are simply locked
+        # out and "GEO panel only" means "nothing at all".
+        assert is_allowed_email(email), f"{email} cannot sign in at all"
+
+    # Non-vacuity, and the boundary: a colleague on the same domain as four of
+    # them keeps the whole workspace.
+    assert not is_geo_only("colleague@legalsoft.com")
+
+
+def test_the_scope_wall_does_not_authenticate_anything(client, monkeypatch):
+    """It is attached to every router, public ones included, so the thing to
+    prove is that it made nothing MORE restrictive for anonymous callers.
+
+    ``deny_outside_geo`` resolves its principal through ``optional_principal``,
+    which returns None rather than raising, precisely so that the sign-in door
+    and the liveness probe stay reachable without a token.
+    """
+    monkeypatch.setattr(settings, "geo_only_emails", "ext@legalsoft.com")
+    assert client.get("/api/health").status_code == 200
+    # the door still answers on its own terms (422 for a malformed body), not 401
+    assert client.post("/api/auth/google", json={}).status_code == 422
+    # and an unusable token is still the route's own 401, never a scope 403
+    assert client.get(IN_SCOPE, headers={"Authorization": "Bearer not-a-jwt"}).status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# The schema itself — the one "route" the ledger structurally cannot see.
+#
+# ``/openapi.json``, ``/docs`` and ``/redoc`` are not ``APIRoute`` objects, so
+# ``test_route_tenancy_conformance._live_routes`` skips them and the audience
+# wall in ``app/scopes.py`` never sees them either: they are mounted by FastAPI
+# itself, outside every router. They were live and completely unauthenticated in
+# production — a plain GET returned 162 paths with every parameter and response
+# model, to anyone, on a service Cloud Run serves --allow-unauthenticated.
+#
+# So they are pinned here instead, where ``_PUBLIC_PATHS`` above already lists
+# them: on the decision, which is pure and testable, and on the app that came
+# out of it.
+# --------------------------------------------------------------------------- #
+
+def test_the_docs_are_off_everywhere_but_local_development():
+    from app.main import doc_urls
+
+    for env in ("production", "staging", "", "Development", "dev"):
+        assert doc_urls(env) == {"docs_url": None, "redoc_url": None, "openapi_url": None}, env
+    assert doc_urls("development") == {
+        "docs_url": "/docs", "redoc_url": "/redoc", "openapi_url": "/openapi.json",
+    }
+
+
+def test_the_live_app_took_that_decision():
+    """The decision applied, not just available.
+
+    Asserted as a correspondence rather than a fixed answer because the suite
+    runs in both worlds: a developer's ``.env`` carries APP_ENV=development and
+    CI has none, which defaults ``app_env`` to production. Pinning "off" would
+    be green on the machine that matters least. What must hold in both is that
+    the app agrees with ``doc_urls`` for the environment it actually booted in.
+    """
+    from app.main import app as live_app, doc_urls
+
+    expected = doc_urls(settings.app_env)
+    assert {
+        "docs_url": live_app.docs_url,
+        "redoc_url": live_app.redoc_url,
+        "openapi_url": live_app.openapi_url,
+    } == expected
+    if settings.app_env != "development":
+        # and the routes are genuinely gone, not merely unlinked
+        served = {getattr(r, "path", None) for r in live_app.routes}
+        assert not served & {"/openapi.json", "/docs", "/redoc"}
 
 
 def test_a_de_provisioned_geo_editor_is_refused_at_the_allowlist_first(client, monkeypatch):

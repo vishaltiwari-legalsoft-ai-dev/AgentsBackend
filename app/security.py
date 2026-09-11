@@ -124,6 +124,29 @@ def is_geo_editor(email: str) -> bool:
     return email.lower() in settings.geo_editor_email_set or is_creator(email)
 
 
+def is_geo_only(email: str) -> bool:
+    """Whether this account's reach STOPS at the GEO workspace.
+
+    The counterpart to ``is_geo_editor`` and its opposite in direction.
+    ``is_geo_editor`` is additive — it opens nine routes on top of whatever the
+    account already reached. This is subtractive: it closes every route outside
+    one workspace. That distinction is the whole defect this closes. Being in
+    ``ALLOWED_EMAILS`` meant the entire workspace, so "GEO panel only" was a
+    label on a flag that removed nothing, and four outside contractors could
+    read the company marketing tracker in two requests.
+
+    Creators and admins are exempt unconditionally, and the check runs BEFORE
+    the list lookup on purpose: an owner who fat-fingers their own address into
+    ``GEO_ONLY_EMAILS`` must not be able to lock themselves out of the panel
+    they administer. It is the same "the people who could already do this keep
+    doing it" implication ``is_admin`` and ``is_geo_editor`` carry, stated once
+    here rather than re-derived at the guard.
+    """
+    if is_creator(email) or is_admin(email):
+        return False
+    return email.lower() in settings.geo_only_email_set
+
+
 def create_token(
     user_id: str, email: str, session_id: str | None = None, timezone: str = "UTC"
 ) -> str:
@@ -221,6 +244,12 @@ def get_current_user(
     try:
         admin, creator = is_admin(email), is_creator(email)
         geo_editor = is_geo_editor(email)
+        # The SCOPE, derived here for the same reason as the three flags above
+        # and never stamped into the token: a scope minted at sign-in would
+        # outlive its own revocation by the 7-day token life, and the direction
+        # that matters most is the one where scoping someone DOWN has to take
+        # effect on the next request rather than next week.
+        geo_only = is_geo_only(email)
     except Exception as exc:  # noqa: BLE001 — cannot evaluate the role config
         # Fail closed, exactly as above: a role check that cannot run is not a
         # grant. 503 because the token may be fine; the server is not.
@@ -236,9 +265,46 @@ def get_current_user(
         "is_admin": admin,
         "is_creator": creator,
         "is_geo_editor": geo_editor,
+        "is_geo_only": geo_only,
         "session_id": payload.get("sid") or "",
         "timezone": payload.get("tz") or "UTC",
     }
+
+
+def optional_principal(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+) -> dict[str, object] | None:
+    """``get_current_user`` for callers who may legitimately not have a token.
+
+    Exists for exactly one consumer: ``app.scopes.deny_outside_geo``, which is
+    attached to EVERY router at include time — public routes, cron routes and
+    OAuth callbacks included. Depending on ``get_current_user`` there would
+    have turned the sign-in door and the Cloud Run liveness probe into
+    authenticated endpoints, which is a far larger change than the one being
+    made.
+
+    So a missing or unusable token is not an error here, it is ``None``: the
+    scope layer has nothing to narrow and steps aside, and the route's own
+    guard — if it has one — still answers 401 a moment later, from the same
+    function, with the same message. Nothing is made reachable that was not
+    already: this returns a principal, never a decision.
+
+    Delegating to ``get_current_user`` rather than decoding here is the point.
+    A second decode would be a second copy of the sign-in allowlist re-check
+    and the role re-derivation, and the copy that drifts is always the one that
+    grants what it should not. The cost is one extra HS256 verification per
+    request, which is a set of hash operations on a string already in memory.
+    """
+    if credentials is None:
+        return None
+    try:
+        return get_current_user(credentials)
+    except HTTPException:
+        # 401 (bad/expired/de-provisioned) and 503 (auth unconfigured) both mean
+        # "no principal to narrow". The route's own dependency raises the very
+        # same thing immediately after, so suppressing it here changes what is
+        # reachable by nothing at all.
+        return None
 
 
 def require_admin(

@@ -31,16 +31,42 @@ single shared team workspace and *wrong* the moment a second client is added.
 Today that count is 49. When the workspace boundary lands, the number moves,
 and :func:`test_workspace_shared_surface_has_not_grown_silently` makes anyone
 who grows it say so on purpose.
+
+Two dimensions, not one
+-----------------------
+Tenancy answers "whose rows does this serve?". It does not answer "who is
+allowed in the room at all?", and that second question is the one that went
+unasked for months. Four of the accounts holding a sign-in are outside
+contractors brought in for the GEO panel; tenancy has nothing to say about
+them, because ``POST /api/mr/ask`` serving the same company tracker to every
+signed-in caller is a perfectly consistent WORKSPACE_SHARED route. It was still
+the whole marketing tracker, two requests from a contractor's browser.
+
+So every entry now carries a second label — :data:`EXTERNAL_OK` or
+:data:`INTERNAL_ONLY` — and, exactly like the first, an entry without one is
+red. The audience labels are not a second opinion: the EXTERNAL_OK set must
+equal ``app.scopes.GEO_SCOPE_ROUTES``, the table the running service actually
+enforces (:func:`test_the_external_surface_is_what_the_service_enforces`), and
+every INTERNAL_ONLY route is driven with a real GEO-only token and must answer
+403 (:func:`test_a_geo_only_caller_is_refused_on_every_internal_route`). The
+predecessor of that test, ``tests/test_allowlist_live_routes.py``, checked five
+admin routes — which is exactly why nobody noticed ``/api/mr/*``.
 """
 from __future__ import annotations
 
 import pytest
 from fastapi.routing import APIRoute
+from fastapi.testclient import TestClient
 
+from app.config import settings
 from app.main import app as fastapi_app
 from app.routers.tests.conftest import client
+from app.scopes import (
+    GEO_SCOPE_ROUTES, SCOPE_REFUSED, UNREACHABLE_BY_THE_WALL, deny_outside_geo,
+)
 from app.security import (
-    get_current_user, require_admin, require_creator, require_geo_editor,
+    create_token, get_current_user, require_admin, require_creator,
+    require_geo_editor,
 )
 
 # --------------------------------------------------------------------------- #
@@ -103,38 +129,59 @@ _AUTHENTICATED = {
 }
 
 # --------------------------------------------------------------------------- #
+# Audience — the second dimension
+# --------------------------------------------------------------------------- #
+
+#: Reachable by an account whose scope stops at the GEO workspace, i.e. by the
+#: four outside contractors among the eight. Read it as a decision that this
+#: route may be served to somebody who does not work here.
+#:
+#: Small on purpose — 33 of 176 — and every entry is either public, part of the
+#: console shell that has to render before GEO is openable, or GEO itself. The
+#: two that are none of those (``GET /api/library``, ``GET /api/seo-geo/overview``)
+#: say so where they are listed in ``app/scopes.py``.
+EXTERNAL_OK = "EXTERNAL_OK"
+
+#: Staff only. A GEO-only principal gets 403 here, proven per route below
+#: rather than asserted — the label is the claim, the test is the evidence.
+INTERNAL_ONLY = "INTERNAL_ONLY"
+
+_AUDIENCES = {EXTERNAL_OK, INTERNAL_ONLY}
+
+# --------------------------------------------------------------------------- #
 # The ledger
 # --------------------------------------------------------------------------- #
 
-#: Every ``(method, path)`` the app serves, and what it does about tenancy.
+#: Every ``(method, path)`` the app serves, what it does about tenancy, and who
+#: is allowed to reach it at all.
 #:
 #: Keep it sorted by classification then path — that is how it was generated and
 #: how a diff stays readable. A new route belongs in the group that describes
 #: what it *actually does*, which usually means reading the handler, not the
 #: route name.
-ROUTE_LEDGER: dict[tuple[str, str], str] = {
+ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     # --- admin / creator panels ------------------------------------------- #
-    ("GET", "/api/admin/analytics"): ADMIN_ONLY,
-    ("POST", "/api/admin/brands/refresh-packs"): ADMIN_ONLY,
-    ("GET", "/api/admin/db/collections"): ADMIN_ONLY,
-    ("GET", "/api/admin/db/collections/{name}"): ADMIN_ONLY,
-    ("POST", "/api/admin/db/purge-telemetry"): ADMIN_ONLY,
-    ("GET", "/api/admin/image-library"): ADMIN_ONLY,
-    ("GET", "/api/admin/image-library/{run_id}/image"): ADMIN_ONLY,
-    ("GET", "/api/admin/users"): ADMIN_ONLY,
-    ("POST", "/api/ref-library/ingest"): ADMIN_ONLY,
-    ("POST", "/api/ref-library/sync-drive"): ADMIN_ONLY,
-    ("GET", "/api/admin/agents"): CREATOR_ONLY,
-    ("POST", "/api/admin/agents/{agent_id}"): CREATOR_ONLY,
-    ("GET", "/api/admin/settings"): CREATOR_ONLY,
-    ("POST", "/api/admin/settings"): CREATOR_ONLY,
-    ("POST", "/api/admin/settings/test"): CREATOR_ONLY,
-    ("GET", "/api/cron/jobs"): CREATOR_ONLY,
-    ("POST", "/api/news"): CREATOR_ONLY,
-    ("POST", "/api/seo-geo/brands"): CREATOR_ONLY,
-    ("DELETE", "/api/seo-geo/brands/{brand_id}"): CREATOR_ONLY,
-    ("PUT", "/api/seo-geo/competitors/{brand_id}"): CREATOR_ONLY,
-    ("POST", "/api/seo-geo/oauth/disconnect/{brand_id}"): CREATOR_ONLY,
+    ("GET", "/api/admin/analytics"): (ADMIN_ONLY, INTERNAL_ONLY),
+    ("POST", "/api/admin/brands/refresh-packs"): (ADMIN_ONLY, INTERNAL_ONLY),
+    ("GET", "/api/admin/db/collections"): (ADMIN_ONLY, INTERNAL_ONLY),
+    ("GET", "/api/admin/db/collections/{name}"): (ADMIN_ONLY, INTERNAL_ONLY),
+    ("POST", "/api/admin/db/purge-telemetry"): (ADMIN_ONLY, INTERNAL_ONLY),
+    ("GET", "/api/admin/image-library"): (ADMIN_ONLY, INTERNAL_ONLY),
+    ("GET", "/api/admin/image-library/{run_id}/image"): (ADMIN_ONLY, INTERNAL_ONLY),
+    ("GET", "/api/admin/users"): (ADMIN_ONLY, INTERNAL_ONLY),
+    ("POST", "/api/ref-library/ingest"): (ADMIN_ONLY, INTERNAL_ONLY),
+    ("POST", "/api/ref-library/sync-drive"): (ADMIN_ONLY, INTERNAL_ONLY),
+    ("GET", "/api/admin/agents"): (CREATOR_ONLY, INTERNAL_ONLY),
+    ("POST", "/api/admin/agents/{agent_id}"): (CREATOR_ONLY, INTERNAL_ONLY),
+    ("GET", "/api/admin/settings"): (CREATOR_ONLY, INTERNAL_ONLY),
+    ("POST", "/api/admin/settings"): (CREATOR_ONLY, INTERNAL_ONLY),
+    ("POST", "/api/admin/settings/test"): (CREATOR_ONLY, INTERNAL_ONLY),
+    ("GET", "/api/cron/jobs"): (CREATOR_ONLY, INTERNAL_ONLY),
+    ("POST", "/api/news"): (CREATOR_ONLY, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/brands"): (CREATOR_ONLY, INTERNAL_ONLY),
+    ("DELETE", "/api/seo-geo/brands/{brand_id}"): (CREATOR_ONLY, INTERNAL_ONLY),
+    ("PUT", "/api/seo-geo/competitors/{brand_id}"): (CREATOR_ONLY, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/oauth/disconnect/{brand_id}"): (CREATOR_ONLY, INTERNAL_ONLY),
     # --- the GEO agent's registry, open to the GEO editor role -------------- #
     # Was CREATOR_ONLY until 2026-09-04. Same handlers, same rows, narrower
     # role: ``require_geo_editor`` instead of ``require_creator``. Pinned by
@@ -148,88 +195,86 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     # gets 403, so it does not grow the un-gated surface the baseline counts.
     # It sits alongside the Creator-only ``POST /api/seo-geo/brands``, which
     # keeps its own guard — this one creates, that one also overwrites.
-    ("POST", "/api/geo/brands"): GEO_EDITOR_ONLY,
-    ("PUT", "/api/geo/brands/{brand_id}/config"): GEO_EDITOR_ONLY,
-    ("PUT", "/api/geo/brands/{brand_id}/personas"): GEO_EDITOR_ONLY,
-    ("PUT", "/api/geo/brands/{brand_id}/prompts"): GEO_EDITOR_ONLY,
-    ("POST", "/api/geo/brands/{brand_id}/prompts/bulk"): GEO_EDITOR_ONLY,
-    ("POST", "/api/geo/brands/{brand_id}/prompts/custom"): GEO_EDITOR_ONLY,
-    ("POST", "/api/geo/brands/{brand_id}/prompts/generate"): GEO_EDITOR_ONLY,
-    ("POST", "/api/geo/brands/{brand_id}/rescan"): GEO_EDITOR_ONLY,
-    ("POST", "/api/geo/brands/{brand_id}/strategy/generate"): GEO_EDITOR_ONLY,
+    ("POST", "/api/geo/brands"): (GEO_EDITOR_ONLY, EXTERNAL_OK),
+    ("PUT", "/api/geo/brands/{brand_id}/config"): (GEO_EDITOR_ONLY, EXTERNAL_OK),
+    ("PUT", "/api/geo/brands/{brand_id}/personas"): (GEO_EDITOR_ONLY, EXTERNAL_OK),
+    ("PUT", "/api/geo/brands/{brand_id}/prompts"): (GEO_EDITOR_ONLY, EXTERNAL_OK),
+    ("POST", "/api/geo/brands/{brand_id}/prompts/bulk"): (GEO_EDITOR_ONLY, EXTERNAL_OK),
+    ("POST", "/api/geo/brands/{brand_id}/prompts/custom"): (GEO_EDITOR_ONLY, EXTERNAL_OK),
+    ("POST", "/api/geo/brands/{brand_id}/prompts/generate"): (GEO_EDITOR_ONLY, EXTERNAL_OK),
+    ("POST", "/api/geo/brands/{brand_id}/rescan"): (GEO_EDITOR_ONLY, EXTERNAL_OK),
+    ("POST", "/api/geo/brands/{brand_id}/strategy/generate"): (GEO_EDITOR_ONLY, EXTERNAL_OK),
     # --- scheduled jobs, guarded by a shared secret in the handler --------- #
-    ("POST", "/api/geo/cron/poll"): CRON_SECRET,
-    ("POST", "/api/mr/cron/refresh"): CRON_SECRET,
-    ("POST", "/api/seo-geo/cron/run"): CRON_SECRET,
+    ("POST", "/api/geo/cron/poll"): (CRON_SECRET, INTERNAL_ONLY),
+    ("POST", "/api/mr/cron/refresh"): (CRON_SECRET, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/cron/run"): (CRON_SECRET, INTERNAL_ONLY),
     # --- public by design -------------------------------------------------- #
-    ("GET", "/"): PUBLIC_BY_DESIGN,
-    ("POST", "/api/auth/google"): PUBLIC_BY_DESIGN,
-    ("GET", "/api/canva/callback"): PUBLIC_BY_DESIGN,
-    ("GET", "/api/health"): PUBLIC_BY_DESIGN,
-    ("GET", "/api/seo-geo/oauth/callback"): PUBLIC_BY_DESIGN,
+    ("GET", "/"): (PUBLIC_BY_DESIGN, EXTERNAL_OK),
+    ("POST", "/api/auth/google"): (PUBLIC_BY_DESIGN, EXTERNAL_OK),
+    ("GET", "/api/canva/callback"): (PUBLIC_BY_DESIGN, INTERNAL_ONLY),
+    ("GET", "/api/health"): (PUBLIC_BY_DESIGN, EXTERNAL_OK),
+    ("GET", "/api/seo-geo/oauth/callback"): (PUBLIC_BY_DESIGN, INTERNAL_ONLY),
     # --- shared reference data --------------------------------------------- #
-    ("GET", "/api/blog/brands"): SHARED_CATALOG,
-    ("GET", "/api/blog/brands/{brand_id}/inventory"): SHARED_CATALOG,
-    ("POST", "/api/blog/brands/{brand_id}/inventory"): SHARED_CATALOG,
-    ("GET", "/api/blog/brands/{brand_id}/voice"): SHARED_CATALOG,
-    ("POST", "/api/blog/brands/{brand_id}/voice"): SHARED_CATALOG,
-    ("GET", "/api/brands"): SHARED_CATALOG,
-    ("GET", "/api/brands/{brand_id}"): SHARED_CATALOG,
-    ("GET", "/api/brands/{brand_id}/kit"): SHARED_CATALOG,
-    ("GET", "/api/creative/types"): SHARED_CATALOG,
-    ("GET", "/api/gd/brands"): SHARED_CATALOG,
-    ("GET", "/api/gd/config"): SHARED_CATALOG,
-    ("GET", "/api/gd/elements"): SHARED_CATALOG,
-    ("GET", "/api/gd/fonts/{font_name}"): SHARED_CATALOG,
-    ("GET", "/api/gd/ingested-brands"): SHARED_CATALOG,
-    ("GET", "/api/gd/prompts"): SHARED_CATALOG,
-    ("GET", "/api/library"): SHARED_CATALOG,
-    ("GET", "/api/mr/config"): SHARED_CATALOG,
-    ("GET", "/api/mr/connectors"): SHARED_CATALOG,
-    ("GET", "/api/news"): SHARED_CATALOG,
-    ("GET", "/api/ref-library"): SHARED_CATALOG,
-    ("GET", "/api/ref-library/asset/{record_id}"): SHARED_CATALOG,
-    ("GET", "/api/ref-library/retrieve"): SHARED_CATALOG,
-    ("GET", "/api/ref-library/types"): SHARED_CATALOG,
+    ("GET", "/api/blog/brands"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/blog/brands/{brand_id}/inventory"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/blog/brands/{brand_id}/voice"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/brands"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/brands/{brand_id}"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/brands/{brand_id}/kit"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/creative/types"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/gd/brands"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/gd/config"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/gd/elements"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/gd/fonts/{font_name}"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/gd/ingested-brands"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/gd/prompts"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/library"): (SHARED_CATALOG, EXTERNAL_OK),
+    ("GET", "/api/mr/config"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/mr/connectors"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/news"): (SHARED_CATALOG, EXTERNAL_OK),
+    ("GET", "/api/ref-library"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/ref-library/asset/{record_id}"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/ref-library/retrieve"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/ref-library/types"): (SHARED_CATALOG, INTERNAL_ONLY),
     # --- scoped to the caller ---------------------------------------------- #
-    ("GET", "/api/blog/runs"): TENANT_SCOPED,
-    ("POST", "/api/blog/runs"): TENANT_SCOPED,
-    ("GET", "/api/blog/runs/{run_id}"): TENANT_SCOPED,
-    ("POST", "/api/blog/runs/{run_id}/blocks/{block_id}/comment"): TENANT_SCOPED,
-    ("POST", "/api/blog/runs/{run_id}/draft"): TENANT_SCOPED,
-    ("GET", "/api/blog/runs/{run_id}/export"): TENANT_SCOPED,
-    ("POST", "/api/blog/runs/{run_id}/research/step"): TENANT_SCOPED,
-    ("POST", "/api/blog/runs/{run_id}/visuals"): TENANT_SCOPED,
-    ("POST", "/api/creative/runs"): TENANT_SCOPED,
-    ("GET", "/api/creative/runs/{run_id}"): TENANT_SCOPED,
-    ("POST", "/api/creative/runs/{run_id}/acknowledge"): TENANT_SCOPED,
-    ("GET", "/api/creative/runs/{run_id}/artifact/{name}"): TENANT_SCOPED,
-    ("POST", "/api/creative/runs/{run_id}/autonomous"): TENANT_SCOPED,
-    ("GET", "/api/creative/runs/{run_id}/decisions"): TENANT_SCOPED,
-    ("POST", "/api/creative/runs/{run_id}/generate"): TENANT_SCOPED,
-    ("POST", "/api/creative/runs/{run_id}/intent"): TENANT_SCOPED,
-    ("POST", "/api/creative/runs/{run_id}/override"): TENANT_SCOPED,
-    ("POST", "/api/creative/runs/{run_id}/plan"): TENANT_SCOPED,
-    ("POST", "/api/creative/runs/{run_id}/plan/approve"): TENANT_SCOPED,
-    ("POST", "/api/creative/runs/{run_id}/plan/text"): TENANT_SCOPED,
-    ("POST", "/api/gd/runs"): TENANT_SCOPED,
-    ("GET", "/api/gd/runs/{run_id}"): TENANT_SCOPED,
-    ("POST", "/api/gd/runs/{run_id}/approve"): TENANT_SCOPED,
-    ("GET", "/api/gd/runs/{run_id}/artifact/{rel:path}"): TENANT_SCOPED,
-    ("POST", "/api/gd/runs/{run_id}/back"): TENANT_SCOPED,
-    ("GET", "/api/gd/runs/{run_id}/brand-logo"): TENANT_SCOPED,
-    ("GET", "/api/gd/runs/{run_id}/brand-logos"): TENANT_SCOPED,
-    ("POST", "/api/gd/runs/{run_id}/config"): TENANT_SCOPED,
-    ("POST", "/api/gd/runs/{run_id}/elements/upload"): TENANT_SCOPED,
-    ("POST", "/api/gd/runs/{run_id}/generate"): TENANT_SCOPED,
-    ("POST", "/api/gd/runs/{run_id}/plan"): TENANT_SCOPED,
-    ("GET", "/api/gd/runs/{run_id}/prompt"): TENANT_SCOPED,
-    ("POST", "/api/gd/runs/{run_id}/stage4"): TENANT_SCOPED,
-    ("POST", "/api/gd/runs/{run_id}/subject/upload"): TENANT_SCOPED,
-    ("POST", "/api/gd/runs/{run_id}/suggest"): TENANT_SCOPED,
-    ("POST", "/api/gd/runs/{run_id}/suggest-placement"): TENANT_SCOPED,
-    ("POST", "/api/gd/runs/{run_id}/text-preview"): TENANT_SCOPED,
-    ("POST", "/api/gd/runs/{run_id}/tweak"): TENANT_SCOPED,
+    ("GET", "/api/blog/runs"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/blog/runs"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/blog/runs/{run_id}"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/blog/runs/{run_id}/blocks/{block_id}/comment"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/blog/runs/{run_id}/draft"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/blog/runs/{run_id}/export"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/blog/runs/{run_id}/research/step"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/blog/runs/{run_id}/visuals"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/creative/runs"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/creative/runs/{run_id}"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/creative/runs/{run_id}/acknowledge"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/creative/runs/{run_id}/artifact/{name}"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/creative/runs/{run_id}/autonomous"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/creative/runs/{run_id}/decisions"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/creative/runs/{run_id}/generate"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/creative/runs/{run_id}/intent"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/creative/runs/{run_id}/override"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/creative/runs/{run_id}/plan"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/creative/runs/{run_id}/plan/approve"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/creative/runs/{run_id}/plan/text"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/gd/runs"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/gd/runs/{run_id}"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/gd/runs/{run_id}/approve"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/gd/runs/{run_id}/artifact/{rel:path}"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/gd/runs/{run_id}/back"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/gd/runs/{run_id}/brand-logo"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/gd/runs/{run_id}/brand-logos"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/gd/runs/{run_id}/config"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/gd/runs/{run_id}/elements/upload"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/gd/runs/{run_id}/generate"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/gd/runs/{run_id}/plan"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/gd/runs/{run_id}/prompt"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/gd/runs/{run_id}/stage4"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/gd/runs/{run_id}/subject/upload"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/gd/runs/{run_id}/suggest"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/gd/runs/{run_id}/suggest-placement"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/gd/runs/{run_id}/text-preview"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/gd/runs/{run_id}/tweak"): (TENANT_SCOPED, INTERNAL_ONLY),
     # The board report. Every read it makes goes through ``_load_dataset(user["id"])``,
     # which queries ``mr_runs`` filtered on ``user_id`` server-side; the run it
     # writes is stamped with the same id, and the idempotency lookup that may
@@ -240,7 +285,7 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     # ``snapshots``, whose routes are WORKSPACE_SHARED. Dark by default
     # (``MR_BOARD_REPORT``), and the kill switch sits INSIDE the handler, so the
     # auth dependency still runs first and an anonymous caller gets 401, not 404.
-    ("POST", "/api/mr/board-report"): TENANT_SCOPED,
+    ("POST", "/api/mr/board-report"): (TENANT_SCOPED, INTERNAL_ONLY),
     # The board report as a document. Both load the run through the same
     # ``run.get("user_id") != user["id"]`` check the sibling readers use and
     # answer 404 - not 403 - to anyone else, so an id belonging to another
@@ -248,66 +293,79 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     # route hands the rendered HTML to the renderer service and carries no
     # tenancy of its own: it renders what the ownership check already let
     # through, and nothing else.
-    ("GET", "/api/mr/board-report/{run_id}/html"): TENANT_SCOPED,
-    ("GET", "/api/mr/board-report/{run_id}/pdf"): TENANT_SCOPED,
-    ("GET", "/api/mr/datasets"): TENANT_SCOPED,
-    ("DELETE", "/api/mr/datasets/{dataset_id}"): TENANT_SCOPED,
-    ("POST", "/api/mr/ingest"): TENANT_SCOPED,
-    ("POST", "/api/mr/ingest-pdf"): TENANT_SCOPED,
-    ("POST", "/api/mr/ingest-sheet"): TENANT_SCOPED,
-    ("GET", "/api/mr/lead-analysis"): TENANT_SCOPED,
-    ("GET", "/api/mr/lead-analysis/pdf"): TENANT_SCOPED,
-    ("GET", "/api/mr/overview"): TENANT_SCOPED,
-    ("GET", "/api/mr/report-periods"): TENANT_SCOPED,
-    ("POST", "/api/mr/reports/{kind}"): TENANT_SCOPED,
-    ("GET", "/api/mr/runs"): TENANT_SCOPED,
-    ("GET", "/api/mr/runs/{run_id}"): TENANT_SCOPED,
-    ("GET", "/api/mr/runs/{run_id}/pdf"): TENANT_SCOPED,
-    ("POST", "/api/mr/schedule/{period}"): TENANT_SCOPED,
-    ("GET", "/api/mr/targets"): TENANT_SCOPED,
-    ("POST", "/api/mr/targets"): TENANT_SCOPED,
-    ("GET", "/api/mr/trends"): TENANT_SCOPED,
+    ("GET", "/api/mr/board-report/{run_id}/html"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/mr/board-report/{run_id}/pdf"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/mr/datasets"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("DELETE", "/api/mr/datasets/{dataset_id}"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/mr/ingest"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/mr/ingest-pdf"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/mr/ingest-sheet"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/mr/lead-analysis"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/mr/lead-analysis/pdf"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/mr/overview"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/mr/report-periods"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/mr/reports/{kind}"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/mr/runs"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/mr/runs/{run_id}"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/mr/runs/{run_id}/pdf"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/mr/schedule/{period}"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/mr/targets"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/mr/targets"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/mr/trends"): (TENANT_SCOPED, INTERNAL_ONLY),
     # The console's record. `firestore_repo.list_runs_for_user` filters on
     # `user_id` before it orders, and both the count and the fallback scan carry
     # the same filter, so there is no path through this route that reads a row
     # belonging to anyone else.
-    ("GET", "/api/runs"): TENANT_SCOPED,
-    ("GET", "/api/usage"): TENANT_SCOPED,
+    ("GET", "/api/runs"): (TENANT_SCOPED, EXTERNAL_OK),
+    ("GET", "/api/usage"): (TENANT_SCOPED, INTERNAL_ONLY),
     # --- shared across the whole workspace, with no boundary object -------- #
+    # Blog Writer, moved out of SHARED_CATALOG on 2026-09-12. That label means
+    # "static or near-static reference data … carries no per-user rows at all",
+    # and these two are neither static nor reads: ``POST …/voice`` OVERWRITES
+    # the brand's stored voice profile for everyone through a model call, and
+    # ``POST …/inventory`` refetches the sitemap and up to 150 pages and
+    # replaces the stored inventory. Billed, destructive, shared brand state,
+    # filed under the one label that says a route cannot be any of those.
+    #
+    # Nothing about the routes changed — the label was the defect, same as the
+    # MR workbook substrate a week earlier. What changes is that the ratchet
+    # below now counts them.
+    ("POST", "/api/blog/brands/{brand_id}/inventory"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/blog/brands/{brand_id}/voice"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     # Agents health: the hub's per-agent rollup deliberately aggregates the
     # WHOLE workspace's run trail — every caller's runs and who ran each agent
     # — the same cross-user rows the admin Database panel browses raw and
     # ``/api/issues`` composes for the same single-team workspace.
-    ("GET", "/api/agents/health"): WORKSPACE_SHARED,
+    ("GET", "/api/agents/health"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     # Canva: one module-level ``_active_token`` in ``routers/canva.py`` holds
     # the most recent OAuth grant, so every caller imports into whichever
     # account authorised last. The file says so itself.
-    ("GET", "/api/canva/authorize"): WORKSPACE_SHARED,
-    ("POST", "/api/canva/import"): WORKSPACE_SHARED,
+    ("GET", "/api/canva/authorize"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/canva/import"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     # GEO: every doc id is ``…-{brand_id}``; no user or workspace key exists.
-    ("GET", "/api/geo/brands"): WORKSPACE_SHARED,
-    ("GET", "/api/geo/brands/{brand_id}/answers"): WORKSPACE_SHARED,
-    ("GET", "/api/geo/brands/{brand_id}/comparison"): WORKSPACE_SHARED,
-    ("GET", "/api/geo/brands/{brand_id}/config"): WORKSPACE_SHARED,
-    ("GET", "/api/geo/brands/{brand_id}/history"): WORKSPACE_SHARED,
+    ("GET", "/api/geo/brands"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("GET", "/api/geo/brands/{brand_id}/answers"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("GET", "/api/geo/brands/{brand_id}/comparison"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("GET", "/api/geo/brands/{brand_id}/config"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("GET", "/api/geo/brands/{brand_id}/history"): (WORKSPACE_SHARED, EXTERNAL_OK),
     # Page check: docs are ``optimizer-analysis-{brand_id}-{aid}`` and
     # ``optimizer-index-{brand_id}`` — brand-keyed like the rest of GEO, and
     # still no user or workspace key.
-    ("POST", "/api/geo/brands/{brand_id}/page-check"): WORKSPACE_SHARED,
-    ("GET", "/api/geo/brands/{brand_id}/page-checks"): WORKSPACE_SHARED,
-    ("GET", "/api/geo/brands/{brand_id}/page-checks/{check_id}"): WORKSPACE_SHARED,
-    ("POST", "/api/geo/brands/{brand_id}/page-checks/{check_id}/rescore"): WORKSPACE_SHARED,
-    ("GET", "/api/geo/brands/{brand_id}/poll/status"): WORKSPACE_SHARED,
-    ("POST", "/api/geo/brands/{brand_id}/poll/step"): WORKSPACE_SHARED,
-    ("GET", "/api/geo/brands/{brand_id}/prompts"): WORKSPACE_SHARED,
-    ("GET", "/api/geo/brands/{brand_id}/report"): WORKSPACE_SHARED,
-    ("GET", "/api/geo/brands/{brand_id}/strategy"): WORKSPACE_SHARED,
-    ("PUT", "/api/geo/brands/{brand_id}/strategy/actions/{action_id}"): WORKSPACE_SHARED,
-    ("GET", "/api/geo/config"): WORKSPACE_SHARED,
+    ("POST", "/api/geo/brands/{brand_id}/page-check"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("GET", "/api/geo/brands/{brand_id}/page-checks"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("GET", "/api/geo/brands/{brand_id}/page-checks/{check_id}"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("POST", "/api/geo/brands/{brand_id}/page-checks/{check_id}/rescore"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("GET", "/api/geo/brands/{brand_id}/poll/status"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("POST", "/api/geo/brands/{brand_id}/poll/step"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("GET", "/api/geo/brands/{brand_id}/prompts"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("GET", "/api/geo/brands/{brand_id}/report"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("GET", "/api/geo/brands/{brand_id}/strategy"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("PUT", "/api/geo/brands/{brand_id}/strategy/actions/{action_id}"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("GET", "/api/geo/config"): (WORKSPACE_SHARED, EXTERNAL_OK),
     # Issues: a read-only composition of the shared brand registry with each
     # brand's SEO run, GEO config, run log and plan — the same rows
     # ``/seo-geo/overview`` serves, for the same reason.
-    ("GET", "/api/issues"): WORKSPACE_SHARED,
+    ("GET", "/api/issues"): (WORKSPACE_SHARED, EXTERNAL_OK),
     # MR workbook substrate — ``/ask``, ``/workbook``, ``/workbook/scan`` and
     # the sources registry behind them. All four were TENANT_SCOPED until
     # 2026-09-05 and none of them ever was: they read ONE deployment-wide
@@ -325,47 +383,47 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
     # admin-removable only. Pinned behaviourally in ``test_mr_cross_tenant.py``
     # ("the sheet-sources registry" section) — this comment is the map, that
     # file is the proof.
-    ("POST", "/api/mr/ask"): WORKSPACE_SHARED,
+    ("POST", "/api/mr/ask"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     # MR snapshots: ``marketing_research_agent/snapshots.py`` has no ``user_id``
     # in any function — every row is keyed by vendor slug and date alone, while
     # the rest of the MR router scopes carefully. This is the inconsistency the
     # module docstring describes.
-    ("GET", "/api/mr/snapshots"): WORKSPACE_SHARED,
-    ("POST", "/api/mr/snapshots/capture"): WORKSPACE_SHARED,
-    ("GET", "/api/mr/snapshots/deltas"): WORKSPACE_SHARED,
-    ("GET", "/api/mr/snapshots/portfolio"): WORKSPACE_SHARED,
-    ("GET", "/api/mr/snapshots/vendor/{slug}"): WORKSPACE_SHARED,
-    ("GET", "/api/mr/snapshots/vendor/{slug}/pdf"): WORKSPACE_SHARED,
-    ("GET", "/api/mr/sources"): WORKSPACE_SHARED,
-    ("POST", "/api/mr/sources"): WORKSPACE_SHARED,
-    ("DELETE", "/api/mr/sources/{spreadsheet_id}"): WORKSPACE_SHARED,
-    ("GET", "/api/mr/workbook"): WORKSPACE_SHARED,
-    ("POST", "/api/mr/workbook/scan"): WORKSPACE_SHARED,
+    ("GET", "/api/mr/snapshots"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/mr/snapshots/capture"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/snapshots/deltas"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/snapshots/portfolio"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/snapshots/vendor/{slug}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/snapshots/vendor/{slug}/pdf"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/sources"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/mr/sources"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("DELETE", "/api/mr/sources/{spreadsheet_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/workbook"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/mr/workbook/scan"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     # SEO: ``state.save("brands", …)`` is a single global Firestore document,
     # and every other doc id is ``…-{brand_id}``.
-    ("POST", "/api/seo-geo/ask/{brand_id}"): WORKSPACE_SHARED,
-    ("GET", "/api/seo-geo/audit/{brand_id}"): WORKSPACE_SHARED,
-    ("POST", "/api/seo-geo/audit/{brand_id}/run"): WORKSPACE_SHARED,
-    ("GET", "/api/seo-geo/brands/{brand_id}"): WORKSPACE_SHARED,
-    ("GET", "/api/seo-geo/briefs/{brand_id}"): WORKSPACE_SHARED,
-    ("POST", "/api/seo-geo/briefs/{brand_id}"): WORKSPACE_SHARED,
-    ("GET", "/api/seo-geo/competitors/{brand_id}"): WORKSPACE_SHARED,
-    ("GET", "/api/seo-geo/competitors/{brand_id}/profiles"): WORKSPACE_SHARED,
-    ("POST", "/api/seo-geo/competitors/{brand_id}/profiles/refresh"): WORKSPACE_SHARED,
-    ("POST", "/api/seo-geo/competitors/{brand_id}/track"): WORKSPACE_SHARED,
-    ("POST", "/api/seo-geo/draft-score/{brand_id}"): WORKSPACE_SHARED,
-    ("GET", "/api/seo-geo/keywords/{brand_id}"): WORKSPACE_SHARED,
-    ("POST", "/api/seo-geo/keywords/{brand_id}/run"): WORKSPACE_SHARED,
-    ("GET", "/api/seo-geo/oauth/start/{brand_id}"): WORKSPACE_SHARED,
-    ("GET", "/api/seo-geo/overview"): WORKSPACE_SHARED,
-    ("GET", "/api/seo-geo/pages/{brand_id}"): WORKSPACE_SHARED,
-    ("POST", "/api/seo-geo/pages/{brand_id}/refresh"): WORKSPACE_SHARED,
-    ("POST", "/api/seo-geo/run/{brand_id}"): WORKSPACE_SHARED,
-    ("POST", "/api/seo-geo/serp/{brand_id}"): WORKSPACE_SHARED,
-    ("GET", "/api/seo-geo/site-review/{brand_id}"): WORKSPACE_SHARED,
-    ("POST", "/api/seo-geo/site-review/{brand_id}"): WORKSPACE_SHARED,
-    ("POST", "/api/seo-geo/todos/{brand_id}/{todo_id}"): WORKSPACE_SHARED,
-    ("POST", "/api/seo-geo/update-plan/{brand_id}"): WORKSPACE_SHARED,
+    ("POST", "/api/seo-geo/ask/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/seo-geo/audit/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/audit/{brand_id}/run"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/seo-geo/brands/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/seo-geo/briefs/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/briefs/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/seo-geo/competitors/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/seo-geo/competitors/{brand_id}/profiles"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/competitors/{brand_id}/profiles/refresh"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/competitors/{brand_id}/track"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/draft-score/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/seo-geo/keywords/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/keywords/{brand_id}/run"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/seo-geo/oauth/start/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/seo-geo/overview"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    ("GET", "/api/seo-geo/pages/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/pages/{brand_id}/refresh"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/run/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/serp/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/seo-geo/site-review/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/site-review/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/todos/{brand_id}/{todo_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/seo-geo/update-plan/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
 }
 
 #: Size of the un-siloed surface at the time this file was written. This is a
@@ -398,7 +456,18 @@ ROUTE_LEDGER: dict[tuple[str, str], str] = {
 #: nightly cron scans all of them), and the destructive path was closed
 #: separately: ``DELETE /mr/sources/{id}`` now requires the caller and refuses
 #: unless they connected the sheet or hold an admin/creator role.
-WORKSPACE_SHARED_BASELINE = 55
+#:
+#: 55 → 57 on 2026-09-12: ``POST /api/blog/brands/{id}/voice`` and
+#: ``POST /api/blog/brands/{id}/inventory``, moved out of SHARED_CATALOG. Same
+#: story as the six above and the same non-event for the exposure: two routes
+#: that were always workspace-wide, overwriting shared brand state through
+#: billed model and crawl calls, wearing the label reserved for static
+#: reference reads. The number now counts them.
+#:
+#: The MR pair audited alongside them — ``POST /mr/snapshots/capture`` and
+#: ``POST /mr/workbook/scan`` — needed no move: they were already counted here
+#: by the 2026-09-05 edit. Hence 57 and not 59.
+WORKSPACE_SHARED_BASELINE = 57
 
 #: The GEO editor surface, BY NAME. Not a count — a count would let a future
 #: route join the role while another left it and say nothing, and the thing
@@ -481,6 +550,31 @@ def _guards_of(route: APIRoute) -> set[str]:
     return found
 
 
+def _with_tenancy(*labels: str) -> list[tuple[str, str]]:
+    """Ledger keys whose TENANCY label is one of ``labels``, sorted."""
+    return sorted(mp for mp, (tenancy, _) in ROUTE_LEDGER.items() if tenancy in labels)
+
+
+def _with_audience(label: str) -> list[tuple[str, str]]:
+    """Ledger keys whose AUDIENCE label is ``label``, sorted."""
+    return sorted(mp for mp, (_, audience) in ROUTE_LEDGER.items() if audience == label)
+
+
+def _probe_url(path: str) -> str:
+    """A concrete URL for a path template.
+
+    Path parameters get a nonsense value on purpose: a route that refuses the
+    caller before parsing them is behaving correctly, and one that 404s on the
+    id *before* checking who is asking shows up here as a missing refusal.
+    """
+    url = path
+    while "{" in url:
+        head, _, rest = url.partition("{")
+        _, _, tail = rest.partition("}")
+        url = f"{head}conformance-probe{tail}"
+    return url
+
+
 # --------------------------------------------------------------------------- #
 # The gate
 # --------------------------------------------------------------------------- #
@@ -495,9 +589,33 @@ def test_every_route_is_classified() -> None:
     missing = sorted(_live_routes() - set(ROUTE_LEDGER))
     assert not missing, (
         "These routes are not in ROUTE_LEDGER. Read the handler, decide what it "
-        "does about tenancy, and add it to the right group in "
-        "app/routers/tests/test_route_tenancy_conformance.py:\n  "
+        "does about tenancy AND who may reach it, and add it to the right group "
+        "in app/routers/tests/test_route_tenancy_conformance.py:\n  "
         + "\n  ".join(f"{m} {p}" for m, p in missing)
+    )
+
+
+def test_every_entry_carries_both_dimensions() -> None:
+    """Unclassified is red in the audience dimension too, not just tenancy.
+
+    Without this an entry could be written as a bare tenancy label — the shape
+    every line in this file had until 2026-09-12 — and inherit no audience at
+    all, which is the failure mode the second dimension exists to end. There is
+    no default: a route is EXTERNAL_OK because somebody decided it should be.
+    """
+    bad = sorted(
+        f"{m} {p}: {entry!r}"
+        for (m, p), entry in ROUTE_LEDGER.items()
+        if not (
+            isinstance(entry, tuple)
+            and len(entry) == 2
+            and entry[0] in _AUTHENTICATED | {CRON_SECRET, PUBLIC_BY_DESIGN}
+            and entry[1] in _AUDIENCES
+        )
+    )
+    assert not bad, (
+        "Every ledger entry is (tenancy, audience). These are not:\n  "
+        + "\n  ".join(bad)
     )
 
 
@@ -524,9 +642,10 @@ def test_classifications_match_the_real_dependency_graph() -> None:
             continue
         guards = _guards_of(route)
         for method in route.methods - {"HEAD", "OPTIONS"}:
-            label = ROUTE_LEDGER.get((method, route.path))
-            if label is None:
+            entry = ROUTE_LEDGER.get((method, route.path))
+            if entry is None:
                 continue  # reported by test_every_route_is_classified
+            label = entry[0]
             if label in (CRON_SECRET, PUBLIC_BY_DESIGN):
                 expected_empty = True
             else:
@@ -562,7 +681,7 @@ def test_workspace_shared_surface_has_not_grown_silently() -> None:
     same commit. Growing it is occasionally legitimate — and must be a sentence
     somebody wrote on purpose, not a diff nobody noticed.
     """
-    actual = sum(1 for label in ROUTE_LEDGER.values() if label == WORKSPACE_SHARED)
+    actual = len(_with_tenancy(WORKSPACE_SHARED))
     assert actual <= WORKSPACE_SHARED_BASELINE, (
         f"WORKSPACE_SHARED grew from {WORKSPACE_SHARED_BASELINE} to {actual}. "
         "If that is deliberate, raise WORKSPACE_SHARED_BASELINE and say why."
@@ -590,7 +709,7 @@ def test_the_geo_editor_surface_is_exactly_the_pinned_set() -> None:
     :func:`test_classifications_match_the_real_dependency_graph`, and a route
     that resolves through it without the label fails there too.
     """
-    labelled = {mp for mp, label in ROUTE_LEDGER.items() if label == GEO_EDITOR_ONLY}
+    labelled = set(_with_tenancy(GEO_EDITOR_ONLY))
     assert labelled == set(GEO_EDITOR_ROUTES), (
         "The GEO editor surface changed. Added routes:\n  "
         + "\n  ".join(f"{m} {p}" for m, p in sorted(labelled - GEO_EDITOR_ROUTES))
@@ -621,15 +740,12 @@ def test_the_geo_editor_role_did_not_widen_the_shared_surface() -> None:
     thing the ratchet was built to catch and the precise opposite of what this
     change did. Asserting the two sets are disjoint states that in one line.
     """
-    shared = {mp for mp, label in ROUTE_LEDGER.items() if label == WORKSPACE_SHARED}
+    shared = set(_with_tenancy(WORKSPACE_SHARED))
     assert not (shared & GEO_EDITOR_ROUTES), sorted(shared & GEO_EDITOR_ROUTES)
     assert len(shared) == WORKSPACE_SHARED_BASELINE
 
 
-@pytest.mark.parametrize(
-    ("method", "path"),
-    sorted(mp for mp, label in ROUTE_LEDGER.items() if label in _AUTHENTICATED),
-)
+@pytest.mark.parametrize(("method", "path"), _with_tenancy(*_AUTHENTICATED))
 def test_authenticated_routes_refuse_an_anonymous_caller(
     method: str, path: str, unauthenticated
 ) -> None:
@@ -642,11 +758,7 @@ def test_authenticated_routes_refuse_an_anonymous_caller(
     *before* checking the token would show up here as a missing 401.
     """
     unauthenticated()
-    url = path
-    while "{" in url:
-        head, _, rest = url.partition("{")
-        _, _, tail = rest.partition("}")
-        url = f"{head}conformance-probe{tail}"
+    url = _probe_url(path)
     resp = client.request(method, url)
     assert resp.status_code in (401, 403), (
         f"{method} {url} answered {resp.status_code} to an anonymous caller; "
@@ -654,10 +766,7 @@ def test_authenticated_routes_refuse_an_anonymous_caller(
     )
 
 
-@pytest.mark.parametrize(
-    ("method", "path"),
-    sorted(mp for mp, label in ROUTE_LEDGER.items() if label == CRON_SECRET),
-)
+@pytest.mark.parametrize(("method", "path"), _with_tenancy(CRON_SECRET))
 def test_cron_routes_reject_a_missing_or_wrong_secret(method: str, path: str) -> None:
     """The cron endpoints carry no FastAPI dependency — assert the real guard.
 
@@ -673,3 +782,211 @@ def test_cron_routes_reject_a_missing_or_wrong_secret(method: str, path: str) ->
             f"{method} {path} answered {resp.status_code} with headers={headers}; "
             "a cron endpoint must refuse an unauthenticated caller."
         )
+
+
+# --------------------------------------------------------------------------- #
+# The audience gate
+#
+# Everything above asks "whose rows?". Everything below asks "who is in the
+# room?" — and answers it by driving the real app with real tokens rather than
+# by reading the dependency graph, because the graph is what looked fine for
+# two months while four contractors could read the company marketing tracker.
+# --------------------------------------------------------------------------- #
+
+#: A GEO-only principal, and the three shapes of account that must NOT be one.
+#: ``geo-only@aivirtual.com`` is an outside-domain address on purpose: it is
+#: the case the whole change exists for.
+_GEO_ONLY = "geo-only@aivirtual.com"
+_MEMBER = "colleague@legalsoft.com"
+_ADMIN = "boss@legalsoft.com"
+_CREATOR = "owner@legalsoft.com"
+
+#: Tenancy labels whose own guard answers 403 to a non-role-holder, so a 403
+#: there does not by itself prove the scope wall ran.
+_ROLE_GATED = {ADMIN_ONLY, CREATOR_ONLY, GEO_EDITOR_ONLY}
+
+
+@pytest.fixture()
+def scoped_app(monkeypatch, tmp_path):
+    """The real app, real ``get_current_user``, real tokens, no egress.
+
+    No dependency override anywhere: exercising the actual guard chain is the
+    entire point, and an override of ``get_current_user`` would take the scope
+    wall's principal out with it. The directory's autouse fixture restores the
+    overrides dict afterwards either way.
+    """
+    import httpx
+
+    import google.auth
+    from app.services import drive_source
+    from marketing_research_agent.sources import sheets_source as ss
+
+    def _blocked(*args, **kwargs):
+        raise AssertionError("outbound network attempted from a test")
+
+    for module, name in (
+        (httpx, "get"), (httpx, "post"), (httpx, "request"), (httpx, "stream"),
+        (google.auth, "default"),
+        (ss, "_sheets_service"), (ss, "_default_fetcher"), (ss, "_default_xlsx_fetcher"),
+        (drive_source, "build_drive_service"),
+    ):
+        monkeypatch.setattr(module, name, _blocked, raising=False)
+
+    monkeypatch.setattr(settings, "jwt_secret", "scope-test-key-" + "0" * 32)
+    monkeypatch.setattr(settings, "allowed_email_domains", "legalsoft.com")
+    monkeypatch.setattr(settings, "allowed_emails", _GEO_ONLY)
+    monkeypatch.setattr(settings, "geo_only_emails", _GEO_ONLY)
+    # All eight real GEO-only accounts are ALSO GEO editors, so the probe is
+    # one too — otherwise the nine registry routes would answer 403 for the
+    # role rather than the scope and the journey sweep would prove nothing.
+    monkeypatch.setattr(settings, "geo_editor_emails", _GEO_ONLY)
+    monkeypatch.setattr(settings, "admin_emails", _ADMIN)
+    monkeypatch.setattr(settings, "creator_emails", _CREATOR)
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("SEO_LOCAL_DIR", str(tmp_path / "seo"))
+    fastapi_app.dependency_overrides.pop(get_current_user, None)
+    # ``raise_server_exceptions=False``: an offline handler may blow up on the
+    # blocked datastore, and a 500 is a perfectly good "not 403".
+    return TestClient(fastapi_app, raise_server_exceptions=False)
+
+
+def _headers(email: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {create_token('u-probe', email)}"}
+
+
+def _detail(resp) -> str:
+    """The ``detail`` string, or "" for a body that is not our JSON error."""
+    try:
+        payload = resp.json()
+    except Exception:  # noqa: BLE001 — a PDF/blob body is not a failure here
+        return ""
+    return str(payload.get("detail", "")) if isinstance(payload, dict) else ""
+
+
+def test_the_external_surface_is_what_the_service_enforces() -> None:
+    """The ledger's EXTERNAL_OK set IS ``app.scopes.GEO_SCOPE_ROUTES``.
+
+    Two statements of one fact, bound together so neither can move alone. The
+    ledger is where a reviewer looks; the scopes table is what the running
+    service consults. A route quietly added to the code table would otherwise
+    widen the contractor-visible surface with nothing in the diff to read, and
+    a route added to the ledger alone would be a promise the service does not
+    keep. Either one fails here.
+    """
+    ledger_external = set(_with_audience(EXTERNAL_OK))
+    assert ledger_external == set(GEO_SCOPE_ROUTES), (
+        "Ledger EXTERNAL_OK and app/scopes.py GEO_SCOPE_ROUTES disagree.\n"
+        f"  in the ledger only: {sorted(ledger_external - GEO_SCOPE_ROUTES)}\n"
+        f"  in scopes.py only:  {sorted(GEO_SCOPE_ROUTES - ledger_external)}"
+    )
+
+
+def test_every_route_sits_behind_the_scope_wall() -> None:
+    """The structural half: the wall is ON every router, not on some of them.
+
+    This is the test that goes red when someone drops
+    ``dependencies=[Depends(deny_outside_geo)]`` from a router — before any
+    request is made and whatever the handlers do. Deliberately about the
+    dependency graph rather than behaviour, because behaviour only reveals the
+    gap on routes somebody remembered to probe, and "somebody remembered" is
+    the failure mode this whole file exists to remove.
+
+    ``GET /`` is the one exemption: it is declared on the ``FastAPI`` object
+    itself, not through a router, so no include-time dependency can reach it.
+    A SECOND app-level route fails here — which is the right outcome, because
+    the next one will not be a static banner.
+    """
+    unwalled: set[tuple[str, str]] = set()
+    for route in fastapi_app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        calls: set = set()
+
+        def walk(dep, sink=calls) -> None:
+            if dep is None:
+                return
+            sink.add(getattr(dep, "call", None))
+            for sub in getattr(dep, "dependencies", []) or []:
+                walk(sub, sink)
+
+        walk(route.dependant)
+        if deny_outside_geo in calls:
+            continue
+        for method in route.methods - {"HEAD", "OPTIONS"}:
+            unwalled.add((method, route.path))
+
+    assert unwalled == set(UNREACHABLE_BY_THE_WALL), (
+        "These routes do not resolve through deny_outside_geo, so a GEO-only "
+        "account reaches them. Mount the router with "
+        "dependencies=[Depends(deny_outside_geo)] in app/main.py:\n  "
+        + "\n  ".join(f"{m} {p}" for m, p in sorted(unwalled - UNREACHABLE_BY_THE_WALL))
+    )
+
+
+@pytest.mark.parametrize(("method", "path"), _with_audience(INTERNAL_ONLY))
+def test_a_geo_only_caller_is_refused_on_every_internal_route(
+    method: str, path: str, scoped_app
+) -> None:
+    """The behavioural half, over the WHOLE ledger — not five admin routes.
+
+    Its predecessor (``tests/test_allowlist_live_routes.py``) checked
+    ``/api/admin/settings``, ``/api/admin/users``, ``/api/admin/analytics``,
+    ``/api/admin/db/collections`` and ``/api/cron/jobs``. All five passed for
+    two months while ``POST /api/mr/ask`` — not an admin route, so nobody
+    thought to list it — served the whole marketing tracker to four outside
+    contractors. The fix for a hand-enumerated test is not a longer
+    hand-enumeration; it is to drive every row of the ledger.
+
+    Where the route has no role guard of its own, the refusal must carry the
+    scope wall's own message: a 403 from ``require_admin`` would satisfy a
+    status-code assertion while proving nothing about the wall.
+    """
+    resp = scoped_app.request(method, _probe_url(path), headers=_headers(_GEO_ONLY))
+    assert resp.status_code == 403, (
+        f"{method} {path} answered {resp.status_code} to a GEO-only account; "
+        "it is INTERNAL_ONLY and must be refused."
+    )
+    if ROUTE_LEDGER[(method, path)][0] not in _ROLE_GATED:
+        assert _detail(resp) == SCOPE_REFUSED, (
+            f"{method} {path} was refused by something other than the scope "
+            f"wall ({_detail(resp)!r}); the wall is what must be doing this."
+        )
+
+
+@pytest.mark.parametrize(("method", "path"), _with_audience(EXTERNAL_OK))
+def test_a_geo_only_caller_completes_the_whole_geo_journey(
+    method: str, path: str, scoped_app
+) -> None:
+    """The other half, and the one that decides whether this shipped or broke.
+
+    Sign in, land on the shell, open the GEO workspace, and do everything
+    ``require_geo_editor`` permits — with no 403 anywhere. Only 403 is
+    asserted: these handlers run for real against a blocked datastore and may
+    answer 404, 422, 500 or 502 for their own honest reasons, none of which is
+    "you are not allowed in here".
+    """
+    resp = scoped_app.request(method, _probe_url(path), headers=_headers(_GEO_ONLY))
+    assert resp.status_code != 403, (
+        f"{method} {path} answered 403 to a GEO-only account: {_detail(resp)!r}. "
+        "It is part of the GEO journey and must stay open."
+    )
+
+
+@pytest.mark.parametrize("email", [_MEMBER, _ADMIN, _CREATOR])
+@pytest.mark.parametrize(("method", "path"), sorted(ROUTE_LEDGER))
+def test_the_scope_wall_refuses_nobody_who_is_not_geo_only(
+    email: str, method: str, path: str, scoped_app
+) -> None:
+    """The negative, stated as the thing most likely to go wrong.
+
+    A plain workspace member, an admin and a creator must reach exactly what
+    they reached before this existed — across every route, not a sample. They
+    still meet their own guards (a member gets 403 from ``require_admin``, as
+    they always did), so the assertion is not on the status code but on the
+    message: the scope wall must never be the thing that refused them.
+    """
+    resp = scoped_app.request(method, _probe_url(path), headers=_headers(email))
+    assert _detail(resp) != SCOPE_REFUSED, (
+        f"{method} {path} refused {email} with the GEO scope wall. No account "
+        "outside GEO_ONLY_EMAILS may ever see this refusal."
+    )

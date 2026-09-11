@@ -185,6 +185,61 @@ def test_the_geo_editor_flag_is_derived_not_carried_in_the_token(_harness, monke
     assert "geo_editor" not in claims and "is_geo_editor" not in claims
 
 
+def test_the_login_response_tells_the_console_who_is_scoped_to_geo(
+    _harness, monkeypatch,
+):
+    """The console's half of the scope wall.
+
+    143 routes now answer 403 to a GEO-only caller, and the console cannot see
+    that from the outside — so it keeps offering panels that fail on click. This
+    flag is what lets it stop drawing them. It is a display hint only:
+    ``app.scopes.deny_outside_geo`` re-derives the scope per request and remains
+    the enforcement whatever this payload says.
+
+    The key is asserted PRESENT in every case, including ``False``. The console
+    reads a missing key as "session predates the wall" and a present ``False``
+    as "not scoped"; omitting it for the common case would merge those.
+    """
+    monkeypatch.setattr(settings, "geo_only_emails", "scoped@legalsoft.com")
+    monkeypatch.setattr(settings, "creator_emails", "")
+    monkeypatch.setattr(settings, "admin_emails", "")
+
+    scoped = login(_harness, "scoped@legalsoft.com").json()["user"]
+    assert scoped["is_geo_only"] is True
+
+    plain = login(_harness, "colleague@legalsoft.com").json()["user"]
+    assert "is_geo_only" in plain and plain["is_geo_only"] is False
+
+    # The exemption, at the response too: an owner who fat-fingers their own
+    # address into GEO_ONLY_EMAILS must not be shown a locked-down console.
+    monkeypatch.setattr(settings, "creator_emails", "boss@legalsoft.com")
+    monkeypatch.setattr(settings, "geo_only_emails", "boss@legalsoft.com")
+    boss = login(_harness, "boss@legalsoft.com").json()["user"]
+    assert boss["is_geo_only"] is False and boss["is_creator"] is True
+
+
+def test_the_geo_only_flag_is_derived_not_carried_in_the_token(_harness, monkeypatch):
+    """A scope in the token would outlive its own revocation by seven days.
+
+    The direction that matters is scoping someone DOWN: that has to bite on the
+    next request, not next week. ``create_token`` therefore stamps no scope
+    claim, and ``get_current_user`` re-derives it from the email claim — the
+    same reasoning as the geo-editor test above, one step more load-bearing
+    because this one takes access away.
+    """
+    import jwt as pyjwt
+
+    monkeypatch.setattr(settings, "geo_only_emails", "scoped@legalsoft.com")
+    monkeypatch.setattr(settings, "creator_emails", "")
+    monkeypatch.setattr(settings, "admin_emails", "")
+
+    body = login(_harness, "scoped@legalsoft.com").json()
+    assert body["user"]["is_geo_only"] is True
+
+    claims = pyjwt.decode(body["token"], settings.jwt_secret, algorithms=["HS256"])
+    assert "geo_only" not in claims and "is_geo_only" not in claims
+
+
 #: The GEO editors on outside domains, admitted one address at a time.
 EXTERNAL_GEO_EDITORS = {
     "lynie.t@aivirtual.com",

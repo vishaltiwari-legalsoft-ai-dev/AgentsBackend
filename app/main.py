@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -31,6 +31,7 @@ from app.routers import (
     runs,
     seo_geo,
 )
+from app.scopes import deny_outside_geo
 from app.services.gd_brand_source import firestore_spec_source
 from graphics_designer_agent import registry as gd_registry
 # Imported after the routers so the agent roots app/__init__ registers are
@@ -40,7 +41,30 @@ from marketing_research_agent import snapshots as mr_snapshots
 
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="AgentOS API", version="1.0.0")
+
+def doc_urls(app_env: str) -> dict[str, str | None]:
+    """Where (and whether) the interactive API docs are served.
+
+    ``/openapi.json``, ``/docs`` and ``/redoc`` are FastAPI defaults and were
+    live and completely unauthenticated in production: a plain GET returned the
+    full schema — 162 paths, every parameter and every response model — to
+    anyone who asked. That is a map of the service handed to whoever wants one,
+    and Cloud Run serves this API ``--allow-unauthenticated``, so "whoever" is
+    the internet.
+
+    A function rather than three inline conditionals because the routes are not
+    ``APIRoute`` objects: the tenancy ledger's scan skips them structurally
+    (``test_route_tenancy_conformance._live_routes``), so the decision has to be
+    pinnable somewhere, and this is somewhere. ``development`` only, matching
+    the same fail-secure default ``app_env`` already uses for exception text —
+    an unset or misspelt ``APP_ENV`` means docs OFF, never on.
+    """
+    if app_env != "development":
+        return {"docs_url": None, "redoc_url": None, "openapi_url": None}
+    return {"docs_url": "/docs", "redoc_url": "/redoc", "openapi_url": "/openapi.json"}
+
+
+app = FastAPI(title="AgentOS API", version="1.0.0", **doc_urls(settings.app_env))
 
 app.add_middleware(
     CORSMiddleware,
@@ -125,7 +149,13 @@ for router in (
     runs,
     issues,
 ):
-    app.include_router(router.router, prefix="/api")
+    # The audience wall goes on at INCLUDE time, for every router, which is the
+    # only placement where a route added tomorrow is walled off by default. Per
+    # handler it would be a thing to remember, and "GEO panel only" already
+    # failed once by being a thing to remember. See app/scopes.py.
+    app.include_router(
+        router.router, prefix="/api", dependencies=[Depends(deny_outside_geo)]
+    )
 
 # Firestore-backed brands become available to the Graphics Designer registry
 # once GD_DYNAMIC_BRANDS=1 (see graphics_designer_agent.registry._registry).

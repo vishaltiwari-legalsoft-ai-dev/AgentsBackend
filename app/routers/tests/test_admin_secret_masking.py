@@ -44,6 +44,21 @@ def test_keys_written_outside_runtime_config_are_masked():
         assert admin._is_sensitive_key(field), f"{field} is rendered in full"
 
 
+def test_a_secret_stored_as_a_list_is_masked_too():
+    """The list branch used to drop ``key=``, so every element was sanitised as
+    if it had no field name at all — and ``_is_sensitive_key("")`` is False, so
+    a rotated key pair or a token array came back to the admin table in full.
+    The dict branch beside it always carried the name down; this one did not.
+    """
+    row = admin._sanitize(
+        {"openrouter_api_key": [SECRET, SECRET], "models": ["opus", "sonnet"]}
+    )
+    assert row["openrouter_api_key"] == [admin._mask(SECRET), admin._mask(SECRET)]
+    assert SECRET not in str(row["openrouter_api_key"])
+    # and the name still has to be a sensitive one — this must not mask the world
+    assert row["models"] == ["opus", "sonnet"]
+
+
 def test_sanitize_masks_nested_secrets_in_a_document():
     row = admin._sanitize(
         {

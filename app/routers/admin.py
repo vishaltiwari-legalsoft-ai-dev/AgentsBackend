@@ -520,7 +520,12 @@ def _sanitize(value, *, key: str = ""):
     if isinstance(value, dict):
         return {k: _sanitize(v, key=k) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_sanitize(v) for v in value]
+        # ``key=key`` carries the field name INTO the list, exactly as the dict
+        # branch above carries it into each value. Without it a secret stored as
+        # a list — a rotated ``api_keys: [...]``, a ``tokens`` array — came back
+        # to the admin table in full, because ``_is_sensitive_key("")`` is False
+        # and the masking test never ran on the elements.
+        return [_sanitize(v, key=key) for v in value]
     if isinstance(value, str) and len(value) > _MAX_CELL_CHARS:
         return f"{value[:_MAX_CELL_CHARS]}… (+{len(value) - _MAX_CELL_CHARS} chars)"
     if isinstance(value, (str, int, float, bool)) or value is None:
