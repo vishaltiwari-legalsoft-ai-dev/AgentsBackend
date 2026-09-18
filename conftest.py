@@ -34,6 +34,7 @@ import pytest
 os.environ.setdefault("MR_OFFLINE", "1")
 os.environ.setdefault("SEO_OFFLINE", "1")
 os.environ.setdefault("BLOG_OFFLINE", "1")
+os.environ.setdefault("INBOX_OFFLINE", "1")
 
 # Which agent each test belongs to, derived from its path. Keep the fragments
 # lowercase — they are matched against a lowercased, forward-slashed path.
@@ -43,6 +44,7 @@ _AGENT_MARKERS = (
     ("agents/seo geo agent", "seo"),
     ("agents/final geo agent", "geo"),
     ("agents/blog writer agent", "blog"),
+    ("agents/inbox triage agent", "inbox"),
 )
 
 

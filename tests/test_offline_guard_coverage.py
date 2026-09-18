@@ -24,7 +24,7 @@ import pytest
 # --------------------------------------------------------------------------- #
 
 def test_the_agent_offline_flags_are_on_for_every_test():
-    for flag in ("MR_OFFLINE", "SEO_OFFLINE", "BLOG_OFFLINE"):
+    for flag in ("MR_OFFLINE", "SEO_OFFLINE", "BLOG_OFFLINE", "INBOX_OFFLINE"):
         assert os.environ.get(flag) == "1", f"{flag} is not set for this run"
 
 
@@ -122,6 +122,7 @@ def test_mr_offline_stops_the_sheets_export_fetchers(monkeypatch):
     import httpx
 
     import google.auth
+    from app.services import google_http
     from marketing_research_agent.sources import sheets_source as ss
 
     class _FakeCreds:
@@ -129,7 +130,7 @@ def test_mr_offline_stops_the_sheets_export_fetchers(monkeypatch):
         token = "fake-token"
 
     monkeypatch.setattr(google.auth, "default", lambda scopes=None: (_FakeCreds(), "p"))
-    monkeypatch.setattr(ss, "_creds_cache", {})
+    monkeypatch.setattr(google_http, "_creds_cache", {})
     monkeypatch.setenv("MR_OFFLINE", "1")
 
     attempted: list[str] = []

@@ -139,6 +139,23 @@ CRON_REGISTRY: tuple[dict[str, Any], ...] = (
         ),
         "expected": {"cron": "*/15 * * * *", "timezone": "America/Los_Angeles"},
     },
+    {
+        "id": "inbox-poll-5min",
+        "agent_id": "a12",
+        "name": "Inbox poll",
+        "endpoint": "POST /api/inbox/cron/poll",
+        "purpose": (
+            "Reads the recruiter's new Gmail inbox mail, classifies each "
+            "message and adds one row per message to her sheet, then works "
+            "through the 90-day backfill with whatever budget is left."
+        ),
+        "why_time": (
+            "Every five minutes, so a mail with a same-day deadline is on the "
+            "sheet within minutes of arriving, and each fire stays small "
+            "enough to finish inside the scheduler's attempt deadline."
+        ),
+        "expected": {"cron": "*/5 * * * *", "timezone": "Asia/Kolkata"},
+    },
 )
 
 

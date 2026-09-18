@@ -147,6 +147,19 @@ def is_geo_only(email: str) -> bool:
     return email.lower() in settings.geo_only_email_set
 
 
+def is_inbox_user(email: str) -> bool:
+    """May connect THEIR OWN Gmail inbox to the Inbox Triage agent (a12).
+
+    Unlike ``is_admin`` and ``is_geo_editor``, Creators are NOT included. Those
+    two guard admin surfaces, where "the people who could already do this keep
+    doing it" holds. This one guards a mailbox: the grant reads one named
+    person's mail, and ``INBOX_TRIAGE_EMAILS`` is the complete statement of
+    whose. An owner who wants their own inbox triaged is added by name like
+    anyone else — there is no implied member of this list.
+    """
+    return email.lower() in settings.inbox_triage_email_set
+
+
 def create_token(
     user_id: str, email: str, session_id: str | None = None, timezone: str = "UTC"
 ) -> str:
@@ -250,6 +263,10 @@ def get_current_user(
         # that matters most is the one where scoping someone DOWN has to take
         # effect on the next request rather than next week.
         geo_only = is_geo_only(email)
+        # Same reasoning again: derived per request, never stamped, so
+        # removing the address from INBOX_TRIAGE_EMAILS takes effect on the
+        # next request and not when a 7-day token happens to expire.
+        inbox_user = is_inbox_user(email)
     except Exception as exc:  # noqa: BLE001 — cannot evaluate the role config
         # Fail closed, exactly as above: a role check that cannot run is not a
         # grant. 503 because the token may be fine; the server is not.
@@ -266,6 +283,7 @@ def get_current_user(
         "is_creator": creator,
         "is_geo_editor": geo_editor,
         "is_geo_only": geo_only,
+        "is_inbox_user": inbox_user,
         "session_id": payload.get("sid") or "",
         "timezone": payload.get("tz") or "UTC",
     }
@@ -345,5 +363,23 @@ def require_geo_editor(
     if not user.get("is_geo_editor"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="GEO editor only"
+        )
+    return user
+def require_inbox_user(
+    user: dict[str, object] = Depends(get_current_user),
+) -> dict[str, object]:
+    """Inbox Triage guard — the routes that connect, configure and disconnect
+    one person's Gmail inbox.
+
+    Reads the ONE flag ``get_current_user`` derived, exactly as
+    ``require_geo_editor`` does, and for the same reasons: the sign-in
+    allowlist runs first, and there is one place that decides who holds the
+    role. ``GET /api/inbox/status`` deliberately does not use this guard — it
+    answers ``enabled: false`` to everyone else so the console can render the
+    panel's "not for this account" state without a 403 to swallow.
+    """
+    if not user.get("is_inbox_user"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Inbox Triage user only"
         )
     return user

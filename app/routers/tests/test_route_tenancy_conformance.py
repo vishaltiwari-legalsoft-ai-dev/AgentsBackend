@@ -66,7 +66,7 @@ from app.scopes import (
 )
 from app.security import (
     create_token, get_current_user, require_admin, require_creator,
-    require_geo_editor,
+    require_geo_editor, require_inbox_user,
 )
 
 # --------------------------------------------------------------------------- #
@@ -107,6 +107,18 @@ CREATOR_ONLY = "CREATOR_ONLY"
 #: existing label with room in it.
 GEO_EDITOR_ONLY = "GEO_EDITOR_ONLY"
 
+#: Behind ``require_inbox_user``: the Inbox Triage agent's connect, sheet and
+#: disconnect routes, open to the named addresses in ``INBOX_TRIAGE_EMAILS``
+#: and — unlike every other role here — NOT to Creators. The role reads one
+#: person's mailbox, so the list is the whole statement of whose. Same reason
+#: for a label of its own as GEO_EDITOR_ONLY: these routes are narrower than
+#: "any signed-in caller", and filing them under WORKSPACE_SHARED would read
+#: in the diff as growth of the un-gated surface, which is the opposite of
+#: what they are. ``GET /api/inbox/status`` is deliberately not in this group:
+#: it answers ``enabled: false`` to everyone outside the list and reads only
+#: the caller's own document, so it is TENANT_SCOPED.
+INBOX_USER_ONLY = "INBOX_USER_ONLY"
+
 #: No FastAPI auth dependency, but guarded *inside the handler* by a shared
 #: secret compared with :func:`hmac.compare_digest`. A dependency-graph scan
 #: alone would call these unauthenticated, which is why
@@ -126,6 +138,7 @@ _AUTHENTICATED = {
     ADMIN_ONLY,
     CREATOR_ONLY,
     GEO_EDITOR_ONLY,
+    INBOX_USER_ONLY,
 }
 
 # --------------------------------------------------------------------------- #
@@ -204,8 +217,18 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("POST", "/api/geo/brands/{brand_id}/prompts/generate"): (GEO_EDITOR_ONLY, EXTERNAL_OK),
     ("POST", "/api/geo/brands/{brand_id}/rescan"): (GEO_EDITOR_ONLY, EXTERNAL_OK),
     ("POST", "/api/geo/brands/{brand_id}/strategy/generate"): (GEO_EDITOR_ONLY, EXTERNAL_OK),
+    # --- the Inbox Triage agent, open to the named inbox owner(s) ---------- #
+    # Every one of these reads and writes ``inbox_triage/{caller's user id}``
+    # and nothing else; the Gmail grant, the sheet reference and the
+    # disconnect all belong to the caller. Added 2026-09-18 with the agent.
+    ("POST", "/api/inbox/disconnect"): (INBOX_USER_ONLY, INTERNAL_ONLY),
+    ("POST", "/api/inbox/oauth/complete"): (INBOX_USER_ONLY, INTERNAL_ONLY),
+    ("POST", "/api/inbox/oauth/start"): (INBOX_USER_ONLY, INTERNAL_ONLY),
+    ("PUT", "/api/inbox/sheet"): (INBOX_USER_ONLY, INTERNAL_ONLY),
+    ("POST", "/api/inbox/sheet/check"): (INBOX_USER_ONLY, INTERNAL_ONLY),
     # --- scheduled jobs, guarded by a shared secret in the handler --------- #
     ("POST", "/api/geo/cron/poll"): (CRON_SECRET, INTERNAL_ONLY),
+    ("POST", "/api/inbox/cron/poll"): (CRON_SECRET, INTERNAL_ONLY),
     ("POST", "/api/mr/cron/refresh"): (CRON_SECRET, INTERNAL_ONLY),
     ("POST", "/api/seo-geo/cron/run"): (CRON_SECRET, INTERNAL_ONLY),
     # --- public by design -------------------------------------------------- #
@@ -275,6 +298,11 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("POST", "/api/gd/runs/{run_id}/suggest-placement"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("POST", "/api/gd/runs/{run_id}/text-preview"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("POST", "/api/gd/runs/{run_id}/tweak"): (TENANT_SCOPED, INTERNAL_ONLY),
+    # The Inbox Triage panel's one read. Any signed-in caller may ask; the
+    # answer is ``enabled: false`` with empty fields unless the caller's
+    # address is in INBOX_TRIAGE_EMAILS, and for one that is, it reads the
+    # document keyed by the caller's own user id and never another.
+    ("GET", "/api/inbox/status"): (TENANT_SCOPED, INTERNAL_ONLY),
     # The board report. Every read it makes goes through ``_load_dataset(user["id"])``,
     # which queries ``mr_runs`` filtered on ``user_id`` server-side; the run it
     # writes is stamped with the same id, and the idempotency lookup that may
@@ -524,6 +552,9 @@ _AUTH_GUARDS = {
     # the GEO_EDITOR_ONLY label below would be an unchecked assertion about a
     # guard nothing could see.
     require_geo_editor: "geo_editor",
+    # Same reasoning: without it an INBOX_USER_ONLY route would walk out as a
+    # plain ``{"user"}`` route and the label would be checked by nothing.
+    require_inbox_user: "inbox_user",
 }
 
 
@@ -671,6 +702,15 @@ def test_classifications_match_the_real_dependency_graph() -> None:
                     f"{method} {route.path}: {label} but sits behind "
                     "require_geo_editor — classify it GEO_EDITOR_ONLY"
                 )
+            elif label == INBOX_USER_ONLY and "inbox_user" not in guards:
+                wrong.append(
+                    f"{method} {route.path}: INBOX_USER_ONLY but no require_inbox_user"
+                )
+            elif label != INBOX_USER_ONLY and "inbox_user" in guards:
+                wrong.append(
+                    f"{method} {route.path}: {label} but sits behind "
+                    "require_inbox_user — classify it INBOX_USER_ONLY"
+                )
     assert not wrong, "Ledger disagrees with the dependency graph:\n  " + "\n  ".join(wrong)
 
 
@@ -803,7 +843,7 @@ _CREATOR = "owner@legalsoft.com"
 
 #: Tenancy labels whose own guard answers 403 to a non-role-holder, so a 403
 #: there does not by itself prove the scope wall ran.
-_ROLE_GATED = {ADMIN_ONLY, CREATOR_ONLY, GEO_EDITOR_ONLY}
+_ROLE_GATED = {ADMIN_ONLY, CREATOR_ONLY, GEO_EDITOR_ONLY, INBOX_USER_ONLY}
 
 
 @pytest.fixture()

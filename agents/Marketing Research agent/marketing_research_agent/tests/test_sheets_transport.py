@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.services import google_http
 from marketing_research_agent.sources import sheets_source as ss
 
 
@@ -41,7 +42,9 @@ def stub_adc(monkeypatch):
     import google.auth
 
     monkeypatch.setattr(google.auth, "default", fake_default)
-    monkeypatch.setattr(ss, "_creds_cache", {})
+    # The cache lives in the shared transport module since 2026-09-18;
+    # ``ss`` re-exports the functions, not the dict.
+    monkeypatch.setattr(google_http, "_creds_cache", {})
     return calls
 
 

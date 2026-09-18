@@ -28,6 +28,8 @@ def get_llm(
     fast: bool = False,
     model: str | None = None,
     agent_id: str | None = None,
+    timeout: float = 120,
+    max_tokens: int | None = None,
 ) -> ChatOpenAI:
     """LangChain chat model backed by OpenRouter.
 
@@ -35,7 +37,14 @@ def get_llm(
     ``fast=True`` selects the cheap parsing model and the default is the
     high-end reasoning model. ``agent_id`` resolves the creator's per-agent
     model override first (agent → global → env); without it the global
-    default applies."""
+    default applies.
+
+    ``timeout`` and ``max_tokens`` exist for callers that make MANY small
+    calls inside one budgeted request (Inbox Triage classifies one email per
+    call, ~70 tokens back, inside a cron fire): the 120s default is right for
+    a long reasoning turn and wrong for a classifier, where two hung calls
+    would eat the whole fire. Both keep the previous behaviour when omitted.
+    """
     resolved = model or runtime_config.get_for_agent(
         agent_id, "openrouter_fast_model" if fast else "openrouter_model"
     )
@@ -45,8 +54,9 @@ def get_llm(
         base_url=settings.openrouter_base_url,
         default_headers=_default_headers(),
         temperature=temperature,
-        timeout=120,
+        timeout=timeout,
         max_retries=2,
+        max_tokens=max_tokens,
     )
 
 

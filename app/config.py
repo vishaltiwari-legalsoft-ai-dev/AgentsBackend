@@ -133,6 +133,23 @@ class Settings(BaseSettings):
         "franceska@aianswering.ai"
     )
 
+    # --- Inbox Triage (a12) ------------------------------------------------
+    # Its OWN Google OAuth client, not the shared Web client above. The shared
+    # client's consent screen also signs in four contractor accounts outside
+    # the Workspace, so it can never become an Internal app — and an Internal
+    # consent screen is what lets one recruiter grant ``gmail.readonly``
+    # without a verification review. A second GCP project owns this client.
+    inbox_google_client_id: str = ""
+    inbox_google_client_secret: str = ""
+    # Comma-separated addresses whose Gmail inbox may be connected — one
+    # recruiter today. Parsed like every list above. Creators are NOT implied
+    # (see ``security.is_inbox_user``): this is a mailbox, not an admin surface.
+    inbox_triage_emails: str = ""
+    # Fernet key that seals the stored Gmail refresh token. Generate it with
+    # ``python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"``.
+    # Empty = connecting is refused with 503; a token is never stored in the clear.
+    inbox_token_key: str = ""
+
     # OpenRouter (agent LLM + image generation)
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
@@ -242,6 +259,16 @@ class Settings(BaseSettings):
         other roles, so one place decides and one place explains.
         """
         return {e.strip().lower() for e in self.geo_only_emails.split(",") if e.strip()}
+
+    @property
+    def inbox_triage_email_set(self) -> set[str]:
+        """Addresses allowed to connect a Gmail inbox to Inbox Triage (a12).
+
+        Parsed exactly like ``geo_editor_email_set``. No role implication is
+        folded in here — ``security.is_inbox_user`` decides, and it decides
+        that nobody is implied.
+        """
+        return {e.strip().lower() for e in self.inbox_triage_emails.split(",") if e.strip()}
 
     @property
     def allowed_email_domain_set(self) -> set[str]:

@@ -177,6 +177,18 @@ AGENTS: list[dict[str, str | bool | list[str]]] = [
         # itself goes to the providers' own APIs, not OpenRouter.
         "fields": ["openrouter_fast_model"],
     },
+    {
+        "id": "a12",
+        "name": "Inbox Triage",
+        "role": "Gmail to a sheet, read-only",
+        "category": "ops",
+        "live": True,
+        # One classification call per email through
+        # inbox_triage_agent.summarise (agent_id="a12") — parsing-grade work,
+        # so the fast model is the only dropdown. Default
+        # anthropic/claude-haiku-4.5 is in TEXT_MODELS above.
+        "fields": ["openrouter_fast_model"],
+    },
 ]
 
 AGENT_IDS = {str(a["id"]) for a in AGENTS}

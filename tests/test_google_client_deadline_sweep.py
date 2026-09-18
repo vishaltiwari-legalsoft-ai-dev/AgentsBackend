@@ -180,6 +180,10 @@ _DEADLINES = [
     ("marketing_research_agent.sources.sheets_source", "AUTH_TIMEOUT_SECONDS"),
     ("marketing_research_agent.sources.sheets_source", "EXPORT_TIMEOUT_SECONDS"),
     ("seo_geo_agent.sources", "GOOGLE_API_TIMEOUT_SECONDS"),
+    ("app.services.google_http", "AUTH_TIMEOUT_SECONDS"),
+    ("inbox_triage_agent.gmail_client", "GMAIL_TIMEOUT_SECONDS"),
+    ("inbox_triage_agent.sheet_writer", "SHEETS_TIMEOUT_SECONDS"),
+    ("inbox_triage_agent.sheet_writer", "DRIVE_TIMEOUT_SECONDS"),
 ]
 
 

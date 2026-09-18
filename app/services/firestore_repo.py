@@ -832,3 +832,169 @@ def set_agent_config(agent_id: str, patch: dict[str, Any]) -> dict[str, Any]:
             agent_cfg[field] = value
     agents[agent_id] = agent_cfg
     return set_app_config({"agents": agents})
+# --------------------------------------------------------------------------- #
+# Inbox Triage (a12) — one connection document per user, one tracking
+# document per message
+# --------------------------------------------------------------------------- #
+# ``inbox_triage/{user_id}`` is the record and the checkpoint for one person's
+# Gmail connection: the sealed refresh token, the history checkpoint, the
+# backfill cursor, the sheet reference and every number the panel shows
+# (counters and a rolling day of fires). One document, keyed by the user id,
+# so status is ONE read with no query and no index — and no doc id string is
+# ever assembled anywhere but here.
+#
+# ``inbox_triage_messages/{user_id}__{message_id}`` tracks a message only for
+# retries: a row the model could not read is written as ``needs_review`` and
+# re-asked on later fires until ``retry_due`` goes false. Every read here is
+# equality-only (``user_id ==``, ``retry_due ==``) on purpose: Firestore
+# serves that from single-field indexes, so nothing in this section needs an
+# entry in ``firestore.indexes.json``. No mail body is ever stored.
+
+INBOX_CONNECTIONS = "inbox_triage"
+INBOX_MESSAGES = "inbox_triage_messages"
+
+
+def get_inbox_connection(user_id: str) -> Optional[dict[str, Any]]:
+    doc = _db().collection(INBOX_CONNECTIONS).document(user_id).get()
+    return doc.to_dict() if doc.exists else None
+
+
+def save_inbox_connection(
+    user_id: str, patch: dict[str, Any], *, clear: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    """Merge ``patch`` into the user's connection document and return the fresh
+    state. Fields named in ``clear`` are deleted — that is how a disconnect
+    removes the sealed token without the caller importing a Firestore sentinel.
+    Firestore's merge is per key and nests, so callers write whole sub-maps
+    (``gmail``, ``backfill``, ``last_poll``) rather than single leaves."""
+    payload: dict[str, Any] = dict(patch)
+    for field in clear:
+        payload[field] = firestore.DELETE_FIELD
+    payload["user_id"] = user_id
+    payload["updated_at"] = _now()
+    _db().collection(INBOX_CONNECTIONS).document(user_id).set(payload, merge=True)
+    return get_inbox_connection(user_id) or {}
+
+
+def delete_inbox_connection(user_id: str) -> None:
+    _db().collection(INBOX_CONNECTIONS).document(user_id).delete()
+
+
+def list_connected_inbox_user_ids() -> list[str]:
+    """User ids whose connection document says Gmail is connected — i.e. the
+    documents that can hold a sealed token (a revoke or a disconnect clears
+    the token and ``gmail.connected`` together). One equality filter on a map
+    subfield: served by the automatic single-field index, no composite entry
+    needed. The cron uses it to find connections of people no longer on
+    ``INBOX_TRIAGE_EMAILS``."""
+    query = _db().collection(INBOX_CONNECTIONS).where(
+        filter=firestore.FieldFilter("gmail.connected", "==", True)
+    )
+    return [str((doc.to_dict() or {}).get("user_id") or doc.id) for doc in query.stream()]
+
+
+def inbox_lease_free(current: Optional[dict[str, Any]], now: datetime) -> bool:
+    """The lease rule, pure so the fake store in the a12 tests applies the SAME
+    rule the transaction does: free when no document, no ``lease_until``, an
+    unparseable one, or one at or before ``now``."""
+    raw = (current or {}).get("lease_until")
+    if not raw:
+        return True
+    try:
+        until = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return True
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    return until <= now
+
+
+def take_inbox_lease(
+    user_id: str, *, now: datetime, until: datetime
+) -> Optional[dict[str, Any]]:
+    """Atomically take the fire lease on ``inbox_triage/{user_id}``: read and
+    write ``lease_until`` inside ONE transaction, so two overlapping fires
+    cannot both read "free" and both proceed (a read-then-``set`` could).
+
+    Returns the document as read inside the transaction, with the new lease,
+    when the lease was taken; ``None`` when another fire holds it or there is
+    no document. Firestore retries the function on contention, and the loser
+    of a race re-reads and sees the winner's lease.
+
+    Semantics against real Firestore were not emulator-tested; the offline
+    tests pin the rule (:func:`inbox_lease_free`) through the a12 fake store."""
+    ref = _db().collection(INBOX_CONNECTIONS).document(user_id)
+    transaction = _db().transaction()
+
+    @firestore.transactional
+    def _apply(txn) -> Optional[dict[str, Any]]:
+        snap = ref.get(transaction=txn)
+        if not snap.exists:
+            return None
+        current = snap.to_dict() or {}
+        if not inbox_lease_free(current, now):
+            return None
+        stamp = {"lease_until": until.isoformat(), "updated_at": _now()}
+        txn.update(ref, stamp)
+        return {**current, **stamp}
+
+    return _apply(transaction)
+
+
+def inbox_message_doc_id(user_id: str, message_id: str) -> str:
+    return f"{user_id}__{message_id}"
+
+
+def list_inbox_messages(
+    user_id: str, *, retry_due: Optional[bool] = None
+) -> list[dict[str, Any]]:
+    """The user's per-message tracking rows, optionally only the ones a later
+    fire should re-ask. Equality filters only — see the section note."""
+    query = _db().collection(INBOX_MESSAGES).where(
+        filter=firestore.FieldFilter("user_id", "==", user_id)
+    )
+    if retry_due is not None:
+        query = query.where(filter=firestore.FieldFilter("retry_due", "==", retry_due))
+    return [doc.to_dict() for doc in query.stream()]
+
+
+def save_inbox_messages(user_id: str, docs: dict[str, dict[str, Any]]) -> int:
+    """Upsert ``{message_id: fields}`` in batches of 400. Every doc is stamped
+    with the user id and the message id so the equality reads above hold."""
+    written = 0
+    batch = _db().batch()
+    batch_size = 0
+    collection = _db().collection(INBOX_MESSAGES)
+    for message_id, fields in docs.items():
+        payload = {**fields, "user_id": user_id, "message_id": message_id, "updated_at": _now()}
+        batch.set(collection.document(inbox_message_doc_id(user_id, message_id)), payload, merge=True)
+        batch_size += 1
+        written += 1
+        if batch_size >= 400:
+            batch.commit()
+            batch = _db().batch()
+            batch_size = 0
+    if batch_size > 0:
+        batch.commit()
+    return written
+
+
+def delete_inbox_messages(user_id: str) -> int:
+    """Delete every tracking row of one user (a disconnect). Returns the count."""
+    query = _db().collection(INBOX_MESSAGES).where(
+        filter=firestore.FieldFilter("user_id", "==", user_id)
+    )
+    deleted = 0
+    batch = _db().batch()
+    batch_size = 0
+    for doc in query.stream():
+        batch.delete(doc.reference)
+        batch_size += 1
+        deleted += 1
+        if batch_size >= 400:
+            batch.commit()
+            batch = _db().batch()
+            batch_size = 0
+    if batch_size > 0:
+        batch.commit()
+    return deleted
