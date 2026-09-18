@@ -15,9 +15,11 @@ One fire, in order:
 3. **New mail first**: history since the checkpoint (or, when Gmail no longer
    holds that history, a re-listing of the last day), fetched, summarised,
    collected as rows.
-4. Then the ``needs_review`` rows due for another try, then the **backfill**
-   with whatever budget is left: the 90-day inbox listing newest-first, up to
-   200 messages per fire, skipping ids already on the sheet.
+4. Then the ``needs_review`` rows due for another try, then — once per
+   sheet, until done — the **re-triage** of rows written before the Action
+   column existed (up to 50 per fire), then the **backfill** with whatever
+   budget is left: the 90-day inbox listing newest-first, up to 200 messages
+   per fire, skipping ids already on the sheet.
 5. Write: one append for the new rows, one batch update for the retried rows.
 6. Only then persist: per-message tracking, the counters, ``last_poll`` and
    the new checkpoint.
@@ -48,7 +50,7 @@ from . import gmail_client, gmail_oauth, sheet_writer, summarise, user_label
 from .gmail_client import GmailUnavailable, HistoryExpired, MessageGone
 from .gmail_oauth import ExchangeFailed, RevokedGrant, TokenKeyMissing, TokenRefreshFailed
 from .sheet_layout import RowFacts, agent_values, parse_sheet_ref, sheet_url
-from .sheet_writer import CHECK_MR_SOURCE, CHECK_OK, SheetCheck, SheetsUnavailable
+from .sheet_writer import CHECK_MR_SOURCE, CHECK_OK, LayoutMismatch, SheetCheck, SheetsUnavailable
 from .summarise import ModelCallFailed, ModelUnavailable
 from .triage import NEEDS_REVIEW, Rejected, Verdict
 
@@ -62,6 +64,15 @@ BACKFILL_PER_FIRE = 200
 RETRIES_PER_FIRE = 50
 #: Later fires a ``needs_review`` message is re-asked on.
 MAX_RETRIES = 3
+#: Old rows (written before the Action column) one fire re-triages. The
+#: re-triage runs once per sheet: 83 rows on the first live sheet is two
+#: fires and ~83 fast-model calls.
+RETRIAGE_PER_FIRE = 50
+#: Ids the re-triage gave up on (gone, or unreadable) are remembered so no
+#: fire asks again; bounded so the document cannot grow without limit.
+RETRIAGE_SKIP_CAP = 1000
+RETRIAGE_RUNNING = "running"
+RETRIAGE_DONE = "done"
 #: Consecutive model-call failures that mean "the model is down", not "this
 #: email is odd" — the fire is abandoned before anything is written.
 MODEL_FAILURE_TRIP = 3
@@ -167,7 +178,12 @@ def set_sheet(user_id: str, ref: str, *, email: str) -> dict:
     spreadsheet_id = parse_sheet_ref(ref)
     if not spreadsheet_id:
         raise ValueError("That does not look like a Google Sheet link or id.")
-    return _check_and_store(user_id, spreadsheet_id, email=email)
+    # A sheet set (or set again) by hand gets its own re-triage pass: it may
+    # be an older sheet whose rows predate the Action column.
+    return _check_and_store(
+        user_id, spreadsheet_id, email=email,
+        extra={"retriage": {"state": RETRIAGE_RUNNING, "skipped": []}},
+    )
 
 
 def recheck_sheet(user_id: str, *, email: str) -> dict:
@@ -197,7 +213,9 @@ def is_mr_sheet(spreadsheet_id: str) -> bool:
         ) from exc
 
 
-def _check_and_store(user_id: str, spreadsheet_id: str, *, email: str) -> dict:
+def _check_and_store(
+    user_id: str, spreadsheet_id: str, *, email: str, extra: dict | None = None
+) -> dict:
     """MR's sheets are refused before Google is asked anything; every other
     sheet goes through ``sheet_writer.check``, which proves the caller owns
     or edits it before its first write. ``checked_for`` records whose
@@ -215,6 +233,7 @@ def _check_and_store(user_id: str, spreadsheet_id: str, *, email: str) -> dict:
             "checked_at": _iso(_utcnow()),
             "checked_for": str(email or "").strip().lower(),
         },
+        **(extra or {}),
     })
     return _activate_backfill(user_id, doc)
 
@@ -377,6 +396,7 @@ class FireReport:
     error: str | None = None
     new_rows: int = 0
     retried_rows: int = 0
+    retriaged_rows: int = 0
     messages_read: int = 0
     needs_review_added: int = 0
     backfill_state: str | None = None
@@ -413,6 +433,7 @@ class _Work:
     messages_read: int = 0
     needs_review_added: int = 0
     recovered: int = 0
+    retriaged: int = 0
     model_failures: int = 0
     unreached: bool = False
 
@@ -460,7 +481,7 @@ def _facts(message: gmail_client.Message, verdict: Verdict | Rejected) -> RowFac
         return RowFacts(
             message_id=message.id, received_at=message.received_at, sender=message.from_,
             subject=message.subject, category=verdict.category, summary=verdict.summary,
-            deadline=verdict.deadline,
+            deadline=verdict.deadline, action=verdict.action,
         )
     return RowFacts(
         message_id=message.id, received_at=message.received_at, sender=message.from_,
@@ -553,7 +574,11 @@ def _fire_leased(
     sheets = sheet_writer.service()
     spreadsheet_id = str(sheet["id"])
     work = _Work(user_id=user_id, gmail=gmail, llm=llm, deadline=deadline - WRITE_RESERVE_SECONDS)
-    work.id_map = sheet_writer.id_rows(spreadsheet_id, svc=sheets)
+    id_map = _read_id_map(user_id, spreadsheet_id, sheets, email=email)
+    if id_map is None:
+        report.skipped = "sheet check: set-up did not pass"
+        return
+    work.id_map = id_map
 
     # 3. new mail first
     new_ids, new_history_id = _new_mail_ids(gmail, doc, now)
@@ -574,7 +599,12 @@ def _fire_leased(
     due = firestore_repo.list_inbox_messages(user_id, retry_due=True)[:RETRIES_PER_FIRE]
     _retry(work, due, now)
 
-    # 4b. the backfill, with what is left
+    # 4b. rows from before the Action column, once per sheet
+    retriage = dict(doc.get("retriage") or {"state": RETRIAGE_RUNNING, "skipped": []})
+    if retriage.get("state") != RETRIAGE_DONE:
+        _retriage(work, retriage, spreadsheet_id, sheets)
+
+    # 4c. the backfill, with what is left
     backfill = dict(doc.get("backfill") or _fresh_backfill(now))
     if backfill.get("state", BACKFILL_NOT_STARTED) == BACKFILL_NOT_STARTED:
         backfill["state"] = BACKFILL_RUNNING
@@ -591,15 +621,15 @@ def _fire_leased(
 
     # 6. persist — tracking rows, counters, the poll, the checkpoint
     _persist(
-        user_id, doc, work, backfill=backfill, row_numbers=row_numbers,
+        user_id, doc, work, backfill=backfill, retriage=retriage, row_numbers=row_numbers,
         checkpoint=new_history_id if checkpoint_advances else None, now=now,
     )
     _fill_report(report, work, backfill)
 
 
 def _persist(
-    user_id: str, doc: dict, work: _Work, *, backfill: dict, row_numbers: list[int],
-    checkpoint: str | None, now: datetime,
+    user_id: str, doc: dict, work: _Work, *, backfill: dict, retriage: dict,
+    row_numbers: list[int], checkpoint: str | None, now: datetime,
 ) -> None:
     """Step 6, after the sheet has the rows: what the next fire and the panel
     read. ``checkpoint`` is ``None`` when the new-mail pass was cut short, so
@@ -617,6 +647,7 @@ def _persist(
         recent.append({"at": _iso(now), "rows": len(work.new_rows)})
     patch: dict = {
         "backfill": backfill,
+        "retriage": retriage,
         "needs_review": max(
             0, int(doc.get("needs_review") or 0) + work.needs_review_added - work.recovered
         ),
@@ -632,7 +663,8 @@ def _persist(
 
 def _fill_report(report: FireReport, work: _Work, backfill: dict) -> None:
     report.new_rows = len(work.new_rows)
-    report.retried_rows = len(work.updated_rows)
+    report.retried_rows = len(work.updated_rows) - work.retriaged
+    report.retriaged_rows = work.retriaged
     report.messages_read = work.messages_read
     report.needs_review_added = work.needs_review_added
     report.backfill_state = backfill.get("state")
@@ -655,6 +687,25 @@ def _ensure_sheet_checked(user_id: str, doc: dict, now: datetime, *, email: str)
     if sheet.get("check") == CHECK_OK and not stale and same_caller:
         return doc
     return _check_and_store(user_id, str(sheet["id"]), email=email)
+
+
+def _read_id_map(user_id: str, spreadsheet_id: str, sheets, *, email: str) -> dict[str, int] | None:
+    """The id → row map, read with row 1. A header that is not the current
+    layout — the first fire after the Action column shipped, on a sheet set
+    up before it — is not written into: set-up runs once more (the full
+    check, ownership included, which migrates a legacy sheet in place) and
+    the map is read again. A second mismatch raises, loudly, with nothing
+    written. ``None`` when the re-check itself did not pass."""
+    try:
+        return sheet_writer.id_rows(spreadsheet_id, svc=sheets)
+    except LayoutMismatch:
+        logger.warning(
+            "a12: the Inbox layout for user %s is not current; re-running set-up", user_label(user_id)
+        )
+    doc = _check_and_store(user_id, spreadsheet_id, email=email)
+    if (doc.get("sheet") or {}).get("check") != CHECK_OK:
+        return None
+    return sheet_writer.id_rows(spreadsheet_id, svc=sheets)
 
 
 def _credentials(doc: dict):
@@ -747,6 +798,36 @@ def _retry(work: _Work, due: list[dict], now: datetime) -> None:
             work.updated_rows[row] = facts
             work.recovered += 1
         work.retry_docs[message_id] = _message_doc(facts, attempts=attempts, sheet_row=row)
+
+
+def _retriage(work: _Work, retriage: dict, spreadsheet_id: str, sheets) -> None:
+    """Fill the Action column — and the new categories — on rows written
+    before it existed: every row with a category but no action, found by id
+    through this fire's map, re-read from Gmail and asked again through the
+    same summarise path. A row the model still cannot read, or whose mail is
+    gone, keeps what it had and is remembered in ``skipped`` so no later
+    fire asks again. ``state`` is ``done`` once a pass reaches the end."""
+    skipped = [str(m) for m in retriage.get("skipped") or []]
+    pending = [
+        message_id
+        for message_id in sheet_writer.blank_action_ids(spreadsheet_id, svc=sheets)
+        if message_id not in skipped
+        and message_id in work.id_map
+        and work.id_map[message_id] not in work.updated_rows
+    ]
+    worked = 0
+    for message_id in pending:
+        if worked >= RETRIAGE_PER_FIRE or work.out_of_time():
+            break
+        worked += 1
+        facts = work.triage(message_id)
+        if facts is None or facts.category == NEEDS_REVIEW:
+            skipped.append(message_id)  # the old row stays exactly as it was
+            continue
+        work.updated_rows[work.id_map[message_id]] = facts
+        work.retriaged += 1
+    retriage["skipped"] = skipped[-RETRIAGE_SKIP_CAP:]
+    retriage["state"] = RETRIAGE_DONE if worked == len(pending) else RETRIAGE_RUNNING
 
 
 def _placeholder(message_id: str) -> RowFacts:

@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from app.services.google_http import execute_with_retry, timed_http
 
 from . import refuse_if_offline
-from .triage import INBOX_TZ, html_to_text
+from .triage import TEAM_TIMEZONE, html_to_text
 
 #: Socket deadline for each Gmail call — see ``app.services.google_http``.
 GMAIL_TIMEOUT_SECONDS = 30
@@ -49,7 +49,7 @@ class MessageGone(RuntimeError):
 class Message:
     id: str
     thread_id: str
-    received_at: datetime  # Gmail's internalDate, in Asia/Kolkata
+    received_at: datetime  # Gmail's internalDate, in triage.TEAM_TIMEZONE
     from_: str
     to: str
     date_header: str
@@ -188,9 +188,9 @@ def parse_message(data: dict) -> Message:
     headers = _headers(payload)
     internal_ms = int(data.get("internalDate") or 0)
     received_at = (
-        datetime.fromtimestamp(internal_ms / 1000, tz=timezone.utc).astimezone(INBOX_TZ)
+        datetime.fromtimestamp(internal_ms / 1000, tz=timezone.utc).astimezone(TEAM_TIMEZONE)
         if internal_ms
-        else datetime.now(tz=INBOX_TZ)
+        else datetime.now(tz=TEAM_TIMEZONE)
     )
     return Message(
         id=str(data.get("id") or ""),

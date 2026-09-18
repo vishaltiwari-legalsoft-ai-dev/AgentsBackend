@@ -3,10 +3,17 @@ scope). She shares her sheet with the service account as an editor; the hub
 never holds her Google identity for Sheets.
 
 What this module never does: sort, delete, or write outside the agent's
-columns A:H (the header row is the one exception, written once and repaired
-only in A:H). Her Status and Notes columns and her row order are hers. Rows
+columns A:I (the header row is the one exception, written once and repaired
+only in A:I). Her Status and Notes columns and her row order are hers. Rows
 are found again through the hidden Message ID column — the reconciliation
 key — never by remembered row numbers, because she reorders freely.
+
+One structural write exists: a sheet still in the first release's layout
+(no Action column) gets the column INSERTED in place, with its header, in
+one atomic ``batchUpdate`` — every existing cell, hers included, shifts
+right intact. Nothing is ever appended to a sheet whose row 1 does not
+match the current layout: :func:`id_rows` checks it on every fire and
+raises :class:`LayoutMismatch` instead.
 
 Before the first write to any sheet — and again on every re-check — the hub
 proves the sheet is the CALLER's: Drive metadata, read as the service
@@ -31,9 +38,12 @@ from app.services.google_http import (
 
 from . import offline, refuse_if_offline
 from .sheet_layout import (
-    AGENT_COLUMNS, AGENT_RANGE, COL_MESSAGE_ID, COL_STATUS, HEADERS, INBOX_TAB,
-    MESSAGE_ID_RANGE, STATUS_OPTIONS, UPCOMING_FORMULA, UPCOMING_TAB,
+    AGENT_COLUMNS, AGENT_RANGE, CATEGORY_LABELS, COL_ACTION, COL_CATEGORY, COL_MESSAGE_ID,
+    COL_STATUS, HEADER_CURRENT, HEADER_EMPTY, HEADER_LEGACY, HEADERS, INBOX_HEADER_RANGE,
+    INBOX_TAB, LAST_AGENT_COL, LAST_COL, MESSAGE_ID_RANGE, MIGRATION_INSERTS, STATUS_OPTIONS,
+    UPCOMING_FORMULA, UPCOMING_HEADERS, UPCOMING_TAB, column_letter, header_state, same_formula,
 )
+from .triage import NEEDS_REVIEW
 
 logger = logging.getLogger("agentos.inbox.sheets")
 
@@ -66,6 +76,12 @@ class SheetsUnavailable(RuntimeError):
     is not one of the panel's check words. The message never carries the
     spreadsheet id or a request URL — it reaches ``last_poll`` and the cron
     envelope."""
+
+
+class LayoutMismatch(SheetsUnavailable):
+    """Row 1 of Inbox is not the current layout, so a positional write could
+    land in the wrong columns. Nothing is written; the fire re-runs set-up
+    (which migrates a legacy sheet) and reads again."""
 
 
 class SheetsRefused(SheetsUnavailable):
@@ -256,9 +272,11 @@ def _metadata(spreadsheet_id: str, svc) -> dict:
 def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> None:
     """Idempotent: the two tabs exist, row 1 carries the headers, row 1 is
     frozen, the Message ID column is hidden, Status has its dropdown, and
-    Upcoming!A2 holds the formula view. Re-running changes nothing that is
-    already right; the layout write always happens and is what proves the
-    hub can edit the sheet.
+    Upcoming!A2 holds the current formula view — rewritten whenever what is
+    stored differs, so a drifted view repairs itself on the next check. A
+    legacy Inbox (no Action column) is migrated in place first. Re-running
+    changes nothing that is already right; the layout write always happens
+    and is what proves the hub can edit the sheet.
 
     Raises :class:`SheetsRefused` with the status so :func:`check` can map
     a 403 to ``not_editable``. Only :func:`check` calls this, after the
@@ -285,18 +303,13 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> None:
                 tabs[str(props["title"])] = int(props.get("sheetId") or 0)
 
     inbox_sheet_id = tabs[INBOX_TAB]
-    _run(
-        svc.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"requests": _layout_requests(inbox_sheet_id)},
-        ),
-        what="layout",
-    )
-
+    # Read first: the layout indexes below are for the CURRENT columns, so a
+    # legacy sheet must be migrated in the same batch, ahead of them.
     read = _run(
         svc.spreadsheets().values().batchGet(
             spreadsheetId=spreadsheet_id,
-            ranges=[f"{INBOX_TAB}!A1:J1", f"{UPCOMING_TAB}!A1:J1", f"{UPCOMING_TAB}!A2"],
+            ranges=[INBOX_HEADER_RANGE, f"{UPCOMING_TAB}!A1:Z1", f"{UPCOMING_TAB}!A2"],
+            valueRenderOption="FORMULA",  # A2 is compared as a formula, not its result
         ),
         what="header read",
     )
@@ -305,14 +318,36 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> None:
     upcoming_head = _first_row(ranges[1] if len(ranges) > 1 else {})
     upcoming_a2 = _first_row(ranges[2] if len(ranges) > 2 else {})
 
+    state = header_state(inbox_head)
+    requests: list[dict] = []
+    if state == HEADER_LEGACY:
+        requests += _migration_requests(inbox_sheet_id)
+        logger.warning(
+            "a12: migrating a legacy Inbox layout in place (inserting %s)",
+            ", ".join(name for _, name in MIGRATION_INSERTS),
+        )
+    requests += _layout_requests(inbox_sheet_id)
+    _run(
+        svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}),
+        what="layout",
+    )
+
     header_writes: list[dict] = []
-    if not inbox_head:
-        header_writes.append({"range": f"{INBOX_TAB}!A1:J1", "values": [list(HEADERS)]})
-    elif inbox_head[: len(AGENT_COLUMNS)] != list(AGENT_COLUMNS):
-        # Repair the agent's own header cells only; hers (I, J) are never touched.
-        header_writes.append({"range": f"{INBOX_TAB}!A1:H1", "values": [list(AGENT_COLUMNS)]})
-    if not upcoming_head:
-        header_writes.append({"range": f"{UPCOMING_TAB}!A1:J1", "values": [list(HEADERS)]})
+    if state == HEADER_EMPTY:
+        header_writes.append({"range": f"{INBOX_TAB}!A1:{LAST_COL}1", "values": [list(HEADERS)]})
+    elif state not in (HEADER_CURRENT, HEADER_LEGACY):
+        # Repair the agent's own header cells only; hers (J, K) are never touched.
+        header_writes.append(
+            {"range": f"{INBOX_TAB}!A1:{LAST_AGENT_COL}1", "values": [list(AGENT_COLUMNS)]}
+        )
+    if [c.strip() for c in upcoming_head] != list(UPCOMING_HEADERS):
+        # Upcoming is the agent's view, not hers: its header is rewritten
+        # whole, and cells left over from a wider old header are blanked.
+        width = max(len(upcoming_head), len(UPCOMING_HEADERS))
+        row = list(UPCOMING_HEADERS) + [""] * (width - len(UPCOMING_HEADERS))
+        header_writes.append(
+            {"range": f"{UPCOMING_TAB}!A1:{column_letter(width)}1", "values": [row]}
+        )
     if header_writes:
         _run(
             svc.spreadsheets().values().batchUpdate(
@@ -321,7 +356,9 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> None:
             ),
             what="header write",
         )
-    if not upcoming_a2:
+    if not same_formula(upcoming_a2[0] if upcoming_a2 else ""):
+        # Empty, drifted (Sheets shifts row-numbered references when rows are
+        # inserted), an older view, or hand-edited: the view is rewritten.
         _run(
             svc.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
@@ -331,6 +368,38 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> None:
             ),
             what="formula write",
         )
+
+
+def _migration_requests(inbox_sheet_id: int) -> list[dict]:
+    """Legacy → current, as structural requests applied in order at the head
+    of the layout batch: each new column inserted at its index (existing
+    cells, formatting, the hidden id column and her Status dropdown all shift
+    right with it), then row 1 rewritten to the current agent header. One
+    ``batchUpdate`` is atomic — the sheet is never left half-migrated."""
+    requests: list[dict] = [
+        {
+            "insertDimension": {
+                "range": {
+                    "sheetId": inbox_sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": index,
+                    "endIndex": index + 1,
+                },
+                "inheritFromBefore": True,
+            }
+        }
+        for index, _name in MIGRATION_INSERTS
+    ]
+    requests.append({
+        "updateCells": {
+            "start": {"sheetId": inbox_sheet_id, "rowIndex": 0, "columnIndex": 0},
+            "rows": [{"values": [
+                {"userEnteredValue": {"stringValue": name}} for name in AGENT_COLUMNS
+            ]}],
+            "fields": "userEnteredValue",
+        }
+    })
+    return requests
 
 
 def _layout_requests(inbox_sheet_id: int) -> list[dict]:
@@ -385,19 +454,70 @@ def _first_row(value_range: dict) -> list[str]:
 
 def id_rows(spreadsheet_id: str, *, svc=None) -> dict[str, int]:
     """``{message_id: 1-based row}`` from the hidden column, read once per
-    fire. The first occurrence wins if she ever duplicated a row by hand."""
+    fire together with row 1. The first occurrence wins if she ever
+    duplicated a row by hand.
+
+    Row 1 must be the current agent header: every append and update is
+    positional, and a legacy or edited header means the id column is not
+    where :data:`MESSAGE_ID_RANGE` looks. That is :class:`LayoutMismatch`,
+    raised before anything is written — never an empty map that would
+    re-append every message."""
     svc = svc or service()
     data = _run(
-        svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=MESSAGE_ID_RANGE),
+        svc.spreadsheets().values().batchGet(
+            spreadsheetId=spreadsheet_id, ranges=[INBOX_HEADER_RANGE, MESSAGE_ID_RANGE],
+        ),
         what="id column read",
     )
+    ranges = data.get("valueRanges") or []
+    head = _first_row(ranges[0] if ranges else {})
+    if header_state(head) != HEADER_CURRENT:
+        raise LayoutMismatch(
+            "The Inbox tab's header row does not match the agent's columns; nothing was written."
+        )
     out: dict[str, int] = {}
-    for row_number, row in enumerate(data.get("values") or [], start=1):
+    ids = (ranges[1] if len(ranges) > 1 else {}).get("values") or []
+    for row_number, row in enumerate(ids, start=1):
         if row_number == 1:
             continue  # the header
         value = str(row[0]).strip() if row else ""
         if value and value not in out:
             out[value] = row_number
+    return out
+
+
+_UNREAD_LABELS = frozenset({NEEDS_REVIEW, CATEGORY_LABELS[NEEDS_REVIEW]})
+
+
+def blank_action_ids(spreadsheet_id: str, *, svc=None) -> list[str]:
+    """Message ids whose row has a Category but an empty Action — rows
+    written before the Action column existed — in sheet order. Rows still
+    marked needs review belong to the retry path. Read only while the
+    one-time re-triage of old rows is running."""
+    svc = svc or service()
+    columns = (COL_MESSAGE_ID, COL_ACTION, COL_CATEGORY)
+    data = _run(
+        svc.spreadsheets().values().batchGet(
+            spreadsheetId=spreadsheet_id,
+            ranges=[f"{INBOX_TAB}!{column_letter(c)}:{column_letter(c)}" for c in columns],
+        ),
+        what="action column read",
+    )
+    ranges = data.get("valueRanges") or []
+
+    def column(i: int) -> list[str]:
+        values = (ranges[i] if i < len(ranges) else {}).get("values") or []
+        return [str(r[0]).strip() if r else "" for r in values]
+
+    ids, actions, categories = column(0), column(1), column(2)
+    out: list[str] = []
+    for index in range(1, len(ids)):  # index 0 is the header row
+        message_id = ids[index]
+        action = actions[index] if index < len(actions) else ""
+        category = categories[index] if index < len(categories) else ""
+        if message_id and not action and category and category not in _UNREAD_LABELS:
+            if message_id not in out:
+                out.append(message_id)
     return out
 
 
@@ -410,7 +530,7 @@ def append(spreadsheet_id: str, rows: list[list[str]], *, svc=None) -> list[int]
     resp = _run(
         svc.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
-            range=f"{INBOX_TAB}!A:H",
+            range=f"{INBOX_TAB}!A:{LAST_AGENT_COL}",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": rows},
@@ -425,8 +545,8 @@ def append(spreadsheet_id: str, rows: list[list[str]], *, svc=None) -> list[int]
 
 
 def update(spreadsheet_id: str, row_values: dict[int, list[str]], *, svc=None) -> int:
-    """One ``values.batchUpdate`` for the retried rows: ``{row: eight cells}``
-    written to ``A{row}:H{row}`` and nowhere else."""
+    """One ``values.batchUpdate`` for the retried rows: ``{row: the agent's
+    cells}`` written to ``A{row}:I{row}`` and nowhere else."""
     if not row_values:
         return 0
     svc = svc or service()

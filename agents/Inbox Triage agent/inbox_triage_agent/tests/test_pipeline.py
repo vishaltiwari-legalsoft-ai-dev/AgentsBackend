@@ -19,9 +19,19 @@ from app.services import firestore_repo
 from inbox_triage_agent import gmail_client, gmail_oauth, pipeline, sheet_writer, summarise
 from inbox_triage_agent.gmail_client import HistoryExpired, Message, MessageGone
 from inbox_triage_agent.gmail_oauth import RevokedGrant, Tokens
+from inbox_triage_agent.sheet_layout import (
+    CATEGORY_LABELS, COL_ACTION, COL_CATEGORY, COL_DEADLINE, COL_MESSAGE_ID, COL_SUMMARY,
+)
 from inbox_triage_agent.sheet_writer import SheetCheck
 from inbox_triage_agent.summarise import ModelCallFailed, ModelUnavailable
-from inbox_triage_agent.triage import INBOX_TZ, NEEDS_REVIEW, Rejected, Verdict
+from inbox_triage_agent.triage import TEAM_TIMEZONE, NEEDS_REVIEW, Rejected, Verdict
+
+#: 0-based positions in a row of agent cells, from the layout's own constants.
+ID, CAT, SUMMARY, ACTION, DEADLINE = (
+    COL_MESSAGE_ID - 1, COL_CATEGORY - 1, COL_SUMMARY - 1, COL_ACTION - 1, COL_DEADLINE - 1,
+)
+ASKS = CATEGORY_LABELS["action_required"]
+UNREAD = CATEGORY_LABELS[NEEDS_REVIEW]
 
 UID = "user-aaaa"
 #: The caller's signed-in address — also the fake mailbox's own address, so
@@ -114,7 +124,7 @@ class FakeStore:
 def _message(message_id: str, subject: str = "Paralegal search", body: str = "Need two by Friday.") -> Message:
     return Message(
         id=message_id, thread_id="t-" + message_id,
-        received_at=datetime(2026, 9, 17, 10, 5, tzinfo=INBOX_TZ),
+        received_at=datetime(2026, 9, 17, 10, 5, tzinfo=TEAM_TIMEZONE),
         from_="gm@rathorelegal.in", to="her@firm.com",
         date_header="Thu, 17 Sep 2026 10:05:00 +0530", subject=subject, body_text=body,
     )
@@ -160,10 +170,13 @@ class FakeMailbox:
 
 
 class FakeSheet:
-    """What ``sheet_writer`` would do: an id map, appends, updates."""
+    """What ``sheet_writer`` would do: an id map, appends, updates, and the
+    Action column the one-time re-triage reads."""
 
     def __init__(self):
         self.rows: dict[str, int] = {}
+        #: ids whose row has a category but an empty Action (legacy rows)
+        self.blank_actions: list[str] = []
         self.appended: list[list[str]] = []
         self.updated: dict[int, list[str]] = {}
         self.checks = 0
@@ -180,6 +193,10 @@ class FakeSheet:
         self.events.append("id_rows")
         return dict(self.rows)
 
+    def blank_action_ids(self, spreadsheet_id, *, svc=None):
+        self.events.append("blank_action_ids")
+        return list(self.blank_actions)
+
     def append(self, spreadsheet_id, rows, *, svc=None):
         if not rows:
             return []
@@ -187,7 +204,7 @@ class FakeSheet:
         first = 2 + len(self.rows)
         numbers = []
         for offset, row in enumerate(rows):
-            self.rows[row[7]] = first + offset
+            self.rows[row[ID]] = first + offset
             numbers.append(first + offset)
             self.appended.append(row)
         return numbers
@@ -196,11 +213,20 @@ class FakeSheet:
         if row_values:
             self.events.append("update")
         self.updated.update(row_values)
+        by_row = {row: mid for mid, row in self.rows.items()}
+        for row, values in row_values.items():
+            if values[ACTION] and by_row.get(row) in self.blank_actions:
+                self.blank_actions.remove(by_row[row])
         return len(row_values)
 
 
-def _reply(summary="The sender asks for two paralegals.", deadline="2026-09-18", category="role_to_fill"):
-    return json.dumps({"summary": summary, "deadline": deadline, "category": category})
+def _reply(
+    summary="Rathore Legal asks for a shortlist of two paralegals in Pune.",
+    deadline="2026-09-18",
+    category="action_required",
+    action="Send Rathore Legal a shortlist of two paralegals by 18 Sep.",
+):
+    return json.dumps({"summary": summary, "action": action, "deadline": deadline, "category": category})
 
 
 class FakeLLM:
@@ -253,7 +279,7 @@ def sheet(monkeypatch) -> FakeSheet:
     fake = FakeSheet()
     monkeypatch.setattr(sheet_writer, "service", lambda: "sheets-service")
     monkeypatch.setattr(sheet_writer, "service_account_email", lambda: "hub@project.iam.gserviceaccount.com")
-    for name in ("check", "id_rows", "append", "update"):
+    for name in ("check", "id_rows", "blank_action_ids", "append", "update"):
         monkeypatch.setattr(sheet_writer, name, getattr(fake, name))
     from marketing_research_agent import sources_registry
 
@@ -358,8 +384,9 @@ def test_new_mail_is_worked_before_the_backfill_and_the_checkpoint_after_the_app
     assert doc["last_poll"] == {"at": NOW.isoformat(), "ok": True, "messages_read": 4, "error": None}
     assert doc["recent_fires"] == [{"at": NOW.isoformat(), "rows": 4}]
     assert doc["lease_until"] is None
-    assert [row[7] for row in sheet.appended] == ["new1", "new2", "old1", "old2"]
-    assert sheet.appended[0][3] == "role_to_fill" and sheet.appended[0][5] == "2026-09-18"
+    assert [row[ID] for row in sheet.appended] == ["new1", "new2", "old1", "old2"]
+    assert sheet.appended[0][CAT] == ASKS and sheet.appended[0][DEADLINE] == "2026-09-18"
+    assert sheet.appended[0][ACTION] == "Send Rathore Legal a shortlist of two paralegals by 18 Sep."
     tracked = connected.messages[f"{UID}__new1"]
     assert tracked["status"] == "ok" and tracked["retry_due"] is False and tracked["sheet_row"] == 2
 
@@ -372,7 +399,7 @@ def test_the_id_map_makes_a_duplicate_row_impossible(connected, mailbox, sheet):
     report = pipeline.fire(UID, email=EMAIL, now=NOW)
     assert report.new_rows == 2
     assert mailbox.fetched == ["m2", "m3"]
-    assert [row[7] for row in sheet.appended] == ["m2", "m3"]
+    assert [row[ID] for row in sheet.appended] == ["m2", "m3"]
 
 
 def test_a_message_deleted_between_listing_and_fetch_is_simply_not_a_row(connected, mailbox, sheet):
@@ -392,7 +419,7 @@ def test_an_unreadable_message_gets_its_row_and_at_most_three_later_tries(connec
     first = pipeline.fire(UID, email=EMAIL, now=NOW)
     assert first.new_rows == 1 and first.needs_review_added == 1
     row = sheet.appended[0]
-    assert row[3] == NEEDS_REVIEW and row[4] == "" and row[5] == ""
+    assert row[CAT] == UNREAD and row[SUMMARY] == "" and row[ACTION] == "" and row[DEADLINE] == ""
     tracked = connected.messages[f"{UID}__odd"]
     assert (tracked["status"], tracked["attempts"], tracked["retry_due"]) == ("needs_review", 1, True)
     assert connected.connections[UID]["needs_review"] == 1
@@ -426,7 +453,7 @@ def test_a_recovered_retry_updates_the_row_found_by_id_not_by_remembered_number(
 
     assert report.retried_rows == 1 and report.new_rows == 0
     assert list(sheet.updated) == [9]
-    assert sheet.updated[9][3] == "role_to_fill" and sheet.updated[9][7] == "odd"
+    assert sheet.updated[9][CAT] == ASKS and sheet.updated[9][ID] == "odd"
     tracked = connected.messages[f"{UID}__odd"]
     assert (tracked["status"], tracked["attempts"], tracked["retry_due"], tracked["sheet_row"]) == ("ok", 2, False, 9)
     assert connected.connections[UID]["needs_review"] == 0
@@ -490,7 +517,7 @@ def test_one_flaky_call_is_a_needs_review_row_not_a_failed_fire(connected, mailb
     mailbox.history_added = ["a", "b"]
     report = pipeline.fire(UID, email=EMAIL, now=NOW)
     assert report.ok and report.new_rows == 2 and report.needs_review_added == 1
-    assert sheet.appended[0][3] == NEEDS_REVIEW and sheet.appended[1][3] == "role_to_fill"
+    assert sheet.appended[0][CAT] == UNREAD and sheet.appended[1][CAT] == ASKS
 
 
 def test_no_model_key_fails_before_any_mail_is_read(connected, mailbox, sheet, monkeypatch):
@@ -530,7 +557,7 @@ def test_the_budget_stops_the_loop_keeps_the_checkpoint_and_reports_partial(conn
 
     assert report.unreached is True and report.ok is True
     assert report.new_rows == 3 and mailbox.fetched == ["m0", "m1", "m2"]
-    assert [row[7] for row in sheet.appended] == ["m0", "m1", "m2"], "what was done is written"
+    assert [row[ID] for row in sheet.appended] == ["m0", "m1", "m2"], "what was done is written"
     assert connected.connections[UID]["checkpoint"]["history_id"] == "800", "an unfinished pass keeps the old checkpoint"
     assert connected.connections[UID]["backfill"]["state"] == "running"
 
@@ -693,7 +720,7 @@ def test_a_valid_reply_is_a_verdict_and_nothing_of_the_email_is_logged(caplog):
 
     with caplog.at_level(logging.INFO, logger="agentos.inbox.summarise"):
         verdict = summarise.summarise(message, llm=llm)
-    assert isinstance(verdict, Verdict) and verdict.category == "role_to_fill"
+    assert isinstance(verdict, Verdict) and verdict.category == "action_required"
     assert llm.invocations == 1
     for secret in ("Paralegal", "Priya", "Friday", "rathorelegal"):
         assert secret not in caplog.text
@@ -738,7 +765,7 @@ def test_the_model_is_built_as_a12_with_the_caps_and_refuses_offline(monkeypatch
     assert summarise.build_llm() == "llm"
     assert captured == {
         "temperature": 0.0, "fast": True, "agent_id": "a12",
-        "timeout": summarise.OPENROUTER_TIMEOUT_SECONDS, "max_tokens": 300,
+        "timeout": summarise.OPENROUTER_TIMEOUT_SECONDS, "max_tokens": 400,
     }
 
 
@@ -818,7 +845,7 @@ def test_a_whole_fire_reads_ids_then_appends_then_persists_then_checkpoints_and_
 
     assert second.ok and second.new_rows == 0 and second.messages_read == 0
     assert timeline[0] == "id_rows" and "append:0" in timeline
-    assert [row[7] for row in sheet.appended] == ["n1", "n2", "b1"], "no row was written twice"
+    assert [row[ID] for row in sheet.appended] == ["n1", "n2", "b1"], "no row was written twice"
     assert mailbox.fetched == ["n1", "n2", "b1"], "nothing already on the sheet is re-read"
 
 
@@ -835,14 +862,14 @@ def test_a_fire_that_died_between_append_and_persist_duplicates_nothing_next_tim
     monkeypatch.setattr(firestore_repo, "save_inbox_messages", dies)
     with pytest.raises(RuntimeError, match="killed"):
         pipeline.fire(UID, email=EMAIL, now=NOW)
-    assert [row[7] for row in sheet.appended] == ["n1", "n2"]
+    assert [row[ID] for row in sheet.appended] == ["n1", "n2"]
     assert connected.connections[UID]["checkpoint"] == before["checkpoint"], "the checkpoint did not move"
     assert connected.connections[UID]["lease_until"] is None, "the lease is cleared even for an unmapped error"
 
     monkeypatch.setattr(firestore_repo, "save_inbox_messages", connected.save_inbox_messages)
     report = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
     assert report.ok and report.new_rows == 0
-    assert [row[7] for row in sheet.appended] == ["n1", "n2"], "duplicate-over-drop must not become a duplicate row"
+    assert [row[ID] for row in sheet.appended] == ["n1", "n2"], "duplicate-over-drop must not become a duplicate row"
     assert connected.connections[UID]["checkpoint"]["history_id"] == "950"
 
 
@@ -853,7 +880,7 @@ def test_reconnecting_after_a_disconnect_appends_nothing_already_on_the_sheet(
     mailbox.messages = {m: _message(m) for m in ("a", "b", "c")}
     mailbox.listing = ["c", "b", "a"]
     pipeline.fire(UID, email=EMAIL, now=NOW)
-    assert [row[7] for row in sheet.appended] == ["c", "b", "a"]
+    assert [row[ID] for row in sheet.appended] == ["c", "b", "a"]
 
     pipeline.disconnect(UID)
     assert store.connections[UID]["sheet"]["id"] == SID and store.messages == {}
@@ -864,7 +891,7 @@ def test_reconnecting_after_a_disconnect_appends_nothing_already_on_the_sheet(
     report = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
 
     assert report.ok and report.new_rows == 0
-    assert [row[7] for row in sheet.appended] == ["c", "b", "a"], "a reconnect must not re-append her rows"
+    assert [row[ID] for row in sheet.appended] == ["c", "b", "a"], "a reconnect must not re-append her rows"
     assert mailbox.fetched == fetched_before, "rows already on the sheet are not re-read either"
     assert store.connections[UID]["backfill"]["state"] == "done"
 
@@ -956,7 +983,7 @@ def test_a_budget_cut_inside_a_backfill_page_reports_partial_and_keeps_the_curso
     assert report.ok and report.unreached is True
     assert report.backfill_state == "running" and report.new_rows == 2
     assert (backfill["cursor"], backfill["done"]) == (None, 0), "a page cut short does not advance"
-    assert [row[7] for row in sheet.appended] == ["o0", "o1"]
+    assert [row[ID] for row in sheet.appended] == ["o0", "o1"]
 
 
 def test_nothing_of_a_message_reaches_any_log_during_a_whole_fire(connected, mailbox, sheet, model, caplog):
@@ -1181,3 +1208,127 @@ def test_a_raw_sheets_refusal_reaches_the_panel_without_the_sheet_id_and_the_log
     for leaked in (SID, "googleapis", uri):
         assert leaked not in error and leaked not in caplog.text
     assert UID not in caplog.text, "logs carry the hashed label, never the user id"
+
+
+# --------------------------------------------------------------------------- #
+# Pinned 2026-09-19: the Action column ships to a sheet that already has rows.
+# The first live sheet had 83 rows in the first release's layout; the first
+# fire after the deploy must migrate it in place, append nothing it already
+# holds, and fill Action on the old rows through the ordinary summarise path.
+# --------------------------------------------------------------------------- #
+
+def _real_sheet(monkeypatch, grid):
+    """The REAL ``sheet_writer`` over the grid fake from the writer tests:
+    set-up, migration, the id read and the writes all run for real."""
+    from inbox_triage_agent.tests.test_sheet_writer import FakeDrive
+    from marketing_research_agent import sources_registry
+
+    monkeypatch.setattr(sheet_writer, "service", lambda: grid)
+    monkeypatch.setattr(sheet_writer, "drive_service", lambda: FakeDrive({
+        "owners": [{"emailAddress": EMAIL}], "permissions": [],
+    }))
+    monkeypatch.setattr(sources_registry, "find_source", lambda sid: None)
+
+
+def test_the_first_fire_after_the_deploy_migrates_the_live_sheet_and_re_offered_mail_appends_nothing(
+    store, mailbox, model, grant, monkeypatch
+):
+    from inbox_triage_agent.sheet_layout import HEADERS
+    from inbox_triage_agent.tests.test_sheet_writer import legacy_sheet
+
+    grid = legacy_sheet(83)
+    before = [list(r) for r in grid.grid["Inbox"]]
+    _real_sheet(monkeypatch, grid)
+    # A fresh ``ok`` check: the hourly re-check would NOT run on its own —
+    # the id read's header check is what triggers the migration.
+    store.connections[UID] = _connected_doc()
+    store.connections[UID]["backfill"]["state"] = "done"
+    ids = [f"m{i}" for i in range(83)]
+    mailbox.messages = {m: _message(m) for m in ids}
+    mailbox.history_added = list(ids)  # every message already on the sheet, offered again
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok, report.error
+    assert report.new_rows == 0 and "values.append" not in grid.names(), "dedupe held across the migration"
+    assert len(grid.grid["Inbox"]) == 84
+    assert grid.row("Inbox", 0, 11) == list(HEADERS)
+    for r in range(1, 84):
+        assert grid.row("Inbox", r, 11)[9:] == (before[r] + ["", ""])[8:10], "her Status and Notes, intact"
+    # The one-time re-triage: 50 this fire, through the same model path.
+    assert report.retriaged_rows == 50 and report.retried_rows == 0
+    filled = [r for r in range(1, 84) if grid.cell("Inbox", r, ACTION)]
+    assert len(filled) == 50
+    assert grid.cell("Inbox", filled[0], ACTION) == "Send Rathore Legal a shortlist of two paralegals by 18 Sep."
+    assert grid.cell("Inbox", filled[0], CAT) == ASKS
+    assert connected_retriage(store)["state"] == "running"
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
+    assert report.ok and report.new_rows == 0 and "values.append" not in grid.names()
+    assert report.retriaged_rows == 33
+    assert all(grid.cell("Inbox", r, ACTION) for r in range(1, 84))
+    assert connected_retriage(store) == {"state": "done", "skipped": []}
+    assert model.invocations == 83, "one call per old row, no re-asks"
+
+    grid.calls.clear()
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=10))
+    reads = [kw["ranges"] for name, kw in grid.calls if name == "values.batchGet"]
+    assert reads == [["Inbox!A1:Z1", "Inbox!I:I"]], "once done, the Action column is never read again"
+
+
+def connected_retriage(store) -> dict:
+    return store.connections[UID]["retriage"]
+
+
+def test_the_retriage_leaves_gone_and_unreadable_rows_as_they_were_and_never_asks_again(
+    connected, mailbox, sheet, model
+):
+    connected.connections[UID]["backfill"]["state"] = "done"
+    sheet.rows = {"a": 2, "gone": 3, "odd": 4}
+    sheet.blank_actions = ["a", "gone", "odd"]
+    mailbox.messages = {"a": _message("a"), "odd": _message("odd", subject="GARBLE")}
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok and report.retriaged_rows == 1
+    assert set(sheet.updated) == {2}, "a row the model could not read keeps what it had"
+    assert sheet.updated[2][ACTION] and sheet.updated[2][CAT] == ASKS
+    assert connected.connections[UID]["retriage"] == {"state": "done", "skipped": ["gone", "odd"]}
+    asked = model.invocations
+    sheet.events.clear()
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
+    assert "blank_action_ids" not in sheet.events and model.invocations == asked
+
+
+def test_a_sheet_with_no_old_rows_finishes_the_retriage_in_one_read(connected, mailbox, sheet, model):
+    connected.connections[UID]["backfill"]["state"] = "done"
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+    assert report.ok and report.retriaged_rows == 0 and model.invocations == 0
+    assert connected.connections[UID]["retriage"] == {"state": "done", "skipped": []}
+    assert sheet.events.count("blank_action_ids") == 1
+
+
+def test_setting_a_sheet_starts_a_fresh_retriage(connected, sheet):
+    connected.connections[UID]["retriage"] = {"state": "done", "skipped": ["x"]}
+    doc = pipeline.set_sheet(UID, SID, email=EMAIL)
+    assert doc["retriage"] == {"state": "running", "skipped": []}
+
+
+def test_a_header_set_up_cannot_fix_fails_the_fire_loudly_with_nothing_written(
+    connected, mailbox, sheet, monkeypatch
+):
+    def mismatched(sid, *, svc=None):
+        raise sheet_writer.LayoutMismatch(
+            "The Inbox tab's header row does not match the agent's columns; nothing was written."
+        )
+    monkeypatch.setattr(sheet_writer, "id_rows", mismatched)
+    mailbox.messages = {"n1": _message("n1")}
+    mailbox.history_added = ["n1"]
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert not report.ok and "header row does not match" in report.error
+    assert sheet.checks == 1, "set-up was re-run once before giving up"
+    assert sheet.appended == [] and sheet.updated == {} and mailbox.fetched == []
+    doc = connected.connections[UID]
+    assert doc["last_poll"]["ok"] is False and doc["checkpoint"]["history_id"] == "800"
