@@ -16,7 +16,7 @@ the refresh token — with three deliberate differences:
 * **Its own OAuth client** (``INBOX_GOOGLE_CLIENT_ID`` / ``_SECRET``). The
   shared Web client's consent screen also signs in outside contractors, so
   it can never become an Internal app — and an Internal consent screen is
-  what lets one recruiter grant ``gmail.readonly`` without a verification
+  what lets a Workspace member grant ``gmail.readonly`` without a verification
   review. A second GCP project owns this client.
 """
 

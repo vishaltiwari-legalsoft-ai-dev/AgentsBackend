@@ -103,8 +103,12 @@ class FakeStore:
             del self.messages[key]
         return len(keys)
 
-    def get_user_by_email(self, email):
-        return self.users.get(email.lower())
+    def get_users_by_ids(self, user_ids):
+        """``self.users`` is keyed by address for readability; the real read
+        is by id, and a deleted user is simply absent."""
+        self.events.append("users")
+        wanted = set(user_ids)
+        return {u["id"]: dict(u) for u in self.users.values() if u["id"] in wanted}
 
 
 def _message(message_id: str, subject: str = "Paralegal search", body: str = "Need two by Friday.") -> Message:
@@ -222,7 +226,7 @@ class FakeLLM:
 #: nothing can fall through to the real (offline-guarded) client.
 STORE_SEAMS = (
     "get_inbox_connection", "save_inbox_connection", "delete_inbox_connection",
-    "list_inbox_messages", "save_inbox_messages", "delete_inbox_messages", "get_user_by_email",
+    "list_inbox_messages", "save_inbox_messages", "delete_inbox_messages", "get_users_by_ids",
     "take_inbox_lease", "list_connected_inbox_user_ids",
 )
 
@@ -614,7 +618,7 @@ def test_connect_seals_the_token_takes_the_checkpoint_and_reads_no_mail(store, s
     assert doc["refresh_token_enc"] != "1//refresh-plain" and "refresh-plain" not in doc["refresh_token_enc"]
     assert gmail_oauth.open_(doc["refresh_token_enc"]) == "1//refresh-plain"
     assert mailbox.fetched == [] and mailbox.events == []
-    payload = pipeline.status_payload(UID, enabled=True, now=NOW)
+    payload = pipeline.status_payload(UID, now=NOW)
     assert "refresh_token_enc" not in json.dumps(payload) and "refresh-plain" not in json.dumps(payload)
 
 
@@ -645,12 +649,10 @@ def test_disconnect_deletes_token_and_tracking_zeroes_counters_and_keeps_the_she
     assert list(connected.messages) == ["other__x"]
 
 
-def test_status_for_an_outsider_is_disabled_nulls_and_never_reads_the_store(monkeypatch):
-    monkeypatch.setattr(firestore_repo, "get_inbox_connection",
-                        lambda uid: pytest.fail("the store must not be read for an outsider"))
-    payload = pipeline.status_payload("anyone", enabled=False, now=NOW)
+def test_status_for_a_user_who_never_connected_is_enabled_with_nulls(store, sheet):
+    payload = pipeline.status_payload("anyone", now=NOW)
     assert payload == {
-        "enabled": False, "service_account_email": "",
+        "enabled": True, "service_account_email": "hub@project.iam.gserviceaccount.com",
         "gmail": {"connected": False, "address": None, "connected_at": None},
         "sheet": {"id": None, "url": None, "title": None, "check": None, "checked_at": None},
         "backfill": {"state": None, "done": 0, "total": None},
@@ -667,7 +669,7 @@ def test_status_for_the_owner_is_one_read_with_the_next_poll_computed(connected,
         {"at": (NOW - timedelta(hours=25)).isoformat(), "rows": 9},
     ]
     doc["needs_review"] = 2
-    payload = pipeline.status_payload(UID, enabled=True, now=NOW)
+    payload = pipeline.status_payload(UID, now=NOW)
     assert payload["enabled"] is True
     assert payload["service_account_email"] == "hub@project.iam.gserviceaccount.com"
     assert payload["gmail"] == {"connected": True, "address": "her@firm.com", "connected_at": doc["gmail"]["connected_at"]}
@@ -677,7 +679,7 @@ def test_status_for_the_owner_is_one_read_with_the_next_poll_computed(connected,
     assert payload["rows_24h"] == 5 and payload["needs_review"] == 2
     assert "refresh_token_enc" not in json.dumps(payload)
     doc["last_poll"] = None
-    assert pipeline.status_payload(UID, enabled=True, now=NOW)["next_poll_at"] == NOW.isoformat()
+    assert pipeline.status_payload(UID, now=NOW)["next_poll_at"] == NOW.isoformat()
 
 
 # --------------------------------------------------------------------------- #
@@ -1112,17 +1114,26 @@ def test_disconnect_with_an_unopenable_or_missing_token_still_clears_and_says_fa
     assert pipeline.disconnect(UID).google_revoked is False  # now there is no token at all
 
 
-def test_purge_delisted_disconnects_only_users_off_the_list(connected, monkeypatch):
+def test_purge_without_access_disconnects_exactly_the_named_users(connected, monkeypatch):
+    import time as _time
+
     connected.connections["user-gone"] = _connected_doc()
     connected.messages["user-gone__x"] = {"user_id": "user-gone", "message_id": "x"}
     revoked: list[str] = []
     monkeypatch.setattr(gmail_oauth, "revoke", lambda token: revoked.append(token) or True)
-    assert pipeline.purge_delisted({UID}) == 1
+    assert pipeline.purge_without_access(["user-gone"], deadline=_time.monotonic() + 60) == 1
     assert "refresh_token_enc" not in connected.connections["user-gone"]
     assert "gmail" not in connected.connections["user-gone"] and connected.messages == {}
     assert connected.connections[UID]["refresh_token_enc"] == "sealed"
     assert revoked == ["plain-sealed"]
-    assert pipeline.purge_delisted({UID}) == 0, "already disconnected — nothing to do"
+
+
+def test_purge_without_access_stops_at_the_deadline_and_leaves_the_rest_connected(connected, monkeypatch):
+    import time as _time
+
+    monkeypatch.setattr(gmail_oauth, "revoke", lambda token: pytest.fail("past the deadline"))
+    assert pipeline.purge_without_access([UID], deadline=_time.monotonic() - 1) == 0
+    assert connected.connections[UID]["refresh_token_enc"] == "sealed"
 
 
 def test_the_lease_rule_is_the_one_the_store_applies():

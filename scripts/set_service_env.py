@@ -10,9 +10,9 @@ Lives in backend/scripts/ (recurring value: every env
 change on either service). Run from backend/:
 
   .venv/Scripts/python scripts/set_service_env.py agentsbackend-staging \
-      --from-env INBOX_TOKEN_KEY INBOX_CRON_KEY INBOX_GOOGLE_CLIENT_ID INBOX_GOOGLE_CLIENT_SECRET INBOX_TRIAGE_EMAILS
+      --from-env INBOX_TOKEN_KEY INBOX_CRON_KEY INBOX_GOOGLE_CLIENT_ID INBOX_GOOGLE_CLIENT_SECRET
   .venv/Scripts/python scripts/set_service_env.py agentsbackend \
-      --from-env INBOX_CRON_KEY INBOX_GOOGLE_CLIENT_ID INBOX_GOOGLE_CLIENT_SECRET INBOX_TRIAGE_EMAILS \
+      --from-env INBOX_CRON_KEY INBOX_GOOGLE_CLIENT_ID INBOX_GOOGLE_CLIENT_SECRET \
       --secret-ref INBOX_TOKEN_KEY=inbox-token-key:1
   .venv/Scripts/python scripts/set_service_env.py agentsbackend --remove INBOX_TOKEN_KEY ...   # rollback
   .venv/Scripts/python scripts/set_service_env.py agentsbackend --traffic-to agentsbackend-00143-62k

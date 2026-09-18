@@ -301,6 +301,24 @@ def get_user_by_email(email: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def get_users_by_ids(user_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """The user documents for ``user_ids``, keyed by id, in ONE batched read.
+
+    An id with no document (the user was deleted) is simply absent from the
+    result — callers treat absence as "no such account", so a missing key
+    must mean exactly that and never "the read failed": a failed read raises.
+    """
+    ids = [uid for uid in dict.fromkeys(str(u) for u in user_ids) if uid]
+    if not ids:
+        return {}
+    users = _db().collection("users")
+    out: dict[str, dict[str, Any]] = {}
+    for snap in _db().get_all([users.document(uid) for uid in ids]):
+        if snap.exists:
+            out[snap.id] = (snap.to_dict() or {}) | {"id": snap.id}
+    return out
+
+
 def get_or_create_google_user(
     email: str, name: str, picture: str, google_sub: str
 ) -> dict[str, Any]:
@@ -885,8 +903,8 @@ def list_connected_inbox_user_ids() -> list[str]:
     documents that can hold a sealed token (a revoke or a disconnect clears
     the token and ``gmail.connected`` together). One equality filter on a map
     subfield: served by the automatic single-field index, no composite entry
-    needed. The cron uses it to find connections of people no longer on
-    ``INBOX_TRIAGE_EMAILS``."""
+    needed. The cron polls exactly these, and disconnects the ones whose user
+    no longer has platform access."""
     query = _db().collection(INBOX_CONNECTIONS).where(
         filter=firestore.FieldFilter("gmail.connected", "==", True)
     )

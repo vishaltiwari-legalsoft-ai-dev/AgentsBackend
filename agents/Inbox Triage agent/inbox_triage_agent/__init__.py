@@ -1,8 +1,8 @@
-"""Inbox Triage (a12) — one recruiter's Gmail inbox, one row per message in a
-sheet she owns.
+"""Inbox Triage (a12) — each signed-in user's own Gmail inbox, one row per
+message in a sheet that user owns.
 
 Read-only against Gmail (``gmail.readonly``), per-user OAuth, never a shared
-mailbox credential. The sheet is her dashboard; Firestore is the record and
+mailbox credential. The sheet is the owner's dashboard; Firestore is the record and
 the checkpoint. The hub never stores a mail body.
 
 ``INBOX_OFFLINE=1`` — the test suite's default, set in ``backend/conftest.py``

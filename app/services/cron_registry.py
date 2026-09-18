@@ -145,9 +145,10 @@ CRON_REGISTRY: tuple[dict[str, Any], ...] = (
         "name": "Inbox poll",
         "endpoint": "POST /api/inbox/cron/poll",
         "purpose": (
-            "Reads the recruiter's new Gmail inbox mail, classifies each "
-            "message and adds one row per message to her sheet, then works "
-            "through the 90-day backfill with whatever budget is left."
+            "For every connected user, reads their new Gmail inbox mail, "
+            "classifies each message and adds one row per message to their "
+            "sheet, then works through the 90-day backfill with whatever "
+            "budget is left — the budget shared fairly between users."
         ),
         "why_time": (
             "Every five minutes, so a mail with a same-day deadline is on the "

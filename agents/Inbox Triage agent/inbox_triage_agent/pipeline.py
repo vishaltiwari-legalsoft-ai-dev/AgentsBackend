@@ -271,19 +271,22 @@ def disconnect(user_id: str) -> Disconnected:
     return Disconnected(doc=doc, google_revoked=revoked)
 
 
-def purge_delisted(allowed_user_ids: set[str]) -> int:
-    """Disconnect — revoke and clear, exactly as :func:`disconnect` — every
-    connection whose user is no longer on ``INBOX_TRIAGE_EMAILS``, so a token
-    does not sit sealed and silently resume polling if the address is ever
-    re-added. One query per cron fire. Returns how many were disconnected."""
+def purge_without_access(user_ids: list[str], *, deadline: float) -> int:
+    """Disconnect — revoke and clear, exactly as :func:`disconnect` — each of
+    ``user_ids``: connections whose user the caller found to have lost access
+    to a12 (deleted, no longer admitted at sign-in, or confined to GEO). Their
+    token must not sit sealed and silently resume polling if access ever
+    returns. Stops at ``deadline`` (a ``time.monotonic()`` value); the rest are
+    still connected, so the next fire finds them again. Returns how many were
+    disconnected."""
     purged = 0
-    for user_id in firestore_repo.list_connected_inbox_user_ids():
-        if user_id in allowed_user_ids:
-            continue
+    for user_id in user_ids:
+        if time.monotonic() >= deadline:
+            break
         result = disconnect(user_id)
         purged += 1
         logger.warning(
-            "a12: disconnected de-listed user %s (google_revoked=%s)",
+            "a12: disconnected user %s who no longer has access (google_revoked=%s)",
             user_label(user_id), result.google_revoked,
         )
     return purged
@@ -309,12 +312,15 @@ def _trim_recent(recent_fires: list, now: datetime) -> list[dict]:
     return kept
 
 
-def status_payload(user_id: str, *, enabled: bool, now: datetime | None = None) -> dict:
-    """What the panel renders, in one read. Every key is present for every
-    caller; a caller outside the list gets ``enabled: false`` and nulls, and
-    the store is not read for them at all. The sealed token is never here."""
+def status_payload(user_id: str, *, now: datetime | None = None) -> dict:
+    """What the panel renders, in one read of the caller's own document.
+    Every key is present for every caller — a user who never connected gets
+    nulls. ``enabled`` is always true: any signed-in user who reaches this may
+    use a12 (a GEO-only account is refused by the scope wall before it gets
+    here). The field stays because the console reads it. The sealed token is
+    never here."""
     now = now or _utcnow()
-    doc = (firestore_repo.get_inbox_connection(user_id) or {}) if enabled else {}
+    doc = firestore_repo.get_inbox_connection(user_id) or {}
     gmail = doc.get("gmail") or {}
     sheet = doc.get("sheet") or {}
     backfill = doc.get("backfill") or {}
@@ -322,11 +328,11 @@ def status_payload(user_id: str, *, enabled: bool, now: datetime | None = None) 
     connected = bool(gmail.get("connected"))
     last_at = _parse_iso(last_poll.get("at"))
     next_poll = None
-    if enabled and connected:
+    if connected:
         next_poll = _iso(last_at + timedelta(seconds=POLL_INTERVAL_SECONDS)) if last_at else _iso(now)
     return {
-        "enabled": enabled,
-        "service_account_email": sheet_writer.service_account_email() if enabled else "",
+        "enabled": True,
+        "service_account_email": sheet_writer.service_account_email(),
         "gmail": {
             "connected": connected,
             "address": gmail.get("address") or None,
@@ -479,8 +485,9 @@ def fire(
     """One user's poll. Never raises for a reason the panel should show; those
     land in ``last_poll`` and in the report. A programming error propagates.
 
-    ``email`` is the user's allowlisted address: the sheet's ownership is
-    re-proved against it whenever the sheet is re-checked."""
+    ``email`` is the user's current address from their user record: the
+    sheet's ownership is re-proved against it whenever the sheet is
+    re-checked."""
     started = time.monotonic()
     now = now or _utcnow()
     report = FireReport(user_id=user_id)
