@@ -30,13 +30,13 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.services.google_http import (
     _RETRY_ATTEMPTS, cached_credentials, execute_with_retry, refresh_if_stale, timed_http,
 )
 
-from . import offline, refuse_if_offline
+from . import offline, refuse_if_offline, sheet_style
 from .sheet_layout import (
     AGENT_COLUMNS, AGENT_RANGE, CATEGORY_LABELS, COL_ACTION, COL_CATEGORY, COL_MESSAGE_ID,
     COL_STATUS, HEADER_CURRENT, HEADER_EMPTY, HEADER_LEGACY, HEADERS, INBOX_HEADER_RANGE,
@@ -94,10 +94,21 @@ class SheetsRefused(SheetsUnavailable):
         self.status = status
 
 
+#: What set-up did about the sheet's look (see ``sheet_style``). Recorded on
+#: the connection doc, so a refused formatting pass is on the record, not
+#: only in a log line.
+FORMAT_APPLIED = "applied"
+FORMAT_ALREADY = "already"
+FORMAT_FAILED = "failed"
+
+
 @dataclass(frozen=True)
 class SheetCheck:
     status: str  # one of the CHECK_* values
     title: str
+    #: One of the FORMAT_* values when set-up ran; "" otherwise. Not part of
+    #: equality: it is a report on the pass, not on the sheet's standing.
+    formatting: str = field(default="", compare=False)
 
 
 def service():
@@ -205,12 +216,12 @@ def check(spreadsheet_id: str, *, caller_email: str, svc=None, drive=None) -> Sh
         return SheetCheck(CHECK_NOT_YOURS, "")
     title = str((meta.get("properties") or {}).get("title") or "")
     try:
-        setup(spreadsheet_id, svc=svc, meta=meta)
+        formatting = setup(spreadsheet_id, svc=svc, meta=meta)
     except SheetsRefused as exc:
         if exc.status == 403:
             return SheetCheck(CHECK_NOT_EDITABLE, "")
         raise
-    return SheetCheck(CHECK_OK, title)
+    return SheetCheck(CHECK_OK, title, formatting)
 
 
 def caller_may_edit(spreadsheet_id: str, caller_email: str, *, drive=None) -> bool:
@@ -263,13 +274,17 @@ def caller_may_edit(spreadsheet_id: str, caller_email: str, *, drive=None) -> bo
 def _metadata(spreadsheet_id: str, svc) -> dict:
     return _run(
         svc.spreadsheets().get(
-            spreadsheetId=spreadsheet_id, fields="properties.title,sheets.properties"
+            spreadsheetId=spreadsheet_id,
+            # developerMetadata carries the "formatted" marker: reading it
+            # here keeps the hourly re-check at the calls it already made.
+            fields="properties.title,sheets.properties,"
+                   "developerMetadata(metadataId,metadataKey,metadataValue)",
         ),
         what="metadata",
     )
 
 
-def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> None:
+def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> str:
     """Idempotent: the two tabs exist, row 1 carries the headers, row 1 is
     frozen, the Message ID column is hidden, Status has its dropdown, and
     Upcoming!A2 holds the current formula view — rewritten whenever what is
@@ -277,6 +292,11 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> None:
     legacy Inbox (no Action column) is migrated in place first. Re-running
     changes nothing that is already right; the layout write always happens
     and is what proves the hub can edit the sheet.
+
+    Last, the look (:mod:`sheet_style`) — once: on a new or just-migrated
+    sheet, or one the marker says was never formatted (the sheets set up
+    before the look existed). Returns a ``FORMAT_*`` value; a refused
+    formatting pass never raises.
 
     Raises :class:`SheetsRefused` with the status so :func:`check` can map
     a 403 to ``not_editable``. Only :func:`check` calls this, after the
@@ -368,6 +388,53 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> None:
             ),
             what="formula write",
         )
+    return _format_once(
+        spreadsheet_id, svc, meta, inbox_sheet_id=inbox_sheet_id,
+        upcoming_sheet_id=tabs[UPCOMING_TAB], migrated=state == HEADER_LEGACY,
+    )
+
+
+def _format_once(
+    spreadsheet_id: str, svc, meta: dict, *, inbox_sheet_id: int, upcoming_sheet_id: int,
+    migrated: bool,
+) -> str:
+    """Apply the look unless the marker says it is already there.
+
+    Its own batch, after the layout batch and the header/formula writes, for
+    two reasons: the layout batch carries the migration and is the proof of
+    editability, and a formatting request Google refuses must neither roll
+    the migration back nor turn into ``not_editable``; and the header cells
+    must exist before they are styled. The batch itself is atomic with the
+    marker as its last request, so a refusal leaves no half-look and no
+    marker — the next hourly check tries again. A refusal is logged (with
+    no sheet id: ``_run``'s messages never carry one) and returned as
+    :data:`FORMAT_FAILED`; rows are still written."""
+    if sheet_style.is_formatted(meta) and not migrated:
+        return FORMAT_ALREADY
+    try:
+        live = _run(
+            svc.spreadsheets().get(
+                spreadsheetId=spreadsheet_id, fields=sheet_style.FORMAT_READ_FIELDS
+            ),
+            what="format read",
+        )
+        requests = sheet_style.format_requests(
+            live, inbox_sheet_id=inbox_sheet_id, upcoming_sheet_id=upcoming_sheet_id
+        )
+        _run(
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id, body={"requests": requests}
+            ),
+            what="formatting",
+        )
+    except SheetsUnavailable as exc:
+        logger.warning(
+            "a12: the sheet's formatting was not applied (%s); rows are still written and "
+            "formatting is retried on the next check", exc,
+        )
+        return FORMAT_FAILED
+    logger.info("a12: sheet formatting applied (version %s)", sheet_style.FORMAT_VERSION)
+    return FORMAT_APPLIED
 
 
 def _migration_requests(inbox_sheet_id: int) -> list[dict]:

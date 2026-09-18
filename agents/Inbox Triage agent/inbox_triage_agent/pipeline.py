@@ -232,6 +232,9 @@ def _check_and_store(
             "check": result.status,
             "checked_at": _iso(_utcnow()),
             "checked_for": str(email or "").strip().lower(),
+            # applied / already / failed: a refused formatting pass is on the
+            # record here, not only in a log line.
+            "formatting": result.formatting,
         },
         **(extra or {}),
     })

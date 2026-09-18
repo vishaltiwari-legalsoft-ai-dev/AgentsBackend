@@ -55,6 +55,7 @@ MIGRATION_INSERTS: tuple[tuple[int, str], ...] = ((AGENT_COLUMNS.index("Action")
 
 STATUS_OPTIONS: tuple[str, ...] = ("New", "In progress", "Done", "Ignore")
 STATUS_DONE = "Done"
+STATUS_IN_PROGRESS = "In progress"
 
 
 def column_letter(col: int) -> str:

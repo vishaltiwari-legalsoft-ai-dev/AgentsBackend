@@ -6,6 +6,8 @@ asserted on the cells, not described."""
 
 from __future__ import annotations
 
+import copy
+import logging
 import re
 from types import SimpleNamespace
 
@@ -13,7 +15,7 @@ import pytest
 from googleapiclient.errors import HttpError
 
 import app  # noqa: F401 — registers the agent roots on sys.path
-from inbox_triage_agent import InboxOffline, sheet_writer
+from inbox_triage_agent import InboxOffline, sheet_style, sheet_writer
 from inbox_triage_agent.sheet_layout import (
     AGENT_COLUMNS, CATEGORY_LABELS, COL_ACTION, COL_MESSAGE_ID, COL_STATUS, HEADERS,
     LEGACY_AGENT_COLUMNS, STATUS_OPTIONS, UPCOMING_FORMULA, UPCOMING_HEADERS,
@@ -68,11 +70,21 @@ def _col(letters: str) -> int:
     return n - 1
 
 
+class _Refused(Exception):
+    """What Sheets would answer 400 to; the fake rolls the batch back."""
+
+
 class FakeSheets:
     """A spreadsheet as a grid per tab (row 0 is sheet row 1), with the
     Inbox tab's hidden columns and dropdown columns tracked by index — an
     inserted column shifts all three, exactly as Sheets does. ``fail`` maps
-    a request name to the HttpError it answers."""
+    a request name to the HttpError it answers.
+
+    Also the look: conditional rules and banding per tab id, spreadsheet
+    developer metadata, and every other formatting request recorded. A
+    ``batchUpdate`` is atomic, as in Sheets: a request Sheets would refuse
+    (a banding over one that exists, a rule index out of range) rolls the
+    whole batch back and answers 400."""
 
     def __init__(self, *, tabs: dict[str, int] | None = None, title: str = "Her inbox"):
         self.title = title
@@ -83,6 +95,11 @@ class FakeSheets:
         self.calls: list[tuple[str, dict]] = []
         self.fail: dict[str, Exception] = {}
         self._next_sheet_id = 100
+        self.rules: dict[int, list[dict]] = {}
+        self.bandings: dict[int, list[int]] = {}
+        self.metadata: list[dict] = []
+        self.styled: list[dict] = []  # repeatCell / widths / heights / freezes
+        self._next_meta_id = 1
 
     # -- grid helpers ---------------------------------------------------- #
     def rows(self, tab: str) -> list[list[str]]:
@@ -147,16 +164,82 @@ class FakeSheets:
     def _get(self, **kw):
         return self._answer("get", kw, lambda: {
             "properties": {"title": self.title},
-            "sheets": [{"properties": {"title": t, "sheetId": i}} for t, i in self.tabs.items()],
+            "sheets": [
+                {
+                    "properties": {"title": t, "sheetId": i},
+                    "conditionalFormats": copy.deepcopy(self.rules.get(i, [])),
+                    "bandedRanges": [{"bandedRangeId": b} for b in self.bandings.get(i, [])],
+                }
+                for t, i in self.tabs.items()
+            ],
+            "developerMetadata": copy.deepcopy(self.metadata),
         })
+
+    def agent_rules(self, tab: str) -> list[dict]:
+        return [r for r in self.rules.get(self.tabs[tab], []) if sheet_style.is_agent_rule(r)]
 
     def _batch_update(self, **kw):
         requests = kw["body"]["requests"]
-        name = "batchUpdate:addSheet" if any("addSheet" in r for r in requests) else "batchUpdate:layout"
+        if any("addSheet" in r for r in requests):
+            name = "batchUpdate:addSheet"
+        elif any("createDeveloperMetadata" in r for r in requests):
+            name = "batchUpdate:format"
+        else:
+            name = "batchUpdate:layout"
+
+        def refuse(why: str):
+            raise _Refused(why)
+
+        def apply_style(request) -> bool:
+            if "addConditionalFormatRule" in request:
+                add = request["addConditionalFormatRule"]
+                sheet_id = add["rule"]["ranges"][0]["sheetId"]
+                rules = self.rules.setdefault(sheet_id, [])
+                if not 0 <= add["index"] <= len(rules):
+                    refuse("rule index out of range")
+                rules.insert(add["index"], copy.deepcopy(add["rule"]))
+            elif "deleteConditionalFormatRule" in request:
+                d = request["deleteConditionalFormatRule"]
+                rules = self.rules.setdefault(d["sheetId"], [])
+                if not 0 <= d["index"] < len(rules):
+                    refuse("no rule at that index")
+                rules.pop(d["index"])
+            elif "addBanding" in request:
+                band = request["addBanding"]["bandedRange"]
+                sheet_id = band["range"]["sheetId"]
+                if self.bandings.get(sheet_id):
+                    refuse("banding overlaps an existing banding")
+                if any(band["bandedRangeId"] in b for b in self.bandings.values()):
+                    refuse("banding id exists")
+                self.bandings[sheet_id] = [band["bandedRangeId"]]
+            elif "deleteBanding" in request:
+                wanted = request["deleteBanding"]["bandedRangeId"]
+                if not any(wanted in b for b in self.bandings.values()):
+                    refuse("no such banding")
+                self.bandings = {k: [x for x in v if x != wanted] for k, v in self.bandings.items()}
+            elif "createDeveloperMetadata" in request:
+                entry = dict(request["createDeveloperMetadata"]["developerMetadata"])
+                entry["metadataId"] = self._next_meta_id
+                self._next_meta_id += 1
+                self.metadata.append(entry)
+            elif "deleteDeveloperMetadata" in request:
+                wanted = request["deleteDeveloperMetadata"]["dataFilter"]["developerMetadataLookup"]["metadataId"]
+                self.metadata = [m for m in self.metadata if m["metadataId"] != wanted]
+            elif "repeatCell" in request or (
+                "updateDimensionProperties" in request
+                and "hiddenByUser" not in request["updateDimensionProperties"]["fields"]
+            ) or ("updateSheetProperties" in request and name == "batchUpdate:format"):
+                self.styled.append(request)
+            else:
+                return False
+            return True
 
         def apply():
             replies = []
             for request in requests:
+                if apply_style(request):
+                    replies.append({})
+                    continue
                 if "addSheet" in request:
                     title = request["addSheet"]["properties"]["title"]
                     self._next_sheet_id += 1
@@ -191,7 +274,14 @@ class FakeSheets:
         self.calls.append((name, kw))
         if name in self.fail:
             return _Req(error=self.fail[name])
-        return _Req(apply())
+        snapshot = copy.deepcopy((self.grid, self.tabs, self.hidden, self.dropdowns, self.rules,
+                                  self.bandings, self.metadata, self.styled))
+        try:
+            return _Req(apply())
+        except _Refused:
+            (self.grid, self.tabs, self.hidden, self.dropdowns, self.rules,
+             self.bandings, self.metadata, self.styled) = snapshot
+            return _Req(error=_http_error(400))
 
     def _values_get(self, **kw):
         return self._answer("values.get", kw, lambda: self._read(kw["range"]))
@@ -334,8 +424,8 @@ def test_setup_on_a_fresh_sheet_creates_tabs_headers_layout_and_the_formula():
     sheet_writer.setup(SID, svc=sheets)
     assert sheets.names() == [
         "get", "batchUpdate:addSheet", "values.batchGet", "batchUpdate:layout",
-        "values.batchUpdate", "values.update",
-    ]
+        "values.batchUpdate", "values.update", "get", "batchUpdate:format",
+    ], "the look is its own batch, last, after the headers it styles exist"
     read = next(c[1] for c in sheets.calls if c[0] == "values.batchGet")
     assert read["valueRenderOption"] == "FORMULA", "A2 must be compared as a formula"
     requests = _layout_requests(sheets)
@@ -422,7 +512,10 @@ def test_a_legacy_sheet_is_migrated_in_place_with_every_cell_kept():
     assert kinds[:2] == ["insertDimension", "updateCells"], "migration first, then the layout"
     insert = requests[0]["insertDimension"]["range"]
     assert (insert["dimension"], insert["startIndex"], insert["endIndex"]) == ("COLUMNS", 5, 6)
-    assert len([c for c in sheets.calls if c[0].startswith("batchUpdate")]) == 1, "one atomic batch"
+    batches = [c[0] for c in sheets.calls if c[0].startswith("batchUpdate")]
+    assert batches == ["batchUpdate:layout", "batchUpdate:format"], (
+        "the migration is one atomic batch; the look follows it, separately")
+    assert sheets.metadata and len(sheets.agent_rules("Inbox")) == len(sheet_style.inbox_rules(1))
 
     grid = sheets.grid["Inbox"]
     assert len(grid) == len(before) == 84, "no row added or lost"
@@ -687,3 +780,248 @@ def test_refusals_and_exhausted_retries_never_carry_the_spreadsheet_id():
 def test_the_drive_client_refuses_to_build_offline():
     with pytest.raises(InboxOffline):
         sheet_writer.drive_service()
+
+
+# --------------------------------------------------------------------------- #
+# The look (sheet_style): applied once, never duplicated, never hers
+# --------------------------------------------------------------------------- #
+
+def _format_batch(sheets) -> list[dict]:
+    return next(c[1] for c in sheets.calls if c[0] == "batchUpdate:format")["body"]["requests"]
+
+
+def _her_rule(sheet_id: int = 1) -> dict:
+    return {"ranges": [{"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": 10,
+                        "endColumnIndex": 11}],
+            "booleanRule": {"condition": {"type": "TEXT_CONTAINS",
+                                          "values": [{"userEnteredValue": "urgent"}]},
+                            "format": {"textFormat": {"italic": True}}}}
+
+
+def _luminance(hex_colour: str) -> float:
+    def channel(v: float) -> float:
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    c = sheet_style.rgb(hex_colour)
+    return 0.2126 * channel(c["red"]) + 0.7152 * channel(c["green"]) + 0.0722 * channel(c["blue"])
+
+
+def _contrast(a: str, b: str) -> float:
+    hi, lo = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def test_a_new_sheet_is_formatted_once_with_the_marker_last_in_the_same_batch():
+    sheets = FakeSheets()
+    result = _check(sheets)
+    assert result == sheet_writer.SheetCheck("ok", "Her inbox")
+    assert result.formatting == sheet_writer.FORMAT_APPLIED
+    requests = _format_batch(sheets)
+    assert "createDeveloperMetadata" in requests[-1], "the marker exists exactly when the look does"
+    marker = requests[-1]["createDeveloperMetadata"]["developerMetadata"]
+    assert (marker["metadataKey"], marker["metadataValue"]) == (
+        sheet_style.FORMAT_MARKER_KEY, sheet_style.FORMAT_VERSION)
+    assert marker["location"] == {"spreadsheet": True}
+    inbox, upcoming = sheets.tabs["Inbox"], sheets.tabs["Upcoming"]
+    assert len(sheets.agent_rules("Inbox")) == len(sheet_style.inbox_rules(inbox))
+    assert len(sheets.agent_rules("Upcoming")) == len(sheet_style.upcoming_rules(upcoming))
+    assert sheets.bandings == {inbox: [sheet_style.INBOX_BANDING_ID]}
+    assert sheets.hidden == {COL_MESSAGE_ID - 1}, "widths never un-hide the Message ID column"
+
+
+def test_every_hourly_recheck_after_that_sends_no_formatting_at_all():
+    sheets = current_sheet()
+    rules_before = copy.deepcopy(sheets.rules)
+    for _ in range(3):
+        assert _check(sheets).formatting == sheet_writer.FORMAT_ALREADY
+    assert sheets.names() == ["get", "values.batchGet", "batchUpdate:layout"] * 3
+    assert sheets.rules == rules_before and len(sheets.metadata) == 1
+
+
+def test_her_later_formatting_survives_the_hourly_recheck():
+    sheets = current_sheet()
+    inbox = sheets.tabs["Inbox"]
+    sheets.rules[inbox] = [_her_rule(inbox)]  # she replaced the colours with her own rule
+    sheets.bandings = {}
+    _check(sheets)
+    assert sheets.rules[inbox] == [_her_rule(inbox)] and sheets.bandings == {}
+
+
+def test_a_sheet_set_up_before_the_look_existed_is_formatted_once_keeping_her_rules_on_top():
+    """The two live sheets: current layout, no marker, her own rule."""
+    sheets = current_sheet()
+    inbox = sheets.tabs["Inbox"]
+    sheets.metadata, sheets.rules, sheets.bandings = [], {inbox: [_her_rule(inbox)]}, {}
+    sheets.calls.clear()
+    assert _check(sheets).formatting == sheet_writer.FORMAT_APPLIED
+    assert sheets.names()[-2:] == ["get", "batchUpdate:format"]
+    rules = sheets.rules[inbox]
+    assert rules[0] == _her_rule(inbox), "hers keeps precedence"
+    assert len(rules) == 1 + len(sheet_style.inbox_rules(inbox))
+    sheets.calls.clear()
+    assert _check(sheets).formatting == sheet_writer.FORMAT_ALREADY
+    assert "batchUpdate:format" not in sheets.names()
+
+
+@pytest.mark.parametrize("marker", ["missing", "older version"])
+def test_re_applying_replaces_only_the_agents_own_rules_banding_and_marker(marker):
+    sheets = current_sheet()
+    inbox, upcoming = sheets.tabs["Inbox"], sheets.tabs["Upcoming"]
+    sheets.rules[inbox].insert(3, _her_rule(inbox))  # hers, between the agent's
+    sheets.rules[upcoming].append(_her_rule(upcoming))
+    if marker == "missing":
+        sheets.metadata = []
+    else:
+        sheets.metadata[0]["metadataValue"] = "0"
+    assert sheet_writer.setup(SID, svc=sheets) == sheet_writer.FORMAT_APPLIED
+    assert len(sheets.agent_rules("Inbox")) == len(sheet_style.inbox_rules(inbox)), "not duplicated"
+    assert len(sheets.agent_rules("Upcoming")) == len(sheet_style.upcoming_rules(upcoming))
+    assert sheets.rules[inbox][0] == _her_rule(inbox) and sheets.rules[upcoming][0] == _her_rule(upcoming)
+    assert sum(r == _her_rule(inbox) for r in sheets.rules[inbox]) == 1
+    assert sheets.bandings[inbox] == [sheet_style.INBOX_BANDING_ID]
+    assert [(m["metadataKey"], m["metadataValue"]) for m in sheets.metadata] == [
+        (sheet_style.FORMAT_MARKER_KEY, sheet_style.FORMAT_VERSION)]
+
+
+def test_her_own_banding_on_inbox_is_kept_and_the_agent_adds_none():
+    sheets = FakeSheets(tabs={"Inbox": 1, "Upcoming": 2})
+    sheets.bandings = {1: [555]}
+    assert _check(sheets).formatting == sheet_writer.FORMAT_APPLIED
+    assert sheets.bandings == {1: [555]}
+    assert not any("addBanding" in r for r in _format_batch(sheets))
+
+
+def test_a_refused_formatting_pass_is_recorded_logged_without_the_id_and_rows_still_flow(caplog):
+    sheets = FakeSheets()
+    sheets.fail["batchUpdate:format"] = HttpError(
+        SimpleNamespace(status=400, reason="bad"), b"body",
+        uri=f"https://sheets.googleapis.com/v4/spreadsheets/{SID}:batchUpdate")
+    with caplog.at_level(logging.WARNING, logger="agentos.inbox.sheets"):
+        result = _check(sheets)
+    assert result.status == "ok" and result.formatting == sheet_writer.FORMAT_FAILED
+    text = caplog.text
+    assert "formatting was not applied" in text and "HTTP 400" in text
+    assert SID not in text and "googleapis" not in text
+    assert sheets.metadata == [] and sheets.rules == {}, "no marker: the next check retries"
+    assert sheet_writer.id_rows(SID, svc=sheets) == {}
+    assert sheet_writer.append(SID, [["d", "f", "s", "c", "sum", "act", "", "l", "m1"]], svc=sheets) == [2]
+
+    del sheets.fail["batchUpdate:format"]
+    assert _check(sheets).formatting == sheet_writer.FORMAT_APPLIED
+
+
+def test_a_failed_format_read_is_also_not_fatal():
+    sheets = current_sheet()
+    sheets.metadata = []
+    real_get = sheets._get
+    calls = {"n": 0}
+
+    def get(**kw):
+        calls["n"] += 1
+        return _Req(error=_http_error(500)) if calls["n"] == 2 else real_get(**kw)
+
+    sheets._get = get
+    assert _check(sheets).formatting == sheet_writer.FORMAT_FAILED
+    assert "batchUpdate:format" not in sheets.names()
+
+
+def test_an_atomic_refusal_mid_batch_leaves_no_half_look():
+    sheets = current_sheet()
+    inbox = sheets.tabs["Inbox"]
+    sheets.metadata = []
+    sheets.bandings = {inbox: [999]}  # hers — but the format read below does not show it
+    real_get = sheets._get
+
+    def stale_get(**kw):
+        meta = real_get(**kw).execute()
+        for sheet in meta["sheets"]:
+            sheet["bandedRanges"] = []
+        return _Req(meta)
+
+    sheets._get = stale_get
+    rules_before = copy.deepcopy(sheets.rules)
+    assert sheet_writer.setup(SID, svc=sheets) == sheet_writer.FORMAT_FAILED
+    assert sheets.rules == rules_before and sheets.metadata == []
+
+
+def test_a_migrated_sheet_is_formatted_in_the_batch_after_the_migration():
+    sheets = legacy_sheet(4)
+    assert _check(sheets).formatting == sheet_writer.FORMAT_APPLIED
+    names = sheets.names()
+    assert names.index("batchUpdate:layout") < names.index("batchUpdate:format")
+    assert sheets.hidden == {COL_MESSAGE_ID - 1} and set(sheets.dropdowns) == {COL_STATUS - 1}
+
+
+def test_the_rules_are_tagged_derived_from_column_names_and_cover_every_future_row():
+    from inbox_triage_agent.sheet_layout import COL_CATEGORY, COL_DEADLINE, DUE_OVERDUE, column_letter
+
+    rules = sheet_style.inbox_rules(7)
+    for rng, condition, _fmt in rules:
+        assert rng["sheetId"] == 7 and rng["startRowIndex"] == 1 and "endRowIndex" not in rng
+        assert sheet_style.is_agent_rule({"booleanRule": {"condition": {
+            "values": [{"userEnteredValue": sheet_style.tagged(condition)}]}}})
+    done_range, done_cond, done_fmt = rules[0]
+    assert (done_range["startColumnIndex"], done_range["endColumnIndex"]) == (0, len(HEADERS)), \
+        "Done colours the whole row"
+    assert done_cond == f'${column_letter(COL_STATUS)}2="Done"'
+    assert done_fmt["textFormat"]["strikethrough"] is True
+    deadline_rules = [r for r in rules if r[0].get("startColumnIndex") == COL_DEADLINE - 1]
+    assert len(deadline_rules) == 2 and all('<>"Done"' in c for _, c, _ in deadline_rules)
+    assert any("TODAY()+2" in c for _, c, _ in deadline_rules)
+    category_rules = [r for r in rules if r[0].get("startColumnIndex") == COL_CATEGORY - 1]
+    styled = {c.split('"')[1] for _, c, _ in category_rules}
+    assert styled == set(CATEGORY_LABELS.values()) - {CATEGORY_LABELS["other"]}
+    upcoming = sheet_style.upcoming_rules(8)
+    assert upcoming[0][1] == f'$A2="{DUE_OVERDUE}"'
+    assert all(r[0]["startColumnIndex"] == UPCOMING_HEADERS.index("Due") for r in upcoming)
+    assert "$B2<=" in upcoming[1][1] and UPCOMING_HEADERS[1] == "Deadline"
+    # Her own custom formula, without the tag, is never taken for the agent's.
+    assert not sheet_style.is_agent_rule({"booleanRule": {"condition": {
+        "type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": '=$D2="Meeting"'}]}}})
+    assert not sheet_style.is_agent_rule(_her_rule())
+
+
+def test_every_coloured_pair_is_readable():
+    pairs = [(sheet_style.BRAND_BLUE, sheet_style.WHITE),
+             (sheet_style.IN_PROGRESS_FILL, sheet_style.IN_PROGRESS_TEXT),
+             (sheet_style.WHITE, sheet_style.DEADLINE_SOON_TEXT),
+             (sheet_style.BAND_TINT, sheet_style.DEADLINE_SOON_TEXT),
+             (sheet_style.BAND_TINT, sheet_style.DEADLINE_OVERDUE_TEXT),
+             (sheet_style.DUE_OVERDUE_FILL, sheet_style.DUE_OVERDUE_TEXT),
+             (sheet_style.DUE_SOON_FILL, sheet_style.DUE_SOON_TEXT),
+             (sheet_style.DUE_LATER_FILL, sheet_style.DUE_LATER_TEXT)]
+    pairs += [(fill, text) for fill, text in sheet_style.CATEGORY_STYLE.values() if fill]
+    weak = [(f, t, round(_contrast(f, t), 2)) for f, t in pairs if _contrast(f, t) < 4.5]
+    assert weak == []
+    # The deliberately faded ones (newsletter text, a Done row) still clear 3:1.
+    faded = sheet_style.CATEGORY_STYLE[CATEGORY_LABELS["newsletter_promo"]][1]
+    assert _contrast(sheet_style.WHITE, faded) >= 3 and _contrast(sheet_style.BAND_TINT, faded) >= 3
+    assert _contrast(sheet_style.DONE_FILL, sheet_style.DONE_TEXT) >= 3
+
+
+def test_widths_are_by_column_name_and_the_header_is_brand_blue_on_both_tabs():
+    requests = sheet_style.format_requests({}, inbox_sheet_id=1, upcoming_sheet_id=2)
+    widths = {
+        (r["updateDimensionProperties"]["range"]["sheetId"],
+         r["updateDimensionProperties"]["range"]["startIndex"]):
+            r["updateDimensionProperties"]["properties"]["pixelSize"]
+        for r in requests
+        if "updateDimensionProperties" in r
+        and r["updateDimensionProperties"]["range"]["dimension"] == "COLUMNS"
+    }
+    assert widths[(1, HEADERS.index("Summary"))] == 380
+    assert widths[(1, HEADERS.index("Notes"))] == 220
+    assert (1, COL_MESSAGE_ID - 1) not in widths
+    assert widths[(2, UPCOMING_HEADERS.index("Due"))] == 100
+    headers = [r["repeatCell"] for r in requests
+               if "repeatCell" in r and r["repeatCell"]["range"].get("endRowIndex") == 1]
+    assert {h["range"]["sheetId"]: h["range"]["endColumnIndex"] for h in headers} == {
+        1: len(HEADERS), 2: len(UPCOMING_HEADERS)}
+    for h in headers:
+        fmt = h["cell"]["userEnteredFormat"]
+        assert fmt["backgroundColor"] == sheet_style.rgb("#1746A2")
+        assert fmt["textFormat"] == {"foregroundColor": sheet_style.rgb("#FFFFFF"), "bold": True}
+        assert fmt["verticalAlignment"] == "MIDDLE"
+    wrapped = {r["repeatCell"]["range"]["startColumnIndex"] for r in requests
+               if "repeatCell" in r and r["repeatCell"]["range"]["sheetId"] == 1
+               and r["repeatCell"]["cell"]["userEnteredFormat"].get("wrapStrategy") == "WRAP"}
+    assert wrapped == {HEADERS.index("Summary"), COL_ACTION - 1}
