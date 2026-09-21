@@ -335,3 +335,196 @@ def test_the_cap_is_configurable_and_a_bad_value_is_not_a_purge(monkeypatch):
     for bad in ("", "   ", "nope", "0", "-5"):
         monkeypatch.setenv("MR_RUN_RETENTION_PER_KIND", bad)
         assert runs.retention_cap() == runs._DEFAULT_RETENTION, bad
+
+
+# --- the workspace key -------------------------------------------------------
+# The key the workbook-derived kinds (dataset / official_spend / lead_analysis)
+# are stored and read under. Resolved from the SERVER's configuration only; the
+# router-level behaviour it buys is pinned in ``test_mr_router.py`` ("the shared
+# MR workspace") and ``test_mr_cross_tenant.py``. Env is read on every call, so
+# each test sets exactly the variables it means and nothing leaks in from the
+# machine running it.
+#
+# Sharing is an OPT-IN: ON only when ``MR_WORKSPACE_SHARED`` positively says so
+# (1 / true / yes / on), OFF for unset and for every other value. Production
+# already has ``MR_CRON_USER_ID`` set, so a switch that defaulted on would have
+# made merely deploying the code the decision to show one account's data to
+# everyone; and one that only recognised "0" as off would fail OPEN on a typo.
+
+def _workspace_env(monkeypatch, *, workspace_id=None, cron_user_id=None, shared=None):
+    for var, value in (("MR_WORKSPACE_ID", workspace_id),
+                       ("MR_CRON_USER_ID", cron_user_id),
+                       ("MR_WORKSPACE_SHARED", shared)):
+        if value is None:
+            monkeypatch.delenv(var, raising=False)
+        else:
+            monkeypatch.setenv(var, value)
+
+
+def test_with_no_key_configured_the_workspace_is_the_callers_own(monkeypatch):
+    """The parity gate: local, dev and every pre-existing suite set neither
+    variable, and for them the workspace must BE the caller."""
+    from marketing_research_agent import workspace
+
+    _workspace_env(monkeypatch)
+    assert workspace.configured_key() == ""
+    assert workspace.is_shared() is False
+    assert workspace.workspace_id("u1") == "u1"
+    assert workspace.workspace_id("u2") == "u2"
+
+    # Switching sharing on with nothing to share is inert, not an error.
+    _workspace_env(monkeypatch, shared="1")
+    assert workspace.sharing_enabled() is True and workspace.is_shared() is False
+    assert workspace.workspace_id("u1") == "u1"
+
+
+def test_the_cron_account_is_the_workspace_when_nothing_more_specific_is_set(monkeypatch):
+    from marketing_research_agent import workspace
+
+    _workspace_env(monkeypatch, cron_user_id="owner-uid", shared="1")
+    assert workspace.is_shared() is True
+    assert workspace.configured_key() == "owner-uid"
+    # Whoever asks — the owner, a colleague — reads the one key.
+    assert workspace.workspace_id("owner-uid") == "owner-uid"
+    assert workspace.workspace_id("a-colleague") == "owner-uid"
+
+
+def test_an_explicit_workspace_id_beats_the_cron_account(monkeypatch):
+    """Precedence: MR_WORKSPACE_ID > MR_CRON_USER_ID > the caller."""
+    from marketing_research_agent import workspace
+
+    _workspace_env(monkeypatch, workspace_id="team-ws", cron_user_id="owner-uid", shared="1")
+    assert workspace.configured_key() == "team-ws"
+    assert workspace.workspace_id("a-colleague") == "team-ws"
+
+    _workspace_env(monkeypatch, workspace_id="team-ws", shared="1")  # no cron account at all
+    assert workspace.is_shared() is True
+    assert workspace.workspace_id("a-colleague") == "team-ws"
+
+
+def test_a_whitespace_only_value_counts_as_unset(monkeypatch):
+    """A stray space in a deployment's env must fall back to per-caller keys. It
+    must never become a key nobody can match — or, worse, one everybody does."""
+    from marketing_research_agent import workspace
+
+    _workspace_env(monkeypatch, workspace_id="   ", cron_user_id="\t ", shared="1")
+    assert workspace.configured_key() == ""
+    assert workspace.is_shared() is False
+    assert workspace.workspace_id("u1") == "u1"
+
+    # …and a blank explicit id defers to the cron account rather than blanking it.
+    _workspace_env(monkeypatch, workspace_id="  ", cron_user_id="owner-uid", shared="1")
+    assert workspace.configured_key() == "owner-uid"
+
+
+def test_the_configured_key_is_stripped(monkeypatch):
+    """A trailing newline (an ``echo``-created secret) must not change the key."""
+    from marketing_research_agent import workspace
+
+    _workspace_env(monkeypatch, cron_user_id="  owner-uid\n", shared="1")
+    assert workspace.workspace_id("someone") == "owner-uid"
+
+
+def test_sharing_turns_on_only_for_a_value_the_code_recognises(monkeypatch):
+    """The opt-in, both directions. Case and surrounding whitespace are ignored;
+    the four words are the whole vocabulary."""
+    from marketing_research_agent import workspace
+
+    for on in ("1", "true", "yes", "on", "TRUE", " Yes ", "On", "\t1\n"):
+        _workspace_env(monkeypatch, cron_user_id="owner-uid", shared=on)
+        assert workspace.sharing_enabled() is True, repr(on)
+        assert workspace.workspace_id("a-colleague") == "owner-uid", repr(on)
+
+    for off in ("0", "false", "off", "no", "OFF", " Off ", ""):
+        _workspace_env(monkeypatch, cron_user_id="owner-uid", shared=off)
+        assert workspace.sharing_enabled() is False, repr(off)
+        assert workspace.is_shared() is False, repr(off)
+        assert workspace.workspace_id("a-colleague") == "a-colleague", repr(off)
+
+
+def test_a_typo_in_the_switch_fails_closed(monkeypatch):
+    """The reason for the polarity. A switch that only recognised "0" / "false" /
+    "off" as off would leave sharing ON for ``ture`` — a typo made while trying
+    to enable it, or worse, while trying to disable it. Here every value the code
+    does not positively recognise is OFF, and OFF is the caller's own key."""
+    from marketing_research_agent import workspace
+
+    for typo in ("ture", "tru", "enabled", "enable", "y", "yep", "2", "-1", "onn",
+                 "of", "flase", "shared", "1 1", "true!", "on;", "yes please"):
+        _workspace_env(monkeypatch, cron_user_id="owner-uid", workspace_id="team-ws",
+                       shared=typo)
+        assert workspace.sharing_enabled() is False, repr(typo)
+        assert workspace.is_shared() is False, repr(typo)
+        assert workspace.workspace_id("a-colleague") == "a-colleague", repr(typo)
+
+
+def test_deploying_without_the_switch_changes_nothing(monkeypatch):
+    """Production ALREADY has ``MR_CRON_USER_ID`` set. Shipping this code must
+    therefore not, by itself, share anything: key configured, switch unset ->
+    every caller is still their own workspace, exactly as before this module
+    existed. Enabling it is a separate, deliberate env change."""
+    from marketing_research_agent import workspace
+
+    _workspace_env(monkeypatch, cron_user_id="owner-uid")
+    assert workspace.configured_key() == "owner-uid"      # the key IS configured…
+    assert workspace.sharing_enabled() is False           # …and still nothing is shared
+    assert workspace.is_shared() is False
+    for who in ("owner-uid", "a-colleague", "another"):
+        assert workspace.workspace_id(who) == who
+
+    # An explicit workspace id alone is no different: it is a key, not a decision.
+    _workspace_env(monkeypatch, workspace_id="team-ws", cron_user_id="owner-uid")
+    assert workspace.is_shared() is False
+    assert workspace.workspace_id("a-colleague") == "a-colleague"
+
+
+def test_a_blank_caller_can_never_become_a_blank_workspace(monkeypatch):
+    """Same contract as ``runs.list_runs``: when the resolver has to fall back to
+    the caller and there is no caller, it raises instead of returning a key that
+    would widen every read keyed on it."""
+    import pytest
+
+    from marketing_research_agent import workspace
+
+    _workspace_env(monkeypatch)
+    for blank in (None, "", "   "):
+        with pytest.raises(ValueError):
+            workspace.workspace_id(blank)
+
+    # Switched off — or never switched on — is a fallback too: the same refusal.
+    for shared in ("0", None, "ture"):
+        _workspace_env(monkeypatch, cron_user_id="owner-uid", shared=shared)
+        with pytest.raises(ValueError):
+            workspace.workspace_id("")
+
+    # A configured, enabled workspace needs no caller id at all — not a widening.
+    _workspace_env(monkeypatch, cron_user_id="owner-uid", shared="1")
+    assert workspace.workspace_id("") == "owner-uid"
+
+
+def test_the_fallback_hands_the_callers_id_back_unchanged(monkeypatch):
+    """MR compares tenant ids raw — ``7`` and ``"7"`` are two tenants, pinned by
+    ``test_tenant_id_type_contract`` — so the unshared mode must not normalise
+    what it was given."""
+    from marketing_research_agent import workspace
+
+    _workspace_env(monkeypatch)
+    assert workspace.workspace_id(7) == 7 and workspace.workspace_id(7) != "7"
+    assert workspace.workspace_id("7") == "7"
+
+
+def test_the_environment_is_read_on_every_call(monkeypatch):
+    """Nothing is cached at import, so a deployment can flip the switch and a
+    test can monkeypatch it."""
+    from marketing_research_agent import workspace
+
+    _workspace_env(monkeypatch)
+    assert workspace.workspace_id("u1") == "u1"
+    monkeypatch.setenv("MR_CRON_USER_ID", "owner-uid")
+    assert workspace.workspace_id("u1") == "u1"           # key alone: still off
+    monkeypatch.setenv("MR_WORKSPACE_SHARED", "1")
+    assert workspace.workspace_id("u1") == "owner-uid"
+    monkeypatch.setenv("MR_WORKSPACE_SHARED", "0")
+    assert workspace.workspace_id("u1") == "u1"
+    monkeypatch.delenv("MR_WORKSPACE_SHARED")             # rollback by unsetting
+    assert workspace.workspace_id("u1") == "u1"

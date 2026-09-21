@@ -35,6 +35,14 @@ CSV = (
 def _harness(tmp_path, monkeypatch, as_caller):
     monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
     monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "targets.json"))
+    # The workspace key is SERVER configuration. Everything above the "shared MR
+    # workspace" section pins the UNSHARED mode — each caller's workbook data is
+    # their own — and a machine that happens to export one of these would flip
+    # the whole module into shared mode and fail for a reason nobody could see.
+    # The shared-mode tests opt in through ``_shared_ws``.
+    for var in ("MR_WORKSPACE_ID", "MR_CRON_USER_ID", "MR_WORKSPACE_SHARED",
+                "MR_PULL_COOLDOWN_SECONDS"):
+        monkeypatch.delenv(var, raising=False)
     as_caller(USER)
 
 
@@ -228,25 +236,27 @@ def test_lead_analysis_pdf_404_before_any_pull():
 # blanked the dashboard permanently and the only evidence was a response body
 # nobody reads. These tests pin the replacement contract.
 
-def _seed_previous_pull():
+def _seed_previous_pull(user_id=None, stamp="2026-08-01T00:00:00+00:00"):
     """A workspace that already holds a good pull: one tracker dataset, the
-    official headline figures, and a lead summary."""
+    official headline figures, and a lead summary. ``user_id`` is the key the
+    runs are stamped with (the caller's own, unless a test is seeding the shared
+    workspace's key); ``stamp`` is when they were pulled."""
     from marketing_research_agent import runs as mr_runs
 
+    user_id = user_id or USER["id"]
     ids = {
         "dataset": mr_runs.new_run_id(),
         "official": mr_runs.new_run_id(),
         "lead": mr_runs.new_run_id(),
     }
-    stamp = "2026-08-01T00:00:00+00:00"
-    mr_runs.save_run({"id": ids["dataset"], "kind": "dataset", "user_id": USER["id"],
+    mr_runs.save_run({"id": ids["dataset"], "kind": "dataset", "user_id": user_id,
                       "agent_id": "a6", "platform": "sheets:Vendor A", "generated_at": stamp,
                       "metrics": [], "leads": [], "gaps": []})
-    mr_runs.save_run({"id": ids["official"], "kind": "official_spend", "user_id": USER["id"],
+    mr_runs.save_run({"id": ids["official"], "kind": "official_spend", "user_id": user_id,
                       "agent_id": "a6", "platform": "sheets-official", "generated_at": stamp,
                       "months": {"2026-07": 8632.0},
                       "totals": {"2026-07": {"spend": 8632.0}}})
-    mr_runs.save_run({"id": ids["lead"], "kind": "lead_analysis", "user_id": USER["id"],
+    mr_runs.save_run({"id": ids["lead"], "kind": "lead_analysis", "user_id": user_id,
                       "agent_id": "a6", "platform": "sheets-leads", "generated_at": stamp,
                       "source_label": "Primary", "tab": "Lead Analysis", "gaps": [],
                       "summary": {"latest_month": "2026-07",
@@ -1534,12 +1544,1462 @@ def test_report_churn_never_costs_the_workspace_its_data(monkeypatch):
 
 def test_several_uploads_all_survive_the_cap(monkeypatch):
     """More datasets than the cap, on purpose: a tracker pull writes one run per
-    tab (eleven, live) and ``_load_dataset`` reads every one of them. A cap that
-    applied here would silently drop vendors from every report."""
+    tab (eleven, live) and every one of them is STORED and listed. A cap that
+    applied here would silently delete vendors' runs.
+
+    Stored is not the same as counted. ``_load_dataset`` feeds a report from the
+    NEWEST run per platform only (``_latest_datasets``), so these five
+    same-platform uploads all survive the cap but only the last one contributes
+    to any figure — the other four are ``superseded`` in the listing, which is
+    what ``test_the_datasets_list_marks_the_runs_that_no_longer_count`` pins."""
     monkeypatch.setenv("MR_RUN_RETENTION_PER_KIND", "2")
     for n in range(5):
         r = client.post("/api/mr/ingest",
                         files={"file": (f"g{n}.csv", io.BytesIO(CSV), "text/csv")},
                         data={"platform": "google_ads"})
         assert r.status_code == 200, r.text
-    assert len(client.get("/api/mr/datasets").json()) == 5
+    listed = client.get("/api/mr/datasets").json()
+    assert len(listed) == 5
+    assert sum(1 for d in listed if not d["superseded"]) == 1, "only the newest one counts"
+
+
+# --------------------------------------------------------------------------- #
+# The shared MR workspace
+# --------------------------------------------------------------------------- #
+# Everything above this line runs with NO workspace key configured, so each
+# caller's workbook data is their own — that is the unshared mode, and it is what
+# local, dev and this module's harness default to.
+#
+# Everything below turns sharing ON — a workspace key (``MR_CRON_USER_ID``, the
+# account the 15-minute cron pulls for) AND the explicit opt-in
+# (``MR_WORKSPACE_SHARED=1``) — and pins what changes: the three
+# workbook-derived kinds and the board report become ONE copy every signed-in
+# member reads, while the reports a person builds, their run list, their targets
+# and their schedule stay their own. Why: on production only the cron account's
+# copy was ever fresh, so every other account opened an empty Overview, an empty
+# month picker and an empty board-report builder in front of a workbook the
+# whole team already shares.
+#
+# The switch is an opt-in that FAILS CLOSED: unset, or any value the code does
+# not positively recognise, is OFF. So the key alone — which production already
+# has — changes nothing (``test_deploying_without_the_switch_changes_nothing``),
+# and a typo in the switch changes nothing
+# (``test_a_typo_in_the_switch_fails_closed``). Rollback is unsetting it (or 0).
+#
+# While shared, what changes the WHOLE team's dashboard is an admin's: uploads,
+# a forced pull and a single-tab pull are 403 for a member. Those tests say so.
+#
+# The key is a THIRD id, neither caller. A test that pulls as USER and reads as
+# MEMBER would also pass if MEMBER were simply reading USER's rows; with a
+# workspace id that belongs to nobody, a pass can only come from the resolver.
+
+#: The deployment's workspace key in these tests — the cron's account.
+WORKSPACE = "mr-shared-workspace"
+
+MEMBER = {"id": "u2", "email": "member@legalsoft.com", "is_admin": False,
+          "is_creator": False, "session_id": "", "timezone": "UTC"}
+
+#: An admin. Everything that changes what the whole team sees is theirs.
+ADMIN = {"id": "u-admin", "email": "admin@legalsoft.com", "is_admin": True,
+         "is_creator": False, "session_id": "", "timezone": "UTC"}
+
+
+def _shared_ws(monkeypatch, key=WORKSPACE):
+    """Turn the shared workspace ON: the cron's account becomes the workspace AND
+    the opt-in switch is set. Both are needed — see the section header."""
+    monkeypatch.setenv("MR_CRON_USER_ID", key)
+    monkeypatch.setenv("MR_WORKSPACE_SHARED", "1")
+    return key
+
+
+def _lead_tab():
+    """A workbook tab the lead-analysis auto-detection recognises by its header."""
+    from marketing_research_agent.workbook import TabGrid
+
+    header = ["Demo Month", "Campaign", "Brand", "Source", "Meeting Outcome",
+              "Deal Stage", "$ Amount", "MRR", "No. of Services Sold"]
+    rows = [header,
+            ["August", "Meta 360 RA", "RA", "Meta", "Completed", "Contract Sent",
+             "$2,000.00", "$2,000.00", "1"],
+            ["August", "Meta 360 RA", "RA", "Meta", "No Show", "Demo No Show", "", "", ""]]
+    return TabGrid(title="Lead Analysis", gid=9, hidden=False, rows=rows,
+                   n_rows=len(rows), n_cols=len(header))
+
+
+def _stub_pull(monkeypatch, tmp_path, *, lead_tab=None):
+    """Stub every Google read a full pull makes; nothing here leaves the process.
+
+    Returns the list each tracker fetch is recorded into, so a test can assert
+    that a skipped pull fetched NOTHING — the cost the cooldown exists to avoid.
+    """
+    fetches: list[str] = []
+    monkeypatch.setenv("MR_SOURCES_FILE", str(tmp_path / "sources.json"))
+
+    def _tracker(sid, year):
+        fetches.append(sid)
+        return _one_tracker_tab()
+
+    monkeypatch.setattr(mr_router, "fetch_all_trackers", _tracker)
+    monkeypatch.setattr(mr_router, "fetch_official_totals",
+                        lambda sid, year, **kw: {"2026-06": {"spend": 5000.0}})
+    monkeypatch.setattr(mr_router.mr_workbook, "fetch_workbook",
+                        lambda sid, **kw: [] if lead_tab is None else [lead_tab])
+    if lead_tab is not None:
+        monkeypatch.setattr(mr_router, "fetch_tab_values", lambda sid, title: lead_tab.rows)
+    return fetches
+
+
+def _stub_cron_extras(monkeypatch):
+    """The snapshot/export half of the cron, stubbed clean."""
+    monkeypatch.setenv("MR_CRON_KEY", "s3cret")
+    monkeypatch.setattr(mr_router, "_workbook_grids", lambda: [])
+    monkeypatch.setattr(mr_router.mr_snapshots, "capture_workbook", lambda grids, **kw: [])
+    monkeypatch.setattr(mr_router.mr_snapshots, "export_all_to_gcs", lambda today: [])
+
+
+def _stored_pull_stamps(key):
+    """``generated_at`` of every run under ``key`` that a FULL pull produced — the
+    ``official_spend`` runs, which nothing but ``_pull_and_swap`` writes and which
+    are what the freshness clock reads."""
+    from marketing_research_agent import runs as mr_runs
+
+    return [r["generated_at"] for r in mr_runs.list_runs(key, kind="official_spend")]
+
+
+def _ago(seconds: float) -> str:
+    """An ISO stamp ``seconds`` in the past, for seeding a pull of a known age."""
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+
+
+def _stub_single_tab(monkeypatch, *, tabs=None, values=None):
+    """Stub the two Sheets reads the SHARED single-tab pull makes (the tab list
+    and the tab's values) and record every call. ``tabs`` is the workbook's tab
+    list; ``values`` maps a tab title to its rows (default: a real tracker)."""
+    calls: list[tuple] = []
+    tab_list = tabs if tabs is not None else [
+        {"gid": 1, "title": "Vendor A", "hidden": False},
+        {"gid": 2, "title": "Marketing 2026 Overall Report", "hidden": False},
+        {"gid": 3, "title": "Old Archive", "hidden": True},
+        {"gid": 4, "title": "Vendor B", "hidden": False},
+    ]
+
+    def _meta(sid, **kw):
+        calls.append(("meta", sid))
+        return {"title": "Tracker", "tabs": tab_list}
+
+    def _values(sid, title, **kw):
+        calls.append(("values", title))
+        return (values or {}).get(title, _tracker_rows(title))
+
+    monkeypatch.setattr(mr_router, "workbook_meta", _meta)
+    monkeypatch.setattr(mr_router, "fetch_tab_values", _values)
+    return calls
+
+
+def _tracker_rows(title="Vendor A"):
+    """A tab ``parse_tracker`` reads as a vendor tracker: the vendor in A1, a
+    month header per column, and a spend + leads row (June $1,200, July $900)."""
+    return [
+        [title, "Jun (Performance)", "Jul (Performance)"],
+        ["Spend", "$1,200.00", "$900.00"],
+        ["Leads", "12", "9"],
+    ]
+
+
+def test_a_second_member_reads_the_pull_a_colleague_triggered(monkeypatch, tmp_path, as_caller):
+    """The bug, end to end. One member presses Pull; a different member — who has
+    never pulled and has no data of their own — opens the same panels and sees
+    the numbers. Before this, they saw a blank workspace."""
+    from marketing_research_agent import runs as mr_runs
+
+    _shared_ws(monkeypatch)
+    _stub_pull(monkeypatch, tmp_path)
+
+    as_caller(USER)
+    pulled = client.post("/api/mr/ingest-sheet", json={})
+    assert pulled.status_code == 200, pulled.text
+
+    # Where it landed: the workspace key, not whoever pressed the button.
+    assert [r["platform"] for r in mr_runs.list_runs(WORKSPACE, kind="dataset")] == [
+        "sheets:Vendor A"]
+    assert [r["kind"] for r in mr_runs.list_runs(WORKSPACE, kind="official_spend")] == [
+        "official_spend"]
+    assert mr_runs.list_runs(USER["id"]) == [], "the pull was stamped with the caller"
+
+    as_caller(MEMBER)
+    assert client.get("/api/mr/overview").json()["has_data"] is True
+    assert client.get("/api/mr/trends").json()["has_data"] is True
+    months = [m["period"] for m in client.get("/api/mr/report-periods").json()["months"]]
+    assert "2026-06" in months
+    assert [d["platform"] for d in client.get("/api/mr/datasets").json()] == ["sheets:Vendor A"]
+
+
+def test_the_cron_pull_is_what_every_signed_in_member_reads(monkeypatch, tmp_path, as_caller):
+    """The production shape: nobody signed in pulls; the scheduler does, for
+    ``MR_CRON_USER_ID``. Neither member below is that account, and both read
+    the result — including the lead analysis, whose flags were judged at pull
+    time."""
+    _shared_ws(monkeypatch)
+    _stub_pull(monkeypatch, tmp_path, lead_tab=_lead_tab())
+    _stub_cron_extras(monkeypatch)
+
+    fired = client.post("/api/mr/cron/refresh", headers={"x-cron-key": "s3cret"})
+    assert fired.status_code == 200, fired.text
+    assert fired.json()["errors"] == []
+
+    for who in (USER, MEMBER):
+        as_caller(who)
+        assert client.get("/api/mr/overview").json()["has_data"] is True, who["id"]
+        periods = client.get("/api/mr/report-periods").json()
+        assert periods["months"] and periods["quarters"], who["id"]
+        lead = client.get("/api/mr/lead-analysis").json()
+        assert lead["has_data"] is True and lead["tab"] == "Lead Analysis", who["id"]
+
+
+def test_an_explicit_workspace_id_is_the_key_the_cron_writes_under(
+        monkeypatch, tmp_path, as_caller):
+    """``MR_WORKSPACE_ID`` outranks the cron account for READS, so the cron must
+    write under it too — otherwise a deployment that sets it would refresh a key
+    nobody reads, which is the blank dashboard again with a green cron."""
+    from marketing_research_agent import runs as mr_runs
+
+    _shared_ws(monkeypatch)
+    monkeypatch.setenv("MR_WORKSPACE_ID", "team-workspace")
+    _stub_pull(monkeypatch, tmp_path)
+    _stub_cron_extras(monkeypatch)
+
+    assert client.post("/api/mr/cron/refresh",
+                       headers={"x-cron-key": "s3cret"}).status_code == 200
+    assert mr_runs.list_runs("team-workspace", kind="dataset")
+    assert mr_runs.list_runs(WORKSPACE) == [], "the cron wrote under the cron account"
+
+    as_caller(MEMBER)
+    assert client.get("/api/mr/overview").json()["has_data"] is True
+
+
+def test_a_pull_inside_the_cooldown_serves_the_fresh_one_and_fetches_nothing(
+        monkeypatch, tmp_path, as_caller):
+    """Every member can press Pull, and the in-process lock only serialises pulls
+    on one Cloud Run instance. Without a freshness gate a team of nineteen is
+    nineteen Google fetches. The answer is honest, not a fake success: nothing
+    was fetched, the body says so, and it names when the data on screen was
+    pulled."""
+    from datetime import datetime
+
+    from marketing_research_agent import runs as mr_runs
+
+    _shared_ws(monkeypatch)
+    fetches = _stub_pull(monkeypatch, tmp_path)
+
+    assert client.post("/api/mr/ingest-sheet", json={}).status_code == 200
+    assert len(fetches) == 1
+    before = {r["id"] for r in mr_runs.list_runs(WORKSPACE)}
+
+    as_caller(MEMBER)
+    again = client.post("/api/mr/ingest-sheet", json={})
+    assert again.status_code == 200, again.text
+    body = again.json()
+    assert body["status"] == "fresh"
+    assert (body["tabs"], body["ingested"], body["failed"], body["degraded"]) == ([], 0, 0, [])
+    newest = max(_stored_pull_stamps(WORKSPACE), key=datetime.fromisoformat)
+    assert body["last_pulled_at"] == newest, "it must name the pull it is pointing at"
+    assert len(fetches) == 1, "the cooldown still went to Google"
+    assert {r["id"] for r in mr_runs.list_runs(WORKSPACE)} == before, (
+        "a skipped pull wrote or deleted runs")
+
+
+def test_a_pull_older_than_the_cooldown_is_pulled_not_skipped(monkeypatch, tmp_path):
+    """The other half: freshness is a window, not a latch."""
+    _shared_ws(monkeypatch)
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    _seed_previous_pull(WORKSPACE, stamp="2026-08-01T00:00:00+00:00")
+
+    r = client.post("/api/mr/ingest-sheet", json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "ok" and r.json()["ingested"] == 1
+    assert len(fetches) == 1
+
+
+def test_a_run_stamped_in_the_future_never_blocks_a_pull(monkeypatch, tmp_path):
+    """A stamp ahead of the clock is skew (or bad data), not freshness. Treated
+    as fresh it would refuse every pull until the year it names."""
+    _shared_ws(monkeypatch)
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    _seed_previous_pull(WORKSPACE, stamp="2099-01-01T00:00:00+00:00")
+
+    r = client.post("/api/mr/ingest-sheet", json={})
+    assert r.status_code == 200 and r.json()["status"] == "ok", r.text
+    assert len(fetches) == 1
+
+
+def test_an_upload_does_not_make_the_next_pull_fresh(monkeypatch, tmp_path, as_caller):
+    """``last_pulled_at`` means WHEN THE SHEET WAS PULLED. A CSV an admin
+    uploaded a minute ago is not a pull, and counting it would answer "fresh"
+    with an upload's timestamp while the tracker data was stale."""
+    _shared_ws(monkeypatch)
+    fetches = _stub_pull(monkeypatch, tmp_path)
+
+    as_caller(ADMIN)                       # uploads are an admin's while shared
+    up = client.post("/api/mr/ingest", files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+                     data={"platform": "google_ads"})
+    assert up.status_code == 200, up.text
+
+    as_caller(MEMBER)
+    pulled = client.post("/api/mr/ingest-sheet", json={})
+    assert pulled.status_code == 200 and pulled.json()["status"] == "ok", pulled.text
+    assert len(fetches) == 1
+
+
+def test_the_cooldown_can_be_switched_off(monkeypatch, tmp_path):
+    _shared_ws(monkeypatch)
+    monkeypatch.setenv("MR_PULL_COOLDOWN_SECONDS", "0")
+    fetches = _stub_pull(monkeypatch, tmp_path)
+
+    for _ in range(2):
+        r = client.post("/api/mr/ingest-sheet", json={})
+        assert r.status_code == 200 and r.json()["status"] == "ok", r.text
+    assert len(fetches) == 2
+
+
+def test_a_bad_cooldown_setting_falls_back_to_the_default_never_to_off(monkeypatch):
+    """A typo in a deployment's env must not become "no gate" or, worse, "never
+    pull again"."""
+    default = mr_router._DEFAULT_PULL_COOLDOWN_SECONDS
+    monkeypatch.delenv("MR_PULL_COOLDOWN_SECONDS", raising=False)
+    assert mr_router._pull_cooldown_seconds() == default
+
+    for bad in ("", "  ", "soon", "-5", "inf", "nan"):
+        monkeypatch.setenv("MR_PULL_COOLDOWN_SECONDS", bad)
+        assert mr_router._pull_cooldown_seconds() == default, bad
+
+    monkeypatch.setenv("MR_PULL_COOLDOWN_SECONDS", "30")
+    assert mr_router._pull_cooldown_seconds() == 30.0
+    monkeypatch.setenv("MR_PULL_COOLDOWN_SECONDS", "0")
+    assert mr_router._pull_cooldown_seconds() == 0.0
+
+
+def test_a_forced_pull_bypasses_the_cooldown_but_not_the_lock(
+        monkeypatch, tmp_path, as_caller):
+    """An admin's ``force`` skips the COOLDOWN. It never skips the in-flight lock.
+    (The floor is switched off here so the cooldown is the only thing under
+    test; the floor has its own tests below.)"""
+    _shared_ws(monkeypatch)
+    monkeypatch.setenv("MR_FORCE_PULL_FLOOR_SECONDS", "0")
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    as_caller(ADMIN)
+    assert client.post("/api/mr/ingest-sheet", json={}).status_code == 200
+
+    forced = client.post("/api/mr/ingest-sheet", json={"force": True})
+    assert forced.status_code == 200 and forced.json()["status"] == "ok", forced.text
+    assert len(fetches) == 2
+
+    # "false" is a non-empty string, and so truthy. A flag that skips a safety
+    # check only ever fires on a real ``true``.
+    lazy = client.post("/api/mr/ingest-sheet", json={"force": "false"})
+    assert lazy.json()["status"] == "fresh"
+    assert len(fetches) == 2
+
+    # Force is not a licence to overlap: the lock is a different protection from
+    # the cooldown and a forced pull still cannot interleave with a running one.
+    lock = mr_router._pull_lock(WORKSPACE)
+    assert lock.acquire(blocking=False)
+    try:
+        blocked = client.post("/api/mr/ingest-sheet", json={"force": True})
+        assert blocked.status_code == 409, blocked.text
+        assert "already running" in blocked.json()["detail"]
+    finally:
+        lock.release()
+    assert len(fetches) == 2
+
+
+#: ``_FORCE_REFUSED`` / ``_SINGLE_TAB_REFUSED`` / ``_UPLOAD_REFUSED`` in the router
+#: — pinned verbatim so the wording the console shows cannot drift from the
+#: wording the router raises.
+FORCE_REFUSED = ("Only an admin can force a pull. The team's data refreshes on its own "
+                 "and a normal pull is always available.")
+SINGLE_TAB_REFUSED = ("Pulling a single tab changes the whole team's dashboard, so only an "
+                      "admin can do it. A normal pull refreshes every tab.")
+UPLOAD_REFUSED = "Uploads go to the whole team's dashboard, so only an admin can add them."
+
+CREATOR = {"id": "u-creator", "email": "creator@legalsoft.com", "is_admin": False,
+           "is_creator": True, "session_id": "", "timezone": "UTC"}
+
+
+def test_a_member_cannot_force_a_pull_but_a_plain_pull_still_works(
+        monkeypatch, tmp_path, as_caller):
+    """``force`` is the only thing that skips the pull limiter, and the console
+    offers it to every reader. So a member is refused 403 — BEFORE the store, the
+    lock or Google are touched — with a plain reason; their ordinary pull still
+    works, and inside the cooldown still answers ``fresh``."""
+    _shared_ws(monkeypatch)
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    calls = _count_run_reads(monkeypatch)
+
+    as_caller(MEMBER)
+    refused = client.post("/api/mr/ingest-sheet", json={"force": True})
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"] == FORCE_REFUSED
+    assert fetches == [] and calls == [], (
+        "a member's force reached the store or Google before it was refused")
+
+    plain = client.post("/api/mr/ingest-sheet", json={})
+    assert plain.status_code == 200 and plain.json()["status"] == "ok", plain.text
+    assert len(fetches) == 1
+    again = client.post("/api/mr/ingest-sheet", json={})
+    assert again.status_code == 200 and again.json()["status"] == "fresh", again.text
+
+    # 403 also when the answer would have been "fresh" anyway: the refusal is
+    # about the caller, and it is evaluated before the floor is ever looked at.
+    still = client.post("/api/mr/ingest-sheet", json={"force": True})
+    assert still.status_code == 403 and "Retry-After" not in still.headers
+    assert len(fetches) == 1
+
+
+def test_a_forced_pull_inside_the_floor_is_a_429_with_retry_after(
+        monkeypatch, tmp_path, as_caller):
+    """An admin's force skips the cooldown, not the FLOOR. Inside it the pull is
+    refused outright — 429 and a ``Retry-After`` — so a scripted caller backs off
+    honestly instead of being told the data is fine. A plain pull inside the
+    cooldown keeps answering 200 ``fresh``."""
+    from marketing_research_agent import runs as mr_runs
+
+    _shared_ws(monkeypatch)
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    for who in (ADMIN, CREATOR):                   # both roles may force
+        as_caller(who)
+        if who is ADMIN:
+            assert client.post("/api/mr/ingest-sheet", json={}).status_code == 200
+        before = {r["id"] for r in mr_runs.list_runs(WORKSPACE)}
+        n = len(fetches)
+
+        hammered = client.post("/api/mr/ingest-sheet", json={"force": True})
+        assert hammered.status_code == 429, f"{who['id']}: {hammered.text}"
+        retry = int(hammered.headers["Retry-After"])
+        assert 1 <= retry <= 30, retry
+        assert "seconds" in hammered.json()["detail"]
+        assert hammered.json().get("status") != "fresh"
+        assert len(fetches) == n, "a forced pull inside the floor still fetched"
+        assert {r["id"] for r in mr_runs.list_runs(WORKSPACE)} == before
+
+        as_caller(MEMBER)                          # a plain pull is still just "fresh"
+        plain = client.post("/api/mr/ingest-sheet", json={})
+        assert plain.status_code == 200 and plain.json()["status"] == "fresh"
+
+
+def test_a_forced_pull_past_the_floor_proceeds(monkeypatch, tmp_path, as_caller):
+    """Past the floor the force is honoured — that is what force is for. A pull
+    60s old is inside the 120s cooldown (a plain pull is "fresh") and past the
+    30s floor (a forced one runs)."""
+    _shared_ws(monkeypatch)
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    _seed_previous_pull(WORKSPACE, stamp=_ago(60))
+
+    as_caller(MEMBER)
+    assert client.post("/api/mr/ingest-sheet", json={}).json()["status"] == "fresh"
+    assert fetches == []
+
+    as_caller(ADMIN)
+    forced = client.post("/api/mr/ingest-sheet", json={"force": True})
+    assert forced.status_code == 200 and forced.json()["status"] == "ok", forced.text
+    assert len(fetches) == 1
+
+
+def test_the_lock_is_taken_before_the_floor_is_read(monkeypatch, tmp_path, as_caller):
+    """Force never skips the lock, and the lock answers first: with a pull in
+    flight AND a very recent one, the admin gets the 409, not the 429."""
+    _shared_ws(monkeypatch)
+    _stub_pull(monkeypatch, tmp_path)
+    _seed_previous_pull(WORKSPACE, stamp=_ago(5))
+
+    lock = mr_router._pull_lock(WORKSPACE)
+    assert lock.acquire(blocking=False)
+    try:
+        as_caller(ADMIN)
+        r = client.post("/api/mr/ingest-sheet", json={"force": True})
+        assert r.status_code == 409, r.text
+    finally:
+        lock.release()
+
+
+def test_the_floor_can_be_switched_off_and_a_bad_setting_never_turns_it_off(
+        monkeypatch, tmp_path, as_caller):
+    _shared_ws(monkeypatch)
+    monkeypatch.setenv("MR_FORCE_PULL_FLOOR_SECONDS", "0")
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    as_caller(ADMIN)
+    for _ in range(2):
+        r = client.post("/api/mr/ingest-sheet", json={"force": True})
+        assert r.status_code == 200 and r.json()["status"] == "ok", r.text
+    assert len(fetches) == 2
+
+    default = mr_router._DEFAULT_FORCE_PULL_FLOOR_SECONDS
+    assert default == 30.0
+    monkeypatch.delenv("MR_FORCE_PULL_FLOOR_SECONDS")
+    assert mr_router._force_pull_floor_seconds() == default
+    for bad in ("", "  ", "soon", "-5", "inf", "nan"):
+        monkeypatch.setenv("MR_FORCE_PULL_FLOOR_SECONDS", bad)
+        assert mr_router._force_pull_floor_seconds() == default, bad
+    monkeypatch.setenv("MR_FORCE_PULL_FLOOR_SECONDS", "10")
+    assert mr_router._force_pull_floor_seconds() == 10.0
+
+
+def test_force_and_the_floor_do_nothing_when_the_workspace_is_not_shared(
+        monkeypatch, tmp_path):
+    """Unshared is today's behaviour, byte for byte: any caller may send
+    ``force`` (it has nothing to skip), and there is no floor to hit."""
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    for _ in range(3):
+        r = client.post("/api/mr/ingest-sheet", json={"force": True})   # USER: no admin flags
+        assert r.status_code == 200 and r.json()["status"] == "ok", r.text
+    assert len(fetches) == 3
+
+
+def test_the_pull_lock_is_the_workspaces_not_the_members(monkeypatch, tmp_path, as_caller):
+    """With one key for everyone, two members pulling at once must serialise. A
+    lock keyed on the caller would let them interleave their write and delete
+    passes over the SAME rows — the data-loss race the lock exists to prevent."""
+    _shared_ws(monkeypatch)
+    _stub_pull(monkeypatch, tmp_path)
+
+    lock = mr_router._pull_lock(WORKSPACE)
+    assert lock.acquire(blocking=False)
+    try:
+        for who in (USER, MEMBER):
+            as_caller(who)
+            r = client.post("/api/mr/ingest-sheet", json={})
+            assert r.status_code == 409, f"{who['id']}: {r.status_code} {r.text}"
+    finally:
+        lock.release()
+
+
+def test_a_cooldown_skip_is_not_a_degraded_cron(monkeypatch, tmp_path):
+    """The scheduler reads only the status code, and a skip is a healthy answer:
+    the data is minutes old. Reporting it as 207 would page nobody usefully and
+    teach whoever reads the alerts to ignore them."""
+    _shared_ws(monkeypatch)
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    _stub_cron_extras(monkeypatch)
+
+    assert client.post("/api/mr/ingest-sheet", json={}).status_code == 200  # a member, just now
+    fired = client.post("/api/mr/cron/refresh", headers={"x-cron-key": "s3cret"})
+    assert fired.status_code == 200, fired.text
+    body = fired.json()
+    assert body["status"] == "ok" and body["errors"] == []
+    assert body["pull"]["status"] == "fresh"
+    assert len(fetches) == 1
+
+
+def test_a_duplicate_tracker_dataset_is_swept_by_the_next_pull(monkeypatch, tmp_path):
+    """Two Cloud Run instances can pull the same workspace at once, and each swap
+    only retires what it read BEFORE it wrote — so both can leave a run of the
+    same tab behind. Readers never see the duplicate, but they would pile up.
+
+    Simulated exactly where that race lands: a second run of the same tab is
+    written AFTER this pull read its superseded set, so the swap cannot retire it
+    and only the sweep can."""
+    from marketing_research_agent import runs as mr_runs
+
+    _shared_ws(monkeypatch)
+    _stub_pull(monkeypatch, tmp_path)
+    real_save = mr_runs.save_run
+    strays: list[str] = []
+
+    def _save_with_a_racing_twin(run):
+        durable = real_save(run)
+        if run.get("kind") == "dataset" and run.get("platform") == "sheets:Vendor A":
+            stray = {**run, "id": mr_runs.new_run_id(),
+                     "generated_at": "2026-01-01T00:00:00+00:00"}  # the older twin
+            real_save(stray)
+            strays.append(stray["id"])
+        return durable
+
+    monkeypatch.setattr(mr_runs, "save_run", _save_with_a_racing_twin)
+
+    r = client.post("/api/mr/ingest-sheet", json={})
+    assert r.status_code == 200, r.text
+    assert len(strays) == 1
+    survivors = mr_runs.list_runs(WORKSPACE, kind="dataset")
+    assert [s["platform"] for s in survivors] == ["sheets:Vendor A"], (
+        "the twin survived the pull that should have swept it")
+    assert strays[0] not in {s["id"] for s in survivors}
+    assert survivors[0]["generated_at"] > "2026-06", "the sweep kept the wrong copy"
+
+
+def test_the_sweep_keeps_the_newest_copy_of_a_tab_and_never_touches_an_upload(
+        monkeypatch, tmp_path):
+    """The invariant that makes the sweep safe: per tab the NEWEST run always
+    survives, so it can never empty a tab — and only ``sheets:*`` is ever a
+    candidate, because an upload is somebody's contribution and its "duplicates"
+    (two ``google_ads`` files) are both wanted."""
+    from marketing_research_agent import runs as mr_runs
+
+    def _dataset(platform, stamp, who=WORKSPACE):
+        rid = mr_runs.new_run_id()
+        mr_runs.save_run({"id": rid, "kind": "dataset", "user_id": who, "agent_id": "a6",
+                          "platform": platform, "generated_at": stamp,
+                          "metrics": [], "leads": [], "gaps": []})
+        return rid
+
+    a_old = _dataset("sheets:Vendor A", "2026-07-01T00:00:00+00:00")
+    a_mid = _dataset("sheets:Vendor A", "2026-07-02T00:00:00+00:00")
+    a_new = _dataset("sheets:Vendor A", "2026-07-03T00:00:00+00:00")
+    b_only = _dataset("sheets:Vendor B", "2026-07-01T00:00:00+00:00")
+    up_1 = _dataset("google_ads", "2026-07-01T00:00:00+00:00")
+    up_2 = _dataset("google_ads", "2026-07-02T00:00:00+00:00")
+    pdf = _dataset("pdf:board.pdf", "2026-07-01T00:00:00+00:00")
+    elsewhere = _dataset("sheets:Vendor A", "2026-06-01T00:00:00+00:00", who="someone-else")
+
+    assert mr_router._sweep_superseded_tracker_runs(WORKSPACE) == 2
+
+    def alive(rid):
+        return mr_runs.get_run(rid) is not None
+
+    assert (alive(a_new), alive(a_mid), alive(a_old)) == (True, False, False)
+    assert alive(b_only) and alive(up_1) and alive(up_2) and alive(pdf)
+    assert alive(elsewhere), "the sweep crossed into another workspace"
+    assert mr_router._sweep_superseded_tracker_runs(WORKSPACE) == 0  # and it is idempotent
+
+
+def test_an_unreadable_store_during_the_freshness_check_still_answers_502(
+        monkeypatch, tmp_path):
+    """The freshness gate reads the store, and a store that cannot be read must
+    not read as "nothing pulled recently, go ahead" NOR as "fresh". It falls
+    through, and the pull's own read of the existing runs is what answers — the
+    same honest 502 the rest of the pull contract gives."""
+    _shared_ws(monkeypatch)
+    _stub_pull(monkeypatch, tmp_path)
+    _dead_runs_store(monkeypatch)
+
+    r = client.post("/api/mr/ingest-sheet", json={})
+    assert r.status_code == 502, r.text
+    detail = r.json()["detail"]
+    assert "left untouched" in detail and "could not read the existing runs" in detail
+
+
+def test_with_no_workspace_key_every_read_is_still_the_callers_own(
+        monkeypatch, tmp_path, as_caller):
+    """The parity gate for local, dev and every suite above: with neither
+    ``MR_CRON_USER_ID`` nor ``MR_WORKSPACE_ID`` set, nothing about the agent
+    changes — a pull belongs to whoever pressed it and nobody else sees it —
+    and there is no cooldown, because there is no shared key to protect."""
+    from marketing_research_agent import runs as mr_runs
+
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    assert client.post("/api/mr/ingest-sheet", json={}).status_code == 200
+    assert mr_runs.list_runs(USER["id"], kind="dataset"), "the pull was not the caller's own"
+
+    as_caller(MEMBER)
+    assert client.get("/api/mr/overview").json()["has_data"] is False
+    assert client.get("/api/mr/datasets").json() == []
+    assert client.get("/api/mr/lead-analysis").json()["has_data"] is False
+    assert client.get("/api/mr/report-periods").json()["months"] == []
+
+    as_caller(USER)
+    again = client.post("/api/mr/ingest-sheet", json={})
+    assert again.status_code == 200 and again.json()["status"] == "ok", again.text
+    assert len(fetches) == 2, "an unshared workspace was rate-limited by a cooldown"
+
+
+def test_the_kill_switch_returns_the_agent_to_per_user_reads(monkeypatch, tmp_path, as_caller):
+    """Turning sharing off — ``MR_WORKSPACE_SHARED=0`` — is the rollback, with the
+    key still configured. No data moves: a pull is stamped with the caller again,
+    and a member reads only their own — exactly the mode above. Unsetting the
+    variable is the same thing (see the next tests)."""
+    from marketing_research_agent import runs as mr_runs
+
+    _shared_ws(monkeypatch)
+    monkeypatch.setenv("MR_WORKSPACE_SHARED", "0")
+    fetches = _stub_pull(monkeypatch, tmp_path)
+
+    assert client.post("/api/mr/ingest-sheet", json={}).status_code == 200
+    assert mr_runs.list_runs(WORKSPACE) == []
+    assert mr_runs.list_runs(USER["id"], kind="dataset")
+
+    as_caller(MEMBER)
+    assert client.get("/api/mr/overview").json()["has_data"] is False
+
+    as_caller(USER)                       # and no cooldown either
+    assert client.post("/api/mr/ingest-sheet", json={}).json()["status"] == "ok"
+    assert len(fetches) == 2
+
+    monkeypatch.setenv("MR_WORKSPACE_SHARED", "1")   # switched ON: the workspace's key
+    as_caller(MEMBER)
+    assert client.get("/api/mr/overview").json()["has_data"] is False  # nothing under it yet
+    assert client.get("/api/mr/datasets").json() == []
+
+
+def test_deploying_without_the_switch_changes_nothing(monkeypatch, tmp_path, as_caller):
+    """Production ALREADY has ``MR_CRON_USER_ID`` set. Shipping the shared
+    workspace must therefore not, by itself, share anything: key configured,
+    ``MR_WORKSPACE_SHARED`` unset -> every read and write is still the caller's
+    own, the cron still pulls for the cron account, and the new restrictions
+    (admin-only uploads, force, single-tab pulls) are not in force — because
+    there is nothing shared for them to protect. Enabling sharing is one
+    deliberate env change."""
+    from marketing_research_agent import runs as mr_runs
+
+    monkeypatch.setenv("MR_CRON_USER_ID", WORKSPACE)          # the key — and no switch
+    monkeypatch.setenv("MR_WORKSPACE_ID", "another-workspace")
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    _stub_cron_extras(monkeypatch)
+
+    assert client.post("/api/mr/ingest-sheet", json={}).status_code == 200
+    assert mr_runs.list_runs(USER["id"], kind="dataset"), "the pull was not the caller's own"
+    assert mr_runs.list_runs(WORKSPACE) == [] and mr_runs.list_runs("another-workspace") == []
+
+    as_caller(MEMBER)
+    assert client.get("/api/mr/overview").json()["has_data"] is False
+    assert client.get("/api/mr/datasets").json() == []
+    assert client.get("/api/mr/report-periods").json()["months"] == []
+
+    # A member is not restricted: nothing is shared, so what they write is theirs.
+    up = client.post("/api/mr/ingest", files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+                     data={"platform": "google_ads"})
+    assert up.status_code == 200, up.text
+    assert mr_runs.get_run(up.json()["dataset_id"])["user_id"] == MEMBER["id"]
+    assert client.post("/api/mr/ingest-sheet", json={"force": True}).status_code == 200
+    assert len(fetches) == 2
+
+    # The cron is what it was: it pulls for the configured account, whose own
+    # sign-in is the only one that reads it.
+    fired = client.post("/api/mr/cron/refresh", headers={"x-cron-key": "s3cret"})
+    assert fired.status_code == 200, fired.text
+    assert mr_runs.list_runs(WORKSPACE, kind="dataset")
+    as_caller({**MEMBER, "id": "u3"})
+    assert client.get("/api/mr/overview").json()["has_data"] is False
+
+
+def test_a_typo_in_the_switch_fails_closed(monkeypatch, tmp_path, as_caller):
+    """A switch that only recognised "0"/"false"/"off" as off would leave sharing
+    ON for ``ture``. Here only 1/true/yes/on turn it on, so every other value —
+    a typo made enabling it, or disabling it — is OFF, at the HTTP surface too."""
+    from marketing_research_agent import runs as mr_runs
+
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    monkeypatch.setenv("MR_CRON_USER_ID", WORKSPACE)
+    for typo in ("ture", "enabled", "2", "y", "of"):
+        monkeypatch.setenv("MR_WORKSPACE_SHARED", typo)
+        as_caller(USER)
+        assert client.post("/api/mr/ingest-sheet", json={"force": True}).status_code == 200
+        assert mr_runs.list_runs(WORKSPACE) == [], f"{typo!r} shared the workspace"
+        as_caller(MEMBER)
+        assert client.get("/api/mr/overview").json()["has_data"] is False, typo
+    assert len(fetches) == 5
+
+
+def test_an_admins_upload_and_single_tab_pull_land_under_the_workspace_key(
+        monkeypatch, tmp_path, as_caller):
+    """The other write sites. Each is stamped with the WORKSPACE key (so every
+    member reads it) and with who added it, server-derived. Only an admin gets
+    this far while the workspace is shared."""
+    from pypdf import PdfWriter
+
+    from marketing_research_agent import runs as mr_runs
+
+    _shared_ws(monkeypatch)
+    monkeypatch.setenv("MR_PULL_COOLDOWN_SECONDS", "0")
+    _stub_single_tab(monkeypatch)
+
+    as_caller(ADMIN)
+    csv = client.post("/api/mr/ingest", files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+                      data={"platform": "google_ads", "created_by": "someone-else"})
+    buf = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.write(buf)
+    pdf = client.post("/api/mr/ingest-pdf",
+                      files={"file": ("board.pdf", io.BytesIO(buf.getvalue()), "application/pdf")})
+    tab = client.post("/api/mr/ingest-sheet", json={"gid": "1"})
+    assert (csv.status_code, pdf.status_code, tab.status_code) == (200, 200, 200), (
+        csv.text, pdf.text, tab.text)
+
+    stored = {r["platform"]: r for r in mr_runs.list_runs(WORKSPACE, kind="dataset")}
+    assert set(stored) == {"google_ads", "pdf:board.pdf", "sheets:Vendor A"}
+    assert mr_runs.list_runs(ADMIN["id"]) == [], "a write was stamped with the caller"
+    for platform in stored:
+        assert stored[platform]["created_by"] == ADMIN["id"], (
+            f"{platform}: created_by must be the authenticated caller, never the request")
+
+    as_caller(USER)
+    assert {d["platform"] for d in client.get("/api/mr/datasets").json()} == set(stored)
+
+
+def test_the_runs_list_costs_two_scoped_queries_when_the_workspace_is_shared(
+        monkeypatch, as_caller):
+    """Companion to ``test_the_runs_list_asks_for_report_kinds_only``, which pins
+    ONE query in the unshared mode. Shared, a member's Reports list is two
+    equality queries — their own runs under their id, the board kinds under the
+    workspace key — never a scan, and never the workspace's non-board runs."""
+    from marketing_research_agent import reports
+
+    _shared_ws(monkeypatch)
+    as_caller(MEMBER)
+    calls = _count_run_reads(monkeypatch)
+    assert client.get("/api/mr/runs").status_code == 200
+
+    assert len(calls) == 2, calls
+    (own_id, own_kinds), (ws_id, ws_kinds) = calls
+    assert own_id == MEMBER["id"] and "daily_summary" in own_kinds
+    assert ws_id == WORKSPACE and set(ws_kinds) == set(reports.BOARD_KINDS), (
+        "the workspace query must ask for the board kinds only — every other kind "
+        "under that key is somebody else's private report")
+
+    # The caller who IS the workspace key needs no second query.
+    monkeypatch.setenv("MR_CRON_USER_ID", MEMBER["id"])
+    calls.clear()
+    assert client.get("/api/mr/runs").status_code == 200
+    assert len(calls) == 1, calls
+
+
+def test_the_shared_runs_list_merges_newest_first_and_keeps_private_reports_private(
+        monkeypatch, as_caller):
+    """One list, two sources: the caller's own reports and the workspace's board
+    reports, ordered together. Another member's private report is in neither."""
+    from marketing_research_agent import runs as mr_runs
+
+    _shared_ws(monkeypatch)
+
+    def _run(rid, kind, owner, stamp):
+        mr_runs.save_run({"id": rid, "kind": kind, "user_id": owner, "agent_id": "a6",
+                          "generated_at": stamp, "structured": {}})
+
+    _run("mine-old", "daily_summary", MEMBER["id"], "2026-09-01T00:00:00+00:00")
+    _run("board-mid", "board_report", WORKSPACE, "2026-09-02T00:00:00+00:00")
+    _run("mine-new", "weekly_summary", MEMBER["id"], "2026-09-03T00:00:00+00:00")
+    _run("theirs", "daily_summary", USER["id"], "2026-09-04T00:00:00+00:00")
+    _run("ws-narrated", "daily_summary", WORKSPACE, "2026-09-05T00:00:00+00:00")
+
+    as_caller(MEMBER)
+    listed = [r["id"] for r in client.get("/api/mr/runs").json()]
+    assert listed == ["mine-new", "board-mid", "mine-old"], listed
+
+def test_the_shared_lead_summary_is_flagged_against_the_workspaces_targets(
+        monkeypatch, tmp_path, as_caller):
+    """The lead-quality flags are frozen into the run the WHOLE workspace reads,
+    so they are judged against ``targets__{workspace}`` — never against whichever
+    member happened to press Pull. Recorded at the one place targets are read
+    during a pull: a member's pull must only ever ask for the workspace's."""
+    from marketing_research_agent import goals as mr_goals
+
+    _shared_ws(monkeypatch)
+    _stub_pull(monkeypatch, tmp_path, lead_tab=_lead_tab())
+    asked: list = []
+    real = mr_goals.get_targets
+    monkeypatch.setattr(mr_goals, "get_targets", lambda uid: asked.append(uid) or real(uid))
+
+    as_caller(MEMBER)
+    r = client.post("/api/mr/ingest-sheet", json={})
+    assert r.status_code == 200, r.text
+    assert asked, "the pull never consulted any targets, so this proves nothing"
+    assert set(asked) == {WORKSPACE}, (
+        f"the shared lead summary was judged against {sorted(set(asked))}")
+
+
+# --- uploads: an admin's while the workspace is shared ------------------------
+# While shared an upload joins the ONE dashboard the team reads, replaces that
+# platform's figure for everyone (newest per platform wins) and is permanent
+# (``dataset`` is exempt from retention; the swap and the sweep only touch
+# ``sheets:*``). A member could therefore overwrite a figure for everybody, and
+# then could not even delete what they had written. Admin-only removes both.
+
+def _blank_pdf() -> bytes:
+    from pypdf import PdfWriter
+
+    buf = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def test_a_member_cannot_upload_while_the_workspace_is_shared(monkeypatch, as_caller):
+    from marketing_research_agent import runs as mr_runs
+
+    _shared_ws(monkeypatch)
+    as_caller(MEMBER)
+
+    csv = client.post("/api/mr/ingest", files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+                      data={"platform": "google_ads"})
+    pdf = client.post("/api/mr/ingest-pdf",
+                      files={"file": ("board.pdf", io.BytesIO(_blank_pdf()), "application/pdf")})
+    for r in (csv, pdf):
+        assert r.status_code == 403, r.text
+        assert r.json()["detail"] == UPLOAD_REFUSED
+    assert mr_runs.list_runs(WORKSPACE) == [] and mr_runs.list_runs(MEMBER["id"]) == [], (
+        "a refused upload was stored anyway")
+
+    # The refusal comes FIRST — ahead of validation — so it depends on nothing
+    # else in the request and a member learns nothing by probing it.
+    bad_platform = client.post("/api/mr/ingest",
+                               files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+                               data={"platform": "no-such-platform"})
+    not_a_pdf = client.post("/api/mr/ingest-pdf",
+                            files={"file": ("notes.txt", io.BytesIO(b"hi"), "text/plain")})
+    assert (bad_platform.status_code, not_a_pdf.status_code) == (403, 403)
+
+
+def test_an_admin_or_creator_can_upload_while_shared_and_is_recorded_as_the_author(
+        monkeypatch, as_caller):
+    from marketing_research_agent import runs as mr_runs
+
+    _shared_ws(monkeypatch)
+    for who, name in ((ADMIN, "admin.pdf"), (CREATOR, "creator.pdf")):
+        as_caller(who)
+        csv = client.post("/api/mr/ingest",
+                          files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+                          data={"platform": "google_ads"})
+        pdf = client.post("/api/mr/ingest-pdf",
+                          files={"file": (name, io.BytesIO(_blank_pdf()), "application/pdf")})
+        assert (csv.status_code, pdf.status_code) == (200, 200), (csv.text, pdf.text)
+        for r in (mr_runs.get_run(csv.json()["dataset_id"]),
+                  mr_runs.get_run(pdf.json()["dataset_id"])):
+            assert r["user_id"] == WORKSPACE and r["created_by"] == who["id"]
+
+
+def test_uploads_stay_open_to_everyone_when_the_workspace_is_not_shared(monkeypatch, as_caller):
+    """Unshared the upload is the caller's own — nobody else reads it — so
+    nothing about it changed."""
+    from marketing_research_agent import runs as mr_runs
+
+    as_caller(MEMBER)
+    csv = client.post("/api/mr/ingest", files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+                      data={"platform": "google_ads"})
+    pdf = client.post("/api/mr/ingest-pdf",
+                      files={"file": ("board.pdf", io.BytesIO(_blank_pdf()), "application/pdf")})
+    assert (csv.status_code, pdf.status_code) == (200, 200), (csv.text, pdf.text)
+    assert mr_runs.get_run(csv.json()["dataset_id"])["user_id"] == MEMBER["id"]
+
+
+# --- the single-tab (gid) pull: an admin's, on the tab's own key --------------
+# It used to file a tab under ``sheets:<gid>`` with the workspace key. The read
+# path keeps the newest run per PLATFORM, so the same tab counted twice (once
+# under its title, once under its number); ``is_rollup_title`` matches "overall"
+# in the LABEL, so a numeric label walked the roll-up straight past the guard;
+# and the branch had no lock and no limiter at all. No member-facing screen sends
+# a ``gid`` — the two callers of ``mrIngestSheet`` send ``{year}`` and
+# ``{force: true}`` — so restricting it to admins costs no one anything.
+
+def test_a_member_cannot_pull_a_single_tab_while_shared(monkeypatch, tmp_path, as_caller):
+    from marketing_research_agent import runs as mr_runs
+
+    _shared_ws(monkeypatch)
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    calls = _stub_single_tab(monkeypatch)
+    reads = _count_run_reads(monkeypatch)
+
+    as_caller(MEMBER)
+    for gid in ("1", 1, "2"):
+        r = client.post("/api/mr/ingest-sheet", json={"gid": gid})
+        assert r.status_code == 403, f"{gid!r}: {r.text}"
+        assert r.json()["detail"] == SINGLE_TAB_REFUSED
+    assert calls == [] and fetches == [] and reads == [], (
+        "a member's single-tab request reached the store or Google before it was refused")
+    assert mr_runs.list_runs(WORKSPACE) == []
+
+
+def test_a_single_tab_pull_lands_on_the_tabs_own_key_and_supersedes_the_pull(
+        monkeypatch, tmp_path, as_caller):
+    """The double count, closed. After a full pull the workspace holds
+    ``sheets:Vendor A``. An admin's single-tab pull of that tab is filed under
+    the SAME key — by title, not number — so it replaces the row instead of
+    adding a second vendor, and the tab is counted once."""
+    _shared_ws(monkeypatch)
+    monkeypatch.setenv("MR_FORCE_PULL_FLOOR_SECONDS", "0")
+    _stub_pull(monkeypatch, tmp_path)
+    calls = _stub_single_tab(monkeypatch)
+    as_caller(ADMIN)
+    assert client.post("/api/mr/ingest-sheet", json={}).status_code == 200
+    first = client.get("/api/mr/datasets").json()
+    assert [d["platform"] for d in first] == ["sheets:Vendor A"] and first[0]["metrics"] == 1
+
+    r = client.post("/api/mr/ingest-sheet", json={"gid": "1", "force": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "ok" and r.json()["tabs"][0]["tab"] == "Vendor A"
+    assert ("meta", mr_router.mr_config.SHEETS_SPREADSHEET_ID) in calls
+
+    rows = client.get("/api/mr/datasets").json()
+    assert [d["platform"] for d in rows] == ["sheets:Vendor A"], (
+        f"the tab is listed under more than one key: {[d['platform'] for d in rows]}")
+    assert rows[0]["metrics"] == 2                       # the single-tab run's June + July
+    assert rows[0]["created_by"] == ADMIN["id"] and rows[0]["superseded"] is False
+    assert rows[0]["id"] != first[0]["id"], "the pull's own row was not superseded"
+    assert not [d for d in rows if d["platform"] == "sheets:1"], "a gid-keyed vendor appeared"
+
+    # Counted ONCE: only the newest run of the tab feeds the workspace's figures.
+    assert len(mr_router._load_dataset(WORKSPACE)["metrics"]) == 2
+
+
+def test_a_single_tab_pull_refuses_the_rollup_tab(monkeypatch, tmp_path, as_caller):
+    """Its numbers are the sum of the vendor tabs. Refused at write time by
+    NAME (the "Overall" tab) and by SCOPE (a tab whose A1 dropdown was left on
+    "All"), 422, and nothing is written."""
+    from marketing_research_agent import runs as mr_runs
+
+    _shared_ws(monkeypatch)
+    monkeypatch.setenv("MR_PULL_COOLDOWN_SECONDS", "0")
+    tabs = [{"gid": 2, "title": "Marketing 2026 Overall Report", "hidden": False},
+            {"gid": 5, "title": "Vendor C", "hidden": False}]
+    _stub_single_tab(monkeypatch, tabs=tabs, values={
+        "Vendor C": [["All", "Jun (Performance)"], ["Spend", "$9,999.00"], ["Leads", "9"]]})
+    as_caller(ADMIN)
+
+    for gid in ("2", "5"):
+        r = client.post("/api/mr/ingest-sheet", json={"gid": gid})
+        assert r.status_code == 422, f"gid {gid}: {r.text}"
+        assert "roll-up" in r.json()["detail"]
+    assert mr_runs.list_runs(WORKSPACE) == [], "a refused roll-up was written anyway"
+
+
+def test_a_single_tab_pull_refuses_a_hidden_unknown_or_unreadable_tab_and_writes_nothing(
+        monkeypatch, tmp_path, as_caller):
+    from marketing_research_agent import runs as mr_runs
+
+    _shared_ws(monkeypatch)
+    monkeypatch.setenv("MR_PULL_COOLDOWN_SECONDS", "0")
+    good = _seed_previous_pull(WORKSPACE)             # holds a good ``sheets:Vendor A``
+    _stub_single_tab(monkeypatch, values={"Vendor B": [["Vendor B"], ["Notes", "nothing"]]})
+    as_caller(ADMIN)
+
+    hidden = client.post("/api/mr/ingest-sheet", json={"gid": "3"})
+    assert hidden.status_code == 422 and "hidden" in hidden.json()["detail"], hidden.text
+    unknown = client.post("/api/mr/ingest-sheet", json={"gid": "999"})
+    assert unknown.status_code == 404, unknown.text
+    empty = client.post("/api/mr/ingest-sheet", json={"gid": "4"})     # parses to nothing
+    assert empty.status_code == 422 and "nothing was changed" in empty.json()["detail"], empty.text
+
+    assert {r["id"] for r in mr_runs.list_runs(WORKSPACE)} == set(good.values()), (
+        "a refused single-tab pull wrote or deleted a run — an EMPTY run under a "
+        "tab's title would supersede the good one and blank that vendor for everyone")
+
+
+def test_a_single_tab_pull_that_cannot_read_the_workbook_is_a_502_never_a_fallback_label(
+        monkeypatch, tmp_path, as_caller):
+    from marketing_research_agent import runs as mr_runs
+
+    _shared_ws(monkeypatch)
+    monkeypatch.setenv("MR_PULL_COOLDOWN_SECONDS", "0")
+    as_caller(ADMIN)
+
+    def _down(*a, **kw):
+        raise RuntimeError("429 Too Many Requests")
+
+    monkeypatch.setattr(mr_router, "workbook_meta", _down)          # the tab list
+    listing = client.post("/api/mr/ingest-sheet", json={"gid": "1"})
+    assert listing.status_code == 502, listing.text
+    assert "left untouched" in listing.json()["detail"] and "429" in listing.json()["detail"]
+
+    _stub_single_tab(monkeypatch)
+    monkeypatch.setattr(mr_router, "fetch_tab_values", _down)       # the tab itself
+    values = client.post("/api/mr/ingest-sheet", json={"gid": "1"})
+    assert values.status_code == 502 and "429" in values.json()["detail"], values.text
+    assert mr_runs.list_runs(WORKSPACE) == [], "a failed read still wrote a run"
+
+
+def test_a_single_tab_pull_takes_the_same_lock_cooldown_and_floor_as_the_full_pull(
+        monkeypatch, tmp_path, as_caller):
+    _shared_ws(monkeypatch)
+    _stub_pull(monkeypatch, tmp_path)
+    calls = _stub_single_tab(monkeypatch)
+    as_caller(ADMIN)
+
+    # The lock — held by a pull in flight.
+    lock = mr_router._pull_lock(WORKSPACE)
+    assert lock.acquire(blocking=False)
+    try:
+        busy = client.post("/api/mr/ingest-sheet", json={"gid": "1", "force": True})
+        assert busy.status_code == 409, busy.text
+    finally:
+        lock.release()
+    assert calls == []
+
+    # The cooldown — a plain single-tab pull just after a full pull is "fresh".
+    assert client.post("/api/mr/ingest-sheet", json={}).status_code == 200
+    fresh = client.post("/api/mr/ingest-sheet", json={"gid": "1"})
+    assert fresh.status_code == 200 and fresh.json()["status"] == "fresh", fresh.text
+    assert fresh.json()["tabs"] == [] and calls == []
+
+    # The floor — force skips the cooldown but not this.
+    too_soon = client.post("/api/mr/ingest-sheet", json={"gid": "1", "force": True})
+    assert too_soon.status_code == 429 and int(too_soon.headers["Retry-After"]) >= 1
+    assert calls == []
+
+
+def test_unshared_the_single_tab_pull_is_exactly_what_it_was(monkeypatch, as_caller):
+    """Unshared the tab is the caller's own and the branch is untouched: any
+    caller, the CSV-export source, the ``gid`` as the label, no admin check."""
+    from marketing_research_agent import runs as mr_runs
+
+    class _OneTab:
+        def __init__(self, *a, **kw):
+            pass
+
+        def fetch_campaign_metrics(self, _range):
+            return _one_tracker_tab()[0]["metrics"], []
+
+    monkeypatch.setattr(mr_router, "SheetsSource", _OneTab)
+    r = client.post("/api/mr/ingest-sheet", json={"gid": "42", "force": True})
+    assert r.status_code == 200, r.text
+    assert [d["platform"] for d in mr_runs.list_runs(USER["id"], kind="dataset")] == [
+        "sheets:42"]
+
+
+# --- the freshness clock is a FULL pull's, and nothing else's ------------------
+
+def test_a_single_tab_pull_does_not_start_the_freshness_clock(
+        monkeypatch, tmp_path, as_caller):
+    """The freeze. If a single-tab (or any dataset) run advanced the clock, one
+    POST every few seconds would keep the cooldown permanently "fresh": every cron
+    fire would answer 200, fetch nothing and sweep nothing, with ``errors: []``,
+    while the team's tracker data stood still and nothing alerted. The clock reads
+    ``official_spend`` — written by a full pull and by nothing else."""
+    _shared_ws(monkeypatch)
+    monkeypatch.setenv("MR_FORCE_PULL_FLOOR_SECONDS", "0")
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    _stub_single_tab(monkeypatch)
+    _stub_cron_extras(monkeypatch)
+    _seed_previous_pull(WORKSPACE, stamp=_ago(1000))         # the last FULL pull: long ago
+
+    as_caller(ADMIN)
+    tab = client.post("/api/mr/ingest-sheet", json={"gid": "1"})
+    assert tab.status_code == 200 and tab.json()["status"] == "ok", tab.text
+    assert fetches == []
+
+    # ...and right after it, the ordinary pull and the cron both still RUN.
+    as_caller(MEMBER)
+    plain = client.post("/api/mr/ingest-sheet", json={})
+    assert plain.status_code == 200 and plain.json()["status"] == "ok", plain.text
+    assert len(fetches) == 1
+
+
+def test_a_single_tab_pull_never_makes_the_cron_answer_fresh(monkeypatch, tmp_path, as_caller):
+    _shared_ws(monkeypatch)
+    fetches = _stub_pull(monkeypatch, tmp_path)
+    _stub_single_tab(monkeypatch)
+    _stub_cron_extras(monkeypatch)
+    _seed_previous_pull(WORKSPACE, stamp=_ago(1000))
+
+    as_caller(ADMIN)
+    assert client.post("/api/mr/ingest-sheet", json={"gid": "1"}).status_code == 200
+    fired = client.post("/api/mr/cron/refresh", headers={"x-cron-key": "s3cret"})
+    assert fired.status_code == 200, fired.text
+    assert fired.json()["pull"]["status"] == "ok", (
+        "a single-tab pull froze the cron: it answered fresh and fetched nothing")
+    assert len(fetches) == 1
+
+
+def test_only_a_full_pull_advances_the_clock(monkeypatch, tmp_path):
+    """The clock, read directly: uploads, single-tab and tracker datasets are all
+    ignored; only ``official_spend`` counts."""
+    from datetime import datetime
+
+    from marketing_research_agent import runs as mr_runs
+
+    assert mr_router._last_pull_at(WORKSPACE) is None
+    for platform in ("google_ads", "pdf:x.pdf", "sheets:Vendor A", "sheets:42"):
+        mr_runs.save_run({"id": mr_runs.new_run_id(), "kind": "dataset", "user_id": WORKSPACE,
+                          "platform": platform, "generated_at": _ago(1), "metrics": []})
+    assert mr_router._last_pull_at(WORKSPACE) is None
+
+    stamp = _ago(50)
+    mr_runs.save_run({"id": mr_runs.new_run_id(), "kind": "official_spend", "user_id": WORKSPACE,
+                      "platform": "sheets-official", "generated_at": stamp, "months": {}})
+    assert mr_router._last_pull_at(WORKSPACE) == datetime.fromisoformat(stamp)
+
+
+# --- the workspace's datasets list says which run still counts ------------------
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_the_datasets_list_marks_the_runs_that_no_longer_count(
+        monkeypatch, as_caller, shared):
+    """``_latest_datasets`` keeps only the newest run per platform, so two
+    ``google_ads`` uploads shadow each other and only the later one is on the
+    dashboard. The list used to show both as if both counted."""
+    from marketing_research_agent import runs as mr_runs
+
+    key = USER["id"]
+    if shared:
+        key = _shared_ws(monkeypatch)
+
+    def _dataset(platform, stamp):
+        rid = mr_runs.new_run_id()
+        mr_runs.save_run({"id": rid, "kind": "dataset", "user_id": key, "agent_id": "a6",
+                          "platform": platform, "generated_at": stamp,
+                          "metrics": [], "leads": [], "gaps": []})
+        return rid
+
+    old_up = _dataset("google_ads", "2026-07-01T00:00:00+00:00")
+    new_up = _dataset("google_ads", "2026-07-03T00:00:00+00:00")
+    mid_up = _dataset("google_ads", "2026-07-02T00:00:00+00:00")
+    pdf = _dataset("pdf:board.pdf", "2026-07-01T00:00:00+00:00")
+    tab = _dataset("sheets:Vendor A", "2026-07-01T00:00:00+00:00")
+
+    rows = {d["id"]: d for d in client.get("/api/mr/datasets").json()}
+    assert {i: rows[i]["superseded"] for i in rows} == {
+        new_up: False, mid_up: True, old_up: True, pdf: False, tab: False}
+
+    # It agrees with what the read path actually counts.
+    counted = {run["id"] for run in mr_router._latest_datasets(key).values()}
+    assert counted == {i for i, d in rows.items() if not d["superseded"]}
+
+
+# --- the cron's account id is read stripped -------------------------------------
+
+def test_a_whitespace_only_cron_user_id_is_unset_not_a_500(monkeypatch, tmp_path):
+    """It used to pass ``if not uid`` and then raise in ``workspace_id`` — an
+    unhandled 500 out of a cron endpoint. Blank is UNSET: the existing skipped
+    path, a degraded 207, in both modes."""
+    _stub_pull(monkeypatch, tmp_path)
+    _stub_cron_extras(monkeypatch)
+    for shared in (False, True):
+        if shared:
+            monkeypatch.setenv("MR_WORKSPACE_SHARED", "1")
+        for blank in ("   ", "\t", " \n "):
+            monkeypatch.setenv("MR_CRON_USER_ID", blank)
+            r = client.post("/api/mr/cron/refresh", headers={"x-cron-key": "s3cret"})
+            assert r.status_code == 207, f"{blank!r} shared={shared}: {r.status_code} {r.text}"
+            assert r.json()["pull"] == "skipped (MR_CRON_USER_ID unset)"
+            assert r.json()["status"] == "partial"
+
+
+def test_a_trailing_space_in_the_cron_user_id_does_not_change_the_key(monkeypatch, tmp_path):
+    """Unshared, the cron wrote under the raw value ("abc ") — a key nobody reads
+    ("abc") — so a stray space meant a green cron and a blank dashboard."""
+    from marketing_research_agent import runs as mr_runs
+
+    _stub_pull(monkeypatch, tmp_path)
+    _stub_cron_extras(monkeypatch)
+    monkeypatch.setenv("MR_CRON_USER_ID", "cron-account \n")
+
+    r = client.post("/api/mr/cron/refresh", headers={"x-cron-key": "s3cret"})
+    assert r.status_code == 200, r.text
+    assert mr_runs.list_runs("cron-account", kind="dataset"), "the cron wrote under a padded key"
+    stored = {run["user_id"] for run in mr_runs.list_runs("cron-account")}
+    assert stored == {"cron-account"}
+
+
+# --- /mr/ask carries the workspace's official totals ----------------------------
+# Ask used to see only the sheet grids, so its headline figure was a vendor-tab
+# sum while the dashboard swapped in the Overall tab's own rows. Same question,
+# two numbers. The handler now makes ONE scoped read of this workspace's newest
+# official-totals run and hands it to the Ask engine.
+
+_ASK_TAB = [["Meta Ads", "Aug (Performance)"], ["Spend", "$4,000"], ["Leads", "40"]]
+
+
+def _stub_ask_workbook(monkeypatch):
+    from marketing_research_agent import profiles as mr_profiles
+    from marketing_research_agent.workbook import TabGrid
+
+    grid = TabGrid("Meta Ads", 1, False, _ASK_TAB, len(_ASK_TAB), 2)
+    monkeypatch.setattr(mr_router, "_workbook_bundle",
+                        lambda **kw: ([grid], [mr_profiles._heuristic_profile(grid, 2026)]))
+
+
+def _seen_official(monkeypatch) -> list[dict]:
+    """Record what the handler passes to the Ask engine, and run the real one."""
+    seen: list[dict] = []
+    real = mr_router.mr_insight.answer
+
+    def _spy(*a, **kw):
+        seen.append(kw.get("official_totals"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(mr_router.mr_insight, "answer", _spy)
+    return seen
+
+
+def _save_official(user_id, totals):
+    from datetime import datetime, timezone
+
+    from marketing_research_agent import runs as mr_runs
+
+    mr_runs.save_run({
+        "id": mr_runs.new_run_id(), "kind": "official_spend", "user_id": user_id,
+        "agent_id": "a6", "platform": "sheets-official",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "months": {k: v["spend"] for k, v in totals.items() if "spend" in v},
+        "totals": totals,
+    })
+
+
+def test_ask_passes_this_workspaces_official_totals_to_the_engine(monkeypatch):
+    _stub_ask_workbook(monkeypatch)
+    seen = _seen_official(monkeypatch)
+    _save_official(USER["id"], {"2026-08": {"spend": 6500.0, "leads": 60}})
+    _save_official("someone-else", {"2026-08": {"spend": 999999.0}})
+
+    r = client.post("/api/mr/ask", json={"question": "how much did we spend in August 2026"})
+    assert r.status_code == 200, r.text
+    assert seen == [{"2026-08": {"spend": 6500.0, "leads": 60}}], "another workspace's roll-up leaked in"
+
+
+def test_ask_reads_the_official_totals_once_and_never_the_whole_dataset(monkeypatch):
+    """`_load_dataset` rehydrates ~13 large documents; the question needs one
+    scoped read of the newest official-totals run."""
+    from marketing_research_agent import runs as mr_runs
+
+    _stub_ask_workbook(monkeypatch)
+    _save_official(USER["id"], {"2026-08": {"spend": 6500.0, "leads": 60}})
+    calls: list[object] = []
+    real_list = mr_runs.list_runs
+    monkeypatch.setattr(mr_runs, "list_runs",
+                        lambda uid, **kw: (calls.append(kw.get("kind")), real_list(uid, **kw))[1])
+    monkeypatch.setattr(mr_router, "_load_dataset",
+                        lambda *a, **kw: pytest.fail("/mr/ask loaded the whole dataset"))
+
+    r = client.post("/api/mr/ask", json={"question": "spend in August 2026"})
+    assert r.status_code == 200, r.text
+    assert calls == ["official_spend"], calls
+
+
+def test_ask_degrades_to_tracker_sums_when_the_run_store_fails(monkeypatch):
+    """A store failure must cost the parity note, never the answer."""
+    from marketing_research_agent import runs as mr_runs
+
+    _stub_ask_workbook(monkeypatch)
+    seen = _seen_official(monkeypatch)
+
+    def _boom(*a, **kw):
+        raise mr_runs.RunStoreError("firestore unavailable")
+
+    monkeypatch.setattr(mr_runs, "list_runs", _boom)
+    r = client.post("/api/mr/ask", json={"question": "how much did we spend in August 2026"})
+    assert r.status_code == 200, r.text
+    assert seen == [{}]
+    body = r.json()
+    assert body["facts"] and body["ai"] is False and body["fallback_reason"]
+    assert any("official totals unavailable" in f["basis"] for f in body["facts"])
+
+
+# --- /mr/ask: second adversarial pass (2026-09-22) --------------------------------
+# Workspace selection through `_ws`, bad input, and each failure mode of the
+# three things the handler depends on (sheet read, official-totals read, model).
+# Tests tagged "DEFECT2 <id>" are xfail(strict=True) and name the rule that would
+# fix them; ids continue the list in test_workbook_intelligence.py.
+
+def test_ask_reads_the_shared_workspaces_official_totals_when_sharing_is_on(monkeypatch):
+    """`_ws(user)` is the only thing that picks the key. Sharing ON: the run under
+    the deployment's workspace key is the one read - once, by kind - and the
+    caller's own (different) official run is never consulted."""
+    from marketing_research_agent import runs as mr_runs
+
+    _stub_ask_workbook(monkeypatch)
+    seen = _seen_official(monkeypatch)
+    key = _shared_ws(monkeypatch)
+    assert key != USER["id"]
+    _save_official(key, {"2026-08": {"spend": 6500.0, "leads": 60}})
+    _save_official(USER["id"], {"2026-08": {"spend": 999999.0}})
+    calls: list[tuple] = []
+    real_list = mr_runs.list_runs
+    monkeypatch.setattr(mr_runs, "list_runs",
+                        lambda uid, **kw: (calls.append((uid, kw.get("kind"))), real_list(uid, **kw))[1])
+    monkeypatch.setattr(mr_router, "_load_dataset",
+                        lambda *a, **kw: pytest.fail("/mr/ask loaded the whole dataset"))
+
+    r = client.post("/api/mr/ask", json={"question": "how much did we spend in August 2026"})
+    assert r.status_code == 200, r.text
+    assert seen == [{"2026-08": {"spend": 6500.0, "leads": 60}}]
+    assert calls == [(key, "official_spend")], calls
+    assert any("the sheet's own Overall roll-up" in f["basis"] for f in r.json()["facts"])
+
+
+def test_ask_uses_only_the_callers_own_official_run_when_sharing_is_off(monkeypatch):
+    _stub_ask_workbook(monkeypatch)
+    seen = _seen_official(monkeypatch)
+    _save_official("a-colleague", {"2026-08": {"spend": 999999.0}})
+    r = client.post("/api/mr/ask", json={"question": "how much did we spend in August 2026"})
+    assert r.status_code == 200, r.text
+    assert seen == [{}], "another workspace's roll-up must never reach the engine"
+    assert all("official totals unavailable" in f["basis"] for f in r.json()["facts"]
+               if f["label"].startswith("all channels — spend"))
+
+
+@pytest.mark.parametrize("body", [None, {}, {"question": ""}, {"question": " \n\t "}, {"other": 1}])
+def test_ask_without_a_question_is_a_400_and_never_reaches_the_engine(monkeypatch, body):
+    _stub_ask_workbook(monkeypatch)
+    monkeypatch.setattr(mr_router.mr_insight, "answer",
+                        lambda *a, **k: pytest.fail("an empty question reached the engine"))
+    r = client.post("/api/mr/ask", json=body)
+    assert r.status_code == 400 and r.json()["detail"] == "question is required"
+
+
+@pytest.mark.parametrize("body", [[1], "spend", 5])
+def test_ask_with_a_body_that_is_not_an_object_is_a_422_not_a_500(monkeypatch, body):
+    _stub_ask_workbook(monkeypatch)
+    r = client.post("/api/mr/ask", json=body)
+    assert r.status_code == 422, r.text
+
+
+@pytest.mark.parametrize("question", [None, 5, ["spend"], {"q": 1}])
+def test_defect2_r2_a_non_string_question_is_a_400(monkeypatch, question):
+    _stub_ask_workbook(monkeypatch)
+    r = client.post("/api/mr/ask", json={"question": question})
+    assert r.status_code == 400, (r.status_code, r.text[:200])
+
+
+def test_defect2_r5_an_enormous_question_is_refused_before_it_reaches_a_paid_model(monkeypatch):
+    _stub_ask_workbook(monkeypatch)
+    r = client.post("/api/mr/ask", json={"question": "spend in August " * 20_000})
+    assert r.status_code in (400, 413, 422), r.status_code
+
+
+@pytest.mark.parametrize("timeframe", [5, 0, True, {"a": 1}, [], "", "monthly", "2026-13", "9999-12", "0000-01"])
+def test_ask_with_a_junk_timeframe_is_an_honest_refusal_never_a_500(monkeypatch, timeframe):
+    _stub_ask_workbook(monkeypatch)
+    r = client.post("/api/mr/ask", json={"question": "how much did we spend", "timeframe": timeframe})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["period_label"] is None and body["ai"] is False and body["fallback_reason"]
+    assert body["facts"] == []
+
+
+def test_ask_when_the_model_call_raises_still_answers_with_the_exact_figures(monkeypatch):
+    from app.services import openrouter
+
+    def _boom(**kw):
+        raise RuntimeError("upstream exploded")
+
+    _stub_ask_workbook(monkeypatch)
+    monkeypatch.setattr(mr_router, "_latest_official_run", lambda uid, all_runs=None: {})
+    monkeypatch.delenv("MR_OFFLINE", raising=False)      # take the real model branch
+    monkeypatch.setattr(openrouter, "get_llm", _boom)
+    r = client.post("/api/mr/ask", json={"question": "how much did we spend in August 2026"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ai"] is False and "call failed" in body["fallback_reason"]
+    assert body["facts"] and "$4,000.00" in body["answer"]
+    assert "Traceback" not in r.text
+
+
+def test_ask_when_the_sheet_cannot_be_read_is_a_502_with_a_message_not_a_trace(monkeypatch):
+    def _boom(**kw):
+        raise RuntimeError("sheets backend error 503")
+
+    monkeypatch.setattr(mr_router, "_workbook_bundle", _boom)
+    r = client.post("/api/mr/ask", json={"question": "spend in August 2026"})
+    assert r.status_code == 502
+    detail = r.json()["detail"]
+    assert detail.startswith("Could not read the spreadsheet") and "Traceback" not in detail
+
+
+def test_ask_when_the_official_read_fails_costs_only_the_parity_note(monkeypatch):
+    """The read raising must neither 502 nor 500 Ask, and the sheet is still read
+    exactly once."""
+    from marketing_research_agent import runs as mr_runs
+
+    _stub_ask_workbook(monkeypatch)
+    reads: list[int] = []
+    real_bundle = mr_router._workbook_bundle
+    monkeypatch.setattr(mr_router, "_workbook_bundle",
+                        lambda **kw: (reads.append(1), real_bundle(**kw))[1])
+
+    def _boom(*a, **kw):
+        raise mr_runs.RunStoreError("firestore unavailable")
+
+    monkeypatch.setattr(mr_runs, "list_runs", _boom)
+    r = client.post("/api/mr/ask", json={"question": "how much did we spend in August 2026"})
+    assert r.status_code == 200, r.text
+    assert reads == [1]
+    assert "firestore unavailable" not in r.text, "the store's message must not reach the caller"

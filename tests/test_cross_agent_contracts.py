@@ -348,6 +348,11 @@ def mr(monkeypatch, tmp_path):
     monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "targets.json"))
     monkeypatch.setenv("MR_SOURCES_FILE", str(tmp_path / "sources.json"))
+    # Workspace sharing is server config: never let a developer's shell flip this
+    # file's per-user pull tests into the shared mode.
+    for var in ("MR_WORKSPACE_ID", "MR_CRON_USER_ID", "MR_WORKSPACE_SHARED",
+                "MR_PULL_COOLDOWN_SECONDS", "MR_FORCE_PULL_FLOOR_SECONDS"):
+        monkeypatch.delenv(var, raising=False)
     from app.routers import marketing_research as mrr
 
     return mrr

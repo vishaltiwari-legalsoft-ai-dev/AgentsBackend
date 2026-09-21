@@ -16,6 +16,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import math
 import os
 import re
 from datetime import date
@@ -73,6 +74,12 @@ def _num(s: str) -> float | None:
     try:
         v = float(s)
     except ValueError:
+        return None
+    # A cell of "NaN", "inf" or "1e999" parses as a float and then poisons
+    # everything downstream: int(nan) raises ValueError out of parse_tracker,
+    # which took the whole Ask answer down with an HTTP 500, and a nan that did
+    # survive would make every sum it touched nan. Unreadable is unreadable.
+    if not math.isfinite(v):
         return None
     return -v if neg else v
 
@@ -271,6 +278,15 @@ def parse_tracker(rows: list[list[str]], year: int, brand: str | None = None) ->
             leads = val("leads", perf, inv)
             if not spend and not leads:
                 continue
+            # A row that EXISTS but has no readable cell for this month is
+            # missing, not zero. CampaignMetric has no null, so the absence is
+            # reported as a gap and the reader of the gap decides; publishing a
+            # blank cell as "leads: 0" is a confident figure nobody wrote.
+            for field in _FIELD_LABELS:
+                if idx[field] is not None and val(field, perf, inv) is None:
+                    gaps.append(DataGap("sheets", (
+                        f"{brand}/{channel}: no '{field}' figure for "
+                        f"{year:04d}-{month:02d}")))
             metrics.append(CampaignMetric(
                 channel=channel,
                 campaign=f"{brand} · {channel}",

@@ -204,6 +204,103 @@ def _clip_to_period(metrics: list, start: date, end: date, fallback: bool = True
     return kept
 
 
+# --- public period / aggregation seam -----------------------------------------
+# The ONE public surface over the private window helpers above. It exists so
+# another module (insight.py / the Ask engine) can resolve a period and roll
+# metrics up through exactly the code a report does, instead of re-implementing
+# date logic or reaching for underscore-private names. Everything here is a thin
+# wrapper: no new behaviour, and nothing in this module calls them, so a report's
+# numbers cannot drift from Ask's.
+
+def resolve_window(period: str | None, today: date, *,
+                   kind: str = "monthly_summary") -> tuple[date, date, str]:
+    """``(start, end, label)`` for a period token.
+
+    ``period`` is ``'YYYY-MM'``, ``'YYYY-Qn'`` or ``'YYYY'`` — the year token
+    meaning year-to-date while the year is still running. ``None`` falls back to
+    ``kind``'s default window, so a "this week" question resolves the same way a
+    weekly report does.
+
+    Raises :class:`PeriodError` for anything unparseable, and for a period that
+    has not started: a period is never silently substituted for another.
+    """
+    if period is None:
+        start, end = _period_window(kind, today)
+        return start, end, _period_label(start, end)
+    token = str(period).strip().upper()
+    # date() cannot express every well-formed token: '9999-12' overflows on its
+    # month end and '0000-01' on its first day. Both arrive from a user-supplied
+    # field, so they are a refusal, never a ValueError escaping to a 500.
+    if _MONTH_RE.match(token) or _QUARTER_RE.match(token):
+        kind = "monthly_summary" if _MONTH_RE.match(token) else "quarterly_summary"
+        try:
+            return _explicit_window(kind, token, today)
+        except PeriodError:
+            raise
+        except (ValueError, OverflowError):
+            raise PeriodError(f"'{_echo_period(period)}' is not a valid period.")
+    y = _YEAR_RE.match(token)
+    if y:
+        year = int(y.group(1))
+        yesterday = today - timedelta(days=1)
+        try:
+            start, full_end = date(year, 1, 1), _month_end(year, 12)
+        except (ValueError, OverflowError):
+            raise PeriodError(f"'{_echo_period(period)}' is not a valid period.")
+        if start > yesterday:
+            raise PeriodError(f"No tracker data for {year} yet.")
+        end = min(full_end, yesterday)
+        label = (str(year) if end == full_end
+                 else f"{start.strftime('%b')}–{end.strftime('%b')} {year} (YTD)")
+        return start, end, label
+    raise PeriodError(
+        f"'{_echo_period(period)}' is not a period (expected YYYY-MM, YYYY-Qn or YYYY).")
+
+
+def clip_metrics(metrics: list, start: date, end: date) -> list:
+    """The metrics whose month the window touches, with **no** fallback: an
+    empty period comes back empty rather than borrowing another month's rows."""
+    return _clip_to_period(metrics, start, end, fallback=False)
+
+
+def apply_official(totals: dict, official_totals: dict, metrics: list) -> tuple[dict, bool]:
+    """``(totals, applied)`` — the dashboard's headline swap, exposed.
+
+    ``_official_totals_for`` + ``_apply_official_totals`` are what
+    ``_campaign_structured`` runs for the KPI strip: where the sheet's own
+    Overall tab covers EVERY month the metrics touch, its figures replace the
+    vendor-tab sums and the derived costs are recomputed from them. Ask calls
+    the same pair, so for a period the roll-up covers the two surfaces cannot
+    show different numbers for the same question.
+
+    ``applied`` is False when the roll-up does not cover the window (or there is
+    none). The caller must then say so rather than imply parity.
+    """
+    # A persisted month may carry a null or a string where a number belongs.
+    # sum() over it raised TypeError - an HTTP 500 out of a read path - so a
+    # non-number is treated as missing and its month is simply not covered.
+    clean = {k: {f: float(v) for f, v in (fields or {}).items()
+                 if isinstance(v, (int, float)) and not isinstance(v, bool)}
+             for k, fields in (official_totals or {}).items()
+             if isinstance(fields, dict)}
+    off = _official_totals_for({"official_totals": clean}, metrics)
+    if off is None:
+        return totals, False
+    return _apply_official_totals(dict(totals), off), True
+
+
+def channel_totals(metrics: list) -> tuple[dict[str, dict], dict]:
+    """``(per-channel aggregates, blended totals)`` — the same pair the
+    dashboard's KPI strip is built from (``_campaign_structured``), so a figure
+    quoted from here equals the dashboard's for the same window. It does NOT
+    apply the sheet's official roll-up figures; a caller that has no
+    ``official_totals`` must say so in its own provenance."""
+    agg = cr.aggregate_by_channel(metrics)
+    total_block = agg.pop("Total", None)
+    totals = total_block if total_block is not None else _totals(agg)
+    return agg, totals
+
+
 # --- per-vendor rollups, red flags, insights -----------------------------------
 
 def _vendor_rollup(vendor_metrics: dict[str, list]) -> list[dict]:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import hmac
 import io
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -40,6 +41,7 @@ from marketing_research_agent import snapshots as mr_snapshots
 from marketing_research_agent import sources_registry as mr_sources_registry
 from marketing_research_agent import trends as mr_trends
 from marketing_research_agent import workbook as mr_workbook
+from marketing_research_agent import workspace as mr_workspace
 from marketing_research_agent.config import COLUMN_MAPS
 from marketing_research_agent.schemas import CampaignMetric, DateRange, Lead
 from marketing_research_agent.sources.csv_source import CsvSource
@@ -49,6 +51,8 @@ from marketing_research_agent.sources.sheets_source import (
     fetch_official_totals,
     fetch_tab_values,
     is_rollup_platform,
+    is_rollup_tab,
+    parse_tracker,
     reconcile_official_spend,
     workbook_meta,
 )
@@ -75,11 +79,36 @@ class SheetPullBusy(RuntimeError):
     """A pull for this workspace is already in flight in this process."""
 
 
+class SheetPullTooSoon(RuntimeError):
+    """A FORCED pull arrived inside the floor no forced pull may cross.
+    ``retry_after`` is whole seconds until it clears (the ``Retry-After``)."""
+
+    def __init__(self, message: str, retry_after: int) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class SheetTabRefused(RuntimeError):
+    """A single-tab pull was refused BEFORE anything was written: the tab does
+    not exist, is the roll-up, or does not parse as a tracker. ``status`` is the
+    HTTP status the caller gets (404 / 422)."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 # 207 (RFC 4918 Multi-Status) = some of it worked. Deliberately still 2xx: a
 # partially-degraded pull must not make Cloud Scheduler retry a permanently bad
 # tab forever, so it stays 2xx and shouts in the log instead. Total failure is a
 # 5xx (below), which the scheduler does retry and alert on.
-_PULL_HTTP_STATUS = {"ok": 200, "partial": 207}
+#
+# "fresh" is a pull that was NOT run because this workspace was pulled moments
+# ago (see ``_pull_gate``). It is 200 because nothing failed and nothing is
+# stale — and it is a distinct status, with the time of the pull it is pointing
+# at, so it can never be mistaken for a pull that fetched something. (A FORCED
+# pull inside the floor is not "fresh": that is a 429, a real refusal.)
+_PULL_HTTP_STATUS = {"ok": 200, "partial": 207, "fresh": 200}
 
 # Per-workspace overlap guard. Two pulls interleaving their write and delete
 # passes is a data-loss race; this is a single-process guard (Cloud Run runs
@@ -92,6 +121,47 @@ _PULL_LOCKS_GUARD = threading.Lock()
 def _pull_lock(user_id: str) -> threading.Lock:
     with _PULL_LOCKS_GUARD:
         return _PULL_LOCKS.setdefault(user_id, threading.Lock())
+
+
+def _ws(user: dict) -> str:
+    """The key this caller's WORKBOOK-DERIVED runs live under.
+
+    The ONLY place that key is chosen — see ``marketing_research_agent.workspace``
+    for the rule and the opt-in switch (sharing is OFF unless
+    ``MR_WORKSPACE_SHARED`` is explicitly on, so this is the caller's own id
+    everywhere it has not been deliberately enabled). It is resolved from the
+    server's own configuration, never from the request, so no caller can name
+    another key.
+
+    Use it for the three kinds a sheet pull produces (``dataset``,
+    ``official_spend``, ``lead_analysis``), for uploads that join that
+    dashboard, and for the board report. Do NOT use it for anything a person
+    builds for themselves — ``/mr/reports/{kind}``, ``/mr/runs*``,
+    ``/mr/schedule/*`` and targets stay keyed on ``user["id"]``.
+
+    The helpers below (``_load_dataset``, ``_latest_*``, ``_pull_and_swap``)
+    keep taking an explicit ``user_id`` on purpose: they receive whichever key
+    the route resolved, and none of them decides one for itself.
+    """
+    return mr_workspace.workspace_id(user["id"])
+
+
+def _is_workspace_admin(user: dict) -> bool:
+    """Admin or creator — the only callers who may change what a whole
+    workspace sees while the workbook data is shared. The same two flags
+    ``/mr/sources`` uses (``_may_remove_any_sheet``)."""
+    return bool(user.get("is_admin") or user.get("is_creator"))
+
+
+def _require_admin_while_shared(user: dict, message: str) -> None:
+    """403 with ``message`` when the workspace is shared and the caller is not an
+    admin/creator. A no-op unshared: the workspace is then the caller's own, so
+    whatever they write, only they read, and today's behaviour is untouched.
+
+    Fails closed on the CALLER — the check reads roles from the authenticated
+    user, never from the request body."""
+    if mr_workspace.is_shared() and not _is_workspace_admin(user):
+        raise HTTPException(403, message)
 
 
 #: Every unit of Marketing Research work lands here — see THE RULE in run_tracking.py.
@@ -240,10 +310,14 @@ def _build_lead_analysis(user_id: str, year: int) -> tuple[dict, dict] | None:
     rows = fetch_tab_values(wb["id"], tab)  # full tab — lead sheets outgrow the grid cap
     records, gaps = mr_leads.parse_lead_rows(rows, year=year)
     # The lead-quality flags are frozen into the run, so they must be judged
-    # against the thresholds of the workspace this run is being written for —
-    # ``user["id"]`` from the UI, ``MR_CRON_USER_ID`` from the cron. Both reach
-    # here as ``user_id``, so the cron is just another caller and never a
-    # special case that could evaluate against somebody else's red lines.
+    # against the thresholds of the workspace this run is being written for.
+    # ``user_id`` here is the WORKSPACE key — ``_ws(user)`` from the UI, the same
+    # resolved key from the cron — so with the shared workspace the summary every
+    # member reads is flagged against ``targets__{workspace}`` (the owner's red
+    # lines), not against whichever member pressed Pull. A member's private
+    # targets therefore never leak into, or get silently overridden by, a
+    # summary the whole workspace shares; and the cron stays just another
+    # caller, never a special case that judges against somebody else's line.
     from marketing_research_agent import goals as mr_goals
 
     summary = mr_leads.summarize(
@@ -269,8 +343,10 @@ _DATASET_KINDS = ("dataset", "official_spend", "lead_analysis")
 
 
 def _load_dataset(user_id: str) -> dict:
-    """Reassemble the user's ingested data into one dataset. Keeps a per-vendor
-    view (one entry per source tab/upload) so reports can name vendors.
+    """Reassemble one workspace's ingested data into one dataset. Keeps a
+    per-vendor view (one entry per source tab/upload) so reports can name
+    vendors. ``user_id`` is the key the caller resolved — ``_ws(user)`` for the
+    shared workbook data, which is what every route but the private ones passes.
 
     ONE run query serves all three components. This used to call ``list_runs``
     three times — and each of those was a full unfiltered scan of ``mr_runs``,
@@ -305,6 +381,18 @@ def _load_dataset(user_id: str) -> dict:
             "today": date.today(), "sources": sources}
 
 
+#: The 403s a member gets, while the workbook data is shared, for the three
+#: things that change what the WHOLE team's dashboard shows: an upload, a forced
+#: pull and a single-tab pull. Plain language, and each says who CAN. Pinned
+#: verbatim in the tests so the wording the console shows cannot drift from the
+#: wording raised here.
+_UPLOAD_REFUSED = "Uploads go to the whole team's dashboard, so only an admin can add them."
+_FORCE_REFUSED = ("Only an admin can force a pull. The team's data refreshes on its own "
+                  "and a normal pull is always available.")
+_SINGLE_TAB_REFUSED = ("Pulling a single tab changes the whole team's dashboard, so only an "
+                       "admin can do it. A normal pull refreshes every tab.")
+
+
 @router.post("/mr/ingest")
 async def ingest(
     file: UploadFile = File(...),
@@ -312,6 +400,16 @@ async def ingest(
     user=Depends(get_current_user),
     act: Activity = trail.records("ingest", "Uploaded a platform export"),
 ):
+    """Upload a platform export (CSV) as a dataset.
+
+    While the workbook data is shared an upload joins the ONE dashboard the whole
+    team reads, replaces that platform's figure for everyone (the newest run per
+    platform wins) and is permanent (``dataset`` is exempt from retention) — so
+    only an admin/creator may add one (403 otherwise). Checked FIRST, before the
+    file is read or the platform validated: a refusal must not depend on, or
+    teach anything about, the rest of the request. Unshared, the upload is the
+    caller's own and this is what it always was."""
+    _require_admin_while_shared(user, _UPLOAD_REFUSED)
     if platform not in COLUMN_MAPS:
         raise HTTPException(400, f"unknown platform '{platform}' (expected one of {list(COLUMN_MAPS)})")
     content = await file.read()
@@ -328,7 +426,10 @@ async def ingest(
     run = {
         "id": runs.new_run_id(),
         "kind": "dataset",
-        "user_id": user["id"],
+        # The WORKSPACE key: an upload joins the dashboard everyone reads. Who
+        # added it is a separate fact, and it is what decides who may delete it.
+        "user_id": _ws(user),
+        "created_by": user["id"],
         "agent_id": MR_AGENT_ID,
         "platform": platform,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -357,50 +458,106 @@ def ingest_sheet(
 ):
     """Pull the live Google-Sheets performance tracker into datasets.
 
-    Body (all optional): ``{"gid": "...", "brand": "...", "year": 2026}``.
-    With a ``gid`` → that single tab is pulled (fast CSV export). With no gid →
-    the whole workbook is scanned and every performance-tracker tab is ingested
-    (auto-discovery; non-tracker tabs are skipped). Each tab becomes one dataset
-    run of channel-aggregate monthly metrics.
+    Body (all optional): ``{"gid": "...", "brand": "...", "year": 2026,
+    "force": true}``.
+    With a ``gid`` → that single tab is pulled. With no gid → the whole workbook
+    is scanned and every performance-tracker tab is ingested (auto-discovery;
+    non-tracker tabs are skipped). Each tab becomes one dataset run of
+    channel-aggregate monthly metrics.
+
+    The data lands under the WORKSPACE key (``_ws``), so a pull by any member
+    refreshes what every member reads.
 
     Status is honest: 200 clean, 207 some component degraded (details in
     ``degraded``), 502 the pull failed and NOTHING was changed, 409 another
-    pull for this workspace is mid-flight."""
+    pull for this workspace is mid-flight.
+
+    **200 with ``status: "fresh"``** means the pull was NOT run: the workspace
+    was pulled inside the cooldown (``MR_PULL_COOLDOWN_SECONDS``, default 120s),
+    so nothing was fetched and ``last_pulled_at`` names when the data on screen
+    was — see :func:`_pull_gate`.
+
+    **While the workbook data is shared** (``workspace.is_shared()``), everything
+    that widens what one request may do to the WHOLE team's dashboard is an
+    admin/creator's, and a member is refused 403 — before the store or the lock
+    is touched — with a plain-language reason:
+
+    * ``"force": true`` — the cooldown is the only limiter on Google fetches. An
+      admin's forced pull is still refused (429 + ``Retry-After``) inside the
+      floor ``MR_FORCE_PULL_FLOOR_SECONDS`` (default 30s), and never skips the
+      in-flight lock (409).
+    * a ``gid`` (single-tab) pull — see :func:`_pull_single_tab`. No member-facing
+      screen sends one; the auto-discovery pull is what everyone uses.
+
+    Unshared, none of that applies: the workspace is the caller's own and this
+    route behaves exactly as it did before the shared workspace existed."""
     body = body or {}
     year = int(body.get("year") or mr_config.SHEETS_YEAR)
+    gid = body.get("gid")
+    # ``is True``, not ``bool(...)``: the string "false" is truthy, and a flag that
+    # skips a safety check should only ever fire on a real true.
+    force = body.get("force") is True
 
-    if body.get("gid"):
-        src = SheetsSource(
-            mr_config.SHEETS_SPREADSHEET_ID, str(body["gid"]), year=year, brand=body.get("brand")
-        )
-        try:
-            metrics, gaps = src.fetch_campaign_metrics(_FULL_RANGE)
-        except Exception as exc:  # auth/network/format — honest 502, nothing written
-            logger.warning("MR single-tab pull failed for gid %s: %s", body["gid"], exc)
-            raise HTTPException(502, f"Could not pull tab {body['gid']}: {exc}") from exc
-        row, _durable = _persist_sheet_dataset(user["id"], str(body["gid"]), metrics, gaps)
-        result = {"tabs": [row], "status": "ok", "ingested": 1, "failed": 0, "degraded": []}
-    else:
-        try:
-            result = _ingest_sheet_all(user["id"], year)
-        except SheetPullBusy as exc:
-            raise HTTPException(409, str(exc)) from exc
-        except SheetPullError as exc:
-            raise HTTPException(
-                502, f"Sheet pull failed — your existing data was left untouched. {exc}"
-            ) from exc
+    if force:
+        _require_admin_while_shared(user, _FORCE_REFUSED)
+    if gid:
+        _require_admin_while_shared(user, _SINGLE_TAB_REFUSED)
+
+    try:
+        if gid and mr_workspace.is_shared():
+            result = _ingest_single_tab(_ws(user), str(gid), year, brand=body.get("brand"),
+                                        created_by=user["id"], force=force)
+        elif gid:
+            # UNSHARED: the caller's own workspace, exactly as before. (Shared,
+            # this path would file the tab under ``sheets:<gid>`` — a second
+            # vendor beside the pull's own ``sheets:<Title>`` row.)
+            src = SheetsSource(
+                mr_config.SHEETS_SPREADSHEET_ID, str(gid), year=year, brand=body.get("brand")
+            )
+            try:
+                metrics, gaps = src.fetch_campaign_metrics(_FULL_RANGE)
+            except Exception as exc:  # auth/network/format — honest 502, nothing written
+                logger.warning("MR single-tab pull failed for gid %s: %s", gid, exc)
+                raise HTTPException(502, f"Could not pull tab {gid}: {exc}") from exc
+            row, _durable = _persist_sheet_dataset(_ws(user), str(gid), metrics, gaps)
+            result = {"tabs": [row], "status": "ok", "ingested": 1, "failed": 0, "degraded": []}
+        else:
+            result = _ingest_sheet_all(_ws(user), year, force=force)
+    except SheetPullBusy as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except SheetPullTooSoon as exc:
+        raise HTTPException(429, str(exc),
+                            headers={"Retry-After": str(exc.retry_after)}) from exc
+    except SheetTabRefused as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    except SheetPullError as exc:
+        raise HTTPException(
+            502, f"Sheet pull failed — your existing data was left untouched. {exc}"
+        ) from exc
 
     response.status_code = _PULL_HTTP_STATUS[result["status"]]
-    ok = len(result["tabs"]) - result["failed"]
-    act.note(f"Sheet pull ({result['status']}) — {ok}/{len(result['tabs'])} tabs ingested",
-             status=str(result["status"]))
+    if result["status"] == "fresh":
+        # Nothing was pulled, so the trail must not claim a pull happened.
+        act.note("Sheet pull skipped — the workspace was already pulled moments ago",
+                 status="fresh")
+    else:
+        ok = len(result["tabs"]) - result["failed"]
+        act.note(f"Sheet pull ({result['status']}) — {ok}/{len(result['tabs'])} tabs ingested",
+                 status=str(result["status"]))
     return {"spreadsheet_id": mr_config.SHEETS_SPREADSHEET_ID, "year": year, **result}
 
 
-def _persist_sheet_dataset(user_id: str, label: str, metrics, gaps) -> tuple[dict, bool]:
+def _persist_sheet_dataset(user_id: str, label: str, metrics, gaps, *,
+                           created_by=None) -> tuple[dict, bool]:
     """Write one tab's dataset run. Returns ``(row, durable)`` — see
     ``runs.save_run``: ``durable`` is False when only the ephemeral disk copy
-    was written, which is what gates the swap's delete pass."""
+    was written, which is what gates the swap's delete pass.
+
+    ``label`` is the tab's TITLE — the platform is ``sheets:<title>``, which is
+    the key the read path keeps the newest run of, so the same tab always lands
+    on the same key. ``created_by`` is set only by a single-tab pull (a person
+    pressed the button); the full pull, which the cron also runs, has no author
+    and leaves it off."""
     run = {
         "id": runs.new_run_id(),
         "kind": "dataset",
@@ -412,28 +569,310 @@ def _persist_sheet_dataset(user_id: str, label: str, metrics, gaps) -> tuple[dic
         "leads": [],
         "gaps": [g.__dict__ for g in gaps],
     }
+    if created_by is not None:
+        run["created_by"] = created_by
     durable = runs.save_run(run)
     return ({"tab": label, "dataset_id": run["id"], "metrics": len(metrics),
              "gaps": run["gaps"]}, durable)
 
 
-def _ingest_sheet_all(user_id: str, year: int) -> dict:
-    """Auto-discovery pull of every tracker tab for one user (UI and cron path).
+#: Seconds a workspace's data counts as fresh after a pull. Every member of a
+#: shared workspace can press Pull, and the in-process lock below only
+#: serialises pulls on ONE Cloud Run instance, so without a freshness gate the
+#: team can fan out into a Google fetch each. ``MR_PULL_COOLDOWN_SECONDS``
+#: overrides it; ``0`` disables the gate.
+_DEFAULT_PULL_COOLDOWN_SECONDS = 120.0
 
-    Serialised per workspace, then handed to :func:`_pull_and_swap`. Returns
-    ``{"tabs", "status", "ingested", "failed", "degraded"}``; raises
-    ``SheetPullError`` (nothing touched) or ``SheetPullBusy``.
+#: The floor a FORCED pull (admin/creator only) cannot cross: seconds since the
+#: last pull inside which even ``force`` is refused (429 + ``Retry-After``).
+#: ``force`` exists to skip the cooldown — without a floor beneath it, one
+#: scripted loop of forced pulls is an unlimited Google fetch. It is much
+#: shorter than the cooldown on purpose: it stops a hammer, not a person who
+#: wants fresher numbers. ``MR_FORCE_PULL_FLOOR_SECONDS`` overrides it; ``0``
+#: disables it.
+_DEFAULT_FORCE_PULL_FLOOR_SECONDS = 30.0
+
+#: Rows read from a tab, the same cap ``fetch_all_trackers`` reads each with —
+#: so a single-tab pull sees exactly what the full pull would have.
+_TRACKER_MAX_ROWS = 200
+
+
+def _seconds_from_env(name: str, default: float) -> float:
+    """A non-negative, finite number of seconds from the environment, read on
+    every call. Anything unparseable, negative or non-finite falls back to
+    ``default`` rather than turning a limiter into a permanent block (``inf``) or
+    silently off."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("%s is not a number (%r) — using %.0fs", name, raw, default)
+        return default
+    if not math.isfinite(value) or value < 0:
+        return default
+    return value
+
+
+def _pull_cooldown_seconds() -> float:
+    return _seconds_from_env("MR_PULL_COOLDOWN_SECONDS", _DEFAULT_PULL_COOLDOWN_SECONDS)
+
+
+def _force_pull_floor_seconds() -> float:
+    return _seconds_from_env("MR_FORCE_PULL_FLOOR_SECONDS", _DEFAULT_FORCE_PULL_FLOOR_SECONDS)
+
+
+def _stamp_of(value) -> datetime | None:
+    """``generated_at`` as an aware datetime, or ``None`` when it is not one.
+    A naive stamp is read as UTC, which is what every writer here produces."""
+    try:
+        stamp = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def _last_pull_at(workspace: str) -> datetime | None:
+    """When this workspace was last fully PULLED, or ``None``.
+
+    ONLY ``official_spend`` runs count, on purpose: that kind is written by
+    :func:`_pull_and_swap` and by nothing else. A ``dataset`` run is not evidence
+    of a pull — an upload is not one, and a single-tab pull writes a fresh
+    ``sheets:<tab>`` dataset too. If either advanced this clock, a request every
+    few seconds would keep the cooldown permanently "fresh": every cron fire
+    would answer 200 ``fresh``, fetch nothing and sweep nothing while the team's
+    tracker data froze with no alert.
+
+    The cost of that rule, stated: a workbook with no roll-up tab, or one whose
+    roll-up was rejected at reconciliation, writes no new ``official_spend`` run,
+    so its clock does not advance and it has no cooldown until a healthy pull.
+    That state is itself a degraded (207) pull the cron already shouts about.
+
+    Raises :class:`runs.RunStoreError` when the store cannot be read.
     """
-    lock = _pull_lock(user_id)
+    newest: datetime | None = None
+    for run in runs.list_runs(workspace, kind="official_spend"):
+        stamp = _stamp_of(run.get("generated_at"))
+        if stamp is not None and (newest is None or stamp > newest):
+            newest = stamp
+    return newest
+
+
+def _pull_gate(workspace: str, *, force: bool) -> dict | None:
+    """The limiter in front of a pull (full or single-tab) while the workspace
+    is SHARED. Returns the ``status: "fresh"`` answer, or ``None`` to go ahead;
+    raises :class:`SheetPullTooSoon` for a forced pull inside the floor.
+
+    * **Not forced**, pulled inside the cooldown -> ``fresh``: nothing is
+      fetched, the body says so (``ingested: 0``, ``tabs: []``) and names when
+      the data on screen was pulled. Honest, not fake success.
+    * **Forced** (admin/creator only — the route refuses everyone else before it
+      gets here) -> the cooldown is skipped, the FLOOR is not. Inside it the
+      pull is refused outright, so a scripted caller backs off honestly instead
+      of being told the data is fine.
+
+    Only ever consulted while shared. With one key per caller there is one puller
+    per key and nothing to protect, so the unshared mode pulls exactly as it
+    always did. An unreadable store never blocks or skips — it falls through to
+    the pull, whose own read of the existing runs answers the honest 502.
+    """
+    try:
+        last = _last_pull_at(workspace)
+    except runs.RunStoreError:
+        return None
+    if last is None:
+        return None
+    age = (datetime.now(timezone.utc) - last).total_seconds()
+    if age < 0:  # a stamp from the future is clock skew, not a recent pull
+        return None
+    if force:
+        floor = _force_pull_floor_seconds()
+        if floor > 0 and age < floor:
+            retry_after = max(1, math.ceil(floor - age))
+            raise SheetPullTooSoon(
+                f"The tracker was pulled {int(age)} seconds ago. Even a forced pull "
+                f"waits {floor:g} seconds after the last one — try again in "
+                f"{retry_after} seconds.", retry_after)
+        return None
+    cooldown = _pull_cooldown_seconds()
+    if cooldown > 0 and age < cooldown:
+        return {"tabs": [], "status": "fresh", "ingested": 0, "failed": 0,
+                "degraded": [], "last_pulled_at": last.isoformat()}
+    return None
+
+
+def _acquire_pull_lock(workspace: str) -> threading.Lock:
+    """The workspace's pull lock, ACQUIRED — or :class:`SheetPullBusy`. Every pull
+    takes it before anything else, ``force`` included: a forced pull is exempt
+    from the cooldown, never from the rule that two pulls must not interleave
+    their write and delete passes over the same rows."""
+    lock = _pull_lock(workspace)
     if not lock.acquire(blocking=False):
         raise SheetPullBusy(
             "A sheet pull for this workspace is already running. Two overlapping "
             "pulls interleave their writes and deletes — try again in a moment."
         )
+    return lock
+
+
+def _ingest_sheet_all(user_id: str, year: int, *, force: bool = False) -> dict:
+    """Auto-discovery pull of every tracker tab for one workspace (UI and cron
+    path). ``user_id`` is the WORKSPACE key the caller resolved.
+
+    Serialised per workspace, then handed to :func:`_pull_and_swap`. Returns
+    ``{"tabs", "status", "ingested", "failed", "degraded"}`` — or, while shared
+    and the workspace was pulled inside the cooldown, the ``"fresh"`` answer of
+    :func:`_pull_gate`, having fetched nothing. Raises ``SheetPullError``
+    (nothing touched), ``SheetPullBusy`` or ``SheetPullTooSoon``.
+
+    The gate sits INSIDE the lock so two pulls on this instance cannot both pass
+    it; a second instance can, which the fetch-then-swap in
+    :func:`_pull_and_swap` and the stale-duplicate sweep at its end make
+    harmless rather than impossible. The cron never forces.
+    """
+    lock = _acquire_pull_lock(user_id)
     try:
+        if mr_workspace.is_shared():
+            fresh = _pull_gate(user_id, force=force)
+            if fresh is not None:
+                return fresh
         return _pull_and_swap(user_id, year)
     finally:
         lock.release()
+
+
+def _ingest_single_tab(workspace: str, gid: str, year: int, *, brand, created_by,
+                       force: bool) -> dict:
+    """A single-tab pull while the workspace is SHARED — under the same lock and
+    the same cooldown/floor as :func:`_ingest_sheet_all`, so it is not a side
+    door around either."""
+    lock = _acquire_pull_lock(workspace)
+    try:
+        fresh = _pull_gate(workspace, force=force)
+        if fresh is not None:
+            return fresh
+        return _pull_single_tab(workspace, gid, year, brand=brand, created_by=created_by)
+    finally:
+        lock.release()
+
+
+def _pull_single_tab(workspace: str, gid: str, year: int, *, brand, created_by) -> dict:
+    """Pull ONE tab of the primary tracker into the shared workspace, by ``gid``.
+
+    Built to land exactly where auto-discovery would have put the same tab, and to
+    refuse everything auto-discovery would have skipped:
+
+    * The tab's TITLE is resolved from the workbook (the Sheets API, the way
+      ``fetch_all_trackers`` enumerates tabs) and the run is labelled
+      ``sheets:<title>``. The old label, ``sheets:<gid>``, was a different key
+      space: the read path keeps the newest run PER PLATFORM, so the same tab
+      counted twice — once as ``sheets:Meta 360 RA``, once as ``sheets:42``.
+      Under the tab's own title the new run SUPERSEDES the pull's, and the
+      stale-duplicate sweep retires the old row.
+    * The roll-up tab is refused at write time (:func:`is_rollup_tab`: by name
+      AND by an "All"/"Overall" A1 scope), 422. Its numbers are the sum of the
+      vendor tabs, so ingesting it is the double count the read-path guard
+      (``is_rollup_platform``) exists to catch — and that guard keys on the
+      LABEL, which a numeric gid used to defeat.
+    * A hidden tab is refused (archives, never a live vendor), a gid that names
+      no tab is a 404, and a tab that parses to NO metrics is a 422 — writing an
+      empty run under the tab's title would supersede the good one and blank
+      that vendor for everyone.
+
+    Nothing is written on any refusal. A failed workbook read is a
+    :class:`SheetPullError` (502), never a fallback label. ``created_by`` is the
+    authenticated caller, server-derived.
+    """
+    sid = mr_config.SHEETS_SPREADSHEET_ID
+    try:
+        tabs = workbook_meta(sid)["tabs"]
+    except Exception as exc:
+        logger.warning("MR single-tab pull: could not list the tracker's tabs: %s", exc)
+        raise SheetPullError(f"could not read the tracker's tab list: {exc}") from exc
+    tab = next((t for t in tabs if str(t.get("gid")) == gid), None)
+    if tab is None:
+        raise SheetTabRefused(404, "That tab was not found in the tracker workbook.")
+    title = str(tab.get("title") or "").strip()
+    if not title:
+        raise SheetTabRefused(422, "That tab has no title to file its numbers under.")
+    if tab.get("hidden"):
+        raise SheetTabRefused(
+            422, f"'{title}' is a hidden tab. Hidden tabs are archives, never a live "
+                 "vendor, so they are not pulled.")
+
+    try:
+        rows = fetch_tab_values(sid, title)[:_TRACKER_MAX_ROWS]
+    except Exception as exc:
+        logger.warning("MR single-tab pull failed for tab %r: %s", title, exc)
+        raise SheetPullError(f"could not read tab '{title}': {exc}") from exc
+    if is_rollup_tab(title, rows):
+        raise SheetTabRefused(
+            422, f"'{title}' is the roll-up tab. Its numbers are the sum of the vendor "
+                 "tabs, so pulling it as a vendor would count every dollar twice.")
+
+    metrics, gaps = parse_tracker(rows, year, brand)
+    if not metrics:
+        why = "; ".join(g.message for g in gaps[:2]) or "no month columns with data"
+        raise SheetTabRefused(
+            422, f"'{title}' does not read as a performance tracker ({why}), so nothing "
+                 "was changed.")
+
+    degraded = sorted({g.message for g in gaps if "column band" in g.message})
+    row, durable = _persist_sheet_dataset(workspace, title, metrics, gaps,
+                                          created_by=created_by)
+    if durable:
+        # The new run shares this tab's key with the pull's own, so it already
+        # wins every read; retiring the superseded row keeps ``/mr/datasets``
+        # from listing one tab twice.
+        _sweep_superseded_tracker_runs(workspace)
+    else:
+        degraded.append("the tab could not be stored durably — the previous run was kept")
+    return {"tabs": [row], "status": "partial" if degraded else "ok", "ingested": 1,
+            "failed": 0, "degraded": degraded}
+
+
+def _sweep_superseded_tracker_runs(workspace: str) -> int:
+    """Retire every ``sheets:*`` dataset a newer run of the same tab replaced.
+
+    The in-process lock cannot stop two Cloud Run instances pulling the same
+    workspace at once, and each one's swap only retires what it read BEFORE it
+    wrote. Both can therefore leave a run of the same tab behind. Readers never
+    see the duplicate (``_latest_datasets`` takes the newest per platform), so
+    this is housekeeping, not a correctness fix — but it is what keeps a busy
+    shared workspace from accumulating one stale copy of every tab per race.
+
+    Per platform the newest run always survives, so this can never empty a tab.
+    Only ``sheets:*`` is touched: uploads (``google_ads``, ``pdf:*``) are people's
+    contributions and are never swept. Best effort — an unreadable store leaves
+    the duplicates for the next pull, which repeats this. Returns how many it
+    retired.
+    """
+    try:
+        current = runs.list_runs(workspace, kind="dataset")
+    except runs.RunStoreError as exc:
+        logger.warning("MR pull: stale-duplicate sweep skipped for %s: %s", workspace, exc)
+        return 0
+    seen: set[str] = set()
+    retired = 0
+    for run in current:  # newest first — the first per platform is the survivor
+        platform = str(run.get("platform") or "")
+        if not platform.startswith("sheets:") or not run.get("id"):
+            continue
+        if platform not in seen:
+            seen.add(platform)
+            continue
+        try:
+            runs.delete_run(run["id"])
+        except Exception:  # housekeeping must never fail the pull that just succeeded
+            logger.warning("MR pull: could not retire superseded run %s", run["id"],
+                           exc_info=True)
+            continue
+        retired += 1
+    if retired:
+        logger.info("MR pull: retired %d superseded tracker dataset(s) for %s",
+                    retired, workspace)
+    return retired
 
 
 def _pull_and_swap(user_id: str, year: int) -> dict:
@@ -564,6 +1003,10 @@ def _pull_and_swap(user_id: str, year: int) -> dict:
                         "kept the previous figures")
     for run_id in superseded_datasets + superseded_official:
         runs.delete_run(run_id)
+    # Only after a durable write of real replacements: sweep whatever a pull on
+    # another instance left behind for the same tabs. See the helper.
+    if swap_datasets and datasets_durable:
+        _sweep_superseded_tracker_runs(user_id)
 
     # ---- phase 3: lead analysis. Runs AFTER the tracker swap so the
     # QL-ratio/booking-rate rule joins against the fresh funnel counts. Its own
@@ -634,11 +1077,17 @@ def cron_refresh(request: Request, response: Response,
     Firebase user session). The pull runs for MR_CRON_USER_ID's workspace — and
     since 2026-08-21 that means it also evaluates red flags against THAT
     workspace's targets, because the runs it writes are stamped with that
-    user_id and only that workspace ever reads them back. With MR_CRON_USER_ID
-    unset the pull is skipped outright (below) rather than run against a
-    deployment-wide default, so there is no path where the cron flags one desk's
-    data with another desk's red lines. The snapshot capture and exports are
-    user-independent.
+    user_id. Since the shared workspace, every signed-in member reads those same
+    runs (``_ws``), so this is the pull that keeps the whole team's dashboard
+    fresh; the key it writes under goes through ``workspace_id`` so an explicit
+    ``MR_WORKSPACE_ID`` cannot make it write a key nobody reads. With
+    MR_CRON_USER_ID unset the pull is skipped outright (below) rather than run
+    against a deployment-wide default, so there is no path where the cron flags
+    one desk's data with another desk's red lines. The snapshot capture and
+    exports are user-independent.
+
+    A pull skipped because a member pulled moments ago (``status: "fresh"``) is
+    clean, not degraded: its ``degraded`` list is empty and the data is current.
 
     Reports 200/207/502 per :func:`_cron_status` — a refresh where every stage
     failed is never a 200."""
@@ -653,11 +1102,16 @@ def cron_refresh(request: Request, response: Response,
     failures: list[str] = []
     fatal = False
 
-    uid = os.environ.get("MR_CRON_USER_ID")
+    # Stripped at the source, and blank counts as UNSET. A whitespace-only value
+    # used to pass ``if not uid`` and then blow up in ``workspace_id`` (a 500,
+    # outside the try below); a stray trailing space wrote the whole pull under a
+    # key ("abc ") that nobody reads ("abc").
+    uid = (os.environ.get("MR_CRON_USER_ID") or "").strip()
     if not uid:
         out["pull"] = "skipped (MR_CRON_USER_ID unset)"
         failures.append("sheet pull skipped: MR_CRON_USER_ID unset")
     else:
+        uid = mr_workspace.workspace_id(uid)
         try:
             out["pull"] = _ingest_sheet_all(uid, mr_config.SHEETS_YEAR)
         except SheetPullBusy as exc:
@@ -698,19 +1152,80 @@ def cron_refresh(request: Request, response: Response,
     return _cron_status(response, out, failures, fatal=fatal)
 
 
+def _may_delete_dataset(run: dict, user: dict) -> bool:
+    """Whether THIS caller may delete this dataset run.
+
+    The listing is workspace-wide now, so "it is in your list" no longer means
+    "you put it there". Mirrors the ``/mr/sources`` rule (``added_by`` /
+    ``can_remove``), which is the precedent for a shared list with owned rows:
+
+    * not in the caller's workspace -> no (also what makes a foreign id a 404);
+    * an admin or creator -> yes, including pull-produced and pre-attribution
+      rows, which nobody else may retire;
+    * an UNSHARED workspace -> yes: the workspace is the caller's own, so every
+      row in it is theirs and this is exactly today's behaviour;
+    * shared, a ``sheets:*`` pull -> no: it is the team's live tracker data, and
+      the next pull would only recreate it (that includes a single-tab pull, whose
+      ``created_by`` is an admin — the platform, not the author, decides);
+    * shared, an upload -> only the person who uploaded it (``created_by``). Only
+      an admin can upload while shared, so for a non-admin this is the person who
+      WAS one when they did; a row with no ``created_by`` predates attribution and
+      has no owner to name.
+    """
+    if run.get("user_id") != _ws(user):
+        return False
+    if _is_workspace_admin(user):
+        return True
+    if not mr_workspace.is_shared():
+        return True
+    if str(run.get("platform") or "").startswith("sheets:"):
+        return False
+    who = str(run.get("created_by") or "").strip()
+    return bool(who) and who == str(user["id"])
+
+
+def _dataset_delete_refusal(run: dict) -> str:
+    """The 403 wording — plain language, and says who CAN do it."""
+    if str(run.get("platform") or "").startswith("sheets:"):
+        return ("This dataset is pulled from the live tracker sheet, so only an "
+                "admin can delete it. The next pull would bring it back anyway.")
+    if not str(run.get("created_by") or "").strip():
+        return ("This dataset was uploaded before we started recording who added "
+                "it. An admin can delete it.")
+    return "Only the person who uploaded this dataset, or an admin, can delete it."
+
+
 @router.get("/mr/datasets")
 def datasets(user=Depends(get_current_user)):
-    return [
-        {
+    """Every dataset in the caller's workspace — pulled tabs and uploads alike.
+
+    Each row says who added it (``created_by``: the uploader, or the admin who
+    ran a single-tab pull; absent on rows that predate attribution and on rows a
+    full pull — which the cron also runs — wrote), whether THIS caller may delete it
+    (``can_delete``, so the console can hide a button that would only earn a
+    403) and whether it is ``superseded`` — a NEWER run of the same platform
+    exists, so this one no longer contributes to any figure. The read path keeps
+    only the newest run per platform (``_latest_datasets``), which is why two
+    ``google_ads`` uploads shadow each other and only the later one is on the
+    dashboard; without this flag the list showed both as if both counted."""
+    listed = runs.list_runs(_ws(user), kind="dataset")  # newest first
+    seen: set[str] = set()
+    out = []
+    for r in listed:
+        platform = r.get("platform", r["id"])  # the key ``_latest_datasets`` uses
+        out.append({
             "id": r["id"],
             "platform": r.get("platform"),
             "generated_at": r.get("generated_at"),
             "metrics": len(r.get("metrics", [])),
             "leads": len(r.get("leads", [])),
             "gaps": r.get("gaps", []),
-        }
-        for r in runs.list_runs(user["id"], kind="dataset")
-    ]
+            "created_by": r.get("created_by"),
+            "can_delete": _may_delete_dataset(r, user),
+            "superseded": platform in seen,
+        })
+        seen.add(platform)
+    return out
 
 
 @router.delete("/mr/datasets/{dataset_id}")
@@ -718,10 +1233,20 @@ def delete_dataset(dataset_id: str, user=Depends(get_current_user),
                    act: Activity = trail.records("dataset_deleted", "Deleted a dataset",
                                                  unit=CHANGE)):
     """Remove one ingested file/pull from the workspace (its numbers leave the
-    Overview and future reports immediately)."""
+    Overview and future reports immediately).
+
+    404 for anything outside the caller's workspace, so a foreign id is
+    indistinguishable from an invented one. 403 — not 404 — for a dataset that IS
+    in the caller's workspace but is not theirs to delete: the row is in their
+    own ``GET /mr/datasets`` listing, so a 404 would leak nothing and lie about a
+    dataset they can plainly see (the same argument as ``DELETE /mr/sources``).
+    A refusal returns before ``act.note``, so it records no "deleted" activity.
+    """
     run = runs.get_run(dataset_id)
-    if not run or run.get("user_id") != user["id"] or run.get("kind") != "dataset":
+    if not run or run.get("user_id") != _ws(user) or run.get("kind") != "dataset":
         raise HTTPException(404, "dataset not found")
+    if not _may_delete_dataset(run, user):
+        raise HTTPException(403, _dataset_delete_refusal(run))
     runs.delete_run(dataset_id)
     act.note(f"Dataset deleted — {run.get('platform') or dataset_id}", run_id=dataset_id)
     return {"deleted": dataset_id}
@@ -781,9 +1306,15 @@ def _metrics_from_pdf(text: str, today: date) -> list[CampaignMetric]:
 async def ingest_pdf(file: UploadFile = File(...), user=Depends(get_current_user),
                      act: Activity = trail.records("ingest_pdf", "Parsed an uploaded PDF")):
     """Upload a PDF report: text is extracted locally, metrics are parsed by the
-    LLM into the canonical schema and saved as a dataset."""
+    LLM into the canonical schema and saved as a dataset.
+
+    Same rule as ``/mr/ingest``: while the workbook data is shared the result
+    joins the whole team's dashboard, so only an admin/creator may upload (403
+    otherwise) — checked first, which also means a member's request never reaches
+    the billed model call."""
     import io as _io
 
+    _require_admin_while_shared(user, _UPLOAD_REFUSED)
     content = await file.read()
     name = file.filename or "report.pdf"
     if not name.lower().endswith(".pdf"):
@@ -808,7 +1339,9 @@ async def ingest_pdf(file: UploadFile = File(...), user=Depends(get_current_user
     run = {
         "id": runs.new_run_id(),
         "kind": "dataset",
-        "user_id": user["id"],
+        # The workspace key + who added it — see ``ingest``.
+        "user_id": _ws(user),
+        "created_by": user["id"],
         "agent_id": MR_AGENT_ID,
         "platform": f"pdf:{name}",
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -824,15 +1357,21 @@ async def ingest_pdf(file: UploadFile = File(...), user=Depends(get_current_user
 
 @router.get("/mr/overview")
 def overview(user=Depends(get_current_user)):
-    """Live dashboard state — latest-month KPIs vs 2026 goals. Persists nothing."""
-    return reports.overview(_load_dataset(user["id"]), user["id"])
+    """Live dashboard state — latest-month KPIs vs 2026 goals. Persists nothing.
+
+    The figures are the WORKSPACE's (``_ws``); the traffic lights are judged
+    against the CALLER's own targets, which stay private."""
+    return reports.overview(_load_dataset(_ws(user)), user["id"])
 
 
 @router.get("/mr/lead-analysis")
 def lead_analysis_view(user=Depends(get_current_user)):
     """The lead sheet's per-vendor Meeting Outcome / Deal Stage picture + the
-    five lead-quality flags. Data refreshes with every sheet pull (UI or cron)."""
-    run = _latest_lead_run(user["id"])
+    five lead-quality flags. Data refreshes with every sheet pull (UI or cron).
+
+    Workspace-wide, and so are its flags: they were frozen at pull time against
+    the workspace's own thresholds (see ``_build_lead_analysis``)."""
+    run = _latest_lead_run(_ws(user))
     if not run:
         return {"has_data": False, "hint": (
             "No lead-analysis tab found yet. Connect the lead sheet from the Data tab "
@@ -848,13 +1387,14 @@ def lead_analysis_view(user=Depends(get_current_user)):
 @router.get("/mr/trends")
 def trends_endpoint(user=Depends(get_current_user)):
     """Monthly rollups + deterministic desk insights for the Overview board."""
-    latest = _latest_datasets(user["id"])
+    ws = _ws(user)
+    latest = _latest_datasets(ws)
     vendor_datasets = [
         {"vendor": plat[7:] if str(plat).startswith("sheets:") else str(plat),
          "metrics": _rehydrate_metrics(run.get("metrics", []))}
         for plat, run in sorted(latest.items())
     ]
-    official = _latest_official_run(user["id"])
+    official = _latest_official_run(ws)
     return mr_trends.build(vendor_datasets, today=date.today(),
                            official_spend=dict(official.get("months") or {}),
                            official_totals=dict(official.get("totals") or {}))
@@ -958,22 +1498,53 @@ def workbook_scan(user=Depends(get_current_user),
     return {"tabs": [asdict(p) for p in profs], "count": len(profs)}
 
 
+#: Longest question ``/mr/ask`` accepts. A real one is a sentence; anything
+#: past this is not a question, and it would be paid for twice.
+ASK_QUESTION_LIMIT = 2_000
+
+
 @router.post("/mr/ask")
 def ask(body: dict | None = None, user=Depends(get_current_user),
         act: Activity = trail.records("ask", "Asked the researcher a question")):
     """Answer a natural-language question with grounded insight from the right tab(s)."""
     body = body or {}
-    question = str(body.get("question", "")).strip()
+    raw = body.get("question")
+    # Only a string is a question. `str(...)` turned an explicit null into the
+    # four-letter question "None", which passed the empty check and paid for a
+    # tab-selection model call before Ask refused it for naming no period.
+    question = raw.strip() if isinstance(raw, str) else ""
     if not question:
         raise HTTPException(400, "question is required")
+    # The question is formatted into TWO provider prompts and echoed into the
+    # payload, so an uncapped one is a signed-in caller's blank cheque.
+    if len(question) > ASK_QUESTION_LIMIT:
+        raise HTTPException(
+            422, f"question is too long (limit {ASK_QUESTION_LIMIT:,} characters)")
     try:
         grids, profs = _workbook_bundle(deep=False)
     except Exception as exc:
         raise HTTPException(502, f"Could not read the spreadsheet: {exc}")
     grid_map = {g.title: g.rows for g in grids}
+    # The dashboard's headline strip is the sheet's OWN Overall-tab figures
+    # wherever it has them; Ask only had the grids, so the same question could
+    # answer differently on the two surfaces. One scoped read of this
+    # workspace's newest official-totals run closes that - deliberately not
+    # `_load_dataset`, which rehydrates ~13 large documents for a question that
+    # needs one. A store failure must not cost the answer: Ask degrades to the
+    # tracker sums and says so in each fact's basis.
+    try:
+        official_totals = dict(_latest_official_run(_ws(user)).get("totals") or {})
+    except runs.RunStoreError as exc:
+        logger.warning("MR ask: official totals unreadable (%s); using tracker sums", exc)
+        official_totals = {}
     answer = mr_insight.answer(
         question, profs, grid_map,
         timeframe=body.get("timeframe"), year=mr_config.SHEETS_YEAR,
+        # A tab the workbook read cut short must not be totalled, and the
+        # omission has to reach the answer payload rather than be discovered as
+        # a short number. This map is the only place that knows.
+        truncated=mr_workbook.truncation_map(grids),
+        official_totals=official_totals,
     )
     act.note(f"Asked: {question}")
     return answer
@@ -1171,8 +1742,9 @@ def get_config(user=Depends(get_current_user)):
 @router.get("/mr/report-periods")
 def report_periods(user=Depends(get_current_user)):
     """Months and quarters that actually hold tracker data — feeds the Reports
-    panel's month/quarter picker."""
-    return reports.available_periods(_load_dataset(user["id"]))
+    panel's month/quarter picker. Workspace-wide: it is the same data every
+    member's Overview is drawn from."""
+    return reports.available_periods(_load_dataset(_ws(user)))
 
 
 @router.post("/mr/reports/{kind}")
@@ -1180,7 +1752,11 @@ def make_report(kind: str, body: dict | None = None, user=Depends(get_current_us
                 act: Activity = trail.records("report", "Built a report")):
     """Build one report. Body (optional): ``{"period": "2026-07" | "2026-Q3"}`` —
     monthly/quarterly only. An explicit period never substitutes another month's
-    data: an empty window is a 422, not a silent fallback."""
+    data: an empty window is a 422, not a silent fallback.
+
+    The figures come from the WORKSPACE's dataset (``_ws``); the report itself is
+    the caller's own — stamped with, and judged against the targets of,
+    ``user["id"]`` — and stays private to them."""
     if kind not in reports.KINDS:
         raise HTTPException(404, f"unknown report kind '{kind}' (expected one of {reports.KINDS})")
     if kind in reports.BOARD_KINDS:
@@ -1196,7 +1772,8 @@ def make_report(kind: str, body: dict | None = None, user=Depends(get_current_us
         report = reports.build(kind, {"snapshot_deltas": mr_snapshots.deltas_for()}, user_id=user["id"])
     else:
         try:
-            report = reports.build(kind, _load_dataset(user["id"]), user_id=user["id"], period=period)
+            report = reports.build(kind, _load_dataset(_ws(user)), user_id=user["id"],
+                                   period=period)
         except reports.PeriodError as exc:
             raise HTTPException(422, str(exc))
     act.note(f"Built {kind} report" + (f" for {period}" if period else ""),
@@ -1246,6 +1823,14 @@ def board_report(body: dict | None = None, user=Depends(get_current_user),
     version), so asking twice for the same quarter of the same capture returns
     the run already stored rather than deriving it again. ``reused`` on the
     response says which happened.
+
+    **Whole workspace.** Unlike the campaign reports, a board report is stamped
+    with, read from and served under the WORKSPACE key (``_ws``): visibility was
+    locked "whole workspace" on 2026-09-05, and it is a pure function of the
+    shared roll-up, so a colleague asking for the same quarter of the same
+    capture is handed the run already stored (``reused: true``) instead of a
+    second copy. The idempotency lookup is still scoped to that one key at the
+    query, so a run stamped with any other key can never be served from here.
     """
     if not reports.board_report_enabled():
         raise HTTPException(404, "Not Found")
@@ -1254,9 +1839,10 @@ def board_report(body: dict | None = None, user=Depends(get_current_user),
     if not period:
         raise HTTPException(
             422, "A board report needs a 'period' (YYYY-MM, YYYY-Qn or YYYY).")
+    ws = _ws(user)
     try:
         report = reports.build_board_report(
-            _load_dataset(user["id"]), user_id=user["id"],
+            _load_dataset(ws), user_id=ws,
             period=period, compare_to=compare_to)
     except reports.PeriodError as exc:
         raise HTTPException(422, str(exc))
@@ -1302,19 +1888,59 @@ def _listed_period(structured: dict) -> str | None:
     return " vs ".join(dict.fromkeys(labels))
 
 
+def _may_read_run(run: dict, user: dict) -> bool:
+    """Whether this caller may read this stored report run.
+
+    Reports are private to whoever built them: the run's ``user_id`` is the
+    caller's own. The one exception is a BOARD run, which lives under the
+    WORKSPACE key and is the workspace's to read. Everything else — another
+    member's daily summary, a run stamped with a key that is neither the
+    caller's nor their workspace's — is not theirs, and the routes answer 404
+    for it, never 403 (a 403 would confirm the id exists).
+
+    Unshared, the workspace key IS the caller's id, so this collapses to the
+    plain ownership check these routes always had. The comparison is raw, not
+    ``str()``: MR treats ``7`` and ``"7"`` as two tenants and the type contract
+    suite pins it.
+    """
+    owner = run.get("user_id")
+    if owner == user["id"]:
+        return True
+    return run.get("kind") in reports.BOARD_KINDS and owner == _ws(user)
+
+
 @router.get("/mr/runs")
 def list_report_runs(user=Depends(get_current_user)):
+    """The caller's saved reports: their own runs, plus the workspace's board
+    reports. Unshared that is ONE query; shared it is two equality queries — the
+    caller's own kinds under their id, the board kinds under the workspace key —
+    merged newest first."""
+    ws = _ws(user)
+    kinds = tuple(reports.KINDS)
+    if ws == user["id"]:
+        rows = runs.list_runs(user["id"], kind=kinds)
+    else:
+        rows = (runs.list_runs(user["id"], kind=kinds)
+                + runs.list_runs(ws, kind=tuple(reports.BOARD_KINDS)))
+        rows.sort(key=lambda r: r.get("generated_at") or "", reverse=True)
     return [
         {"id": r["id"], "kind": r.get("kind"), "generated_at": r.get("generated_at"),
          "period": _listed_period(r.get("structured") or {})}
-        for r in runs.list_runs(user["id"], kind=tuple(reports.KINDS))
+        for r in rows
     ]
 
 
 @router.get("/mr/runs/{run_id}")
 def get_report_run(run_id: str, user=Depends(get_current_user)):
+    """One saved REPORT, whole. Only the report kinds are served here — the same
+    filter ``report_run_pdf`` has. ``mr_runs`` also holds the workbook-derived
+    kinds (``dataset`` with its metrics and leads, ``official_spend``,
+    ``lead_analysis``), and under the shared workspace they are stamped with the
+    workspace key: the one account whose id EQUALS that key satisfies
+    ``_may_read_run``'s own-id clause for every one of them. Without this filter
+    it could open, by run id, documents no route is meant to hand over whole."""
     run = runs.get_run(run_id)
-    if not run or run.get("user_id") != user["id"]:
+    if not run or run.get("kind") not in reports.KINDS or not _may_read_run(run, user):
         raise HTTPException(404, "run not found")
     return run
 
@@ -1336,7 +1962,7 @@ def report_run_pdf(run_id: str, user=Depends(get_current_user),
     """The Reports panel document as a PDF — same sections, same order, same
     figures the user is looking at on screen."""
     run = runs.get_run(run_id)
-    if not run or run.get("user_id") != user["id"] or run.get("kind") not in reports.KINDS:
+    if not run or not _may_read_run(run, user) or run.get("kind") not in reports.KINDS:
         raise HTTPException(404, "run not found")
     if run.get("kind") in reports.BOARD_KINDS:
         # ``mr_pdf.report_pdf`` renders the campaign report's sections from a
@@ -1381,16 +2007,18 @@ def _board_brand() -> str:
     return os.environ.get("MR_BOARD_REPORT_BRAND", "").strip() or _DEFAULT_BOARD_BRAND
 
 
-def _board_run(run_id: str, user_id: str) -> dict:
-    """This caller's own board run, or 404.
+def _board_run(run_id: str, user: dict) -> dict:
+    """A board run this caller may read - their workspace's, or one they built
+    themselves before board runs moved to the workspace key - or 404.
 
-    The same ownership check as ``get_report_run`` and ``report_run_pdf`` above,
-    and the same answer for the same reason: a run another workspace owns is
-    *not found*, never 403 - a 403 would confirm the id exists.
+    The same check as ``get_report_run`` and ``report_run_pdf`` above
+    (:func:`_may_read_run`), narrowed to the board kinds, and the same answer for
+    the same reason: a run another workspace owns is *not found*, never 403 - a
+    403 would confirm the id exists.
     """
     run = runs.get_run(run_id)
-    if (not run or run.get("user_id") != user_id
-            or run.get("kind") not in reports.BOARD_KINDS):
+    if (not run or run.get("kind") not in reports.BOARD_KINDS
+            or not _may_read_run(run, user)):
         raise HTTPException(404, "board report not found")
     return run
 
@@ -1581,7 +2209,7 @@ def board_report_html(run_id: str, user=Depends(get_current_user)):
     """
     if not reports.board_report_enabled():
         raise HTTPException(404, "Not Found")
-    run = _board_run(run_id, user["id"])
+    run = _board_run(run_id, user)
     html = _board_document(run)
     return Response(
         content=html,
@@ -1754,7 +2382,7 @@ def board_report_pdf(run_id: str, user=Depends(get_current_user),
     """
     if not reports.board_report_enabled():
         raise HTTPException(404, "Not Found")
-    run = _board_run(run_id, user["id"])
+    run = _board_run(run_id, user)
     html = _board_document(run)
     pdf, blocked = _render_pdf_via_service(html, run_id=run_id)
     if blocked not in ("", "0"):
@@ -1778,7 +2406,7 @@ def lead_analysis_pdf(month: str | None = None, user=Depends(get_current_user),
     """The Leads panel as a PDF — same story line, red-flag card and vendor
     table the user is looking at. ``month`` (YYYY-MM) defaults to the latest;
     an unknown month is a 422, never a silently substituted one."""
-    run = _latest_lead_run(user["id"])
+    run = _latest_lead_run(_ws(user))
     if not run or not (run.get("summary") or {}).get("months"):
         raise HTTPException(404, "no lead-analysis data yet")
     try:
@@ -1822,6 +2450,7 @@ def trigger_schedule(period: str, user=Depends(get_current_user),
     }.get(period)
     if not fn:
         raise HTTPException(404, f"unknown period '{period}'")
-    result = fn(_load_dataset(user["id"]), user_id=user["id"])
+    # The workspace's figures, the caller's own reports and red lines.
+    result = fn(_load_dataset(_ws(user)), user_id=user["id"])
     act.note(f"Ran the {period} schedule", action=f"schedule:{period}")
     return result

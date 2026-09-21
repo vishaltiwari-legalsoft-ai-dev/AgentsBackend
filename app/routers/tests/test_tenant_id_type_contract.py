@@ -66,6 +66,12 @@ def _harness(tmp_path, monkeypatch, as_caller):
     monkeypatch.setattr(cruns, "CREATIVE_RUNS_ROOT", tmp_path / "creative")
     monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path / "mr"))
     monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "targets.json"))
+    # Workspace sharing is server configuration; on a machine that exports the
+    # key this file would flip into the shared mode and stop pinning the raw
+    # comparison it exists for. Same clearing the other MR harnesses do.
+    for var in ("MR_WORKSPACE_ID", "MR_CRON_USER_ID", "MR_WORKSPACE_SHARED",
+                "MR_PULL_COOLDOWN_SECONDS", "MR_FORCE_PULL_FLOOR_SECONDS"):
+        monkeypatch.delenv(var, raising=False)
     as_caller(NUMERIC)
 
 

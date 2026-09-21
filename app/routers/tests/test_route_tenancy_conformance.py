@@ -28,7 +28,8 @@ The ledger is also documentation with teeth. ``WORKSPACE_SHARED`` is not a
 euphemism for "insecure" — it is a checked-in, counted statement that these
 routes serve the same rows to every signed-in caller, which is *correct* for a
 single shared team workspace and *wrong* the moment a second client is added.
-Today that count is 49. When the workspace boundary lands, the number moves,
+Today that count is :data:`WORKSPACE_SHARED_BASELINE` (its history is written
+out beside it). When the workspace boundary lands, the number moves,
 and :func:`test_workspace_shared_surface_has_not_grown_silently` makes anyone
 who grows it say so on purpose.
 
@@ -288,35 +289,31 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("PUT", "/api/inbox/sheet"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("POST", "/api/inbox/sheet/check"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("GET", "/api/inbox/status"): (TENANT_SCOPED, INTERNAL_ONLY),
-    # The board report. Every read it makes goes through ``_load_dataset(user["id"])``,
-    # which queries ``mr_runs`` filtered on ``user_id`` server-side; the run it
-    # writes is stamped with the same id, and the idempotency lookup that may
-    # serve it back is scoped to that id before the cache key is even compared —
-    # so two workspaces asking for the same quarter of the same capture hash
-    # identically and still cannot reach each other's run. It reads the roll-up
-    # tab through ``reports``/``board_report`` and deliberately never imports
-    # ``snapshots``, whose routes are WORKSPACE_SHARED. Dark by default
-    # (``MR_BOARD_REPORT``), and the kill switch sits INSIDE the handler, so the
-    # auth dependency still runs first and an anonymous caller gets 401, not 404.
-    ("POST", "/api/mr/board-report"): (TENANT_SCOPED, INTERNAL_ONLY),
-    # The board report as a document. Both load the run through the same
-    # ``run.get("user_id") != user["id"]`` check the sibling readers use and
-    # answer 404 - not 403 - to anyone else, so an id belonging to another
-    # workspace is indistinguishable from one that does not exist. The PDF
-    # route hands the rendered HTML to the renderer service and carries no
-    # tenancy of its own: it renders what the ownership check already let
-    # through, and nothing else.
-    ("GET", "/api/mr/board-report/{run_id}/html"): (TENANT_SCOPED, INTERNAL_ONLY),
-    ("GET", "/api/mr/board-report/{run_id}/pdf"): (TENANT_SCOPED, INTERNAL_ONLY),
-    ("GET", "/api/mr/datasets"): (TENANT_SCOPED, INTERNAL_ONLY),
-    ("DELETE", "/api/mr/datasets/{dataset_id}"): (TENANT_SCOPED, INTERNAL_ONLY),
-    ("POST", "/api/mr/ingest"): (TENANT_SCOPED, INTERNAL_ONLY),
-    ("POST", "/api/mr/ingest-pdf"): (TENANT_SCOPED, INTERNAL_ONLY),
-    ("POST", "/api/mr/ingest-sheet"): (TENANT_SCOPED, INTERNAL_ONLY),
-    ("GET", "/api/mr/lead-analysis"): (TENANT_SCOPED, INTERNAL_ONLY),
-    ("GET", "/api/mr/lead-analysis/pdf"): (TENANT_SCOPED, INTERNAL_ONLY),
-    ("GET", "/api/mr/overview"): (TENANT_SCOPED, INTERNAL_ONLY),
-    ("GET", "/api/mr/report-periods"): (TENANT_SCOPED, INTERNAL_ONLY),
+    # The MR routes that stay PRIVATE to the caller after the shared workspace
+    # (2026-09-21): a report a person builds, their list of them, their schedule
+    # runs and their targets. Every one is keyed on ``user["id"]`` — the run a
+    # report is stamped with, ``_may_read_run``'s owner comparison, and
+    # ``mr_config/targets__{user_id}`` — and every one answers 404, not 403, to a
+    # run that is not the caller's (``GET /mr/runs/{id}`` serves the REPORT kinds
+    # only, so the workbook-derived documents stamped with the workspace key are
+    # not readable whole through it, not even by the account that key belongs to).
+    # They read the WORKSPACE's dataset to build from (``_load_dataset(_ws(user))``)
+    # but write nothing under its key, so a member's daily summary and their own
+    # targets stay theirs.
+    #
+    # What is NOT private, stated so this comment stays true: the lead-quality
+    # flags in the shared ``lead_analysis`` run are judged against the WORKSPACE
+    # account's targets, and ``lead_analysis._evaluate`` prints three of those
+    # thresholds — ``bad_lead_rate_red``, ``no_show_rate_red``,
+    # ``canceled_rate_red`` — verbatim into the flag message text. That text is
+    # frozen into the run and served to every member through
+    # ``GET /mr/lead-analysis``, its PDF, ``GET /mr/overview`` and the campaign
+    # reports. So those three numbers of the workspace account's are visible to
+    # every member. ACCEPTED for now (they are company thresholds, not anyone's
+    # private figures); dropping the numbers from the text is the owner's call.
+    # A member's OWN targets never reach anyone else. Pinned behaviourally in
+    # ``test_mr_cross_tenant.py`` ("the shared workspace" section): this comment
+    # is the map, that file is the proof.
     ("POST", "/api/mr/reports/{kind}"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("GET", "/api/mr/runs"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("GET", "/api/mr/runs/{run_id}"): (TENANT_SCOPED, INTERNAL_ONLY),
@@ -324,7 +321,6 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("POST", "/api/mr/schedule/{period}"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("GET", "/api/mr/targets"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("POST", "/api/mr/targets"): (TENANT_SCOPED, INTERNAL_ONLY),
-    ("GET", "/api/mr/trends"): (TENANT_SCOPED, INTERNAL_ONLY),
     # The console's record. `firestore_repo.list_runs_for_user` filters on
     # `user_id` before it orders, and both the count and the fallback scan carry
     # the same filter, so there is no path through this route that reads a row
@@ -397,6 +393,57 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     # ("the sheet-sources registry" section) — this comment is the map, that
     # file is the proof.
     ("POST", "/api/mr/ask"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    # MR workbook-derived data — the shared workspace (2026-09-21). These thirteen
+    # were TENANT_SCOPED until then and are now WORKSPACE_SHARED, on purpose:
+    # ``dataset``, ``official_spend`` and ``lead_analysis`` runs and the board
+    # report are stored and read under ONE key the server resolves
+    # (``marketing_research_agent/workspace.py``: ``MR_WORKSPACE_ID``, else
+    # ``MR_CRON_USER_ID``, else the caller). The key never comes from the request,
+    # so no caller can name another one.
+    #
+    # It is an OPT-IN that fails closed: ON only when ``MR_WORKSPACE_SHARED`` is
+    # explicitly ``1``/``true``/``yes``/``on``; unset, or any other value (a typo
+    # included), is OFF and per-user exactly as before. Production already has
+    # ``MR_CRON_USER_ID``, so merely deploying this changes nothing. Rollback is
+    # unsetting the variable (or ``0``).
+    #
+    # Board reports (visibility locked "whole workspace" on 2026-09-05) are the
+    # same: stamped with the workspace key, and every lookup — the run a route
+    # loads by id, and the idempotency scan — compares against it, so a run
+    # stamped with any other key is not found rather than forbidden.
+    #
+    # Three of these are NOT open to every caller while shared, because each
+    # changes what the WHOLE team's dashboard shows: ``POST /mr/ingest`` and
+    # ``POST /mr/ingest-pdf`` (an upload replaces that platform's figure for
+    # everyone and is permanent) are admin/creator only, and so is the
+    # ``gid``/``force`` half of ``POST /mr/ingest-sheet`` — a single-tab pull, and
+    # a pull that skips the cooldown (which an admin still cannot fire more often
+    # than the floor allows). A member's plain pull is unchanged. All 403 for a
+    # member, and only while shared.
+    #
+    # ``DELETE /mr/datasets/{id}`` is listed here for the same reason
+    # ``DELETE /mr/sources/{id}`` is: it operates on the shared listing but is NOT
+    # open to every caller. A member may delete only a row whose ``created_by`` is
+    # them; a pulled ``sheets:*`` tab and any row that predates attribution are
+    # admin/creator only; a row outside the caller's workspace is a 404. Pinned
+    # behaviourally in ``test_mr_cross_tenant.py`` ("the shared workspace"
+    # section) — this comment is the map, that file is the proof.
+    #
+    # Deliberately still TENANT_SCOPED, above: ``POST /mr/reports/{kind}``,
+    # ``/mr/runs*``, ``POST /mr/schedule/{period}`` and ``/mr/targets`` — a
+    # person's own reports, run list, schedule and red lines.
+    ("POST", "/api/mr/board-report"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/board-report/{run_id}/html"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/board-report/{run_id}/pdf"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/datasets"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("DELETE", "/api/mr/datasets/{dataset_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/mr/ingest"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/mr/ingest-pdf"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/mr/ingest-sheet"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/lead-analysis"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/lead-analysis/pdf"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/overview"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/report-periods"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     # MR snapshots: ``marketing_research_agent/snapshots.py`` has no ``user_id``
     # in any function — every row is keyed by vendor slug and date alone, while
     # the rest of the MR router scopes carefully. This is the inconsistency the
@@ -410,6 +457,7 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("GET", "/api/mr/sources"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("POST", "/api/mr/sources"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("DELETE", "/api/mr/sources/{spreadsheet_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/trends"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("GET", "/api/mr/workbook"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("POST", "/api/mr/workbook/scan"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     # SEO: ``state.save("brands", …)`` is a single global Firestore document,
@@ -480,7 +528,42 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
 #: The MR pair audited alongside them — ``POST /mr/snapshots/capture`` and
 #: ``POST /mr/workbook/scan`` — needed no move: they were already counted here
 #: by the 2026-09-05 edit. Hence 57 and not 59.
-WORKSPACE_SHARED_BASELINE = 57
+#:
+#: 57 → 70 on 2026-09-21: the shared MR workspace. Thirteen routes moved OUT of
+#: TENANT_SCOPED, and this one is a real widening, unlike the two moves above —
+#: so it is said plainly. On production only the cron account's copy of the
+#: workbook-derived data was ever fresh, and every other account opened an empty
+#: Overview, month picker and board-report builder. ``GET /mr/overview``,
+#: ``/mr/trends``, ``/mr/report-periods``, ``/mr/lead-analysis`` (+ ``/pdf``),
+#: ``/mr/datasets``, the three ``POST /mr/ingest*`` writes, the board report's
+#: build and its two document routes, and ``DELETE /mr/datasets/{id}`` now serve
+#: one deployment-wide copy to every signed-in member.
+#:
+#: What that does and does not change. The figures come from ONE workbook that
+#: every member can already read in full through ``POST /mr/ask``,
+#: ``GET /mr/workbook`` and ``GET /mr/config`` (all counted above), so the reach
+#: is unchanged; what changes is freshness and convenience, not who can learn
+#: what. The key is resolved by the server from its own configuration, never from
+#: the request. No ``/api/mr`` route is in ``app.scopes.GEO_SCOPE_ROUTES``, so all
+#: thirteen stay INTERNAL_ONLY and a GEO-only contractor is still refused on every
+#: one (``test_a_geo_only_caller_is_refused_on_every_internal_route``). A person's
+#: own reports, run list, schedule and targets did NOT move — they stay
+#: TENANT_SCOPED above — and the routes that would let one member change what the
+#: whole team sees are NOT open to every caller while shared: uploads, a forced
+#: pull and a single-tab pull are admin/creator only, and ``DELETE
+#: /mr/datasets/{id}`` lets a member delete only what they added.
+#:
+#: One thing is shared that is not a workbook figure, and is accepted: the shared
+#: lead-analysis flag text prints the workspace account's ``bad_lead_rate_red``,
+#: ``no_show_rate_red`` and ``canceled_rate_red`` targets, so those three
+#: numbers are visible to every member (they are company thresholds).
+#:
+#: It ships OFF. Sharing turns on only when ``MR_WORKSPACE_SHARED`` is explicitly
+#: ``1``/``true``/``yes``/``on``; production already has ``MR_CRON_USER_ID``, so
+#: merely deploying changes nothing, and a typo in the switch fails closed.
+#: Enabling it is one deliberate env change. Rollback is unsetting it (or ``0``)
+#: — no redeploy of code, no data moved.
+WORKSPACE_SHARED_BASELINE = 70
 
 #: The GEO editor surface, BY NAME. Not a count — a count would let a future
 #: route join the role while another left it and say nothing, and the thing

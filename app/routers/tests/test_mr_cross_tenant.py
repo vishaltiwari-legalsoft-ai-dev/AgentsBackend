@@ -25,8 +25,9 @@ read path behind ``/overview``, ``/trends``, ``/report-periods``,
 Also here: ``/mr/targets``, which was one document for the whole deployment
 until 2026-08-21 — a second tenant read and overwrote the first tenant's
 thresholds, and every report built from them. It is keyed on ``user["id"]`` now
-and the last section pins that, at the store and at the two places the figures
-are *applied* (report flags, overview traffic lights).
+and the targets section pins that, at the store and at the two places the
+figures are *applied* (report flags, overview traffic lights) — and it stays
+per user in the shared mode too.
 
 And the blind spot this file had of its own (fixed 2026-09-05). The harness
 below has set ``MR_SOURCES_FILE`` since the day it was written, and not one
@@ -40,8 +41,34 @@ routes TENANT_SCOPED.
 The resolution is NOT per-user sources; see ``sources_registry``'s docstring
 for why (one shared primary tracker, one shared service account, a cron that
 scans every workbook). Reads stay shared and the ledger now says
-WORKSPACE_SHARED. What closed is the destructive path, and the last section
-here is what holds it shut.
+WORKSPACE_SHARED. What closed is the destructive path, and the sheet-sources
+section here is what holds it shut.
+
+TWO MODES, both pinned (2026-09-21)
+-----------------------------------
+The workbook-derived kinds (``dataset``, ``official_spend``, ``lead_analysis``),
+uploads and the board report are keyed on a key the SERVER resolves
+(``marketing_research_agent/workspace.py``): ``MR_WORKSPACE_ID``, else
+``MR_CRON_USER_ID``, else the caller's own id — and only while sharing has been
+switched ON. Which mode a test runs in is selected by those variables alone:
+
+* **Unshared — the default.** The harness deletes every workspace variable, so
+  this is everything above the last section, and it is what local, dev and CI
+  are. Each tenant's workbook data is their own, so "the stranger sees nothing"
+  means what it says. It is also what a deployment gets when it merely has
+  ``MR_CRON_USER_ID`` set, or a typo in ``MR_WORKSPACE_SHARED``: sharing is an
+  opt-in that fails closed, and only ``1`` / ``true`` / ``yes`` / ``on`` turn it
+  on. Unsetting (or ``0``) is the rollback.
+* **Shared — a key AND ``MR_WORKSPACE_SHARED=1``**, via the ``shared_workspace``
+  fixture in the last section. There the stranger DOES see the owner's workbook
+  data — on purpose; on production only the cron account's copy was ever fresh,
+  so every other account opened an empty workspace — while a person's saved
+  reports, run list and targets stay their own, uploads are an admin's, a member
+  cannot delete what a colleague added, and only an admin retires a pulled
+  tracker tab.
+
+The suite fails if either mode drifts. Every assertion in the unshared half is
+also a parity gate for the shared one: nothing there changed.
 """
 from __future__ import annotations
 
@@ -82,6 +109,12 @@ def _harness(tmp_path, monkeypatch, as_caller):
     monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path / "mr"))
     monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "targets.json"))
     monkeypatch.setenv("MR_SOURCES_FILE", str(tmp_path / "sources.json"))
+    # The workspace key is server configuration and selects the MODE this suite
+    # runs in (see the module docstring). Default is UNSHARED, whatever the
+    # machine exports; the last section opts into the shared mode explicitly.
+    for var in ("MR_WORKSPACE_ID", "MR_CRON_USER_ID", "MR_WORKSPACE_SHARED",
+                "MR_PULL_COOLDOWN_SECONDS"):
+        monkeypatch.delenv(var, raising=False)
     as_caller(OWNER)
 
 
@@ -435,8 +468,10 @@ def board_on(monkeypatch):
 
 def test_an_identical_board_request_from_another_tenant_is_not_a_cache_hit(
         board_on, as_caller):
-    """Same period, same capture date, same generator — so the same key. The
-    second tenant must still derive their OWN run from their OWN figures."""
+    """UNSHARED mode. Same period, same capture date, same generator — so the
+    same key. The second tenant must still derive their OWN run from their OWN
+    figures. (In the shared mode the very same request IS a cache hit, on
+    purpose — see the last section, which pairs with this test.)"""
     _seed_official_for(OWNER["id"])
     _seed_official_for(STRANGER["id"])
 
@@ -724,3 +759,457 @@ def test_the_kill_switch_still_refuses_both_write_paths(sheets_reachable, monkey
     assert client.post("/api/mr/sources", json={"url": SHEET_LEGACY}).status_code == 403
     assert client.delete(f"/api/mr/sources/{SHEET_A}").status_code == 403
     assert client.get("/api/mr/sources").json()["enabled"] is False
+
+
+# --------------------------------------------------------------------------- #
+# The shared workspace — the OTHER mode this suite pins
+# --------------------------------------------------------------------------- #
+# Everything above runs UNSHARED (the harness deletes the workspace variables),
+# so each tenant's workbook data is their own and every "the stranger sees
+# nothing" above means exactly that. This section turns sharing ON through
+# ``shared_workspace`` — a workspace key (``MR_CRON_USER_ID``) AND the explicit
+# opt-in (``MR_WORKSPACE_SHARED=1``) — and pins the deliberate opposite, for the
+# three workbook-derived kinds and the board report: one copy, read by every
+# signed-in member.
+#
+# The opt-in fails closed, and the last tests here pin that at the tenancy
+# surface: a configured key alone — which production already has — or a typo in
+# the switch leaves every tenant isolated.
+#
+# What did NOT move is as much the point as what did. A report a person builds,
+# their run list, their targets and their schedule are still theirs; what
+# changes the whole team's dashboard (an upload) is an admin's, so it cannot be
+# used to overwrite a colleague's figure; a shared listing needs an owner on its
+# rows, so a member cannot delete what somebody else added; and nobody but an
+# admin retires a pulled tracker tab.
+#
+# The key is a THIRD id, neither OWNER nor STRANGER: a pass can then only come
+# from the resolver, never from one of them merely reading the other's rows.
+
+#: The deployment's workspace key — the account the cron pulls for.
+WORKSPACE = "mr-shared-workspace"
+
+#: ``marketing_research.py::_dataset_delete_refusal`` and ``_UPLOAD_REFUSED`` —
+#: pinned so the wording the console shows and the wording the router raises
+#: cannot drift apart.
+DELETE_UPLOADER_ONLY = "Only the person who uploaded this dataset, or an admin, can delete it."
+DELETE_TRACKER_TAB = ("This dataset is pulled from the live tracker sheet, so only an "
+                      "admin can delete it. The next pull would bring it back anyway.")
+DELETE_UNATTRIBUTED = ("This dataset was uploaded before we started recording who added "
+                       "it. An admin can delete it.")
+UPLOAD_REFUSED = "Uploads go to the whole team's dashboard, so only an admin can add them."
+
+
+@pytest.fixture()
+def shared_workspace(monkeypatch) -> str:
+    """Sharing ON: the key and the explicit opt-in. Both are required."""
+    monkeypatch.setenv("MR_CRON_USER_ID", WORKSPACE)
+    monkeypatch.setenv("MR_WORKSPACE_SHARED", "1")
+    return WORKSPACE
+
+
+def _upload_csv() -> str:
+    """Upload the fixture CSV as whoever is signed in. While the workspace is
+    shared that has to be an admin — tests say so with ``as_caller(ADMIN)``."""
+    r = client.post("/api/mr/ingest",
+                    files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+                    data={"platform": "google_ads"})
+    assert r.status_code == 200, r.text
+    return r.json()["dataset_id"]
+
+
+def _seed_dataset(platform: str, *, user_id: str = WORKSPACE, created_by: str | None = None,
+                  stamp: str = "2026-08-01T00:00:00+00:00") -> str:
+    from marketing_research_agent import runs as mr_runs
+
+    rid = mr_runs.new_run_id()
+    run = {"id": rid, "kind": "dataset", "user_id": user_id, "agent_id": "a6",
+           "platform": platform, "generated_at": stamp, "metrics": [], "leads": [], "gaps": []}
+    if created_by is not None:
+        run["created_by"] = created_by
+    mr_runs.save_run(run)
+    return rid
+
+
+def _listed(dataset_id: str) -> dict | None:
+    return next((d for d in client.get("/api/mr/datasets").json() if d["id"] == dataset_id), None)
+
+
+def test_a_colleague_shares_the_workbook_dataset_but_not_my_saved_reports(
+        shared_workspace, as_caller):
+    """THE property, both halves in one test. The stranger reads the same figures
+    the owner does — on every panel that draws on the workbook — and still cannot
+    see, open or export a single report the owner built."""
+    from marketing_research_agent import runs as mr_runs
+
+    as_caller(ADMIN)
+    dataset_id = _upload_csv()                       # the team's data: an admin's upload
+    as_caller(OWNER)
+    report = client.post("/api/mr/reports/daily_summary")
+    assert report.status_code == 200, report.text
+    report_id = report.json()["id"]
+    assert report.json()["user_id"] == OWNER["id"], "a saved report must stay the owner's"
+    mr_runs.save_run({
+        "id": mr_runs.new_run_id(), "kind": "lead_analysis", "user_id": WORKSPACE,
+        "agent_id": "a6", "platform": "sheets-leads",
+        "generated_at": "2026-08-01T00:00:00+00:00",
+        "source_label": "Primary", "tab": "Lead Analysis", "gaps": [],
+        "summary": {"latest_month": "2026-07",
+                    "months": {"2026-07": {"vendors": [], "flag_count": 0}}},
+    })
+
+    as_caller(STRANGER)
+    # -- shared: the workbook-derived panels -----------------------------------
+    assert [d["id"] for d in client.get("/api/mr/datasets").json()] == [dataset_id]
+    overview = client.get("/api/mr/overview").json()
+    assert overview["has_data"] is True and overview["sources"]
+    trends = client.get("/api/mr/trends").json()
+    assert trends["has_data"] is True and trends["monthly"]
+    periods = client.get("/api/mr/report-periods").json()
+    assert periods["months"] and periods["quarters"]
+    assert client.get("/api/mr/lead-analysis").json()["has_data"] is True
+    assert client.get("/api/mr/lead-analysis/pdf").status_code == 200
+
+    # -- private: what the owner built ------------------------------------------
+    assert client.get("/api/mr/runs").json() == [], "the owner's report was listed"
+    refused = client.get(f"/api/mr/runs/{report_id}")
+    assert refused.status_code == 404 and refused.json()["detail"] == RUN_NOT_FOUND
+    pdf = client.get(f"/api/mr/runs/{report_id}/pdf")
+    assert pdf.status_code == 404 and pdf.json()["detail"] == RUN_NOT_FOUND
+
+    # -- and a report the stranger builds is drawn from the shared data, theirs alone
+    mine = client.post("/api/mr/reports/daily_summary")
+    assert mine.status_code == 200, mine.text
+    assert "1200" in str(mine.json()["structured"]), "built from an empty dataset"
+    assert mine.json()["user_id"] == STRANGER["id"]
+
+    as_caller(OWNER)
+    assert [r["id"] for r in client.get("/api/mr/runs").json()] == [report_id]
+    assert client.get(f"/api/mr/runs/{mine.json()['id']}").status_code == 404
+
+
+# --- the workbook-derived documents are not readable whole through /mr/runs ----
+
+def _seed_workspace_documents(key: str) -> dict:
+    """One of each workbook-derived kind under ``key`` — the documents
+    ``GET /mr/runs/{id}`` must never hand over, whoever asks."""
+    from marketing_research_agent import runs as mr_runs
+
+    ids = {"dataset": _seed_dataset("google_ads", user_id=key, created_by=STRANGER["id"])}
+    # The official run is stamped OLDER than ``_seed_official_for``'s capture
+    # (2026-04-01), so a test that also builds a board report still derives it
+    # from that capture — the newest official run is the one the roll-up reads.
+    for kind, stamp, extra in (
+            ("official_spend", "2026-03-15T00:00:00+00:00",
+             {"months": {"2026-07": 1.0}, "totals": {"2026-07": {"spend": 1.0}}}),
+            ("lead_analysis", "2026-08-01T00:00:00+00:00",
+             {"summary": {"months": {}}, "tab": "Leads"})):
+        rid = mr_runs.new_run_id()
+        mr_runs.save_run({"id": rid, "kind": kind, "user_id": key, "agent_id": "a6",
+                          "generated_at": stamp, **extra})
+        ids[kind] = rid
+    return ids
+
+
+def test_the_account_whose_id_is_the_workspace_key_cannot_open_workbook_runs_by_id(
+        board_on, monkeypatch, as_caller):
+    """The gap this closes: workbook-derived runs are stamped with the workspace
+    key, and the ONE account whose id equals that key satisfies the plain
+    ``owner == user["id"]`` clause for every one of them. ``GET /mr/runs/{id}``
+    had no kind filter, so that account could open whole ``dataset`` documents
+    (metrics, leads, ``created_by``), ``official_spend`` and ``lead_analysis``
+    runs that no route is meant to hand over. It can still read what it is meant
+    to: a board report and its own saved report."""
+    monkeypatch.setenv("MR_CRON_USER_ID", OWNER["id"])       # the key IS this account
+    monkeypatch.setenv("MR_WORKSPACE_SHARED", "1")
+    docs = _seed_workspace_documents(OWNER["id"])
+    _seed_official_for(OWNER["id"])
+    board = client.post("/api/mr/board-report", json={"period": "2026-Q1"})
+    narrated = client.post("/api/mr/reports/daily_summary")
+    assert (board.status_code, narrated.status_code) == (200, 200), (board.text, narrated.text)
+
+    for kind, run_id in docs.items():
+        r = client.get(f"/api/mr/runs/{run_id}")
+        assert r.status_code == 404 and r.json()["detail"] == RUN_NOT_FOUND, (
+            f"the workspace account opened a whole {kind} run: {r.status_code}")
+        assert client.get(f"/api/mr/runs/{run_id}/pdf").status_code == 404, kind
+        assert client.get(f"/api/mr/board-report/{run_id}/html").status_code == 404, kind
+    assert docs["dataset"] not in [r["id"] for r in client.get("/api/mr/runs").json()]
+
+    assert client.get(f"/api/mr/runs/{board.json()['id']}").status_code == 200
+    assert client.get(f"/api/mr/runs/{narrated.json()['id']}").status_code == 200
+
+
+def test_an_ordinary_member_cannot_open_workbook_runs_by_id(
+        board_on, shared_workspace, as_caller):
+    """Same three kinds, an ordinary member: 404 (they never matched the owner
+    clause and the workspace clause is board-only) — and what they may read is
+    unchanged."""
+    docs = _seed_workspace_documents(WORKSPACE)
+    _seed_official_for(WORKSPACE)
+    as_caller(OWNER)
+    board = client.post("/api/mr/board-report", json={"period": "2026-Q1"})
+    private = client.post("/api/mr/reports/daily_summary")
+    assert (board.status_code, private.status_code) == (200, 200)
+
+    # A narrated report that somehow carries the WORKSPACE key (nothing writes one
+    # today) is still not a member's to read: the workspace clause is board-only.
+    from marketing_research_agent import runs as mr_runs
+
+    stray = mr_runs.new_run_id()
+    mr_runs.save_run({"id": stray, "kind": "daily_summary", "user_id": WORKSPACE,
+                      "agent_id": "a6", "generated_at": "2026-08-02T00:00:00+00:00",
+                      "structured": {}})
+    docs["narrated stamped with the workspace key"] = stray
+
+    as_caller(STRANGER)
+    for kind, run_id in docs.items():
+        r = client.get(f"/api/mr/runs/{run_id}")
+        assert r.status_code == 404 and r.json()["detail"] == RUN_NOT_FOUND, kind
+        assert client.get(f"/api/mr/runs/{run_id}/pdf").status_code == 404, kind
+    assert client.get(f"/api/mr/runs/{board.json()['id']}").status_code == 200   # the workspace's
+    assert client.get(f"/api/mr/runs/{private.json()['id']}").status_code == 404  # the owner's
+
+
+# --- uploads and deletes -------------------------------------------------------
+
+def test_a_member_cannot_upload_into_the_shared_dashboard(shared_workspace, as_caller):
+    """An upload replaces that platform's figure for the whole team and is
+    permanent, so while the workspace is shared it is an admin's. The refusal is
+    what stops a member overwriting a colleague's figure — and then being unable
+    to delete what they wrote."""
+    as_caller(STRANGER)
+    refused = client.post("/api/mr/ingest",
+                          files={"file": ("g.csv", io.BytesIO(CSV), "text/csv")},
+                          data={"platform": "google_ads"})
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"] == UPLOAD_REFUSED
+
+    as_caller(OWNER)
+    assert client.get("/api/mr/datasets").json() == [], "a refused upload still landed"
+    assert client.get("/api/mr/overview").json()["has_data"] is False
+
+
+def test_a_colleague_cannot_delete_a_dataset_they_did_not_upload(shared_workspace, as_caller):
+    """The listing is workspace-wide now, so "it is in your list" no longer means
+    "you put it there". 403, not 404: the row is in the caller's own listing, so
+    a 404 would leak nothing and lie about a dataset they can plainly see.
+
+    Rows are seeded rather than uploaded — while shared, only an admin can upload
+    — which is also the honest shape of the case: a row whose author is a person
+    who has since lost the role."""
+    mine = _seed_dataset("google_ads", created_by=OWNER["id"])
+    theirs = _seed_dataset("pdf:board.pdf", created_by=STRANGER["id"])
+
+    as_caller(STRANGER)
+    row = _listed(mine)
+    assert row is not None, "the shared listing hides a colleague's dataset"
+    assert row["created_by"] == OWNER["id"] and row["can_delete"] is False
+    assert _listed(theirs)["can_delete"] is True
+
+    refused = client.delete(f"/api/mr/datasets/{mine}")
+    assert refused.status_code == 403, (
+        f"a member deleted a colleague's dataset: {refused.status_code} {refused.text}")
+    assert refused.json()["detail"] == DELETE_UPLOADER_ONLY
+    assert _listed(mine) is not None, "the dataset was deleted despite the refusal"
+
+    as_caller(OWNER)
+    assert _listed(mine)["can_delete"] is True and _listed(theirs)["can_delete"] is False
+    assert client.delete(f"/api/mr/datasets/{theirs}").status_code == 403
+
+    assert client.delete(f"/api/mr/datasets/{mine}").status_code == 200        # the author
+    as_caller(STRANGER)
+    assert client.delete(f"/api/mr/datasets/{theirs}").status_code == 200
+    assert client.get("/api/mr/datasets").json() == []
+
+
+def test_an_admin_can_delete_any_dataset_in_the_workspace(shared_workspace, as_caller):
+    as_caller(ADMIN)
+    uploaded = _upload_csv()
+    authored = _seed_dataset("pdf:x.pdf", created_by=OWNER["id"])
+    for dataset_id in (uploaded, authored):
+        assert _listed(dataset_id)["can_delete"] is True
+        assert client.delete(f"/api/mr/datasets/{dataset_id}").status_code == 200
+        assert _listed(dataset_id) is None
+
+
+def test_a_tracker_dataset_can_only_be_retired_by_an_admin(shared_workspace, as_caller):
+    """A ``sheets:*`` tab is the team's live tracker data and the next pull would
+    only recreate it — so it is not a member's to delete, whoever they are. Rows
+    that predate attribution have no owner to name, and get the same rule as the
+    ``/mr/sources`` legacy rows: admin only. Authorship does not change that for
+    a tab: a single-tab pull records its admin, and the platform still decides."""
+    tab = _seed_dataset("sheets:Vendor A")                         # no created_by: a pull
+    authored_tab = _seed_dataset("sheets:Vendor B", created_by=OWNER["id"])   # a single-tab pull
+    legacy = _seed_dataset("google_ads")                           # uploaded before attribution
+
+    for who in (STRANGER, OWNER):                                  # a member; and the tab's author
+        as_caller(who)
+        assert _listed(tab)["can_delete"] is False, who["id"]
+        r = client.delete(f"/api/mr/datasets/{tab}")
+        assert r.status_code == 403, f"{who['id']}: {r.status_code} {r.text}"
+        assert r.json()["detail"] == DELETE_TRACKER_TAB
+
+        assert _listed(authored_tab)["can_delete"] is False, who["id"]
+        assert client.delete(f"/api/mr/datasets/{authored_tab}").status_code == 403
+
+        assert _listed(legacy)["can_delete"] is False, who["id"]
+        r = client.delete(f"/api/mr/datasets/{legacy}")
+        assert r.status_code == 403, f"{who['id']}: {r.status_code} {r.text}"
+        assert r.json()["detail"] == DELETE_UNATTRIBUTED
+        assert _listed(tab) and _listed(legacy), "a refused delete still removed the row"
+
+    as_caller(ADMIN)
+    for rid in (tab, authored_tab, legacy):
+        assert _listed(rid)["can_delete"]
+        assert client.delete(f"/api/mr/datasets/{rid}").status_code == 200
+    assert client.get("/api/mr/datasets").json() == []
+
+
+def test_a_dataset_stamped_with_a_foreign_key_is_not_found_not_forbidden(
+        shared_workspace, as_caller):
+    """Outside the caller's workspace is a 404 — the same answer as an invented
+    id — never the 403 that would confirm it exists."""
+    foreign = _seed_dataset("google_ads", user_id="another-workspace", created_by=OWNER["id"])
+
+    for who in (OWNER, STRANGER, ADMIN):
+        as_caller(who)
+        r = client.delete(f"/api/mr/datasets/{foreign}")
+        assert r.status_code == 404 and r.json()["detail"] == DATASET_NOT_FOUND, who["id"]
+
+
+def test_in_an_unshared_workspace_you_can_still_delete_every_row_you_can_see(as_caller):
+    """The parity half of the delete gate. With no workspace key the listing is
+    the caller's own, so every row in it is theirs — including a pulled tab and a
+    row that predates attribution — exactly as before the gate existed."""
+    tab = _seed_dataset("sheets:Vendor A", user_id=OWNER["id"])
+    legacy = _seed_dataset("google_ads", user_id=OWNER["id"])
+    assert _listed(tab)["can_delete"] is True and _listed(legacy)["can_delete"] is True
+
+    assert client.delete(f"/api/mr/datasets/{tab}").status_code == 200
+    assert client.delete(f"/api/mr/datasets/{legacy}").status_code == 200
+
+    as_caller(STRANGER)
+    other = _seed_dataset("google_ads", user_id=OWNER["id"])
+    assert client.delete(f"/api/mr/datasets/{other}").status_code == 404   # not theirs to see
+
+
+def test_targets_stay_private_in_a_shared_workspace(shared_workspace, as_caller):
+    """The figures are shared; the red lines are not. Each member is judged
+    against their OWN targets, and no edit is ever written under the workspace
+    key — that would make one member's threshold everybody's."""
+    from marketing_research_agent import goals as mr_goals
+
+    as_caller(ADMIN)
+    _upload_csv()                                    # $1,200 for 4 booked demos: $300 each
+    as_caller(OWNER)
+    assert client.post("/api/mr/targets",
+                       json={"thresholds": {"cost_per_booking_flag": 500}}).status_code == 200
+    mine = client.get("/api/mr/overview").json()
+    assert not [f for f in mine["flag_summary"] if f["metric"] == "cost_per_booking"], (
+        "the owner raised their own ceiling above $300 and is still flagged")
+
+    as_caller(STRANGER)
+    theirs = client.get("/api/mr/overview").json()
+    assert theirs["has_data"] is True, "the shared figures were not shared"
+    assert [f for f in theirs["flag_summary"] if f["metric"] == "cost_per_booking"], (
+        "the stranger's overview was judged against the owner's raised ceiling")
+    assert client.get("/api/mr/targets").json()["thresholds"]["cost_per_booking_flag"] != 500
+
+    assert client.post("/api/mr/targets",
+                       json={"thresholds": {"cac_red": 4242}}).status_code == 200
+    as_caller(OWNER)
+    assert client.get("/api/mr/targets").json()["thresholds"]["cac_red"] != 4242
+
+    assert mr_goals.get_targets(WORKSPACE)["edited"] is False, (
+        "a member's edit was written under the workspace key")
+
+
+def test_a_second_tenant_still_gets_their_own_report_from_the_shared_data(
+        shared_workspace, as_caller):
+    """``make_report`` is the one route that reads the shared dataset AND writes
+    a private run. Both halves, on the run itself: stamped with the builder."""
+    as_caller(ADMIN)
+    _upload_csv()
+    as_caller(STRANGER)
+    built = client.post("/api/mr/reports/daily_summary").json()
+    assert built["user_id"] == STRANGER["id"]
+    assert [r["id"] for r in client.get("/api/mr/runs").json()] == [built["id"]]
+
+
+# --- the switch fails closed: a key, or a typo, shares nothing ------------------
+
+def test_a_configured_key_without_the_switch_still_isolates_every_tenant(
+        monkeypatch, as_caller):
+    """Production already has ``MR_CRON_USER_ID``. With the switch unset — or a
+    typo in it — every tenant is exactly as isolated as in the unshared half of
+    this suite: nothing about the tenancy surface moves until someone turns
+    sharing on deliberately."""
+    monkeypatch.setenv("MR_CRON_USER_ID", WORKSPACE)
+    monkeypatch.setenv("MR_WORKSPACE_ID", "another-workspace")
+    for switch in (None, "", "ture", "enabled", "2"):
+        if switch is None:
+            monkeypatch.delenv("MR_WORKSPACE_SHARED", raising=False)
+        else:
+            monkeypatch.setenv("MR_WORKSPACE_SHARED", switch)
+        as_caller(OWNER)
+        dataset_id = _upload_csv()                       # unshared: anyone may, and it is theirs
+        report_id = client.post("/api/mr/reports/daily_summary").json()["id"]
+
+        as_caller(STRANGER)
+        assert client.get("/api/mr/datasets").json() == [], repr(switch)
+        assert client.get("/api/mr/overview").json()["has_data"] is False, repr(switch)
+        assert client.get(f"/api/mr/runs/{report_id}").status_code == 404, repr(switch)
+        assert client.delete(f"/api/mr/datasets/{dataset_id}").status_code == 404, repr(switch)
+
+
+# --- the board report: one copy per workspace, one key at the query ------------
+
+def test_a_colleague_asking_for_the_same_board_report_is_handed_the_stored_run(
+        board_on, shared_workspace, as_caller):
+    """The pure-function report of a shared capture is one run for the whole
+    workspace. The colleague's identical request is a cache hit — the same run,
+    ``reused: true`` — and they can open it three ways: JSON, list and document."""
+    _seed_official_for(WORKSPACE)
+
+    as_caller(OWNER)
+    mine = client.post("/api/mr/board-report", json={"period": "2026-Q1"}).json()
+    assert mine["reused"] is False and mine["user_id"] == WORKSPACE
+
+    as_caller(STRANGER)
+    theirs = client.post("/api/mr/board-report", json={"period": "2026-Q1"}).json()
+    assert theirs["reused"] is True and theirs["id"] == mine["id"]
+
+    assert client.get(f"/api/mr/runs/{mine['id']}").status_code == 200
+    assert mine["id"] in [r["id"] for r in client.get("/api/mr/runs").json()]
+    assert client.get(f"/api/mr/board-report/{mine['id']}/html").status_code == 200
+
+
+def test_a_board_run_stamped_with_a_foreign_key_is_never_served(
+        board_on, shared_workspace, as_caller):
+    """The idempotency lookup is scoped to ONE key at the query, and that is what
+    keeps a workspace's cache from serving somebody else's figures. Here a run
+    with the identical cache key is stamped with a key that is neither the
+    workspace nor the caller: the request must re-derive, and the foreign run
+    must stay unreadable through every route that hands a board run over."""
+    from marketing_research_agent import runs as mr_runs
+
+    _seed_official_for(WORKSPACE)
+    built = client.post("/api/mr/board-report", json={"period": "2026-Q1"}).json()
+    stored = mr_runs.get_run(built["id"])
+    mr_runs.delete_run(built["id"])
+    foreign = {**stored, "id": mr_runs.new_run_id(), "user_id": "another-workspace"}
+    mr_runs.save_run(foreign)
+
+    as_caller(STRANGER)
+    theirs = client.post("/api/mr/board-report", json={"period": "2026-Q1"}).json()
+    assert theirs["structured"]["cache_key"] == foreign["structured"]["cache_key"], (
+        "the keys diverged, so this no longer exercises the collision it exists for")
+    assert theirs["reused"] is False, "a run stamped with a foreign key was served"
+    assert theirs["id"] != foreign["id"] and theirs["user_id"] == WORKSPACE
+
+    assert client.get(f"/api/mr/runs/{foreign['id']}").status_code == 404
+    assert foreign["id"] not in [r["id"] for r in client.get("/api/mr/runs").json()]
+    for suffix in ("html", "pdf"):
+        r = client.get(f"/api/mr/board-report/{foreign['id']}/{suffix}")
+        assert r.status_code == 404 and r.json()["detail"] == "board report not found", suffix
