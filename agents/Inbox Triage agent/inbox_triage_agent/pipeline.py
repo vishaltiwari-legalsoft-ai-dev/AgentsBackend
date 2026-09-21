@@ -275,6 +275,13 @@ def _check_and_store(
             # applied / already / failed: a refused formatting pass is on the
             # record here, not only in a log line.
             "formatting": result.formatting,
+            # ours / claimed — and "" for every answer that is not ``ok``,
+            # which has no standing to report. Written on EVERY check, so a
+            # sheet that stops being the caller's cannot leave a stale
+            # ``ours`` behind for the Worktree pass to write through. This is
+            # the key :func:`_worktree_pass` gates on: without it the tab is
+            # created and styled and then never filled.
+            "worktree": result.worktree,
         },
         **(extra or {}),
     })

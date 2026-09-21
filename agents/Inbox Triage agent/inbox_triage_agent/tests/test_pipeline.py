@@ -636,6 +636,9 @@ def test_the_budget_stops_the_loop_keeps_the_checkpoint_and_reports_partial(conn
     assert [row[ID] for row in sheet.appended] == ["m0", "m1"], "what was done is written"
     assert connected.connections[UID]["checkpoint"]["history_id"] == "800", "an unfinished pass keeps the old checkpoint"
     assert connected.connections[UID]["backfill"]["state"] == "running"
+    # The Worktree's reserve is kept back from the same budget, so a work
+    # pass that ran itself out does not also cost the tab its rebuild.
+    assert report.worktree_rows == 2 and sheet.worktree_writes == 1
 
 
 def test_the_backfill_only_moves_its_cursor_past_a_page_it_finished(connected, mailbox, sheet, monkeypatch):
@@ -735,6 +738,30 @@ def test_setting_a_sheet_checks_it_and_starts_the_backfill_once_gmail_is_connect
     doc = pipeline.connect(UID, code="c", state="s", email=EMAIL)
     assert doc["backfill"]["state"] == "running"
     assert sheet.checks == 1
+
+
+def test_a_checked_sheet_stores_the_worktree_standing_set_up_reported(store, sheet):
+    """Every answer set-up gives about the Worktree tab reaches the document.
+
+    The fire's Worktree pass gates on ``sheet.worktree``; a standing that
+    stays only in :class:`SheetCheck` means the tab is created and styled and
+    then never filled, which is exactly what both live sheets did."""
+    assert pipeline.set_sheet(UID, SID, email=EMAIL)["sheet"]["worktree"] == "ours"
+
+    sheet.check_result = SheetCheck("ok", "Her inbox", "", "claimed")
+    assert pipeline.recheck_sheet(UID, email=EMAIL)["sheet"]["worktree"] == "claimed"
+
+    # A sheet that is not the caller's has no standing at all, and the stored
+    # one must not survive as a stale "ours" the pass would write through.
+    sheet.check_result = SheetCheck("not_yours", "")
+    doc = pipeline.recheck_sheet(UID, email=EMAIL)
+    assert doc["sheet"]["check"] == "not_yours" and doc["sheet"]["worktree"] == ""
+
+    # Same for a sheet refused before Google is asked anything.
+    from marketing_research_agent import config as mr_config
+
+    doc = pipeline.set_sheet(UID, str(mr_config.SHEETS_SPREADSHEET_ID), email=EMAIL)
+    assert doc["sheet"]["check"] == "mr_source" and doc["sheet"]["worktree"] == ""
 
 
 def test_a_recheck_without_a_sheet_says_so(store):
@@ -1538,6 +1565,68 @@ def test_the_worktree_waits_until_set_up_has_looked_at_the_tab(connected, mailbo
     assert report.ok and report.new_rows == 1
     assert sheet.worktree_writes == 0 and "read_inbox" not in sheet.events
     assert not connected.connections[UID]["worktree"]
+
+
+def test_a_sheet_set_up_end_to_end_builds_the_worktree_on_its_first_fire_with_mail(
+    store, sheet, mailbox, model, grant, consent
+):
+    """The whole path with nothing seeded by hand: consent, set the sheet,
+    then one fire with new mail. The tab must have rows at the end of it.
+
+    Every other Worktree test starts from ``_connected_doc``, which writes
+    ``sheet.worktree`` itself — so the connection made the way a real user
+    makes one is the only thing that pins the standing actually being
+    stored, and the pass actually running rather than declining."""
+    pipeline.connect(UID, code="c", state="s", email=EMAIL)
+    pipeline.set_sheet(UID, SID, email=EMAIL)
+    mailbox.messages = {
+        "a": _message("a", subject="Paralegal search", thread="t1"),
+        "b": _message("b", subject="Invoice INV-2231", thread="t2"),
+    }
+    mailbox.history_added = ["a", "b"]
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok and report.new_rows == 2
+    assert report.worktree_rows == 2 and sheet.worktree_writes == 1
+    assert sorted(sheet.worktree_column("Process")) == ["Invoice INV-2231", "Paralegal search"]
+    doc = store.connections[UID]
+    assert doc["worktree"]["state"] == "ours" and doc["worktree"]["rows"] == 2
+    assert doc["thread_backfill"]["state"] == "done"
+    assert doc["sent_backfill"]["state"] == "done"
+
+
+def test_a_live_sheet_still_mid_thread_walk_gets_its_worktree_on_that_same_fire(
+    connected, mailbox, sheet, monkeypatch
+):
+    """The shape of the two live sheets: rows already written and tracked
+    before thread ids were stored. The walk is bounded per fire, so it is
+    still ``running`` when the pass reaches the tab — and the tab must be
+    built from the threads that ARE resolved, with the rest counted as
+    ``untagged``, rather than withheld until the walk ends."""
+    mailbox.messages = {
+        "a": _message("a", subject="Paralegal search", thread="t1"),
+        "b": _message("b", subject="Invoice INV-2231", thread="t2"),
+    }
+    mailbox.history_added = ["a", "b"]
+    pipeline.fire(UID, email=EMAIL, now=NOW)  # the rows land on the sheet
+    for key in (f"{UID}__a", f"{UID}__b"):  # ...tracked the way phase 0 tracked
+        connected.messages[key].pop("thread_id")
+    for key in ("thread_backfill", "sent_backfill", "worktree"):
+        connected.connections[UID].pop(key, None)
+    mailbox.listing = ["a", "b"]
+    mailbox.threads = {"a": "t1", "b": "t2"}
+    monkeypatch.setattr(gmail_client, "LIST_THREAD_PAGE_MAX", 1)
+    monkeypatch.setattr(pipeline, "THREAD_BACKFILL_PAGES_PER_FIRE", 1)
+    sheet.worktree_writes = 0
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(hours=2))
+
+    assert connected.connections[UID]["thread_backfill"]["state"] == "running"
+    assert report.threads_tagged == 1
+    assert sheet.worktree_writes == 1 and report.worktree_rows == 1
+    assert sheet.worktree_column("Process") == ["Paralegal search"]
+    assert connected.connections[UID]["worktree"]["untagged"] == 1
 
 
 def test_a_refused_worktree_write_does_not_fail_the_fire_and_is_retried(
