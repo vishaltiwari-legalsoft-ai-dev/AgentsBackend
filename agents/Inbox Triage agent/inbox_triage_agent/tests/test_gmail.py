@@ -337,6 +337,61 @@ def test_list_inbox_asks_for_the_inbox_label_after_an_epoch_and_pages():
     assert (ids, token) == (["m1"], None)
 
 
+def test_the_listing_carries_the_thread_id_which_is_what_the_backfill_reads():
+    """One ``messages.list`` answers "which thread is this in?" for a whole
+    page — the reason the thread-id backfill is pages, not one call a message."""
+    gmail = FakeGmail()
+    gmail.list_pages = [{
+        "messages": [
+            {"id": "m3", "threadId": "t1"},
+            {"id": "m2", "threadId": "t1"},
+            {"id": "m1"},  # Gmail left it out: no thread id, and none invented
+        ],
+        "resultSizeEstimate": 3,
+    }]
+    pairs, token, estimate = gmail_client.list_inbox_pairs(
+        gmail, after_epoch=1_700_000_000, max_results=gmail_client.LIST_THREAD_PAGE_MAX
+    )
+    assert (pairs, token, estimate) == ([("m3", "t1"), ("m2", "t1"), ("m1", "")], None, 3)
+    _, kw = gmail.calls[-1]
+    assert kw["maxResults"] == 500, "the backfill takes Gmail's whole page"
+    assert kw["labelIds"] == ["INBOX"], "the same window the mail passes walk"
+    ids, _, _ = gmail_client.list_inbox(gmail, after_epoch=1_700_000_000)
+    assert ids == ["m3", "m2", "m1"], "the mail passes see the same page without the threads"
+
+
+def test_the_sent_listing_asks_for_the_sent_label_and_nothing_else():
+    gmail = FakeGmail()
+    gmail.list_pages = [{"messages": [{"id": "s1", "threadId": "t1"}], "resultSizeEstimate": 1}]
+    pairs, token, _ = gmail_client.list_sent_pairs(gmail, after_epoch=1_700_000_000)
+    assert (pairs, token) == ([("s1", "t1")], None)
+    _, kw = gmail.calls[-1]
+    assert kw["labelIds"] == ["SENT"] and kw["q"] == "after:1700000000"
+    assert kw["maxResults"] == 500
+    assert "format" not in kw, "a listing reads no content, so there is none to ask for"
+
+
+def test_a_stamp_reads_the_time_and_only_the_time():
+    gmail = FakeGmail()
+    gmail.mail["s1"] = {
+        "id": "s1", "threadId": "t1", "labelIds": ["SENT"],
+        "internalDate": "1789000000000",
+    }
+    when = gmail_client.stamp(gmail, "s1")
+    _, kw = gmail.calls[-1]
+    assert kw["format"] == "minimal", "no headers, no body — the subject is never read"
+    assert when.tzinfo is not None and when.year == 2026
+
+
+def test_a_stamp_for_a_message_she_deleted_is_gone_not_a_failed_fire():
+    gmail = FakeGmail()
+    with pytest.raises(MessageGone):
+        gmail_client.stamp(gmail, "vanished")
+    gmail.mail["s2"] = {"id": "s2", "threadId": "t1"}  # no internalDate at all
+    with pytest.raises(MessageGone):
+        gmail_client.stamp(gmail, "s2")
+
+
 def test_history_collects_inbox_additions_dedupes_and_returns_the_new_checkpoint():
     gmail = FakeGmail()
     gmail.history_pages = [

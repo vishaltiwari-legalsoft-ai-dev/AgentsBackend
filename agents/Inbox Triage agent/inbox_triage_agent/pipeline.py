@@ -21,6 +21,14 @@ One fire, in order:
    budget is left: the 90-day inbox listing newest-first, up to 200 messages
    per fire, skipping ids already on the sheet.
 5. Write: one append for the new rows, one batch update for the retried rows.
+5b. The **Worktree**: the sheet's rows grouped into one process per Gmail
+   thread and written to their own tab — but only when something changed,
+   and never in a way that touches an Inbox cell. It also carries the two
+   one-time backfills it needs: thread ids onto messages tracked before they
+   were stored, and **markers for mail the mailbox SENT** (id, thread, time
+   — never a subject, a recipient or a body), which is what makes "whose
+   move is it?" a read fact. Derived data: a failure here is recorded and
+   retried, never a failed fire.
 6. Only then persist: per-message tracking, the counters, ``last_poll`` and
    the new checkpoint.
 
@@ -37,6 +45,7 @@ row. What does not: one message the model cannot read — that gets its row as
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from dataclasses import asdict, dataclass, field
@@ -46,13 +55,16 @@ from googleapiclient.errors import HttpError
 
 from app.services import firestore_repo
 
-from . import gmail_client, gmail_oauth, sheet_writer, summarise, user_label
+from . import gmail_client, gmail_oauth, sheet_writer, summarise, user_label, worktree
 from .gmail_client import GmailUnavailable, HistoryExpired, MessageGone
 from .gmail_oauth import ExchangeFailed, RevokedGrant, TokenKeyMissing, TokenRefreshFailed
 from .sheet_layout import RowFacts, agent_values, parse_sheet_ref, sheet_url
-from .sheet_writer import CHECK_MR_SOURCE, CHECK_OK, LayoutMismatch, SheetCheck, SheetsUnavailable
+from .sheet_writer import (
+    CHECK_MR_SOURCE, CHECK_OK, WORKTREE_CLAIMED, WORKTREE_OURS, LayoutMismatch, SheetCheck,
+    SheetsUnavailable,
+)
 from .summarise import ModelCallFailed, ModelUnavailable
-from .triage import NEEDS_REVIEW, Rejected, Verdict
+from .triage import NEEDS_REVIEW, TEAM_TIMEZONE, Rejected, Verdict
 
 logger = logging.getLogger("agentos.inbox.pipeline")
 
@@ -81,6 +93,34 @@ MODEL_FAILURE_TRIP = 3
 FIRE_BUDGET_SECONDS = 240.0
 #: Kept back from the budget for the two writes and the persist at the end.
 WRITE_RESERVE_SECONDS = 20.0
+#: Kept back on top of that for the Worktree pass — one Firestore scan, the
+#: two backfills' Gmail reads, one sheet read and at most one Sheets write.
+WORKTREE_RESERVE_SECONDS = 45.0
+#: And kept back inside that, so the sheet read and the tab's write always
+#: happen however long the backfills took.
+WORKTREE_WRITE_RESERVE_SECONDS = 12.0
+#: Gmail listing pages one fire gives the thread-id backfill. Each page is
+#: :data:`gmail_client.LIST_THREAD_PAGE_MAX` ``(id, thread id)`` pairs for one
+#: call, so 4 pages is 2,000 messages a fire: a 3,699-row sheet is caught up
+#: in two fires, ten minutes, at five Gmail quota units a page.
+THREAD_BACKFILL_PAGES_PER_FIRE = 4
+#: Sent-listing pages one fire gives the historical sent walk — the same shape
+#: and the same cost as the thread pages: 500 ``(id, thread id)`` a call.
+SENT_BACKFILL_PAGES_PER_FIRE = 4
+#: Sent markers one fire will read a timestamp for. This is the one part of
+#: either backfill that costs a call per message
+#: (``messages.get(format="minimal")``, five quota units), so it is bounded
+#: tightly and checked against the deadline before every single message.
+SENT_STAMPS_PER_FIRE = 100
+#: Once the historical walk is done, every build re-lists the last day of sent
+#: mail: one call, and it cannot miss a reply she sent since the last build.
+#: Cheaper and far more robust than a checkpoint that could skip a gap.
+SENT_RECENT_LOOKBACK_SECONDS = 86400
+#: A Worktree that nothing changed is still rebuilt this often, because two of
+#: its columns are made of the passage of time: "Waiting since" turns over at
+#: midnight and a thread crosses the chase threshold without any mail
+#: arriving. Hourly is well inside a day.
+WORKTREE_REFRESH_SECONDS = 3600
 LEASE_SECONDS = 300
 POLL_INTERVAL_SECONDS = 300
 SHEET_RECHECK_SECONDS = 3600
@@ -405,6 +445,14 @@ class FireReport:
     backfill_state: str | None = None
     backfill_done: int = 0
     backfill_total: int | None = None
+    #: Tracking documents given a thread id this fire (the one-time backfill).
+    threads_tagged: int = 0
+    #: Sent messages newly marked, and markers given their timestamp.
+    sent_marked: int = 0
+    sent_stamped: int = 0
+    #: Rows the Worktree tab was given this fire; 0 when nothing changed and
+    #: the rewrite was skipped, which is the common case.
+    worktree_rows: int = 0
     unreached: bool = False
     seconds: float = 0.0
 
@@ -428,6 +476,9 @@ class _Work:
     gmail: object
     llm: object
     deadline: float
+    #: The connected mailbox's own address, so a message's direction ("did we
+    #: send this?") is decided once, here, and stored with the message.
+    address: str = ""
     id_map: dict[str, int] = field(default_factory=dict)
     seen: set[str] = field(default_factory=set)
     new_rows: list[RowFacts] = field(default_factory=list)
@@ -437,6 +488,10 @@ class _Work:
     needs_review_added: int = 0
     recovered: int = 0
     retriaged: int = 0
+    threads_tagged: int = 0
+    sent_marked: int = 0
+    sent_stamped: int = 0
+    worktree_rows: int = 0
     model_failures: int = 0
     unreached: bool = False
 
@@ -484,21 +539,49 @@ def _facts(message: gmail_client.Message, verdict: Verdict | Rejected) -> RowFac
         return RowFacts(
             message_id=message.id, received_at=message.received_at, sender=message.from_,
             subject=message.subject, category=verdict.category, summary=verdict.summary,
-            deadline=verdict.deadline, action=verdict.action,
+            deadline=verdict.deadline, action=verdict.action, thread_id=message.thread_id,
         )
     return RowFacts(
         message_id=message.id, received_at=message.received_at, sender=message.from_,
         subject=message.subject, category=NEEDS_REVIEW, summary="", deadline=None,
+        thread_id=message.thread_id,
     )
 
 
-def _message_doc(facts: RowFacts, *, attempts: int, sheet_row: int | None) -> dict:
+def _tracking(facts: RowFacts, *, attempts: int, sheet_row: int | None) -> dict:
+    """The retry bookkeeping — all a tracking document held before the
+    Worktree. Written on its own for a message that no longer exists, so a
+    placeholder cannot blank the facts a real one left behind."""
     status = STATUS_NEEDS_REVIEW if facts.category == NEEDS_REVIEW else STATUS_OK
     return {
         "status": status,
         "attempts": attempts,
         "sheet_row": sheet_row,
         "retry_due": status == STATUS_NEEDS_REVIEW and attempts < 1 + MAX_RETRIES,
+    }
+
+
+def _grouping(facts: RowFacts, *, address: str) -> dict:
+    """What a process is made of, stored per message: which thread it belongs
+    to, whether we sent it, when it arrived, and what the triage said about
+    it. No body and no summary — the sheet holds the prose — and the sender's
+    address is reduced to the one bit the rules use, so no mailbox address is
+    kept in Firestore."""
+    return {
+        "thread_id": facts.thread_id or "",
+        "from_me": worktree.sent_by(facts.sender, address),
+        "received_at": facts.received_at.isoformat(),
+        "subject": facts.subject,
+        "category": facts.category,
+        "deadline": facts.deadline.isoformat() if facts.deadline else None,
+        "action": facts.action,
+    }
+
+
+def _message_doc(facts: RowFacts, *, attempts: int, sheet_row: int | None, address: str) -> dict:
+    return {
+        **_tracking(facts, attempts=attempts, sheet_row=sheet_row),
+        **_grouping(facts, address=address),
     }
 
 
@@ -576,7 +659,11 @@ def _fire_leased(
     gmail = gmail_client.service(creds)
     sheets = sheet_writer.service()
     spreadsheet_id = str(sheet["id"])
-    work = _Work(user_id=user_id, gmail=gmail, llm=llm, deadline=deadline - WRITE_RESERVE_SECONDS)
+    work = _Work(
+        user_id=user_id, gmail=gmail, llm=llm,
+        deadline=deadline - WRITE_RESERVE_SECONDS - WORKTREE_RESERVE_SECONDS,
+        address=str((doc.get("gmail") or {}).get("address") or ""),
+    )
     id_map = _read_id_map(user_id, spreadsheet_id, sheets, email=email)
     if id_map is None:
         report.skipped = "sheet check: set-up did not pass"
@@ -622,10 +709,19 @@ def _fire_leased(
         spreadsheet_id, {row: agent_values(f) for row, f in work.updated_rows.items()}, svc=sheets
     )
 
+    # 5b. the Worktree view, over the sheet the rows just landed in. Derived
+    # data: it never fails the fire and never touches an Inbox cell.
+    thread_backfill, sent_backfill, worktree_state = _worktree_pass(
+        user_id, doc, work, spreadsheet_id=spreadsheet_id, sheets=sheets, now=now,
+        deadline=deadline - WRITE_RESERVE_SECONDS,
+    )
+
     # 6. persist — tracking rows, counters, the poll, the checkpoint
     _persist(
         user_id, doc, work, backfill=backfill, retriage=retriage, row_numbers=row_numbers,
         checkpoint=new_history_id if checkpoint_advances else None, now=now,
+        thread_backfill=thread_backfill, sent_backfill=sent_backfill,
+        worktree_state=worktree_state,
     )
     _fill_report(report, work, backfill)
 
@@ -633,6 +729,7 @@ def _fire_leased(
 def _persist(
     user_id: str, doc: dict, work: _Work, *, backfill: dict, retriage: dict,
     row_numbers: list[int], checkpoint: str | None, now: datetime,
+    thread_backfill: dict, sent_backfill: dict, worktree_state: dict,
 ) -> None:
     """Step 6, after the sheet has the rows: what the next fire and the panel
     read. ``checkpoint`` is ``None`` when the new-mail pass was cut short, so
@@ -640,7 +737,9 @@ def _persist(
     message_docs: dict[str, dict] = {}
     for index, facts in enumerate(work.new_rows):
         row = row_numbers[index] if index < len(row_numbers) else None
-        message_docs[facts.message_id] = _message_doc(facts, attempts=1, sheet_row=row)
+        message_docs[facts.message_id] = _message_doc(
+            facts, attempts=1, sheet_row=row, address=work.address
+        )
     message_docs.update(work.retry_docs)
     if message_docs:
         firestore_repo.save_inbox_messages(user_id, message_docs)
@@ -651,6 +750,9 @@ def _persist(
     patch: dict = {
         "backfill": backfill,
         "retriage": retriage,
+        "thread_backfill": thread_backfill,
+        "sent_backfill": sent_backfill,
+        "worktree": worktree_state,
         "needs_review": max(
             0, int(doc.get("needs_review") or 0) + work.needs_review_added - work.recovered
         ),
@@ -673,6 +775,10 @@ def _fill_report(report: FireReport, work: _Work, backfill: dict) -> None:
     report.backfill_state = backfill.get("state")
     report.backfill_done = int(backfill.get("done") or 0)
     report.backfill_total = backfill.get("total")
+    report.threads_tagged = work.threads_tagged
+    report.sent_marked = work.sent_marked
+    report.sent_stamped = work.sent_stamped
+    report.worktree_rows = work.worktree_rows
     report.unreached = work.unreached
 
 
@@ -785,14 +891,14 @@ def _retry(work: _Work, due: list[dict], now: datetime) -> None:
         if not message_id or not row:
             # She deleted the row, or it was never written: stop tracking it.
             work.retry_docs[message_id or "?"] = {
-                **_message_doc(_placeholder(message_id), attempts=attempts, sheet_row=None),
+                **_tracking(_placeholder(message_id), attempts=attempts, sheet_row=None),
                 "retry_due": False,
             }
             continue
         facts = work.triage(message_id)
         if facts is None:
             work.retry_docs[message_id] = {
-                **_message_doc(_placeholder(message_id), attempts=attempts, sheet_row=row),
+                **_tracking(_placeholder(message_id), attempts=attempts, sheet_row=row),
                 "retry_due": False,
             }
             continue
@@ -800,7 +906,9 @@ def _retry(work: _Work, due: list[dict], now: datetime) -> None:
         if facts.category != NEEDS_REVIEW:
             work.updated_rows[row] = facts
             work.recovered += 1
-        work.retry_docs[message_id] = _message_doc(facts, attempts=attempts, sheet_row=row)
+        work.retry_docs[message_id] = _message_doc(
+            facts, attempts=attempts, sheet_row=row, address=work.address
+        )
 
 
 def _retriage(work: _Work, retriage: dict, spreadsheet_id: str, sheets) -> None:
@@ -838,6 +946,324 @@ def _placeholder(message_id: str) -> RowFacts:
         message_id=message_id, received_at=_utcnow(), sender="", subject="",
         category=NEEDS_REVIEW, summary="", deadline=None,
     )
+
+
+# --------------------------------------------------------------------------- #
+# The Worktree — the mail log as a list of open work
+# --------------------------------------------------------------------------- #
+
+def _fresh_thread_backfill() -> dict:
+    return {"state": BACKFILL_NOT_STARTED, "cursor": None, "tagged": 0, "pages": 0, "unresolved": 0}
+
+
+def _fresh_sent_backfill() -> dict:
+    return {
+        "state": BACKFILL_NOT_STARTED, "cursor": None, "pages": 0,
+        "markers": 0, "stamped": 0, "unstamped": 0,
+    }
+
+
+def _worktree_pass(
+    user_id: str, doc: dict, work: _Work, *, spreadsheet_id: str, sheets,
+    now: datetime, deadline: float,
+) -> tuple[dict, dict, dict]:
+    """``(thread_backfill, sent_backfill, worktree)`` — the three
+    sub-documents this pass owns.
+
+    Runs only when it would change something: mail landed or a row was
+    rewritten this fire, the last build is over an hour old, one of the two
+    one-time backfills is still going, or a sent marker is still waiting for
+    its timestamp. Otherwise it costs nothing at all — not a Firestore scan,
+    not a Gmail call, not a sheet read, not a write.
+
+    Nothing here can fail the fire. The Worktree is derived from rows that are
+    already safely in the sheet, so a refusal is recorded on the connection
+    document and retried on the next fire; the Inbox tab, her Status and
+    Notes, and the Upcoming formula are never touched by any of it."""
+    sheet = doc.get("sheet") or {}
+    thread_backfill = dict(doc.get("thread_backfill") or _fresh_thread_backfill())
+    sent_backfill = dict(doc.get("sent_backfill") or _fresh_sent_backfill())
+    state = dict(doc.get("worktree") or {})
+    standing = str(sheet.get("worktree") or "")
+    if not standing:
+        return thread_backfill, sent_backfill, state  # set-up has not looked yet
+    if standing == WORKTREE_CLAIMED:
+        # Hers. Say so on the record, once, and never write to it.
+        return thread_backfill, sent_backfill, {
+            "state": WORKTREE_CLAIMED, "at": _iso(now), "rows": 0, "total": 0,
+            "untagged": 0, "hash": None, "error": None,
+        }
+
+    backfilling = any(
+        sub.get("state") != BACKFILL_DONE for sub in (thread_backfill, sent_backfill)
+    ) or int(sent_backfill.get("unstamped") or 0) > 0
+    changed = bool(work.new_rows or work.updated_rows)
+    built_at = _parse_iso(state.get("at"))
+    stale = built_at is None or (now - built_at).total_seconds() >= WORKTREE_REFRESH_SECONDS
+    if not (backfilling or changed or stale):
+        return thread_backfill, sent_backfill, state
+
+    try:
+        return _build_worktree(
+            user_id, doc, work, thread_backfill=thread_backfill,
+            sent_backfill=sent_backfill, previous=state,
+            spreadsheet_id=spreadsheet_id, sheets=sheets, now=now, deadline=deadline,
+        )
+    except (SheetsUnavailable, GmailUnavailable, HttpError) as exc:
+        reason = _panel_reason(exc)
+        logger.warning(
+            "a12: the Worktree for user %s was not rebuilt (%s); the Inbox rows are written "
+            "and it is retried next fire", user_label(user_id), reason,
+        )
+        return thread_backfill, sent_backfill, {**state, "error": reason}
+
+
+def _build_worktree(
+    user_id: str, doc: dict, work: _Work, *, thread_backfill: dict, sent_backfill: dict,
+    previous: dict, spreadsheet_id: str, sheets, now: datetime, deadline: float,
+) -> tuple[dict, dict, dict]:
+    tracked = firestore_repo.list_inbox_messages(user_id)
+    markers = {
+        str(entry.get("message_id") or ""): dict(entry)
+        for entry in tracked if entry.get("message_id") and worktree.is_sent_marker(entry)
+    }
+    thread_ids = {
+        str(entry.get("message_id") or ""): str(entry.get("thread_id") or "")
+        for entry in tracked
+        if entry.get("message_id") and not worktree.is_sent_marker(entry)
+    }
+    # This fire's own messages are persisted after this pass, so their thread
+    # ids are taken from the work in hand rather than waited a fire for.
+    for facts in [*work.new_rows, *work.updated_rows.values()]:
+        if facts.thread_id:
+            thread_ids[facts.message_id] = facts.thread_id
+    gmail_deadline = deadline - WORKTREE_WRITE_RESERVE_SECONDS
+    _backfill_thread_ids(
+        user_id, work, thread_backfill, thread_ids,
+        since=_thread_since(doc, now), deadline=gmail_deadline,
+    )
+    if thread_backfill.get("state") == BACKFILL_DONE:
+        # Sent mail is only useful once the inbox rows know their threads: it
+        # is kept ONLY where it joins a thread we already have.
+        _ingest_sent(
+            user_id, work, sent_backfill, markers=markers, thread_ids=thread_ids,
+            since=_thread_since(doc, now), now=now, deadline=gmail_deadline,
+        )
+
+    rows = sheet_writer.read_inbox(spreadsheet_id, svc=sheets)
+    messages = [
+        message for message in (
+            worktree.from_row(row, connected_address=work.address, thread_ids=thread_ids)
+            for row in rows
+        ) if message is not None
+    ]
+    messages += [
+        marker for marker in (worktree.from_marker(entry) for entry in markers.values())
+        if marker is not None
+    ]
+    tree = worktree.build(messages, today=now.astimezone(TEAM_TIMEZONE).date())
+    values = [worktree.values(process) for process in tree.processes]
+    digest = _worktree_hash(values)
+
+    state = {
+        "state": WORKTREE_OURS, "at": _iso(now), "hash": digest,
+        "rows": len(values), "total": tree.total, "untagged": tree.untagged,
+        "sent_used": tree.sent_used, "error": None,
+    }
+    if digest == previous.get("hash") and previous.get("rows") is not None:
+        state["rows"] = int(previous.get("rows") or 0)
+        # Nothing moved; the tab already says this.
+        return thread_backfill, sent_backfill, state
+    work.worktree_rows = sheet_writer.write_worktree(
+        spreadsheet_id, values, previous_rows=int(previous.get("rows") or 0), svc=sheets
+    )
+    return thread_backfill, sent_backfill, state
+
+
+def _worktree_hash(values: list[list[str]]) -> str:
+    """A fingerprint of the rows as they would be written. Row order is part
+    of it: a thread that moved to the top of the chase list is a change worth
+    a rewrite."""
+    digest = hashlib.sha256()
+    for row in values:
+        digest.update("\x1f".join(row).encode("utf-8", "replace"))
+        digest.update(b"\x1e")
+    return digest.hexdigest()
+
+
+def _ingest_sent(
+    user_id: str, work: _Work, sent: dict, *, markers: dict[str, dict],
+    thread_ids: dict[str, str], since: int, now: datetime, deadline: float,
+) -> None:
+    """Learn which threads the connected mailbox has already answered.
+
+    Markers only. Two stages, and neither ever reads a subject, a recipient or
+    a line of her own mail:
+
+    1. **Which of her sent mail belongs to a conversation we have.** Pages of
+       ``messages.list(labelIds=[SENT])`` — ids and thread ids, 500 a call —
+       filtered down to thread ids an Inbox row already uses. Sent mail in a
+       thread the agent never ingested is dropped on the floor: it has no
+       subject to name it and no triage to describe it, so it could never be
+       a process anyway. That filter is what keeps stage 2 small.
+    2. **When each of those was sent.** ``messages.get(format="minimal")``,
+       which answers ids, labels and ``internalDate`` and nothing else. One
+       call per marker, so this is the bounded part:
+       :data:`SENT_STAMPS_PER_FIRE` a fire, and the deadline is checked
+       before every one.
+
+    Stage 1 is a one-time 90-day walk with its page token on the connection
+    document; once it is ``done`` every build re-lists the last day instead,
+    for one call, which cannot miss a reply she sent since the last build. A
+    marker with no stamp yet is not used by the rules at all, so a thread
+    reads exactly as it did before rather than wrongly."""
+    known_threads = {thread for thread in thread_ids.values() if thread}
+    if not known_threads:
+        return  # nothing for sent mail to attach to yet
+    known_ids = set(thread_ids) | set(markers)
+    found: dict[str, dict] = {}
+
+    if sent.get("state") != BACKFILL_DONE:
+        sent["state"] = BACKFILL_RUNNING
+        cursor = sent.get("cursor") or None
+        for _ in range(SENT_BACKFILL_PAGES_PER_FIRE):
+            if time.monotonic() >= deadline:
+                break
+            pairs, cursor, _estimate = gmail_client.list_sent_pairs(
+                work.gmail, after_epoch=since, page_token=cursor,
+            )
+            sent["pages"] = int(sent.get("pages") or 0) + 1
+            _claim_sent(pairs, known_threads, known_ids, markers, found)
+            sent["cursor"] = cursor
+            if not cursor:
+                sent["state"] = BACKFILL_DONE
+                break
+    elif time.monotonic() < deadline:
+        recent = int((now - timedelta(seconds=SENT_RECENT_LOOKBACK_SECONDS)).timestamp())
+        pairs, _cursor, _estimate = gmail_client.list_sent_pairs(work.gmail, after_epoch=recent)
+        _claim_sent(pairs, known_threads, known_ids, markers, found)
+
+    work.sent_marked = len(found)
+    sent["markers"] = int(sent.get("markers") or 0) + len(found)
+
+    pending = [
+        message_id for message_id, marker in markers.items()
+        if not marker.get("received_at") and not marker.get("gone")
+    ]
+    for message_id in pending[:SENT_STAMPS_PER_FIRE]:
+        if time.monotonic() >= deadline:
+            break
+        try:
+            received = gmail_client.stamp(work.gmail, message_id)
+        except MessageGone:
+            # She deleted it. Remember that, so no later fire asks again.
+            markers[message_id]["gone"] = True
+            found.setdefault(message_id, {})["gone"] = True
+            continue
+        markers[message_id]["received_at"] = _iso(received)
+        found.setdefault(message_id, {})["received_at"] = _iso(received)
+        work.sent_stamped += 1
+
+    sent["stamped"] = int(sent.get("stamped") or 0) + work.sent_stamped
+    sent["unstamped"] = sum(
+        1 for marker in markers.values()
+        if not marker.get("received_at") and not marker.get("gone")
+    )
+    if found:
+        firestore_repo.save_inbox_messages(user_id, found)
+        logger.info(
+            "a12: sent markers for user %s: %d new, %d stamped, %d still unstamped",
+            user_label(user_id), work.sent_marked, work.sent_stamped, sent["unstamped"],
+        )
+
+
+def _claim_sent(
+    pairs: list[tuple[str, str]], known_threads: set[str], known_ids: set[str],
+    markers: dict[str, dict], found: dict[str, dict],
+) -> None:
+    """Turn one listing page into markers for the sent mail that joins a
+    thread we already have — and only that. A message id that is already a
+    sheet row or already a marker is left alone, so a mail she sent to
+    herself (which Gmail files under both labels) keeps its real row and
+    never doubles."""
+    for message_id, thread_id in pairs:
+        if not thread_id or thread_id not in known_threads or message_id in known_ids:
+            continue
+        known_ids.add(message_id)
+        doc = {
+            "kind": worktree.KIND_SENT,
+            "thread_id": thread_id,
+            "from_me": True,
+            "received_at": None,
+        }
+        markers[message_id] = {**doc, "message_id": message_id}
+        found[message_id] = doc
+
+
+def _thread_since(doc: dict, now: datetime) -> int:
+    backfill = doc.get("backfill") or {}
+    return int(
+        backfill.get("since_epoch")
+        or (now - timedelta(days=BACKFILL_DAYS)).timestamp()
+    )
+
+
+def _backfill_thread_ids(
+    user_id: str, work: _Work, thread_backfill: dict, thread_ids: dict[str, str],
+    *, since: int, deadline: float,
+) -> None:
+    """Give the thread id to every message tracked before it was stored.
+
+    Gmail's own listing carries ``threadId`` on every entry, so this walks the
+    same 90-day window the mail backfill used, at 500 pairs a call, and writes
+    the ids onto the tracking documents that lack one. A bounded number of
+    pages per fire, the page token kept on the connection document, and
+    ``state`` only ``done`` once the listing runs out — so it resumes exactly
+    where it stopped and never runs twice.
+
+    Ids the listing never mentions (archived, deleted, or older than the
+    window) keep no thread id and are counted as ``unresolved``: they belong
+    to no process, and the count says so rather than a guess filling in."""
+    if thread_backfill.get("state") == BACKFILL_DONE:
+        return
+    thread_backfill["state"] = BACKFILL_RUNNING
+    missing = {message_id for message_id, thread in thread_ids.items() if not thread}
+    if not missing:
+        # Nothing left to resolve — a fresh connection whose every message
+        # arrived with its thread id, or a walk that has caught up.
+        thread_backfill.update(state=BACKFILL_DONE, cursor=None, unresolved=0)
+        return
+
+    cursor = thread_backfill.get("cursor") or None
+    found: dict[str, dict] = {}
+    for _ in range(THREAD_BACKFILL_PAGES_PER_FIRE):
+        if time.monotonic() >= deadline:
+            break
+        pairs, cursor, _estimate = gmail_client.list_inbox_pairs(
+            work.gmail, after_epoch=since, page_token=cursor,
+            max_results=gmail_client.LIST_THREAD_PAGE_MAX,
+        )
+        thread_backfill["pages"] = int(thread_backfill.get("pages") or 0) + 1
+        for message_id, thread_id in pairs:
+            if thread_id and message_id in missing:
+                found[message_id] = {"thread_id": thread_id}
+                thread_ids[message_id] = thread_id
+                missing.discard(message_id)
+        thread_backfill["cursor"] = cursor
+        if not cursor:
+            thread_backfill["state"] = BACKFILL_DONE
+            break
+
+    if found:
+        firestore_repo.save_inbox_messages(user_id, found)
+        thread_backfill["tagged"] = int(thread_backfill.get("tagged") or 0) + len(found)
+        work.threads_tagged = len(found)
+        logger.info(
+            "a12: thread ids backfilled for user %s: %d this fire, %d total",
+            user_label(user_id), len(found), thread_backfill["tagged"],
+        )
+    if thread_backfill.get("state") == BACKFILL_DONE:
+        thread_backfill["unresolved"] = len(missing)
 
 
 def _backfill(work: _Work, backfill: dict, now: datetime) -> None:

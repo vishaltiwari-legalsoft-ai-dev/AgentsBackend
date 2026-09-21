@@ -16,13 +16,16 @@ from cryptography.fernet import Fernet
 import app  # noqa: F401 — registers the agent roots on sys.path
 from app.config import settings
 from app.services import firestore_repo
-from inbox_triage_agent import gmail_client, gmail_oauth, pipeline, sheet_writer, summarise
+from inbox_triage_agent import (
+    gmail_client, gmail_oauth, pipeline, sheet_writer, summarise, worktree,
+)
 from inbox_triage_agent.gmail_client import HistoryExpired, Message, MessageGone
 from inbox_triage_agent.gmail_oauth import RevokedGrant, Tokens
 from inbox_triage_agent.sheet_layout import (
-    CATEGORY_LABELS, COL_ACTION, COL_CATEGORY, COL_DEADLINE, COL_MESSAGE_ID, COL_SUMMARY,
+    CATEGORY_LABELS, COL_ACTION, COL_CATEGORY, COL_DEADLINE, COL_MESSAGE_ID, COL_STATUS,
+    COL_SUMMARY, HEADERS, WORKTREE_HEADERS, message_link,
 )
-from inbox_triage_agent.sheet_writer import SheetCheck
+from inbox_triage_agent.sheet_writer import SheetCheck, SheetsUnavailable
 from inbox_triage_agent.summarise import ModelCallFailed, ModelUnavailable
 from inbox_triage_agent.triage import TEAM_TIMEZONE, NEEDS_REVIEW, Rejected, Verdict
 
@@ -121,11 +124,14 @@ class FakeStore:
         return {u["id"]: dict(u) for u in self.users.values() if u["id"] in wanted}
 
 
-def _message(message_id: str, subject: str = "Paralegal search", body: str = "Need two by Friday.") -> Message:
+def _message(
+    message_id: str, subject: str = "Paralegal search", body: str = "Need two by Friday.",
+    *, thread: str = "", sender: str = "gm@rathorelegal.in",
+) -> Message:
     return Message(
-        id=message_id, thread_id="t-" + message_id,
+        id=message_id, thread_id=thread or ("t-" + message_id),
         received_at=datetime(2026, 9, 17, 10, 5, tzinfo=TEAM_TIMEZONE),
-        from_="gm@rathorelegal.in", to="her@firm.com",
+        from_=sender, to="her@firm.com",
         date_header="Thu, 17 Sep 2026 10:05:00 +0530", subject=subject, body_text=body,
     )
 
@@ -140,6 +146,14 @@ class FakeMailbox:
         self.history_expired = False
         self.history_id = "900"
         self.listing: list[str] = []
+        #: ``message id -> thread id`` as the LISTING reports it; a message
+        #: the listing never mentions is not in here.
+        self.threads: dict[str, str] = {}
+        #: What the SENT label lists, in the same ``(id, thread id)`` shape,
+        #: and the times a stamp read answers with.
+        self.sent: list[tuple[str, str]] = []
+        self.sent_times: dict[str, datetime] = {}
+        self.stamped: list[str] = []
         self.fetched: list[str] = []
         self.profile_calls = 0
         self.events: list[str] = []
@@ -153,6 +167,35 @@ class FakeMailbox:
         if self.history_expired:
             raise HistoryExpired("Gmail history: not found")
         return list(self.history_added), self.history_id
+
+    def thread_of(self, message_id: str) -> str:
+        """The thread id Gmail's listing carries for a message."""
+        if message_id in self.threads:
+            return self.threads[message_id]
+        message = self.messages.get(message_id)
+        return message.thread_id if message else ""
+
+    def list_inbox_pairs(self, svc, *, after_epoch, page_token=None, max_results=100):
+        self.events.append("list_pairs")
+        start = int(page_token or 0)
+        page = self.listing[start:start + max_results]
+        next_token = str(start + max_results) if start + max_results < len(self.listing) else None
+        return [(m, self.thread_of(m)) for m in page], next_token, len(self.listing)
+
+    def list_sent_pairs(self, svc, *, after_epoch, page_token=None, max_results=500):
+        self.events.append("list_sent")
+        start = int(page_token or 0)
+        page = self.sent[start:start + max_results]
+        next_token = str(start + max_results) if start + max_results < len(self.sent) else None
+        return list(page), next_token, len(self.sent)
+
+    def stamp(self, svc, message_id):
+        """``messages.get(format="minimal")`` — the time, and nothing else."""
+        self.events.append("stamp:" + message_id)
+        self.stamped.append(message_id)
+        if message_id not in self.sent_times:
+            raise MessageGone(message_id)
+        return self.sent_times[message_id]
 
     def list_inbox(self, svc, *, after_epoch, page_token=None, max_results=100):
         self.events.append("list")
@@ -170,8 +213,9 @@ class FakeMailbox:
 
 
 class FakeSheet:
-    """What ``sheet_writer`` would do: an id map, appends, updates, and the
-    Action column the one-time re-triage reads."""
+    """What ``sheet_writer`` would do: an id map, appends, updates, the
+    Action column the one-time re-triage reads, and a real grid — her Status
+    column included — so the Worktree is built from cells, not from a stub."""
 
     def __init__(self):
         self.rows: dict[str, int] = {}
@@ -180,9 +224,36 @@ class FakeSheet:
         self.appended: list[list[str]] = []
         self.updated: dict[int, list[str]] = {}
         self.checks = 0
-        self.check_result = SheetCheck("ok", "Her inbox")
+        self.check_result = SheetCheck("ok", "Her inbox", "", "ours")
         self.checked_for: list[str] = []
         self.events: list[str] = []
+        #: 1-based row number -> the eleven cells A..K, hers included
+        self.grid: dict[int, list[str]] = {}
+        self.worktree: list[list[str]] = []
+        self.worktree_writes = 0
+
+    def _put(self, row: int, values: list[str]) -> None:
+        cells = self.grid.setdefault(row, [""] * len(HEADERS))
+        for index, value in enumerate(values):
+            cells[index] = value
+
+    def set_status(self, message_id: str, value: str) -> None:
+        """Her Status cell, set the way she would set it."""
+        self._put(self.rows[message_id], [])
+        self.grid[self.rows[message_id]][COL_STATUS - 1] = value
+
+    def read_inbox(self, spreadsheet_id, *, svc=None):
+        self.events.append("read_inbox")
+        return [list(self.grid[row]) for row in sorted(self.grid)]
+
+    def write_worktree(self, spreadsheet_id, rows, *, previous_rows=0, svc=None):
+        self.events.append("write_worktree")
+        self.worktree_writes += 1
+        self.worktree = [list(row) for row in rows]
+        return len(rows)
+
+    def worktree_column(self, name: str) -> list[str]:
+        return [row[WORKTREE_HEADERS.index(name)] for row in self.worktree]
 
     def check(self, spreadsheet_id, *, caller_email):
         self.checks += 1
@@ -207,6 +278,7 @@ class FakeSheet:
             self.rows[row[ID]] = first + offset
             numbers.append(first + offset)
             self.appended.append(row)
+            self._put(first + offset, row)
         return numbers
 
     def update(self, spreadsheet_id, row_values, *, svc=None):
@@ -215,6 +287,7 @@ class FakeSheet:
         self.updated.update(row_values)
         by_row = {row: mid for mid, row in self.rows.items()}
         for row, values in row_values.items():
+            self._put(row, values)
             if values[ACTION] and by_row.get(row) in self.blank_actions:
                 self.blank_actions.remove(by_row[row])
         return len(row_values)
@@ -269,7 +342,8 @@ def store(monkeypatch) -> FakeStore:
 def mailbox(monkeypatch) -> FakeMailbox:
     fake = FakeMailbox()
     monkeypatch.setattr(gmail_client, "service", lambda creds: "gmail-service")
-    for name in ("profile", "history_since", "list_inbox", "fetch"):
+    for name in ("profile", "history_since", "list_inbox", "list_inbox_pairs",
+                 "list_sent_pairs", "stamp", "fetch"):
         monkeypatch.setattr(gmail_client, name, getattr(fake, name))
     return fake
 
@@ -279,7 +353,8 @@ def sheet(monkeypatch) -> FakeSheet:
     fake = FakeSheet()
     monkeypatch.setattr(sheet_writer, "service", lambda: "sheets-service")
     monkeypatch.setattr(sheet_writer, "service_account_email", lambda: "hub@project.iam.gserviceaccount.com")
-    for name in ("check", "id_rows", "blank_action_ids", "append", "update"):
+    for name in ("check", "id_rows", "blank_action_ids", "append", "update",
+                 "read_inbox", "write_worktree"):
         monkeypatch.setattr(sheet_writer, name, getattr(fake, name))
     from marketing_research_agent import sources_registry
 
@@ -315,7 +390,7 @@ def _connected_doc(*, sheet_check="ok", checked_at=NOW - timedelta(minutes=5), h
         "checkpoint": {"history_id": history_id, "updated_at": (NOW - timedelta(minutes=5)).isoformat()},
         "sheet": {"id": SID, "url": "https://docs.google.com/spreadsheets/d/x/edit", "title": "Her inbox",
                   "check": sheet_check, "checked_at": checked_at.isoformat() if checked_at else None,
-                  "checked_for": EMAIL},
+                  "checked_for": EMAIL, "worktree": "ours"},
         "backfill": {"state": "running", "cursor": None, "done": 0, "total": None,
                      "since_epoch": int((NOW - timedelta(days=90)).timestamp())},
         "needs_review": 0, "recent_fires": [], "last_poll": None, "lease_until": None,
@@ -553,11 +628,12 @@ def test_the_budget_stops_the_loop_keeps_the_checkpoint_and_reports_partial(conn
 
     mailbox.messages = {f"m{i}": _message(f"m{i}") for i in range(12)}
     mailbox.history_added = [f"m{i}" for i in range(12)]
-    report = pipeline.fire(UID, email=EMAIL, now=NOW, budget_seconds=100.0)  # 80s of work after the reserve
+    # 100s less the write reserve and the Worktree reserve = 60s of fetching.
+    report = pipeline.fire(UID, email=EMAIL, now=NOW, budget_seconds=100.0)
 
     assert report.unreached is True and report.ok is True
-    assert report.new_rows == 3 and mailbox.fetched == ["m0", "m1", "m2"]
-    assert [row[ID] for row in sheet.appended] == ["m0", "m1", "m2"], "what was done is written"
+    assert report.new_rows == 2 and mailbox.fetched == ["m0", "m1"]
+    assert [row[ID] for row in sheet.appended] == ["m0", "m1"], "what was done is written"
     assert connected.connections[UID]["checkpoint"]["history_id"] == "800", "an unfinished pass keeps the old checkpoint"
     assert connected.connections[UID]["backfill"]["state"] == "running"
 
@@ -575,7 +651,8 @@ def test_the_backfill_only_moves_its_cursor_past_a_page_it_finished(connected, m
 
     mailbox.messages = {f"o{i}": _message(f"o{i}") for i in range(6)}
     mailbox.listing = [f"o{i}" for i in range(6)]
-    report = pipeline.fire(UID, email=EMAIL, now=NOW, budget_seconds=110.0)  # 90s: three fetches
+    # 110s less both reserves = 70s: three fetches (the third ends at 90s).
+    report = pipeline.fire(UID, email=EMAIL, now=NOW, budget_seconds=130.0)
 
     backfill = connected.connections[UID]["backfill"]
     assert mailbox.fetched == ["o0", "o1", "o2"]
@@ -977,7 +1054,8 @@ def test_a_budget_cut_inside_a_backfill_page_reports_partial_and_keeps_the_curso
     mailbox.messages = {f"o{i}": _message(f"o{i}") for i in range(5)}
     mailbox.listing = [f"o{i}" for i in range(5)]
 
-    report = pipeline.fire(UID, email=EMAIL, now=NOW, budget_seconds=80.0)  # 60s of work: two fetches
+    # 105s less the write and Worktree reserves = 40s of work: two fetches.
+    report = pipeline.fire(UID, email=EMAIL, now=NOW, budget_seconds=105.0)
 
     backfill = connected.connections[UID]["backfill"]
     assert report.ok and report.unreached is True
@@ -1332,3 +1410,459 @@ def test_a_header_set_up_cannot_fix_fails_the_fire_loudly_with_nothing_written(
     assert sheet.appended == [] and sheet.updated == {} and mailbox.fetched == []
     doc = connected.connections[UID]
     assert doc["last_poll"]["ok"] is False and doc["checkpoint"]["history_id"] == "800"
+
+
+# --------------------------------------------------------------------------- #
+# The Worktree — one process a thread, written only when it changed
+# --------------------------------------------------------------------------- #
+
+def test_the_worktree_groups_the_rows_into_one_process_a_thread(connected, mailbox, sheet):
+    mailbox.messages = {
+        "a": _message("a", subject="Paralegal search", thread="t1"),
+        "b": _message("b", subject="Re: Paralegal search", thread="t1"),
+        "c": _message("c", subject="Invoice INV-2231", thread="t2"),
+    }
+    mailbox.history_added = ["a", "b", "c"]
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok and report.new_rows == 3 and report.worktree_rows == 2
+    assert sheet.worktree_writes == 1
+    assert sheet.worktree_column("Process") == ["Invoice INV-2231", "Paralegal search"]
+    assert sheet.worktree_column("Mails") == ["1", "2"]
+    assert sheet.worktree_column("Status") == [worktree.STATUS_WAITING_ON_US] * 2
+    assert sheet.worktree_column("Due") == ["2026-09-18", "2026-09-18"]
+    assert sheet.worktree_column("Waiting since") == ["1 day", "1 day"]
+    assert sheet.worktree_column("Latest") == [
+        message_link("c"), message_link("b"),
+    ], "the newest message of each thread"
+    state = connected.connections[UID]["worktree"]
+    assert (state["state"], state["rows"], state["total"], state["error"]) == ("ours", 2, 2, None)
+    assert state["hash"]
+
+
+def test_the_worktree_is_rebuilt_when_mail_lands_or_the_day_turns_and_never_otherwise(
+    connected, mailbox, sheet
+):
+    mailbox.messages = {"a": _message("a", thread="t1")}
+    mailbox.history_added = ["a"]
+    pipeline.fire(UID, email=EMAIL, now=NOW)
+    assert sheet.worktree_writes == 1
+
+    # Five minutes on, no mail: not even a read. This is the common fire.
+    sheet.events.clear()
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
+    assert "read_inbox" not in sheet.events and sheet.worktree_writes == 1
+
+    # Two hours on it is rebuilt — but nothing moved, so nothing is written.
+    sheet.events.clear()
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(hours=2))
+    assert "read_inbox" in sheet.events and sheet.worktree_writes == 1
+    assert "write_worktree" not in sheet.events
+
+
+def test_a_thread_she_has_marked_done_leaves_the_worktree(connected, mailbox, sheet):
+    mailbox.messages = {"a": _message("a", thread="t1")}
+    mailbox.history_added = ["a"]
+    pipeline.fire(UID, email=EMAIL, now=NOW)
+    assert sheet.worktree_column("Process") == ["Paralegal search"]
+
+    sheet.set_status("a", "Done")
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(hours=2))
+
+    assert sheet.worktree == [] and sheet.worktree_writes == 2
+    assert connected.connections[UID]["worktree"]["rows"] == 0
+
+
+def test_a_tracked_message_carries_what_grouping_needs_and_no_mailbox_address(
+    connected, mailbox, sheet
+):
+    mailbox.messages = {
+        "a": _message("a", thread="t9"),
+        "b": _message("b", thread="t9", sender=f"Her Name <{EMAIL}>"),
+    }
+    mailbox.history_added = ["a", "b"]
+
+    pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    theirs = connected.messages[f"{UID}__a"]
+    assert theirs["thread_id"] == "t9" and theirs["from_me"] is False
+    assert theirs["received_at"].startswith("2026-09-17T10:05")
+    assert theirs["subject"] == "Paralegal search"
+    assert theirs["category"] == "action_required" and theirs["deadline"] == "2026-09-18"
+    assert theirs["action"].startswith("Send Rathore Legal")
+    assert theirs["status"] == "ok", "the retry bookkeeping is still there"
+    assert connected.messages[f"{UID}__b"]["from_me"] is True, "her own address means we sent it"
+    assert not any("@" in str(v) for v in theirs.values()), "no mailbox address is stored"
+
+
+def test_a_message_the_model_could_not_read_keeps_its_facts_when_the_mail_is_gone(
+    connected, mailbox, sheet
+):
+    """A placeholder must not blank what a real message already wrote."""
+    mailbox.messages = {"a": _message("a", subject="GARBLE", thread="t1")}
+    mailbox.history_added = ["a"]
+    pipeline.fire(UID, email=EMAIL, now=NOW)
+    connected.messages[f"{UID}__a"]["subject"] = "Paralegal search"  # an earlier good pass
+
+    del mailbox.messages["a"]  # she deleted it before the retry
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
+
+    tracked = connected.messages[f"{UID}__a"]
+    assert tracked["retry_due"] is False
+    assert tracked["subject"] == "Paralegal search", "the placeholder wrote no facts at all"
+
+
+def test_a_worktree_tab_of_hers_is_never_written_to_and_is_recorded(connected, mailbox, sheet):
+    sheet.check_result = SheetCheck("ok", "Her inbox", "", "claimed")
+    connected.connections[UID]["sheet"]["worktree"] = "claimed"
+    mailbox.messages = {"a": _message("a")}
+    mailbox.history_added = ["a"]
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok and report.new_rows == 1, "her Inbox rows still flow"
+    assert sheet.worktree_writes == 0 and "read_inbox" not in sheet.events
+    assert connected.connections[UID]["worktree"]["state"] == "claimed"
+
+
+def test_the_worktree_waits_until_set_up_has_looked_at_the_tab(connected, mailbox, sheet):
+    """A connection stored before the Worktree existed: nothing is assumed
+    until the hourly check has reported on the tab."""
+    connected.connections[UID]["sheet"].pop("worktree")
+    mailbox.messages = {"a": _message("a")}
+    mailbox.history_added = ["a"]
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok and report.new_rows == 1
+    assert sheet.worktree_writes == 0 and "read_inbox" not in sheet.events
+    assert not connected.connections[UID]["worktree"]
+
+
+def test_a_refused_worktree_write_does_not_fail_the_fire_and_is_retried(
+    connected, mailbox, sheet, monkeypatch
+):
+    def refused(*_args, **_kwargs):
+        raise SheetsUnavailable("Sheets worktree write was refused: HTTP 400")
+
+    monkeypatch.setattr(sheet_writer, "write_worktree", refused)
+    mailbox.messages = {"a": _message("a")}
+    mailbox.history_added = ["a"]
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok is True and report.new_rows == 1
+    assert [row[ID] for row in sheet.appended] == ["a"], "the Inbox row is written regardless"
+    doc = connected.connections[UID]
+    assert doc["last_poll"]["ok"] is True and doc["last_poll"]["error"] is None
+    assert "HTTP 400" in doc["worktree"]["error"]
+
+
+# --------------------------------------------------------------------------- #
+# The one-time thread-id backfill
+# --------------------------------------------------------------------------- #
+
+def _tracked_without_a_thread(store, count: int, *, prefix: str = "old") -> None:
+    """Rows tracked before thread ids were stored — the two live sheets."""
+    for index in range(count):
+        store.messages[f"{UID}__{prefix}{index}"] = {
+            "user_id": UID, "message_id": f"{prefix}{index}", "status": "ok",
+            "attempts": 1, "sheet_row": 2 + index, "retry_due": False,
+        }
+
+
+def test_the_thread_id_backfill_is_bounded_resumable_and_runs_exactly_once(
+    connected, mailbox, sheet, monkeypatch
+):
+    connected.connections[UID]["backfill"]["state"] = "done"  # mail backfill already finished
+    _tracked_without_a_thread(connected, 12)
+    mailbox.listing = [f"old{i}" for i in range(12)]
+    mailbox.threads = {f"old{i}": f"t{i // 4}" for i in range(12)}
+    monkeypatch.setattr(gmail_client, "LIST_THREAD_PAGE_MAX", 5)
+    monkeypatch.setattr(pipeline, "THREAD_BACKFILL_PAGES_PER_FIRE", 1)
+
+    first = pipeline.fire(UID, email=EMAIL, now=NOW)
+    assert first.threads_tagged == 5
+    state = connected.connections[UID]["thread_backfill"]
+    assert (state["state"], state["cursor"], state["tagged"]) == ("running", "5", 5)
+    assert connected.messages[f"{UID}__old0"]["thread_id"] == "t0"
+    assert "thread_id" not in connected.messages[f"{UID}__old11"], "not reached yet"
+
+    second = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
+    assert second.threads_tagged == 5
+    assert connected.connections[UID]["thread_backfill"]["cursor"] == "10"
+
+    third = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=10))
+    assert third.threads_tagged == 2
+    state = connected.connections[UID]["thread_backfill"]
+    assert (state["state"], state["tagged"], state["unresolved"]) == ("done", 12, 0)
+    assert {d["thread_id"] for d in connected.messages.values()} == {"t0", "t1", "t2"}
+
+    mailbox.events.clear()
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=15))
+    assert "list_pairs" not in mailbox.events, "done means done; it never runs again"
+
+
+def test_a_message_the_listing_never_mentions_is_counted_not_guessed(
+    connected, mailbox, sheet, monkeypatch
+):
+    connected.connections[UID]["backfill"]["state"] = "done"
+    _tracked_without_a_thread(connected, 3)
+    mailbox.listing = ["old0", "old1"]  # old2 was archived, or is older than the window
+    mailbox.threads = {"old0": "t0", "old1": "t0"}
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    state = connected.connections[UID]["thread_backfill"]
+    assert (state["state"], state["unresolved"]) == ("done", 1)
+    assert report.threads_tagged == 2
+    assert "thread_id" not in connected.messages[f"{UID}__old2"]
+
+
+def test_the_backfill_walks_the_same_window_the_mail_backfill_used(
+    connected, mailbox, sheet, monkeypatch
+):
+    connected.connections[UID]["backfill"]["state"] = "done"
+    _tracked_without_a_thread(connected, 1)
+    mailbox.listing = ["old0"]
+    mailbox.threads = {"old0": "t0"}
+    seen: list[int] = []
+    real_pairs = mailbox.list_inbox_pairs
+
+    def watched(svc, *, after_epoch, page_token=None, max_results=100):
+        seen.append(after_epoch)
+        return real_pairs(svc, after_epoch=after_epoch, page_token=page_token,
+                          max_results=max_results)
+
+    monkeypatch.setattr(gmail_client, "list_inbox_pairs", watched)
+    pipeline.fire(UID, email=EMAIL, now=NOW)
+    assert seen == [connected.connections[UID]["backfill"]["since_epoch"]]
+
+
+def test_a_fresh_connection_has_nothing_to_backfill_and_says_so_at_once(
+    connected, mailbox, sheet
+):
+    mailbox.messages = {"a": _message("a", thread="t1")}
+    mailbox.history_added = ["a"]
+    mailbox.events.clear()
+
+    pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert "list_pairs" not in mailbox.events
+    state = connected.connections[UID]["thread_backfill"]
+    assert (state["state"], state["tagged"], state["unresolved"]) == ("done", 0, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Reading what she SENT — markers only, and what they change
+# --------------------------------------------------------------------------- #
+
+def test_mail_she_sent_flips_the_thread_and_is_stored_as_a_marker_and_nothing_more(
+    connected, mailbox, sheet
+):
+    mailbox.messages = {"a": _message("a", thread="t1")}
+    mailbox.history_added = ["a"]
+    mailbox.sent = [("s1", "t1")]
+    mailbox.sent_times = {"s1": datetime(2026, 9, 18, 9, 30, tzinfo=TEAM_TIMEZONE)}
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert (report.sent_marked, report.sent_stamped) == (1, 1)
+    assert sheet.worktree_column("Status") == [worktree.STATUS_WAITING_ON_THEM]
+    assert sheet.worktree_column("Mails") == ["2"]
+    assert sheet.worktree_column("Latest") == [message_link("a")]
+    marker = connected.messages[f"{UID}__s1"]
+    assert marker == {
+        "user_id": UID, "message_id": "s1", "kind": "sent", "thread_id": "t1",
+        "from_me": True, "received_at": "2026-09-18T09:30:00+05:30",
+    }, "id, thread, side and time — no subject, no recipient, no body, no row"
+
+
+def test_a_reply_she_sent_days_ago_that_nobody_answered_is_a_chase(
+    connected, mailbox, sheet
+):
+    mailbox.messages = {"a": _message("a", thread="t1")}
+    mailbox.history_added = ["a"]
+    mailbox.sent = [("s1", "t1")]
+    # She answered the day after it arrived, and has heard nothing since.
+    mailbox.sent_times = {"s1": datetime(2026, 9, 18, 9, 30, tzinfo=TEAM_TIMEZONE)}
+
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(days=5))
+
+    assert sheet.worktree_column("Status") == [worktree.STATUS_CHASING]
+    assert sheet.worktree_column("Waiting since") == ["5 days"]
+
+
+def test_sent_mail_in_a_thread_we_never_ingested_is_dropped_on_the_floor(
+    connected, mailbox, sheet
+):
+    """It has no subject to name it and no triage to describe it, so keeping
+    it would buy a blank row and a Firestore document for nothing."""
+    mailbox.messages = {"a": _message("a", thread="t1")}
+    mailbox.history_added = ["a"]
+    mailbox.sent = [("s1", "t1"), ("s2", "some-other-thread")]
+    mailbox.sent_times = {
+        "s1": datetime(2026, 9, 18, 9, 30, tzinfo=TEAM_TIMEZONE),
+        "s2": datetime(2026, 9, 18, 9, 31, tzinfo=TEAM_TIMEZONE),
+    }
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.sent_marked == 1
+    assert f"{UID}__s2" not in connected.messages
+    assert "s2" not in mailbox.stamped, "and it is never even asked about"
+
+
+def test_sent_ingestion_waits_for_the_thread_ids_it_needs_to_join_on(
+    connected, mailbox, sheet, monkeypatch
+):
+    connected.connections[UID]["backfill"]["state"] = "done"
+    _tracked_without_a_thread(connected, 8)
+    mailbox.listing = [f"old{i}" for i in range(8)]
+    mailbox.threads = {f"old{i}": "t0" for i in range(8)}
+    mailbox.sent = [("s1", "t0")]
+    mailbox.sent_times = {"s1": datetime(2026, 9, 18, 9, 30, tzinfo=TEAM_TIMEZONE)}
+    monkeypatch.setattr(gmail_client, "LIST_THREAD_PAGE_MAX", 4)
+    monkeypatch.setattr(pipeline, "THREAD_BACKFILL_PAGES_PER_FIRE", 1)
+
+    mailbox.events.clear()
+    first = pipeline.fire(UID, email=EMAIL, now=NOW)
+    assert connected.connections[UID]["thread_backfill"]["state"] == "running"
+    assert "list_sent" not in mailbox.events and first.sent_marked == 0
+    assert connected.connections[UID]["sent_backfill"]["state"] == "not_started"
+
+    # The fire that finishes the thread ids is the one that may read SENT.
+    second = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
+    assert connected.connections[UID]["thread_backfill"]["state"] == "done"
+    assert second.sent_marked == 1
+    assert connected.connections[UID]["sent_backfill"]["state"] == "done"
+
+
+def test_the_sent_walk_is_bounded_resumable_and_then_only_watches_the_last_day(
+    connected, mailbox, sheet, monkeypatch
+):
+    mailbox.messages = {"a": _message("a", thread="t1")}
+    mailbox.history_added = ["a"]
+    mailbox.sent = [(f"s{i}", "t1") for i in range(10)]
+    mailbox.sent_times = {
+        f"s{i}": datetime(2026, 9, 18, 9, i, tzinfo=TEAM_TIMEZONE) for i in range(10)
+    }
+    monkeypatch.setattr(pipeline, "SENT_BACKFILL_PAGES_PER_FIRE", 1)
+
+    def one_page(svc, *, after_epoch, page_token=None, max_results=500):
+        return mailbox.list_sent_pairs(svc, after_epoch=after_epoch,
+                                       page_token=page_token, max_results=4)
+    monkeypatch.setattr(gmail_client, "list_sent_pairs", one_page)
+
+    first = pipeline.fire(UID, email=EMAIL, now=NOW)
+    state = connected.connections[UID]["sent_backfill"]
+    assert (first.sent_marked, state["state"], state["cursor"]) == (4, "running", "4")
+
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
+    assert connected.connections[UID]["sent_backfill"]["cursor"] == "8"
+
+    third = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=10))
+    state = connected.connections[UID]["sent_backfill"]
+    assert (state["state"], state["markers"], state["stamped"]) == ("done", 10, 10)
+    assert third.sent_marked == 2
+
+    # Done: every later build watches the last day, for one call.
+    mailbox.events.clear()
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(hours=2))
+    assert mailbox.events.count("list_sent") == 1
+
+
+def test_the_last_day_watch_picks_up_a_reply_she_sends_after_the_walk_finished(
+    connected, mailbox, sheet
+):
+    mailbox.messages = {"a": _message("a", thread="t1")}
+    mailbox.history_added = ["a"]
+    pipeline.fire(UID, email=EMAIL, now=NOW)
+    assert sheet.worktree_column("Status") == [worktree.STATUS_WAITING_ON_US]
+    assert connected.connections[UID]["sent_backfill"]["state"] == "done"
+
+    mailbox.sent = [("s1", "t1")]  # she answered it
+    mailbox.sent_times = {"s1": datetime(2026, 9, 18, 12, 0, tzinfo=TEAM_TIMEZONE)}
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(hours=2))
+
+    assert sheet.worktree_column("Status") == [worktree.STATUS_WAITING_ON_THEM]
+
+
+def test_the_stamp_reads_are_capped_per_fire_and_resume(
+    connected, mailbox, sheet, monkeypatch
+):
+    """The one call-per-message step in either backfill, so it is the one
+    that is bounded tightest."""
+    mailbox.messages = {"a": _message("a", thread="t1")}
+    mailbox.history_added = ["a"]
+    mailbox.sent = [(f"s{i}", "t1") for i in range(5)]
+    mailbox.sent_times = {
+        f"s{i}": datetime(2026, 9, 18, 9, i, tzinfo=TEAM_TIMEZONE) for i in range(5)
+    }
+    monkeypatch.setattr(pipeline, "SENT_STAMPS_PER_FIRE", 2)
+
+    first = pipeline.fire(UID, email=EMAIL, now=NOW)
+    assert first.sent_marked == 5 and first.sent_stamped == 2
+    assert connected.connections[UID]["sent_backfill"]["unstamped"] == 3
+    assert len(mailbox.stamped) == 2
+
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
+    assert connected.connections[UID]["sent_backfill"]["unstamped"] == 1
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=10))
+    state = connected.connections[UID]["sent_backfill"]
+    assert (state["unstamped"], state["stamped"]) == (0, 5)
+    assert sorted(mailbox.stamped) == [f"s{i}" for i in range(5)]
+
+
+def test_a_sent_message_she_has_since_deleted_is_remembered_and_never_asked_again(
+    connected, mailbox, sheet
+):
+    mailbox.messages = {"a": _message("a", thread="t1")}
+    mailbox.history_added = ["a"]
+    mailbox.sent = [("s1", "t1")]
+    mailbox.sent_times = {}  # the stamp read answers 404
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.sent_marked == 1 and report.sent_stamped == 0
+    assert connected.messages[f"{UID}__s1"]["gone"] is True
+    assert connected.connections[UID]["sent_backfill"]["unstamped"] == 0
+    assert sheet.worktree_column("Status") == [worktree.STATUS_WAITING_ON_US], \
+        "a marker with no time changes nothing"
+
+    mailbox.stamped.clear()
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(hours=2))
+    assert mailbox.stamped == [], "gone means gone"
+
+
+def test_a_mail_she_sent_to_herself_keeps_its_row_and_is_not_marked_twice(
+    connected, mailbox, sheet
+):
+    """Gmail files a note-to-self under both labels. The row wins: it is the
+    one with a subject, a category and an Action."""
+    mailbox.messages = {"a": _message("a", thread="t1", sender=f"Her Name <{EMAIL}>")}
+    mailbox.history_added = ["a"]
+    mailbox.sent = [("a", "t1")]
+    mailbox.sent_times = {"a": datetime(2026, 9, 17, 10, 5, tzinfo=TEAM_TIMEZONE)}
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.sent_marked == 0
+    tracked = connected.messages[f"{UID}__a"]
+    assert tracked["subject"] == "Paralegal search" and tracked["from_me"] is True
+    assert "kind" not in tracked, "the row was never turned into a marker"
+    assert sheet.worktree_column("Mails") == ["1"]
+
+
+def test_a_disconnect_clears_the_markers_with_everything_else(connected, mailbox, sheet):
+    mailbox.messages = {"a": _message("a", thread="t1")}
+    mailbox.history_added = ["a"]
+    mailbox.sent = [("s1", "t1")]
+    mailbox.sent_times = {"s1": datetime(2026, 9, 18, 9, 30, tzinfo=TEAM_TIMEZONE)}
+    pipeline.fire(UID, email=EMAIL, now=NOW)
+    assert f"{UID}__s1" in connected.messages
+
+    pipeline.disconnect(UID)
+
+    assert connected.messages == {}

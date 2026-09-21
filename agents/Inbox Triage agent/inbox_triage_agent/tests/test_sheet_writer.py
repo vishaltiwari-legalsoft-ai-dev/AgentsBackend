@@ -15,10 +15,10 @@ import pytest
 from googleapiclient.errors import HttpError
 
 import app  # noqa: F401 — registers the agent roots on sys.path
-from inbox_triage_agent import InboxOffline, sheet_style, sheet_writer
+from inbox_triage_agent import InboxOffline, sheet_layout, sheet_style, sheet_writer
 from inbox_triage_agent.sheet_layout import (
     AGENT_COLUMNS, CATEGORY_LABELS, COL_ACTION, COL_MESSAGE_ID, COL_STATUS, HEADERS,
-    LEGACY_AGENT_COLUMNS, STATUS_OPTIONS, UPCOMING_FORMULA, UPCOMING_HEADERS,
+    LEGACY_AGENT_COLUMNS, STATUS_OPTIONS, UPCOMING_FORMULA, UPCOMING_HEADERS, WORKTREE_HEADERS,
 )
 from inbox_triage_agent.sheet_writer import LayoutMismatch, SheetsUnavailable
 
@@ -180,9 +180,19 @@ class FakeSheets:
 
     def _batch_update(self, **kw):
         requests = kw["body"]["requests"]
+
+        def creates(key: str) -> bool:
+            return any(
+                ((r.get("createDeveloperMetadata") or {}).get("developerMetadata") or {})
+                .get("metadataKey") == key
+                for r in requests
+            )
+
         if any("addSheet" in r for r in requests):
             name = "batchUpdate:addSheet"
-        elif any("createDeveloperMetadata" in r for r in requests):
+        elif creates(sheet_style.FORMAT_MARKER_KEY):
+            # The layout batch writes a marker too — the Worktree tab's — so
+            # it is the FORMAT marker that names the formatting batch.
             name = "batchUpdate:format"
         else:
             name = "batchUpdate:layout"
@@ -349,6 +359,23 @@ def current_sheet() -> FakeSheets:
     return sheets
 
 
+def forget_the_look(sheets: FakeSheets, *, version: str | None = None) -> None:
+    """Drop the FORMAT marker (or age it), and only it. The Worktree marker
+    is a different key recording a different fact — wiping it would say the
+    Worktree tab is hers, which is a different test."""
+    kept = []
+    for entry in sheets.metadata:
+        if entry["metadataKey"] != sheet_style.FORMAT_MARKER_KEY:
+            kept.append(entry)
+        elif version is not None:
+            kept.append({**entry, "metadataValue": version})
+    sheets.metadata = kept
+
+
+def format_markers(sheets: FakeSheets) -> list[dict]:
+    return [m for m in sheets.metadata if m["metadataKey"] == sheet_style.FORMAT_MARKER_KEY]
+
+
 class FakeDrive:
     """``files().get`` answering owners and permissions. ``meta`` is what
     Drive returns; ``error`` makes it refuse instead."""
@@ -398,9 +425,10 @@ def test_check_maps_a_refused_write_to_not_editable_and_hides_the_title():
 def test_check_ok_also_sets_the_sheet_up():
     sheets = FakeSheets()
     assert _check(sheets) == sheet_writer.SheetCheck("ok", "Her inbox")
-    assert set(sheets.tabs) == {"Inbox", "Upcoming"}
+    assert set(sheets.tabs) == {"Inbox", "Upcoming", "Worktree"}
     assert sheets.row("Inbox", 0, len(HEADERS)) == list(HEADERS)
     assert sheets.row("Upcoming", 0, len(UPCOMING_HEADERS)) == list(UPCOMING_HEADERS)
+    assert sheets.row("Worktree", 0, len(WORKTREE_HEADERS)) == list(WORKTREE_HEADERS)
     assert sheets.cell("Upcoming", 1, 0) == UPCOMING_FORMULA
 
 
@@ -431,7 +459,11 @@ def test_setup_on_a_fresh_sheet_creates_tabs_headers_layout_and_the_formula():
     requests = _layout_requests(sheets)
     assert [name for r in requests for name in r] == [
         "updateSheetProperties", "updateDimensionProperties", "setDataValidation",
-    ]
+        "createDeveloperMetadata",
+    ], "the new Worktree tab is claimed in the same batch that proves we can write"
+    claim = requests[-1]["createDeveloperMetadata"]["developerMetadata"]
+    assert claim["metadataKey"] == sheet_layout.WORKTREE_MARKER_KEY
+    assert claim["metadataValue"] == str(sheets.tabs["Worktree"])
     assert requests[0]["updateSheetProperties"]["properties"]["gridProperties"] == {"frozenRowCount": 1}
     hidden = requests[1]["updateDimensionProperties"]["range"]
     assert (hidden["startIndex"], hidden["endIndex"]) == (COL_MESSAGE_ID - 1, COL_MESSAGE_ID) == (8, 9)  # I
@@ -513,7 +545,7 @@ def test_a_legacy_sheet_is_migrated_in_place_with_every_cell_kept():
     insert = requests[0]["insertDimension"]["range"]
     assert (insert["dimension"], insert["startIndex"], insert["endIndex"]) == ("COLUMNS", 5, 6)
     batches = [c[0] for c in sheets.calls if c[0].startswith("batchUpdate")]
-    assert batches == ["batchUpdate:layout", "batchUpdate:format"], (
+    assert batches == ["batchUpdate:addSheet", "batchUpdate:layout", "batchUpdate:format"], (
         "the migration is one atomic batch; the look follows it, separately")
     assert sheets.metadata and len(sheets.agent_rules("Inbox")) == len(sheet_style.inbox_rules(1))
 
@@ -834,7 +866,7 @@ def test_every_hourly_recheck_after_that_sends_no_formatting_at_all():
     for _ in range(3):
         assert _check(sheets).formatting == sheet_writer.FORMAT_ALREADY
     assert sheets.names() == ["get", "values.batchGet", "batchUpdate:layout"] * 3
-    assert sheets.rules == rules_before and len(sheets.metadata) == 1
+    assert sheets.rules == rules_before and len(format_markers(sheets)) == 1
 
 
 def test_her_later_formatting_survives_the_hourly_recheck():
@@ -850,7 +882,8 @@ def test_a_sheet_set_up_before_the_look_existed_is_formatted_once_keeping_her_ru
     """The two live sheets: current layout, no marker, her own rule."""
     sheets = current_sheet()
     inbox = sheets.tabs["Inbox"]
-    sheets.metadata, sheets.rules, sheets.bandings = [], {inbox: [_her_rule(inbox)]}, {}
+    forget_the_look(sheets)
+    sheets.rules, sheets.bandings = {inbox: [_her_rule(inbox)]}, {}
     sheets.calls.clear()
     assert _check(sheets).formatting == sheet_writer.FORMAT_APPLIED
     assert sheets.names()[-2:] == ["get", "batchUpdate:format"]
@@ -868,17 +901,14 @@ def test_re_applying_replaces_only_the_agents_own_rules_banding_and_marker(marke
     inbox, upcoming = sheets.tabs["Inbox"], sheets.tabs["Upcoming"]
     sheets.rules[inbox].insert(3, _her_rule(inbox))  # hers, between the agent's
     sheets.rules[upcoming].append(_her_rule(upcoming))
-    if marker == "missing":
-        sheets.metadata = []
-    else:
-        sheets.metadata[0]["metadataValue"] = "0"
-    assert sheet_writer.setup(SID, svc=sheets) == sheet_writer.FORMAT_APPLIED
+    forget_the_look(sheets, version=None if marker == "missing" else "0")
+    assert sheet_writer.setup(SID, svc=sheets).formatting == sheet_writer.FORMAT_APPLIED
     assert len(sheets.agent_rules("Inbox")) == len(sheet_style.inbox_rules(inbox)), "not duplicated"
     assert len(sheets.agent_rules("Upcoming")) == len(sheet_style.upcoming_rules(upcoming))
     assert sheets.rules[inbox][0] == _her_rule(inbox) and sheets.rules[upcoming][0] == _her_rule(upcoming)
     assert sum(r == _her_rule(inbox) for r in sheets.rules[inbox]) == 1
     assert sheets.bandings[inbox] == [sheet_style.INBOX_BANDING_ID]
-    assert [(m["metadataKey"], m["metadataValue"]) for m in sheets.metadata] == [
+    assert [(m["metadataKey"], m["metadataValue"]) for m in format_markers(sheets)] == [
         (sheet_style.FORMAT_MARKER_KEY, sheet_style.FORMAT_VERSION)]
 
 
@@ -901,7 +931,7 @@ def test_a_refused_formatting_pass_is_recorded_logged_without_the_id_and_rows_st
     text = caplog.text
     assert "formatting was not applied" in text and "HTTP 400" in text
     assert SID not in text and "googleapis" not in text
-    assert sheets.metadata == [] and sheets.rules == {}, "no marker: the next check retries"
+    assert format_markers(sheets) == [] and sheets.rules == {}, "no marker: the next check retries"
     assert sheet_writer.id_rows(SID, svc=sheets) == {}
     assert sheet_writer.append(SID, [["d", "f", "s", "c", "sum", "act", "", "l", "m1"]], svc=sheets) == [2]
 
@@ -911,7 +941,7 @@ def test_a_refused_formatting_pass_is_recorded_logged_without_the_id_and_rows_st
 
 def test_a_failed_format_read_is_also_not_fatal():
     sheets = current_sheet()
-    sheets.metadata = []
+    forget_the_look(sheets)
     real_get = sheets._get
     calls = {"n": 0}
 
@@ -927,7 +957,7 @@ def test_a_failed_format_read_is_also_not_fatal():
 def test_an_atomic_refusal_mid_batch_leaves_no_half_look():
     sheets = current_sheet()
     inbox = sheets.tabs["Inbox"]
-    sheets.metadata = []
+    forget_the_look(sheets)
     sheets.bandings = {inbox: [999]}  # hers — but the format read below does not show it
     real_get = sheets._get
 
@@ -939,8 +969,8 @@ def test_an_atomic_refusal_mid_batch_leaves_no_half_look():
 
     sheets._get = stale_get
     rules_before = copy.deepcopy(sheets.rules)
-    assert sheet_writer.setup(SID, svc=sheets) == sheet_writer.FORMAT_FAILED
-    assert sheets.rules == rules_before and sheets.metadata == []
+    assert sheet_writer.setup(SID, svc=sheets).formatting == sheet_writer.FORMAT_FAILED
+    assert sheets.rules == rules_before and format_markers(sheets) == []
 
 
 def test_a_migrated_sheet_is_formatted_in_the_batch_after_the_migration():
@@ -1025,3 +1055,170 @@ def test_widths_are_by_column_name_and_the_header_is_brand_blue_on_both_tabs():
                if "repeatCell" in r and r["repeatCell"]["range"]["sheetId"] == 1
                and r["repeatCell"]["cell"]["userEnteredFormat"].get("wrapStrategy") == "WRAP"}
     assert wrapped == {HEADERS.index("Summary"), COL_ACTION - 1}
+
+
+# --------------------------------------------------------------------------- #
+# Worktree — the third tab: whose it is, what is read, what is written
+# --------------------------------------------------------------------------- #
+
+def _worktree_markers(sheets: FakeSheets) -> list[dict]:
+    return [m for m in sheets.metadata if m["metadataKey"] == sheet_layout.WORKTREE_MARKER_KEY]
+
+
+def test_a_new_worktree_tab_is_created_claimed_by_its_marker_and_headed():
+    sheets = FakeSheets(tabs={"Inbox": 1, "Upcoming": 2})
+    done = sheet_writer.setup(SID, svc=sheets)
+    assert done.worktree == sheet_writer.WORKTREE_OURS
+    assert done.worktree_sheet_id == sheets.tabs["Worktree"]
+    assert sheets.row("Worktree", 0, len(WORKTREE_HEADERS)) == list(WORKTREE_HEADERS)
+    assert [(m["metadataKey"], m["metadataValue"]) for m in _worktree_markers(sheets)] == [
+        (sheet_layout.WORKTREE_MARKER_KEY, str(sheets.tabs["Worktree"]))]
+
+
+def test_an_existing_sheet_gains_the_tab_without_its_inbox_or_upcoming_moving():
+    sheets = FakeSheets(tabs={"Inbox": 1, "Upcoming": 2})
+    sheet_writer.setup(SID, svc=sheets)
+    # Wind it back to the sheet as it stands today: two tabs, no Worktree.
+    del sheets.tabs["Worktree"], sheets.grid["Worktree"]
+    sheets.metadata = [
+        m for m in sheets.metadata if m["metadataKey"] != sheet_layout.WORKTREE_MARKER_KEY
+    ]
+    inbox_before = [list(r) for r in sheets.grid["Inbox"]]
+    upcoming_before = [list(r) for r in sheets.grid["Upcoming"]]
+
+    assert sheet_writer.setup(SID, svc=sheets).worktree == sheet_writer.WORKTREE_OURS
+
+    assert sheets.grid["Inbox"] == inbox_before and sheets.grid["Upcoming"] == upcoming_before
+    assert sheets.row("Worktree", 0, len(WORKTREE_HEADERS)) == list(WORKTREE_HEADERS)
+
+
+def test_a_worktree_tab_the_agent_did_not_create_is_hers_and_is_left_exactly_as_it_is():
+    sheets = FakeSheets(tabs={"Inbox": 1, "Upcoming": 2, "Worktree": 9})
+    sheets.grid["Worktree"] = [["Her plan"], ["call the landlord"]]
+    before = [list(r) for r in sheets.grid["Worktree"]]
+
+    done = sheet_writer.setup(SID, svc=sheets)
+
+    assert done.worktree == sheet_writer.WORKTREE_CLAIMED and done.worktree_sheet_id is None
+    assert sheets.grid["Worktree"] == before, "not a cell of hers is written"
+    assert _worktree_markers(sheets) == [], "the agent never claims a tab it did not make"
+    assert 9 not in sheets.rules, "and never styles one"
+
+
+def test_a_tab_the_agent_made_is_recognised_again_by_the_id_in_its_marker():
+    sheets = current_sheet()
+    assert sheet_writer.setup(SID, svc=sheets).worktree == sheet_writer.WORKTREE_OURS
+    # She renamed it and made her own in its place: the id no longer matches.
+    sheets.tabs["Worktree notes"] = sheets.tabs.pop("Worktree")
+    sheets.grid["Worktree notes"] = sheets.grid.pop("Worktree")
+    sheets.tabs["Worktree"] = 77
+    sheets.grid["Worktree"] = [["hers"]]
+    assert sheet_writer.setup(SID, svc=sheets).worktree == sheet_writer.WORKTREE_CLAIMED
+    assert sheets.grid["Worktree"] == [["hers"]]
+
+
+def test_a_renamed_agent_tab_is_made_again_and_the_stale_marker_is_replaced():
+    sheets = current_sheet()
+    sheets.tabs["Old worktree"] = sheets.tabs.pop("Worktree")
+    sheets.grid["Old worktree"] = sheets.grid.pop("Worktree")
+
+    done = sheet_writer.setup(SID, svc=sheets)
+
+    assert done.worktree == sheet_writer.WORKTREE_OURS
+    assert [m["metadataValue"] for m in _worktree_markers(sheets)] == [str(sheets.tabs["Worktree"])]
+    assert len(_worktree_markers(sheets)) == 1, "exactly one claim, on the tab that exists"
+
+
+def test_read_inbox_returns_her_columns_too_and_skips_the_header():
+    sheets = current_sheet()
+    sheets.put("Inbox", 1, 0, "2026-09-17 10:05")
+    sheets.put("Inbox", 1, COL_MESSAGE_ID - 1, "m1")
+    sheets.put("Inbox", 1, COL_STATUS - 1, "In progress")
+    sheets.put("Inbox", 1, COL_STATUS, "her note")
+
+    rows = sheet_writer.read_inbox(SID, svc=sheets)
+
+    assert len(rows) == 1
+    assert rows[0][COL_MESSAGE_ID - 1] == "m1"
+    assert rows[0][COL_STATUS - 1:COL_STATUS + 1] == ["In progress", "her note"], \
+        "the Worktree needs her Status; it only ever reads it"
+    read = next(c[1] for c in sheets.calls if c[0] == "values.batchGet")
+    assert read["ranges"][1] == "Inbox!A:K"
+
+
+def test_read_inbox_refuses_a_layout_that_is_not_the_current_one():
+    sheets = current_sheet()
+    sheets.grid["Inbox"][0] = list(LEGACY_HEADERS)
+    with pytest.raises(LayoutMismatch):
+        sheet_writer.read_inbox(SID, svc=sheets)
+
+
+def test_write_worktree_replaces_the_body_and_blanks_what_a_longer_build_left():
+    sheets = current_sheet()
+    three = [[f"P{i}", "Type", "Waiting on us", "do it", "1 day", "", "1", "link"] for i in range(3)]
+    assert sheet_writer.write_worktree(SID, three, previous_rows=0, svc=sheets) == 3
+    assert [sheets.cell("Worktree", r, 0) for r in (1, 2, 3)] == ["P0", "P1", "P2"]
+
+    assert sheet_writer.write_worktree(SID, three[:1], previous_rows=3, svc=sheets) == 1
+    assert [sheets.cell("Worktree", r, 0) for r in (1, 2, 3)] == ["P0", "", ""], \
+        "a shorter build leaves no stale process behind it"
+    assert sheets.row("Worktree", 0, len(WORKTREE_HEADERS)) == list(WORKTREE_HEADERS), \
+        "the header row is never in the rectangle"
+
+
+def test_write_worktree_writes_raw_inside_its_own_rectangle_and_nothing_else():
+    sheets = current_sheet()
+    sheet_writer.write_worktree(SID, [["a"] * len(WORKTREE_HEADERS)] * 2, svc=sheets)
+    call = next(c[1] for c in sheets.calls if c[0] == "values.update")
+    assert call["range"] == "Worktree!A2:H3" and call["valueInputOption"] == "RAW"
+    assert len(sheets.calls) == 1, "one call, not a clear and an update"
+
+
+def test_write_worktree_with_nothing_to_say_and_nothing_to_clear_does_not_call_sheets():
+    sheets = current_sheet()
+    assert sheet_writer.write_worktree(SID, [], previous_rows=0, svc=sheets) == 0
+    assert sheets.calls == []
+
+
+def test_the_worktree_rules_colour_a_chase_row_whole_and_the_status_cell_otherwise():
+    from inbox_triage_agent.worktree import (
+        STATUS_CHASING, STATUS_OVERDUE_REPLY, STATUS_WAITING_ON_THEM, STATUS_WAITING_ON_US,
+    )
+
+    rules = sheet_style.worktree_rules(9)
+    for rng, condition, _fmt in rules:
+        assert rng["sheetId"] == 9 and rng["startRowIndex"] == 1 and "endRowIndex" not in rng
+        assert sheet_style.is_agent_rule({"booleanRule": {"condition": {
+            "values": [{"userEnteredValue": sheet_style.tagged(condition)}]}}})
+    chase_range, chase_condition, chase_format = rules[0]
+    assert (chase_range["startColumnIndex"], chase_range["endColumnIndex"]) == (
+        0, len(WORKTREE_HEADERS)), "a chase is the one whole-row alarm on this tab"
+    assert chase_condition == (
+        f'OR($C2="{STATUS_CHASING}", $C2="{STATUS_OVERDUE_REPLY}")'
+    ), "both alarms wear the same red, whichever side owes the reply"
+    assert chase_format["backgroundColor"] == sheet_style.rgb(sheet_style.CHASE_FILL)
+    assert [c for _, c, _ in rules[1:3]] == [
+        f'$C2="{STATUS_WAITING_ON_US}"', f'$C2="{STATUS_WAITING_ON_THEM}"']
+    due_rules = [r for r in rules if r[0].get("startColumnIndex") == WORKTREE_HEADERS.index("Due")]
+    assert len(due_rules) == 2 and any("TODAY()+2" in c for _, c, _ in due_rules)
+
+
+def test_the_look_covers_the_worktree_tab_only_when_it_is_the_agents():
+    sheets = FakeSheets(tabs={"Inbox": 1, "Upcoming": 2})
+    _check(sheets)
+    worktree_id = sheets.tabs["Worktree"]
+    assert len(sheets.agent_rules("Worktree")) == len(sheet_style.worktree_rules(worktree_id))
+    widths = [
+        r["updateDimensionProperties"] for r in sheets.styled
+        if "updateDimensionProperties" in r
+        and r["updateDimensionProperties"]["range"]["sheetId"] == worktree_id
+        and r["updateDimensionProperties"]["range"]["dimension"] == "COLUMNS"
+    ]
+    assert len(widths) == len(WORKTREE_HEADERS), "every Worktree column gets a width"
+
+    hers = FakeSheets(tabs={"Inbox": 1, "Upcoming": 2, "Worktree": 9})
+    _check(hers)
+    assert 9 not in hers.rules and not any(
+        r.get("updateDimensionProperties", {}).get("range", {}).get("sheetId") == 9
+        for r in hers.styled
+    ), "hers is not styled at all"

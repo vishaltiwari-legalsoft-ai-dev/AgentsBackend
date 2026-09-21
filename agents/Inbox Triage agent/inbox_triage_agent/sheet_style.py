@@ -27,12 +27,19 @@ from __future__ import annotations
 
 from .sheet_layout import (
     CATEGORY_LABELS, COL_CATEGORY, COL_DEADLINE, COL_STATUS, DUE_OVERDUE, DUE_UPCOMING,
-    HEADERS, STATUS_DONE, STATUS_IN_PROGRESS, UPCOMING_HEADERS, column_letter,
+    HEADERS, STATUS_DONE, STATUS_IN_PROGRESS, UPCOMING_HEADERS, WORKTREE_HEADERS,
+    column_letter,
 )
 from .triage import NEEDS_REVIEW
+from .worktree import (
+    STATUS_CHASING, STATUS_OVERDUE_REPLY, STATUS_WAITING_ON_THEM, STATUS_WAITING_ON_US,
+)
 
 FORMAT_MARKER_KEY = "agentos.a12.format"
-FORMAT_VERSION = "1"
+#: Bumped to 2 when the Worktree tab arrived: the look is applied once per
+#: version, so every sheet set up before it gets one more pass and then stops
+#: again. Re-applying deletes only the agent's own tagged rules and banding.
+FORMAT_VERSION = "2"
 #: Always-true term in every agent rule's formula — see the module docstring.
 RULE_TAG = 'N("agentos-a12")=0'
 _TAG_TEXT = "agentos-a12"
@@ -72,16 +79,25 @@ DEADLINE_OVERDUE_TEXT = "#A3161A"
 DUE_OVERDUE_FILL, DUE_OVERDUE_TEXT = "#C0282D", WHITE
 DUE_SOON_FILL, DUE_SOON_TEXT = "#FFD6A5", "#6E3500"
 DUE_LATER_FILL, DUE_LATER_TEXT = "#D4F0DC", "#18562E"
+#: Worktree: a row to chase is the one true alarm on that tab, so it is the
+#: only whole-row colour there — the soft red of "Action required", which is
+#: already what an obligation looks like on Inbox.
+CHASE_FILL, CHASE_TEXT = CATEGORY_STYLE[CATEGORY_LABELS["action_required"]]
+WAITING_ON_US_FILL, WAITING_ON_US_TEXT = IN_PROGRESS_FILL, IN_PROGRESS_TEXT
+WAITING_ON_THEM_FILL, WAITING_ON_THEM_TEXT = DUE_LATER_FILL, DUE_LATER_TEXT
 
 HEADER_ROW_PIXELS = 34
-#: Width in pixels by column name, both tabs. Message ID is hidden: no width.
+#: Width in pixels by column name, every tab. Message ID is hidden: no width.
 COLUMN_WIDTHS: dict[str, int] = {
     "Date": 130, "Received": 130, "From": 200, "Subject": 260, "Category": 140,
     "Summary": 380, "Action": 300, "Deadline": 110, "Link": 90, "Status": 110,
     "Notes": 220, "Due": 100,
+    # Worktree
+    "Process": 300, "Type": 140, "Next action": 300, "Waiting since": 120,
+    "Mails": 70, "Latest": 90,
 }
-WRAPPED = ("Summary", "Action")
-CLIPPED = ("Link",)
+WRAPPED = ("Summary", "Action", "Process", "Next action")
+CLIPPED = ("Link", "Latest")
 
 
 def rgb(hex_colour: str) -> dict:
@@ -205,6 +221,35 @@ def upcoming_rules(sheet_id: int) -> list[tuple[dict, str, dict]]:
     ]
 
 
+def worktree_rules(sheet_id: int) -> list[tuple[dict, str, dict]]:
+    """Both alarms red across the whole row — ``Chasing`` and
+    ``Overdue reply`` are the same urgency pointed in opposite directions —
+    then waiting-on-us amber, waiting-on-them green, and the Due cell exactly
+    as Inbox colours a deadline. The alarm rule is first and covers the whole
+    row, so it wins over the Status colour beneath it: the same precedence
+    Inbox gives a Done row."""
+    status = f"${column_letter(WORKTREE_HEADERS.index('Status') + 1)}2"
+    due = f"${column_letter(WORKTREE_HEADERS.index('Due') + 1)}2"
+    today = 'TEXT(TODAY(), "yyyy-mm-dd")'
+    in_two_days = 'TEXT(TODAY()+2, "yyyy-mm-dd")'
+    status_cell = _rows_from_2(sheet_id, WORKTREE_HEADERS.index("Status") + 1)
+    due_cell = _rows_from_2(sheet_id, WORKTREE_HEADERS.index("Due") + 1)
+    return [
+        (_rows_from_2(sheet_id, width=len(WORKTREE_HEADERS)),
+         f'OR({status}="{STATUS_CHASING}", {status}="{STATUS_OVERDUE_REPLY}")',
+         _cell_format(CHASE_FILL, CHASE_TEXT, bold=True)),
+        (status_cell, f'{status}="{STATUS_WAITING_ON_US}"',
+         _cell_format(WAITING_ON_US_FILL, WAITING_ON_US_TEXT, bold=True)),
+        (dict(status_cell), f'{status}="{STATUS_WAITING_ON_THEM}"',
+         _cell_format(WAITING_ON_THEM_FILL, WAITING_ON_THEM_TEXT)),
+        # Due cells are ISO text, so text comparison is date comparison.
+        (due_cell, f'{due}<>"", {due}<{today}',
+         _cell_format(None, DEADLINE_OVERDUE_TEXT, bold=True)),
+        (dict(due_cell), f'{due}<>"", {due}>={today}, {due}<={in_two_days}',
+         _cell_format(None, DEADLINE_SOON_TEXT, bold=True)),
+    ]
+
+
 def _header_requests(sheet_id: int, width: int) -> list[dict]:
     return [
         {
@@ -279,14 +324,24 @@ def _sheet(meta: dict, sheet_id: int) -> dict:
     return {}
 
 
-def format_requests(meta: dict, *, inbox_sheet_id: int, upcoming_sheet_id: int) -> list[dict]:
+def format_requests(
+    meta: dict, *, inbox_sheet_id: int, upcoming_sheet_id: int,
+    worktree_sheet_id: int | None = None,
+) -> list[dict]:
     """The whole look as one ordered request list, built against ``meta``
     (a :data:`FORMAT_READ_FIELDS` read): the agent's own previous rules,
     banding and marker are removed first, then everything is added, and the
-    marker is last."""
+    marker is last.
+
+    ``worktree_sheet_id`` is ``None`` when the sheet has a Worktree tab the
+    agent did not create — hers. Nothing here then touches it: no header
+    fill, no widths, no rules."""
     requests: list[dict] = []
     her_rule_counts: dict[int, int] = {}
-    for sheet_id in (inbox_sheet_id, upcoming_sheet_id):
+    styled = [inbox_sheet_id, upcoming_sheet_id]
+    if worktree_sheet_id is not None:
+        styled.append(worktree_sheet_id)
+    for sheet_id in styled:
         rules = _sheet(meta, sheet_id).get("conditionalFormats") or []
         ours = [i for i, rule in enumerate(rules) if is_agent_rule(rule)]
         her_rule_counts[sheet_id] = len(rules) - len(ours)
@@ -312,6 +367,9 @@ def format_requests(meta: dict, *, inbox_sheet_id: int, upcoming_sheet_id: int) 
     requests += _header_requests(upcoming_sheet_id, len(UPCOMING_HEADERS))
     requests += _body_requests(inbox_sheet_id, HEADERS)
     requests += _body_requests(upcoming_sheet_id, UPCOMING_HEADERS)
+    if worktree_sheet_id is not None:
+        requests += _header_requests(worktree_sheet_id, len(WORKTREE_HEADERS))
+        requests += _body_requests(worktree_sheet_id, WORKTREE_HEADERS)
     if not her_banding:
         requests.append({
             "addBanding": {"bandedRange": {
@@ -321,8 +379,11 @@ def format_requests(meta: dict, *, inbox_sheet_id: int, upcoming_sheet_id: int) 
             }}
         })
     # After hers: her own rules keep precedence over the agent's.
-    for sheet_id, rules in ((inbox_sheet_id, inbox_rules(inbox_sheet_id)),
-                            (upcoming_sheet_id, upcoming_rules(upcoming_sheet_id))):
+    by_tab = [(inbox_sheet_id, inbox_rules(inbox_sheet_id)),
+              (upcoming_sheet_id, upcoming_rules(upcoming_sheet_id))]
+    if worktree_sheet_id is not None:
+        by_tab.append((worktree_sheet_id, worktree_rules(worktree_sheet_id)))
+    for sheet_id, rules in by_tab:
         start = her_rule_counts[sheet_id]
         requests += [_rule(rng, cond, fmt, start + i) for i, (rng, cond, fmt) in enumerate(rules)]
 

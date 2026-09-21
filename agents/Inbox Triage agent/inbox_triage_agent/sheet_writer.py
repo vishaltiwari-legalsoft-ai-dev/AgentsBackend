@@ -2,11 +2,18 @@
 scope). She shares her sheet with the service account as an editor; the hub
 never holds her Google identity for Sheets.
 
-What this module never does: sort, delete, or write outside the agent's
-columns A:I (the header row is the one exception, written once and repaired
-only in A:I). Her Status and Notes columns and her row order are hers. Rows
-are found again through the hidden Message ID column — the reconciliation
-key — never by remembered row numbers, because she reorders freely.
+What this module never does on the Inbox tab: sort, delete, or write outside
+the agent's columns A:I (the header row is the one exception, written once and
+repaired only in A:I). Her Status and Notes columns and her row order are
+hers — :func:`read_inbox` reads them, nothing writes them. Rows are found
+again through the hidden Message ID column — the reconciliation key — never by
+remembered row numbers, because she reorders freely.
+
+Upcoming and Worktree are different in kind: they are the agent's own views,
+with no cell of hers in them, so their headers are rewritten whole and
+Worktree's body is replaced on every build. A tab named Worktree that the
+agent did not create is hers, is detected by the absence of its marker, and
+is never written to at all.
 
 One structural write exists: a sheet still in the first release's layout
 (no Action column) gets the column INSERTED in place, with its header, in
@@ -40,8 +47,10 @@ from . import offline, refuse_if_offline, sheet_style
 from .sheet_layout import (
     AGENT_COLUMNS, AGENT_RANGE, CATEGORY_LABELS, COL_ACTION, COL_CATEGORY, COL_MESSAGE_ID,
     COL_STATUS, HEADER_CURRENT, HEADER_EMPTY, HEADER_LEGACY, HEADERS, INBOX_HEADER_RANGE,
-    INBOX_TAB, LAST_AGENT_COL, LAST_COL, MESSAGE_ID_RANGE, MIGRATION_INSERTS, STATUS_OPTIONS,
-    UPCOMING_FORMULA, UPCOMING_HEADERS, UPCOMING_TAB, column_letter, header_state, same_formula,
+    INBOX_ROWS_RANGE, INBOX_TAB, LAST_AGENT_COL, LAST_COL, MESSAGE_ID_RANGE, MIGRATION_INSERTS,
+    STATUS_OPTIONS, UPCOMING_FORMULA, UPCOMING_HEADERS, UPCOMING_TAB, WORKTREE_HEADER_RANGE,
+    WORKTREE_HEADERS, WORKTREE_MARKER_KEY, WORKTREE_ROWS_RANGE, WORKTREE_TAB, column_letter,
+    header_state, same_formula,
 )
 from .triage import NEEDS_REVIEW
 
@@ -101,6 +110,23 @@ FORMAT_APPLIED = "applied"
 FORMAT_ALREADY = "already"
 FORMAT_FAILED = "failed"
 
+#: The Worktree tab is the agent's: it created it and may rewrite it.
+WORKTREE_OURS = "ours"
+#: The sheet already had a tab called Worktree that the agent did not create.
+#: It is hers. Nothing is ever written to it, nothing is styled on it, and the
+#: connection document records this so the panel can say why the tab is empty.
+WORKTREE_CLAIMED = "claimed"
+
+
+@dataclass(frozen=True)
+class Setup:
+    """What one set-up pass did beyond proving the sheet is writable."""
+
+    formatting: str
+    worktree: str
+    #: The Worktree tab's sheet id when it is the agent's; ``None`` when hers.
+    worktree_sheet_id: int | None = None
+
 
 @dataclass(frozen=True)
 class SheetCheck:
@@ -109,6 +135,8 @@ class SheetCheck:
     #: One of the FORMAT_* values when set-up ran; "" otherwise. Not part of
     #: equality: it is a report on the pass, not on the sheet's standing.
     formatting: str = field(default="", compare=False)
+    #: ``ours`` / ``claimed`` when set-up ran; "" otherwise. Same reason.
+    worktree: str = field(default="", compare=False)
 
 
 def service():
@@ -216,12 +244,12 @@ def check(spreadsheet_id: str, *, caller_email: str, svc=None, drive=None) -> Sh
         return SheetCheck(CHECK_NOT_YOURS, "")
     title = str((meta.get("properties") or {}).get("title") or "")
     try:
-        formatting = setup(spreadsheet_id, svc=svc, meta=meta)
+        done = setup(spreadsheet_id, svc=svc, meta=meta)
     except SheetsRefused as exc:
         if exc.status == 403:
             return SheetCheck(CHECK_NOT_EDITABLE, "")
         raise
-    return SheetCheck(CHECK_OK, title, formatting)
+    return SheetCheck(CHECK_OK, title, done.formatting, done.worktree)
 
 
 def caller_may_edit(spreadsheet_id: str, caller_email: str, *, drive=None) -> bool:
@@ -284,8 +312,45 @@ def _metadata(spreadsheet_id: str, svc) -> dict:
     )
 
 
-def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> str:
-    """Idempotent: the two tabs exist, row 1 carries the headers, row 1 is
+def worktree_standing(meta: dict, tabs: dict[str, int]) -> tuple[str, int | None]:
+    """``(WORKTREE_* state, sheet id)`` for the Worktree tab, decided before
+    anything is created.
+
+    No tab yet → it will be the agent's. A tab whose id the agent's marker
+    names → still the agent's. A tab called Worktree that no marker names →
+    HERS: she made it, or renamed something onto that name, and the agent
+    neither writes nor styles it. The marker carries the sheet id rather than
+    a bare "yes" for exactly that reason."""
+    sheet_id = tabs.get(WORKTREE_TAB)
+    if sheet_id is None:
+        return WORKTREE_OURS, None
+    for entry in (meta or {}).get("developerMetadata") or []:
+        if entry.get("metadataKey") == WORKTREE_MARKER_KEY:
+            if str(entry.get("metadataValue") or "") == str(sheet_id):
+                return WORKTREE_OURS, int(sheet_id)
+    return WORKTREE_CLAIMED, None
+
+
+def _worktree_marker_requests(meta: dict, sheet_id: int) -> list[dict]:
+    """Claim a freshly created Worktree tab: drop any stale marker (she
+    renamed or deleted the old tab), then record this one's id."""
+    requests: list[dict] = [
+        {"deleteDeveloperMetadata": {"dataFilter": {
+            "developerMetadataLookup": {"metadataId": entry["metadataId"]}}}}
+        for entry in (meta or {}).get("developerMetadata") or []
+        if entry.get("metadataKey") == WORKTREE_MARKER_KEY and entry.get("metadataId") is not None
+    ]
+    requests.append({"createDeveloperMetadata": {"developerMetadata": {
+        "metadataKey": WORKTREE_MARKER_KEY,
+        "metadataValue": str(sheet_id),
+        "location": {"spreadsheet": True},
+        "visibility": "DOCUMENT",
+    }}})
+    return requests
+
+
+def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> Setup:
+    """Idempotent: the three tabs exist, row 1 carries the headers, row 1 is
     frozen, the Message ID column is hidden, Status has its dropdown, and
     Upcoming!A2 holds the current formula view — rewritten whenever what is
     stored differs, so a drifted view repairs itself on the next check. A
@@ -293,10 +358,15 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> str:
     changes nothing that is already right; the layout write always happens
     and is what proves the hub can edit the sheet.
 
-    Last, the look (:mod:`sheet_style`) — once: on a new or just-migrated
-    sheet, or one the marker says was never formatted (the sheets set up
-    before the look existed). Returns a ``FORMAT_*`` value; a refused
-    formatting pass never raises.
+    The third tab is Worktree, added to an existing sheet without touching
+    Inbox or Upcoming — unless the sheet already had a tab of that name that
+    the agent did not create, which is hers (:func:`worktree_standing`): it is
+    left exactly as it is, the state comes back as
+    :data:`WORKTREE_CLAIMED`, and the connection document records it.
+
+    Last, the look (:mod:`sheet_style`) — once: on a new, just-migrated or
+    just-given-a-Worktree sheet, or one the marker says was never formatted at
+    this version. A refused formatting pass never raises.
 
     Raises :class:`SheetsRefused` with the status so :func:`check` can map
     a 403 to ``not_editable``. Only :func:`check` calls this, after the
@@ -308,7 +378,11 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> str:
         for s in meta.get("sheets") or []
         if s.get("properties")
     }
-    missing = [tab for tab in (INBOX_TAB, UPCOMING_TAB) if tab not in tabs]
+    worktree_state, worktree_sheet_id = worktree_standing(meta, tabs)
+    wanted = [INBOX_TAB, UPCOMING_TAB]
+    if worktree_state == WORKTREE_OURS:
+        wanted.append(WORKTREE_TAB)
+    missing = [tab for tab in wanted if tab not in tabs]
     if missing:
         created = _run(
             svc.spreadsheets().batchUpdate(
@@ -323,12 +397,23 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> str:
                 tabs[str(props["title"])] = int(props.get("sheetId") or 0)
 
     inbox_sheet_id = tabs[INBOX_TAB]
+    worktree_created = worktree_state == WORKTREE_OURS and WORKTREE_TAB in missing
+    if worktree_state == WORKTREE_OURS:
+        worktree_sheet_id = tabs[WORKTREE_TAB]
+    if worktree_state == WORKTREE_CLAIMED:
+        logger.warning(
+            "a12: this sheet already has a Worktree tab the agent did not create; "
+            "it is left untouched and no worktree is written"
+        )
     # Read first: the layout indexes below are for the CURRENT columns, so a
     # legacy sheet must be migrated in the same batch, ahead of them.
     read = _run(
         svc.spreadsheets().values().batchGet(
             spreadsheetId=spreadsheet_id,
-            ranges=[INBOX_HEADER_RANGE, f"{UPCOMING_TAB}!A1:Z1", f"{UPCOMING_TAB}!A2"],
+            ranges=[
+                INBOX_HEADER_RANGE, f"{UPCOMING_TAB}!A1:Z1", f"{UPCOMING_TAB}!A2",
+                *([WORKTREE_HEADER_RANGE] if worktree_state == WORKTREE_OURS else []),
+            ],
             valueRenderOption="FORMULA",  # A2 is compared as a formula, not its result
         ),
         what="header read",
@@ -337,6 +422,7 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> str:
     inbox_head = _first_row(ranges[0] if len(ranges) > 0 else {})
     upcoming_head = _first_row(ranges[1] if len(ranges) > 1 else {})
     upcoming_a2 = _first_row(ranges[2] if len(ranges) > 2 else {})
+    worktree_head = _first_row(ranges[3] if len(ranges) > 3 else {})
 
     state = header_state(inbox_head)
     requests: list[dict] = []
@@ -347,6 +433,8 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> str:
             ", ".join(name for _, name in MIGRATION_INSERTS),
         )
     requests += _layout_requests(inbox_sheet_id)
+    if worktree_created:
+        requests += _worktree_marker_requests(meta, int(worktree_sheet_id or 0))
     _run(
         svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}),
         what="layout",
@@ -368,6 +456,15 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> str:
         header_writes.append(
             {"range": f"{UPCOMING_TAB}!A1:{column_letter(width)}1", "values": [row]}
         )
+    if worktree_state == WORKTREE_OURS and [c.strip() for c in worktree_head] != list(
+        WORKTREE_HEADERS
+    ):
+        # Worktree, like Upcoming, is the agent's view: header rewritten whole.
+        width = max(len(worktree_head), len(WORKTREE_HEADERS))
+        row = list(WORKTREE_HEADERS) + [""] * (width - len(WORKTREE_HEADERS))
+        header_writes.append(
+            {"range": f"{WORKTREE_TAB}!A1:{column_letter(width)}1", "values": [row]}
+        )
     if header_writes:
         _run(
             svc.spreadsheets().values().batchUpdate(
@@ -388,17 +485,23 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> str:
             ),
             what="formula write",
         )
-    return _format_once(
+    formatting = _format_once(
         spreadsheet_id, svc, meta, inbox_sheet_id=inbox_sheet_id,
-        upcoming_sheet_id=tabs[UPCOMING_TAB], migrated=state == HEADER_LEGACY,
+        upcoming_sheet_id=tabs[UPCOMING_TAB], worktree_sheet_id=worktree_sheet_id,
+        restyle=state == HEADER_LEGACY or worktree_created,
+    )
+    return Setup(
+        formatting=formatting, worktree=worktree_state, worktree_sheet_id=worktree_sheet_id
     )
 
 
 def _format_once(
     spreadsheet_id: str, svc, meta: dict, *, inbox_sheet_id: int, upcoming_sheet_id: int,
-    migrated: bool,
+    worktree_sheet_id: int | None, restyle: bool,
 ) -> str:
-    """Apply the look unless the marker says it is already there.
+    """Apply the look unless the marker says it is already there at this
+    version. ``restyle`` forces a pass on a sheet that just gained a column
+    or a tab, whatever the marker says.
 
     Its own batch, after the layout batch and the header/formula writes, for
     two reasons: the layout batch carries the migration and is the proof of
@@ -409,7 +512,7 @@ def _format_once(
     marker — the next hourly check tries again. A refusal is logged (with
     no sheet id: ``_run``'s messages never carry one) and returned as
     :data:`FORMAT_FAILED`; rows are still written."""
-    if sheet_style.is_formatted(meta) and not migrated:
+    if sheet_style.is_formatted(meta) and not restyle:
         return FORMAT_ALREADY
     try:
         live = _run(
@@ -419,7 +522,8 @@ def _format_once(
             what="format read",
         )
         requests = sheet_style.format_requests(
-            live, inbox_sheet_id=inbox_sheet_id, upcoming_sheet_id=upcoming_sheet_id
+            live, inbox_sheet_id=inbox_sheet_id, upcoming_sheet_id=upcoming_sheet_id,
+            worktree_sheet_id=worktree_sheet_id,
         )
         _run(
             svc.spreadsheets().batchUpdate(
@@ -526,22 +630,19 @@ def id_rows(spreadsheet_id: str, *, svc=None) -> dict[str, int]:
 
     Row 1 must be the current agent header: every append and update is
     positional, and a legacy or edited header means the id column is not
-    where :data:`MESSAGE_ID_RANGE` looks. That is :class:`LayoutMismatch`,
-    raised before anything is written — never an empty map that would
-    re-append every message."""
+    where the layout looks. That is :class:`LayoutMismatch`, raised before
+    anything is written — never an empty map that would re-append every
+    message."""
     svc = svc or service()
     data = _run(
         svc.spreadsheets().values().batchGet(
-            spreadsheetId=spreadsheet_id, ranges=[INBOX_HEADER_RANGE, MESSAGE_ID_RANGE],
+            spreadsheetId=spreadsheet_id,
+            ranges=[INBOX_HEADER_RANGE, MESSAGE_ID_RANGE],
         ),
         what="id column read",
     )
     ranges = data.get("valueRanges") or []
-    head = _first_row(ranges[0] if ranges else {})
-    if header_state(head) != HEADER_CURRENT:
-        raise LayoutMismatch(
-            "The Inbox tab's header row does not match the agent's columns; nothing was written."
-        )
+    _require_current_header(_first_row(ranges[0] if ranges else {}))
     out: dict[str, int] = {}
     ids = (ranges[1] if len(ranges) > 1 else {}).get("values") or []
     for row_number, row in enumerate(ids, start=1):
@@ -551,6 +652,71 @@ def id_rows(spreadsheet_id: str, *, svc=None) -> dict[str, int]:
         if value and value not in out:
             out[value] = row_number
     return out
+
+
+def _require_current_header(head: list[str]) -> None:
+    if header_state(head) != HEADER_CURRENT:
+        raise LayoutMismatch(
+            "The Inbox tab's header row does not match the agent's columns; nothing was written."
+        )
+
+
+def read_inbox(spreadsheet_id: str, *, svc=None) -> list[list[str]]:
+    """Every Inbox row from 2 down, as raw cells, HER columns included.
+
+    The one read in this module that looks at Status and Notes, and it is
+    read-only: the Worktree needs to know what she has already marked Done or
+    Ignore, and no rule can know that from the agent's own columns. Row 1 is
+    dropped, and rows come back ragged exactly as Sheets returns them —
+    :func:`worktree.from_row` reads by column index and treats a short row as
+    blank cells.
+
+    Called only by the Worktree pass, and only when that pass has decided a
+    rebuild is warranted; the append path still reads the narrow id column."""
+    svc = svc or service()
+    data = _run(
+        svc.spreadsheets().values().batchGet(
+            spreadsheetId=spreadsheet_id, ranges=[INBOX_HEADER_RANGE, INBOX_ROWS_RANGE],
+        ),
+        what="inbox read",
+    )
+    ranges = data.get("valueRanges") or []
+    _require_current_header(_first_row(ranges[0] if ranges else {}))
+    rows = (ranges[1] if len(ranges) > 1 else {}).get("values") or []
+    return [[str(cell) for cell in row] for row in rows[1:]]
+
+
+def write_worktree(
+    spreadsheet_id: str, rows: list[list[str]], *, previous_rows: int = 0, svc=None
+) -> int:
+    """Rewrite the Worktree tab's body in ONE ``values.update``.
+
+    The tab is derived data with no cell of hers in it, so it is replaced
+    rather than reconciled. Rows left over from a longer previous build are
+    blanked in the same rectangle — ``previous_rows`` is what the connection
+    document remembers writing — so no stale process is left below the new
+    list and no second ``values.clear`` call is needed. Nothing outside
+    ``Worktree!A2:H`` is ever touched, and the values are RAW because a
+    Process title is a subject line.
+
+    Returns the number of real rows written."""
+    width = len(WORKTREE_HEADERS)
+    height = max(len(rows), int(previous_rows or 0))
+    if height <= 0:
+        return 0
+    padded = [list(row) + [""] * (width - len(row)) for row in rows]
+    padded += [[""] * width for _ in range(height - len(rows))]
+    svc = svc or service()
+    _run(
+        svc.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=WORKTREE_ROWS_RANGE.format(last=height + 1),
+            valueInputOption="RAW",
+            body={"values": padded},
+        ),
+        what="worktree write",
+    )
+    return len(rows)
 
 
 _UNREAD_LABELS = frozenset({NEEDS_REVIEW, CATEGORY_LABELS[NEEDS_REVIEW]})

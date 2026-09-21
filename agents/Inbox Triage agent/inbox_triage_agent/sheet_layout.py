@@ -83,6 +83,9 @@ LAST_AGENT_COL = column_letter(len(AGENT_COLUMNS))  # I
 AGENT_RANGE = f"A{{row}}:{LAST_AGENT_COL}{{row}}"
 #: The Message ID column, whole, for the id → row map.
 MESSAGE_ID_RANGE = f"{INBOX_TAB}!{column_letter(COL_MESSAGE_ID)}:{column_letter(COL_MESSAGE_ID)}"
+#: Every column of Inbox, whole — the agent's cells AND hers. Read only by
+#: the Worktree pass, which needs her Status to know what is already done.
+INBOX_ROWS_RANGE = f"{INBOX_TAB}!A:{LAST_COL}"
 #: Row 1 of Inbox, wide enough to see a legacy or current header and hers.
 INBOX_HEADER_RANGE = f"{INBOX_TAB}!A1:Z1"
 
@@ -104,6 +107,27 @@ UPCOMING_COLUMNS: tuple[tuple[str, int], ...] = (
 DUE_UPCOMING = "Upcoming"
 DUE_OVERDUE = "Overdue"
 UPCOMING_HEADERS: tuple[str, ...] = ("Due",) + tuple(name for name, _ in UPCOMING_COLUMNS)
+
+
+WORKTREE_TAB = "Worktree"
+#: The Worktree tab's columns, in sheet order (A..H). Read left to right they
+#: answer: what is this, what kind, whose move, what do I do, how long has it
+#: been sitting, by when, how much mail, and where is the last one. All eight
+#: are the agent's: the tab is a view it rewrites, so there is deliberately no
+#: column of hers here — a note would be attached to a row whose position
+#: changes with the next build. Notes belong on the Inbox row, which the agent
+#: never reorders and never rewrites.
+WORKTREE_HEADERS: tuple[str, ...] = (
+    "Process", "Type", "Status", "Next action", "Waiting since", "Due", "Mails", "Latest",
+)
+WORKTREE_LAST_COL = column_letter(len(WORKTREE_HEADERS))  # H
+#: Written from row 2 down, always the full rectangle — see
+#: ``sheet_writer.write_worktree``.
+WORKTREE_ROWS_RANGE = f"{WORKTREE_TAB}!A2:{WORKTREE_LAST_COL}{{last}}"
+WORKTREE_HEADER_RANGE = f"{WORKTREE_TAB}!A1:Z1"
+#: Records that the agent created the Worktree tab, and which tab that was.
+#: A tab named Worktree with no marker is hers and is never written to.
+WORKTREE_MARKER_KEY = "agentos.a12.worktree"
 
 
 def _whole(col: int) -> str:
@@ -188,6 +212,9 @@ CATEGORY_LABELS: dict[str, str] = {
     "other": "Other",
     NEEDS_REVIEW: "Needs review",
 }
+#: Label → key, for reading a Category cell back. Built from the same map, so
+#: the two can never drift; an unrecognised label is the caller's to handle.
+CATEGORY_KEYS: dict[str, str] = {label: key for key, label in CATEGORY_LABELS.items()}
 #: Stamped by code in the Action column when the model said the email asks
 #: nothing of the reader — never model text.
 NO_ACTION = "No action — FYI"
@@ -197,7 +224,11 @@ NO_ACTION = "No action — FYI"
 class RowFacts:
     """What one message contributes to its row. ``category`` is one of the
     contract's categories or ``needs_review``; ``summary`` and ``action`` are
-    empty then. ``action`` is ``None`` when the email asks nothing."""
+    empty then. ``action`` is ``None`` when the email asks nothing.
+
+    ``thread_id`` is Gmail's, and is the only field here that no column
+    carries: the Inbox layout is unchanged by the Worktree, so the thread id
+    lives on the message's tracking document instead."""
 
     message_id: str
     received_at: datetime
@@ -207,6 +238,7 @@ class RowFacts:
     summary: str
     deadline: date | None
     action: str | None = None
+    thread_id: str = ""
 
 
 def message_link(message_id: str) -> str:
