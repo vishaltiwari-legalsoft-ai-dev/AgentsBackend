@@ -14,6 +14,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from app.main import app as fastapi_app
+from app.route_inventory import iter_api_routes
 from app.security import get_current_user
 from app.services import cron_registry
 from app.services.agent_config import AGENT_LABELS
@@ -172,8 +173,8 @@ def test_every_registry_endpoint_is_a_real_route():
     lying about the system — the exact failure this panel exists to catch.
     ``endpoint`` carries the method too, so both halves are checked."""
     served = {
-        (method, route.path)
-        for route in fastapi_app.routes if isinstance(route, APIRoute)
+        (method, path)
+        for path, route in iter_api_routes(fastapi_app)
         for method in route.methods - {"HEAD", "OPTIONS"}
     }
     for entry in cron_registry.CRON_REGISTRY:

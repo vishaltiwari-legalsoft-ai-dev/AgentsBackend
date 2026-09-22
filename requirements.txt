@@ -1,4 +1,12 @@
-fastapi>=0.115
+# Pinned, not floored: Cloud Run builds pip-install at deploy time, so an open
+# range ships whatever FastAPI released that morning. One such release changed
+# how include_router mounts routes and silently broke the GEO scope wall's
+# route matching (app/scopes.py) — every GEO-only contractor 403'd out of their
+# own workspace in prod. The code now tolerates both routing shapes, but the
+# framework stays pinned so a behavior change is a diff someone reviews, never
+# a deploy-day surprise. Bump deliberately, with `pytest` green on the new pin.
+fastapi==0.141.1
+starlette==1.6.0
 uvicorn[standard]>=0.30
 pydantic>=2.7
 pydantic[email]>=2.7

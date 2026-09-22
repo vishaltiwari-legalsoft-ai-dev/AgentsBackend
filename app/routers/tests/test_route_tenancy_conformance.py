@@ -61,6 +61,7 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app as fastapi_app
+from app.route_inventory import iter_api_routes, iter_api_routes_with_mount_deps
 from app.routers.tests.conftest import client
 from app.scopes import (
     GEO_SCOPE_ROUTES, SCOPE_REFUSED, UNREACHABLE_BY_THE_WALL, deny_outside_geo,
@@ -341,11 +342,12 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     # below now counts them.
     ("POST", "/api/blog/brands/{brand_id}/inventory"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("POST", "/api/blog/brands/{brand_id}/voice"): (WORKSPACE_SHARED, INTERNAL_ONLY),
-    # Agents health: the hub's per-agent rollup deliberately aggregates the
-    # WHOLE workspace's run trail — every caller's runs and who ran each agent
-    # — the same cross-user rows the admin Database panel browses raw and
-    # ``/api/issues`` composes for the same single-team workspace.
-    ("GET", "/api/agents/health"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    # ``GET /api/agents/health`` was entered here on 2026-09-02 for the hub's
+    # per-agent rollup — but the endpoint itself never landed in any router
+    # (the frontend's ``agentsHealth`` client is equally unconsumed). The entry
+    # sat undetected because route discovery had gone vacuous under a newer
+    # FastAPI (see ``app/route_inventory.py``); removed when the sweep saw the
+    # service again. If the rollup ships, classify it here in the same commit.
     # Canva: one module-level ``_active_token`` in ``routers/canva.py`` holds
     # the most recent OAuth grant, so every caller imports into whichever
     # account authorised last. The file says so itself.
@@ -563,7 +565,12 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
 #: merely deploying changes nothing, and a typo in the switch fails closed.
 #: Enabling it is one deliberate env change. Rollback is unsetting it (or ``0``)
 #: — no redeploy of code, no data moved.
-WORKSPACE_SHARED_BASELINE = 70
+#:
+#: 70 → 69 on 2026-09-22: the ``GET /api/agents/health`` entry removed — it was
+#: ledgered on 2026-09-02 but the route never actually mounted (see the note at
+#: its old place in the ledger), so the count described a service one route
+#: larger than the one running.
+WORKSPACE_SHARED_BASELINE = 69
 
 #: The GEO editor surface, BY NAME. Not a count — a count would let a future
 #: route join the role while another left it and say nothing, and the thing
@@ -603,11 +610,9 @@ def _live_routes() -> set[tuple[str, str]]:
     no handler of their own, so classifying them would be noise.
     """
     out: set[tuple[str, str]] = set()
-    for route in fastapi_app.routes:
-        if not isinstance(route, APIRoute):
-            continue
+    for path, route in iter_api_routes(fastapi_app):
         for method in route.methods - {"HEAD", "OPTIONS"}:
-            out.add((method, route.path))
+            out.add((method, path))
     return out
 
 
@@ -733,12 +738,10 @@ def test_classifications_match_the_real_dependency_graph() -> None:
     label kept saying CREATOR_ONLY.
     """
     wrong: list[str] = []
-    for route in fastapi_app.routes:
-        if not isinstance(route, APIRoute):
-            continue
+    for path, route in iter_api_routes(fastapi_app):
         guards = _guards_of(route)
         for method in route.methods - {"HEAD", "OPTIONS"}:
-            entry = ROUTE_LEDGER.get((method, route.path))
+            entry = ROUTE_LEDGER.get((method, path))
             if entry is None:
                 continue  # reported by test_every_route_is_classified
             label = entry[0]
@@ -747,16 +750,16 @@ def test_classifications_match_the_real_dependency_graph() -> None:
             else:
                 expected_empty = False
             if expected_empty and guards:
-                wrong.append(f"{method} {route.path}: {label} but has guards {sorted(guards)}")
+                wrong.append(f"{method} {path}: {label} but has guards {sorted(guards)}")
             elif not expected_empty and not guards:
-                wrong.append(f"{method} {route.path}: {label} but has NO auth dependency")
+                wrong.append(f"{method} {path}: {label} but has NO auth dependency")
             elif label == ADMIN_ONLY and "admin" not in guards:
-                wrong.append(f"{method} {route.path}: ADMIN_ONLY but no require_admin")
+                wrong.append(f"{method} {path}: ADMIN_ONLY but no require_admin")
             elif label == CREATOR_ONLY and "creator" not in guards:
-                wrong.append(f"{method} {route.path}: CREATOR_ONLY but no require_creator")
+                wrong.append(f"{method} {path}: CREATOR_ONLY but no require_creator")
             elif label == GEO_EDITOR_ONLY and "geo_editor" not in guards:
                 wrong.append(
-                    f"{method} {route.path}: GEO_EDITOR_ONLY but no require_geo_editor"
+                    f"{method} {path}: GEO_EDITOR_ONLY but no require_geo_editor"
                 )
             # The reverse, and the one that actually bites: a route wearing the
             # narrow guard while the ledger still calls it something broader is
@@ -764,7 +767,7 @@ def test_classifications_match_the_real_dependency_graph() -> None:
             # any GEO editor. Caught in both directions or not at all.
             elif label != GEO_EDITOR_ONLY and "geo_editor" in guards:
                 wrong.append(
-                    f"{method} {route.path}: {label} but sits behind "
+                    f"{method} {path}: {label} but sits behind "
                     "require_geo_editor — classify it GEO_EDITOR_ONLY"
                 )
     assert not wrong, "Ledger disagrees with the dependency graph:\n  " + "\n  ".join(wrong)
@@ -815,9 +818,9 @@ def test_the_geo_editor_surface_is_exactly_the_pinned_set() -> None:
     )
 
     live = {
-        (method, route.path)
-        for route in fastapi_app.routes
-        if isinstance(route, APIRoute) and "geo_editor" in _guards_of(route)
+        (method, path)
+        for path, route in iter_api_routes(fastapi_app)
+        if "geo_editor" in _guards_of(route)
         for method in route.methods - {"HEAD", "OPTIONS"}
     }
     assert live == set(GEO_EDITOR_ROUTES), (
@@ -993,10 +996,11 @@ def test_every_route_sits_behind_the_scope_wall() -> None:
     the next one will not be a static banner.
     """
     unwalled: set[tuple[str, str]] = set()
-    for route in fastapi_app.routes:
-        if not isinstance(route, APIRoute):
-            continue
-        calls: set = set()
+    for path, route, mount_deps in iter_api_routes_with_mount_deps(fastapi_app):
+        # Where the include-time dependency lives is a FastAPI version detail:
+        # flattened includes merged it into ``route.dependant``, wrapped ones
+        # keep it on the include context (``mount_deps``). Either counts.
+        calls: set = set(mount_deps)
 
         def walk(dep, sink=calls) -> None:
             if dep is None:
@@ -1009,7 +1013,7 @@ def test_every_route_sits_behind_the_scope_wall() -> None:
         if deny_outside_geo in calls:
             continue
         for method in route.methods - {"HEAD", "OPTIONS"}:
-            unwalled.add((method, route.path))
+            unwalled.add((method, path))
 
     assert unwalled == set(UNREACHABLE_BY_THE_WALL), (
         "These routes do not resolve through deny_outside_geo, so a GEO-only "

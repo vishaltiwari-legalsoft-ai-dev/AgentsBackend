@@ -48,6 +48,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from app.main import app as fastapi_app
+from app.route_inventory import iter_api_routes
 from app.security import get_current_user
 from app.services import agent_config, firestore_repo, run_tracking
 from app.services.run_tracking import CHANGE, JOB, OUTPUT, ActivityTrail, silent
@@ -232,34 +233,33 @@ def silence_reason(route: APIRoute) -> str:
     return str(getattr(route.endpoint, "__activity_silence__", "") or "")
 
 
-def _label(route: APIRoute) -> str:
+def _label(path: str, route: APIRoute) -> str:
     method = sorted(route.methods - {"HEAD", "OPTIONS"})[0]
-    return f"{method} {route.path} ({route.endpoint.__name__})"
+    return f"{method} {path} ({route.endpoint.__name__})"
 
 
-def undeclared_mutations(routes) -> list[str]:
+def undeclared_mutations(pairs) -> list[str]:
     """Every mutating route that neither records nor says why it does not.
 
-    The checker, factored out so it can be pointed at something other than the
-    real app — see the blind-spot test below, which is the whole reason this is
-    a function and not four lines inlined into one assertion.
+    Takes ``(path, APIRoute)`` pairs (``iter_api_routes``), so it can be
+    pointed at something other than the real app — see the blind-spot test
+    below, which is the whole reason this is a function and not four lines
+    inlined into one assertion.
     """
     offenders = []
-    for route in routes:
-        if not isinstance(route, APIRoute):
-            continue
+    for path, route in pairs:
         methods = route.methods - {"HEAD", "OPTIONS"}
         if methods <= {"GET"}:
             continue  # reads are silent by the rule itself, not by declaration
         if trail_marker(route) is None and not silence_reason(route):
-            offenders.append(_label(route))
+            offenders.append(_label(path, route))
     return sorted(offenders)
 
 
-def agent_routes() -> list[APIRoute]:
+def agent_routes() -> list[tuple[str, APIRoute]]:
     return [
-        route for route in fastapi_app.routes
-        if isinstance(route, APIRoute) and route.endpoint.__module__ in AGENT_ROUTERS
+        (path, route) for path, route in iter_api_routes(fastapi_app)
+        if route.endpoint.__module__ in AGENT_ROUTERS
     ]
 
 
@@ -268,7 +268,7 @@ def test_the_sweep_actually_covers_the_service():
     route discovery quietly returned nothing they would all pass on nothing."""
     assert set(AGENT_ROUTERS.values()) >= {"a1", "a2", "a6", "a9", "a10"}, AGENT_ROUTERS
     assert len(agent_routes()) >= 130, len(agent_routes())
-    declared = {_label(r) for r in agent_routes() if trail_marker(r)}
+    declared = {_label(p, r) for p, r in agent_routes() if trail_marker(r)}
     assert len(declared) >= 60, sorted(declared)
     # One from each agent, so a whole router losing its trail is visible here
     # and not only in the aggregate count.
@@ -300,8 +300,8 @@ def test_every_declared_trail_is_bound_to_a_catalogued_agent():
     """A trail bound to an id the catalog does not know writes into an
     ``agent_runs__<id>`` table the admin panel labels "unknown"."""
     wrong = sorted(
-        f"{_label(route)} -> {marker.trail.agent_id}"
-        for route in agent_routes()
+        f"{_label(path, route)} -> {marker.trail.agent_id}"
+        for path, route in agent_routes()
         if (marker := trail_marker(route)) and marker.trail.agent_id not in agent_config.AGENT_LABELS
     )
     assert wrong == [], wrong
@@ -309,8 +309,8 @@ def test_every_declared_trail_is_bound_to_a_catalogued_agent():
 
 def test_every_declared_trail_names_a_known_unit_of_work():
     unknown = sorted(
-        f"{_label(route)} -> {marker.unit}"
-        for route in agent_routes()
+        f"{_label(path, route)} -> {marker.unit}"
+        for path, route in agent_routes()
         if (marker := trail_marker(route)) and marker.unit not in (JOB, OUTPUT, CHANGE)
     )
     assert unknown == [], unknown
@@ -320,7 +320,7 @@ def test_the_silent_endpoints_state_a_reason_a_reader_can_weigh():
     """The counterpart to the law: silence is allowed, unexplained silence is
     not. Kept as an assertion as well as a guard inside ``silent()`` so that
     setting the attribute by hand cannot get round the factory."""
-    silent_routes = {_label(r): silence_reason(r) for r in agent_routes() if silence_reason(r)}
+    silent_routes = {_label(p, r): silence_reason(r) for p, r in agent_routes() if silence_reason(r)}
     assert len(silent_routes) >= 10, silent_routes
     thin = sorted(label for label, reason in silent_routes.items() if len(reason) < 15)
     assert thin == [], thin
@@ -330,7 +330,7 @@ def test_the_gets_that_hand_the_user_a_file_are_recorded():
     """The one class of read the rule does cover. These are click-driven
     downloads, not page renders — if one of them loses its trail, "who exported
     the client's numbers" stops having an answer."""
-    declared = {route.path for route in agent_routes() if trail_marker(route)}
+    declared = {path for path, route in agent_routes() if trail_marker(route)}
     for path in (
         "/api/blog/runs/{run_id}/export",
         "/api/mr/board-report/{run_id}/pdf",
@@ -345,7 +345,7 @@ def test_the_reads_that_render_a_panel_stay_out_of_the_trail():
     """The other half of the rule, and the one that protects the datastore: a
     row per page load would grow ``runs`` faster than the work it describes."""
     recorded_reads = sorted(
-        route.path for route in agent_routes()
+        path for path, route in agent_routes()
         if route.methods - {"HEAD", "OPTIONS"} <= {"GET"} and trail_marker(route)
     )
     assert recorded_reads == [
@@ -386,7 +386,7 @@ def test_a_router_that_only_imports_the_trail_is_caught():
 
     probe = FastAPI()
     probe.include_router(router)
-    assert undeclared_mutations(probe.routes) == ["POST /ghost/thing (ghost_thing)"]
+    assert undeclared_mutations(iter_api_routes(probe)) == ["POST /ghost/thing (ghost_thing)"]
 
 
 def test_the_checker_accepts_a_router_that_actually_wires_the_trail():
@@ -406,7 +406,7 @@ def test_the_checker_accepts_a_router_that_actually_wires_the_trail():
 
     probe = FastAPI()
     probe.include_router(router)
-    assert undeclared_mutations(probe.routes) == []
+    assert undeclared_mutations(iter_api_routes(probe)) == []
 
 
 # --------------------------------------------------------------------------- #

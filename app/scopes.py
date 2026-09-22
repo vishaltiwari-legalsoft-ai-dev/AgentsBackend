@@ -159,11 +159,25 @@ def route_key(request: Request) -> tuple[str, str] | None:
     ``None`` when there is no route on the scope, which should not happen
     inside a route's own dependency. The caller treats it as "unknown", and
     unknown is refused.
+
+    Whether ``route.path`` carries the ``include_router(prefix="/api")`` prefix
+    depends on the FastAPI version: it used to be baked in at include time, and
+    newer releases mount the router wrapped so the matched route keeps its
+    unprefixed template (``/geo/brands``). The table's entries all carry
+    ``/api`` — the path the service actually publishes — so the missing prefix
+    is restored here. Left unnormalised, NOTHING matched the table and the
+    default-deny wall refused a GEO-only account its own workspace. Every
+    router in this service is mounted under ``/api`` (the ``include_router``
+    loop in ``app.main``); the one route outside it, ``GET /``, is app-level
+    and pinned in :data:`UNREACHABLE_BY_THE_WALL`.
     """
     path = getattr(request.scope.get("route"), "path", None)
     if not path:
         return None
-    return (request.method.upper(), str(path))
+    path = str(path)
+    if not path.startswith("/api") and path != "/":
+        path = "/api" + path
+    return (request.method.upper(), path)
 
 
 def deny_outside_geo(

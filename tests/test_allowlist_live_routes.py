@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app as fastapi_app
+from app.route_inventory import iter_api_routes
 from app.routers.auth import is_allowed_email
 from app.security import (
     create_token, get_current_user, require_admin, require_creator,
@@ -117,13 +118,18 @@ def _flat_dependency_calls(dependant) -> set:
     return calls
 
 
-def _authenticated_get_routes() -> list[APIRoute]:
-    """Every parameterless GET that runs ``get_current_user``."""
+def _routes_with_paths() -> list[tuple[str, APIRoute]]:
+    """Every ``APIRoute`` paired with its full mounted path — see
+    ``app.route_inventory`` for why the walk is version-sensitive."""
+    return list(iter_api_routes(fastapi_app))
+
+
+def _authenticated_get_routes() -> list[str]:
+    """The full path of every parameterless GET that runs ``get_current_user``."""
     return [
-        route for route in fastapi_app.routes
-        if isinstance(route, APIRoute)
-        and "GET" in route.methods
-        and "{" not in route.path
+        path for path, route in _routes_with_paths()
+        if "GET" in route.methods
+        and "{" not in path
         and get_current_user in _flat_dependency_calls(route.dependant)
     ]
 
@@ -135,7 +141,7 @@ def _authenticated_get_routes() -> list[APIRoute]:
 def test_the_sweep_actually_covers_the_service(client):
     """Non-vacuity, and the shape of the assertion below: if route discovery
     silently returned [], every allowlist claim here would pass on nothing."""
-    paths = {route.path for route in _authenticated_get_routes()}
+    paths = set(_authenticated_get_routes())
     assert len(paths) >= 20, sorted(paths)
     # One from each agent's router, so a whole router dropping out is visible.
     for expected in ("/api/mr/runs", "/api/geo/config", "/api/seo-geo/overview"):
@@ -148,8 +154,8 @@ def test_no_route_on_the_real_app_honours_a_non_allowlisted_token(client):
     token = create_token("u-stranger", "randomperson@gmail.com")
     headers = {"Authorization": f"Bearer {token}"}
     leaks = [
-        route.path for route in _authenticated_get_routes()
-        if client.get(route.path, headers=headers).status_code != 401
+        path for path in _authenticated_get_routes()
+        if client.get(path, headers=headers).status_code != 401
     ]
     assert leaks == [], f"non-allowlisted token was honoured on: {sorted(leaks)}"
 
@@ -163,8 +169,8 @@ def test_an_allowlisted_token_is_not_refused_by_the_same_sweep(client):
     token = create_token("u-colleague", "colleague@legalsoft.com")
     headers = {"Authorization": f"Bearer {token}"}
     refused = [
-        route.path for route in _authenticated_get_routes()
-        if client.get(route.path, headers=headers).status_code == 401
+        path for path in _authenticated_get_routes()
+        if client.get(path, headers=headers).status_code == 401
     ]
     assert refused == [], f"a valid colleague was locked out of: {sorted(refused)}"
 
@@ -177,8 +183,8 @@ def test_removing_the_domain_locks_an_issued_token_out_of_every_route(client, mo
 
     monkeypatch.setattr(settings, "allowed_email_domains", "")
     still_in = [
-        route.path for route in _authenticated_get_routes()
-        if client.get(route.path, headers=headers).status_code != 401
+        path for path in _authenticated_get_routes()
+        if client.get(path, headers=headers).status_code != 401
     ]
     assert still_in == [], f"revoked account still served on: {sorted(still_in)}"
 
@@ -187,10 +193,9 @@ def test_every_route_is_either_authenticated_or_deliberately_public():
     """The structural law. A new router mounted without ``get_current_user``
     is not caught by any behavioural test — nothing knows to go look for it."""
     unguarded = {
-        route.path for route in fastapi_app.routes
-        if isinstance(route, APIRoute)
-        and get_current_user not in _flat_dependency_calls(route.dependant)
-        and route.path not in _PUBLIC_PATHS
+        path for path, route in _routes_with_paths()
+        if get_current_user not in _flat_dependency_calls(route.dependant)
+        and path not in _PUBLIC_PATHS
     }
     # Cron endpoints authenticate with a shared key header instead of a JWT.
     unguarded = {path for path in unguarded if "/cron/" not in path}
