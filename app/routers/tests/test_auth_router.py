@@ -249,10 +249,15 @@ EXTERNAL_GEO_EDITORS = {
 }
 
 
+#: Domains admitted wholesale. legalsoft.com is the company; aivirtual.com was
+#: added by owner decision on 2026-09-24 so every mailbox there gets the hub.
+ALLOWED_DOMAINS = {"legalsoft.com", "aivirtual.com"}
+
+
 def test_allowlist_defaults_are_closed(monkeypatch):
     defaults = _pristine_settings(monkeypatch)
-    assert defaults.allowed_email_domain_set == {"legalsoft.com"}
-    # Named individuals, not a fourth domain. The exception list growing is
+    assert defaults.allowed_email_domain_set == ALLOWED_DOMAINS
+    # Named individuals, not more domains. The exception list growing is
     # expected — it is the mechanism for contractors and clients — so this
     # pins WHO is on it rather than that it is empty.
     assert defaults.allowed_email_set == EXTERNAL_GEO_EDITORS
@@ -279,42 +284,48 @@ def test_the_geo_editor_roster_is_pinned(monkeypatch):
     assert EXTERNAL_GEO_EDITORS <= defaults.allowed_email_set
 
 
-def test_the_outside_domains_were_not_admitted_wholesale(monkeypatch):
-    """The failure mode this change was one keystroke away from.
+def test_the_other_outside_domains_were_not_admitted_wholesale(monkeypatch):
+    """Only the domains the owner chose are open; the rest stay named addresses.
 
-    Four GEO editors are at aivirtual.com, usimmigration.ai, medvirtual.ai and
-    aianswering.ai. Adding those DOMAINS would have been shorter and would have
-    opened sign-in to every mailbox at four companies whose accounts nobody here
-    provisions or de-provisions — on a service Cloud Run serves
-    --allow-unauthenticated, where this list is the only door.
+    Three GEO editors are at usimmigration.ai, medvirtual.ai and aianswering.ai.
+    Adding those DOMAINS would open sign-in to every mailbox at three companies
+    whose accounts nobody here provisions or de-provisions — on a service
+    Cloud Run serves --allow-unauthenticated, where this list is the only door.
+    aivirtual.com is the one exception, by decision, and is pinned above.
     """
     defaults = _pristine_settings(monkeypatch)
-    assert defaults.allowed_email_domain_set == {"legalsoft.com"}
-    for address in EXTERNAL_GEO_EDITORS:
+    assert defaults.allowed_email_domain_set == ALLOWED_DOMAINS
+    for address in EXTERNAL_GEO_EDITORS - {"lynie.t@aivirtual.com"}:
         domain = address.rpartition("@")[2]
         assert domain not in defaults.allowed_email_domain_set
 
 
-def test_a_colleague_of_an_allowlisted_external_editor_cannot_sign_in(
+def test_shipped_domains_admit_aivirtual_but_no_other_outside_company(
     _harness, monkeypatch,
 ):
     """The same statement at the door instead of in the config.
 
-    The harness blanks ``allowed_emails``; this restores the SHIPPED default
+    The harness pins a one-domain allowlist; this restores the SHIPPED defaults
     (read from a pristine ``Settings``, never retyped here) so the assertion is
     about what the service actually deploys with.
     """
-    monkeypatch.setattr(
-        settings, "allowed_emails", _pristine_settings(monkeypatch).allowed_emails,
-    )
-    assert login(_harness, "lynie.t@aivirtual.com").status_code == 200
+    pristine = _pristine_settings(monkeypatch)
+    monkeypatch.setattr(settings, "allowed_email_domains", pristine.allowed_email_domains)
+    monkeypatch.setattr(settings, "allowed_emails", pristine.allowed_emails)
 
-    for stranger in ("someone.else@aivirtual.com", "ceo@usimmigration.ai",
-                     "intern@medvirtual.ai", "billing@aivirtual.com",
-                     "support@aianswering.ai"):
+    # Anyone at aivirtual.com — not just the named editor — gets in.
+    for member in ("lynie.t@aivirtual.com", "someone.else@aivirtual.com",
+                   "Billing@AIVirtual.com"):
+        assert login(_harness, member).status_code == 200, member
+
+    # A colleague of the other named outside editors still does not.
+    for stranger in ("ceo@usimmigration.ai", "intern@medvirtual.ai",
+                     "support@aianswering.ai", "attacker@mail.aivirtual.com"):
         assert login(_harness, stranger).status_code == 403, stranger
     # Refused before the upsert, so no junk user document either.
-    assert _harness["created"] == ["lynie.t@aivirtual.com"]
+    assert _harness["created"] == [
+        "lynie.t@aivirtual.com", "someone.else@aivirtual.com", "Billing@AIVirtual.com",
+    ]
 
 
 def test_app_env_defaults_to_production(monkeypatch):

@@ -115,17 +115,23 @@ class Settings(BaseSettings):
     # platform's LLM billing). A verified Google account may sign in only when
     # its domain is listed here or its full address is in `allowed_emails`.
     # Comma-separated; subdomains are NOT implied (list them explicitly).
-    allowed_email_domains: str = "legalsoft.com"
+    #
+    # aivirtual.com was admitted as a whole domain on 2026-09-24 by owner
+    # decision: every mailbox there gets the full Agent Hub, provisioned and
+    # de-provisioned by that company, not here. The production and staging
+    # services carry this same value as a plain ALLOWED_EMAIL_DOMAINS env var,
+    # which overrides this default — change both or neither.
+    allowed_email_domains: str = "legalsoft.com,aivirtual.com"
     # Comma-separated individual addresses allowed regardless of domain — the
     # exception list for contractors/clients. Fillable via env, no code change.
     #
-    # The four entries below are the GEO editors on outside domains. They are
-    # listed ONE ADDRESS AT A TIME on purpose. Putting aivirtual.com,
-    # usimmigration.ai and medvirtual.ai into ``allowed_email_domains`` would
-    # have been four shorter lines and would have admitted every mailbox at
-    # four other companies — including ones nobody here provisions or
-    # de-provisions — to a service Cloud Run serves --allow-unauthenticated,
-    # where this list is the only door. Named addresses only.
+    # The entries below are the GEO editors on outside domains, listed ONE
+    # ADDRESS AT A TIME on purpose: usimmigration.ai, medvirtual.ai and
+    # aianswering.ai are NOT admitted wholesale, because that would open a
+    # service Cloud Run serves --allow-unauthenticated to every mailbox at
+    # companies nobody here provisions or de-provisions. lynie.t is kept even
+    # though her domain now signs in on its own, so her access does not hinge
+    # on the domain rule staying.
     allowed_emails: str = (
         "lynie.t@aivirtual.com,"
         "miguel@usimmigration.ai,"
