@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import uuid
 from dataclasses import asdict
@@ -79,6 +80,8 @@ GD_AGENT_ID = _GD_AGENT_ID
 # drawn from the social-story bucket of the Brand Reference Library.
 STUDIO_CREATIVE_TYPE = "social_story"
 
+logger = logging.getLogger("graphics_designer.pipeline")
+
 
 def _optimizer_enabled() -> bool:
     """Stage-3 Text Optimizer master switch (spec 2026-07-14). Default ON;
@@ -109,7 +112,7 @@ def _reference_grounding(run: dict) -> str:
     try:
         from . import reference_library as rl
 
-        records = rl.load_index(rl.default_base_dir())
+        records = _brand_reference_records(run.get("brand_id"), rl)
         if not records:
             return ""
         cfg = run.get("config") or {}
@@ -124,12 +127,48 @@ def _reference_grounding(run: dict) -> str:
             brief=brief,
             k=3,
             style_k=2,
+            # Browser uploads (either ``kind``, any ``creative_type``) ground
+            # the brand: they are what a member chose for it, not a Drive
+            # folder whose name happened to match the studio type.
+            include_sources=("upload",),
         )
         if not hits:
             return ""
         return rl.summarize_for_prompt(hits)
     except Exception:  # noqa: BLE001 - grounding is additive; never fail generation
         return ""
+
+
+def _brand_reference_records(brand_id: str | None, rl) -> list[dict]:
+    """Every reference the run's brand may ground on: the browser-uploaded
+    references (Firestore, via ``firestore_repo.references_for_brand``) merged
+    ahead of the Drive-synced JSON index. The JSON index alone is what this
+    used to read, so a brand whose references were only ever uploaded from the
+    UI got no grounding at all.
+
+    The Firestore half is additive and best-effort: if the app layer is not
+    importable (standalone package) or the read fails, the legacy records
+    still serve — never fewer references than before this existed.
+    """
+    legacy = rl.load_index(rl.default_base_dir())
+    if not brand_id:
+        return legacy
+    try:
+        from app.services.firestore_repo import references_for_brand
+
+        merged = references_for_brand(brand_id, legacy_records=legacy)
+    except Exception as exc:  # noqa: BLE001 - legacy grounding must survive a Firestore miss
+        logger.warning("uploaded references unavailable for %r; using the JSON index: %s",
+                       brand_id, exc)
+        return legacy
+    for rec in merged:
+        # Uploaded docs carry width/height, not the ingest-time derived fields
+        # the prompt block prints; fill those in so the block reads cleanly.
+        if not rec.get("aspect_ratio") and rec.get("width") and rec.get("height"):
+            rec["aspect_ratio"] = rl.aspect_ratio_str(int(rec["width"]), int(rec["height"]))
+        if not rec.get("summary"):
+            rec["summary"] = rec.get("note") or f"uploaded {rec.get('kind') or 'reference'}"
+    return merged
 
 
 class PipelineError(Exception):
@@ -1054,9 +1093,10 @@ def brand_logo_png(brand_id: str | None) -> bytes | None:
     if not fid:
         return None
     try:
-        from app.services import firestore_repo, imaging, storage
+        from app.services import imaging, storage
+        from app.services.gd_brand_source import brand_logo_record
 
-        rec = firestore_repo.find_brand_logo(fid)
+        rec = brand_logo_record(fid)
         if not rec:
             return None
         data = storage.download_bytes(rec["file_url"])

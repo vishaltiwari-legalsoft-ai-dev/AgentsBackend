@@ -21,6 +21,7 @@ import hashlib
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -36,6 +37,16 @@ from .stage3_text import style_options as _stage3
 
 # The default brand when a run carries no ``brand_id`` (back-compat + Legal Soft).
 DEFAULT_BRAND_ID = "legalsoft"
+
+
+class UnknownBrand(KeyError):
+    """``get_pack`` was asked for a brand id the registry does not hold.
+
+    A ``KeyError`` so callers that already treat a missing key as "not found"
+    keep working; a distinct class so the HTTP layer can answer 404 instead of
+    500. Raised instead of the old silent Legal Soft fallback: a run started
+    for a brand that does not exist must not quietly render as another brand.
+    """
 
 _AGENT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -223,6 +234,18 @@ _PACKS_LOCK = threading.Lock()
 # imports; the callable itself is the only seam.
 _DYNAMIC_SOURCE: Callable[[], list[dict]] | None = None
 
+# Second app-level seam: a callable returning the dynamic brand set's VERSION
+# (an int the store bumps on every brand write). ``refresh()`` only clears the
+# instance that served the request; Cloud Run runs several, so a brand created
+# on one instance used to stay invisible on the others until they restarted.
+# With a version source every instance compares one small number — at most
+# once per ``VERSION_CHECK_SECONDS`` — and rebuilds when it moved.
+_VERSION_SOURCE: Callable[[], int] | None = None
+VERSION_CHECK_SECONDS = 10.0
+_loaded_version: int | None = None      # version the current _PACKS was built from
+_version_seen: int | None = None        # last value the source returned
+_version_checked_at: float | None = None
+
 
 def register_dynamic_source(fn: Callable[[], list[dict]] | None) -> None:
     """App-level injection point: a callable returning templated-brand spec
@@ -233,13 +256,59 @@ def register_dynamic_source(fn: Callable[[], list[dict]] | None) -> None:
     refresh()
 
 
+def register_version_source(fn: Callable[[], int] | None) -> None:
+    """App-level injection point: a callable returning the dynamic brand set's
+    current version. Only consulted while dynamic brands are enabled. Pass
+    None to detach."""
+    global _VERSION_SOURCE
+    _VERSION_SOURCE = fn
+    refresh()
+
+
 def refresh() -> None:
     """Drop the pack cache; next access rebuilds (call after enrichment runs).
     Lock-guarded so it can't interleave mid-build with `_registry()` and clobber
     (or be clobbered by) a build that's already in flight."""
-    global _PACKS
+    global _PACKS, _version_checked_at
     with _PACKS_LOCK:
         _PACKS = {}
+        _version_checked_at = None  # the next access re-reads the version too
+
+
+def _dynamic_enabled() -> bool:
+    return _DYNAMIC_SOURCE is not None and os.getenv("GD_DYNAMIC_BRANDS") == "1"
+
+
+def _observe_version(*, force: bool = False) -> int | None:
+    """The dynamic brand set's version, read from the source at most once per
+    ``VERSION_CHECK_SECONDS`` (``force`` bypasses the throttle — used at build
+    time so the version recorded is the one the packs were really built from).
+
+    ``None`` when there is nothing to compare (no source, or dynamic brands
+    off). A failing source keeps the last value it returned and logs: a
+    version read that cannot run must never take the registry down with it.
+    """
+    global _version_seen, _version_checked_at
+    if _VERSION_SOURCE is None or not _dynamic_enabled():
+        return None
+    now = time.monotonic()
+    if (not force and _version_checked_at is not None
+            and (now - _version_checked_at) < VERSION_CHECK_SECONDS):
+        return _version_seen
+    try:
+        seen: int | None = int(_VERSION_SOURCE())
+    except Exception as exc:  # noqa: BLE001 - keep serving the packs we have
+        logger.warning("brand version source failed; keeping the loaded packs: %s", exc)
+        seen = _version_seen
+    _version_checked_at = now
+    _version_seen = seen
+    return seen
+
+
+def _stale() -> bool:
+    """Whether the built registry predates the store's current version."""
+    seen = _observe_version()
+    return seen is not None and seen != _loaded_version
 
 
 def _registry() -> dict[str, BrandPack]:
@@ -250,12 +319,16 @@ def _registry() -> dict[str, BrandPack]:
     `_PACKS` until it's complete — and rebind it in one atomic assignment.
     A concurrent reader therefore only ever sees either the old registry or
     the fully-built new one, never a partially-populated dict."""
-    global _PACKS
-    if _PACKS:
+    global _PACKS, _loaded_version
+    if _PACKS and not _stale():
         return _PACKS
     with _PACKS_LOCK:
-        if _PACKS:
+        if _PACKS and not _stale():
             return _PACKS
+        # Read the version BEFORE listing brands: a write that lands between
+        # the two is then newer than the recorded version and triggers the
+        # next rebuild instead of being missed for good.
+        version_at_build = _observe_version(force=True)
         local: dict[str, BrandPack] = {DEFAULT_BRAND_ID: _build_legalsoft()}
         # Templated brands (Phase C). Lazy import avoids a cycle — templated_brands
         # imports BrandPack from this module.
@@ -268,7 +341,7 @@ def _registry() -> dict[str, BrandPack]:
         # is byte-identical to today when unset, and fault-isolated: one bad
         # spec is logged and skipped, never fatal to the whole registry. Static
         # packs always win on id collision (setdefault).
-        if _DYNAMIC_SOURCE is not None and os.getenv("GD_DYNAMIC_BRANDS") == "1":
+        if _dynamic_enabled():
             for spec in _DYNAMIC_SOURCE():
                 try:
                     pack = templated_brands.build_templated_pack(spec)
@@ -287,14 +360,25 @@ def _registry() -> dict[str, BrandPack]:
                 logger.warning("library variants skipped for %r: %s", bid, exc)
 
         _PACKS = local
+        _loaded_version = version_at_build
         return _PACKS
 
 
 def get_pack(brand_id: str | None = None) -> BrandPack:
-    """The active brand pack. Falls back to Legal Soft for unknown/None ids so the
-    pipeline always has a brand (back-compat with runs created before brands)."""
+    """The active brand pack.
+
+    ``None``/empty resolves to Legal Soft (back-compat with runs created before
+    brands existed). An id the registry does not hold raises
+    :class:`UnknownBrand` — never a silent fallback, because a creative rendered
+    in the wrong brand's colours is worse than an honest 404.
+    """
     reg = _registry()
-    return reg.get((brand_id or DEFAULT_BRAND_ID), reg[DEFAULT_BRAND_ID])
+    if not brand_id:
+        return reg[DEFAULT_BRAND_ID]
+    try:
+        return reg[brand_id]
+    except KeyError:
+        raise UnknownBrand(brand_id) from None
 
 
 def list_packs() -> list[dict]:

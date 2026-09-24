@@ -831,3 +831,419 @@ def test_enrich_iter_reraises_after_yielding_prior_entries(monkeypatch, tmp_path
 
     with pytest.raises(RuntimeError, match="beta exploded"):
         next(it)
+
+
+# --------------------------------------------------------------------------- #
+# Self-serve GD brands (2026-09-25) — firestore_repo brand store + storage paths
+#
+# A multi-collection in-memory Firestore with a buffered transaction: writes
+# land only when the callback returns, so a raise mid-transaction writes
+# nothing — the property the real transaction gives the code.
+# --------------------------------------------------------------------------- #
+
+from google.cloud import firestore as _gfs  # noqa: E402
+
+from app.services import storage  # noqa: E402
+
+
+def _apply_fields(cur: dict, data: dict) -> None:
+    for k, v in data.items():
+        if isinstance(v, _gfs.Increment):
+            cur[k] = (cur.get(k) or 0) + v.value
+        elif isinstance(v, dict) and isinstance(cur.get(k), dict):
+            _apply_fields(cur[k], v)
+        else:
+            cur[k] = v
+
+
+class _MemSnap:
+    def __init__(self, doc_id, data):
+        self.id = doc_id
+        self.exists = data is not None
+        self._data = data
+
+    def to_dict(self):
+        return None if self._data is None else json.loads(json.dumps(self._data))
+
+
+class _MemDoc:
+    def __init__(self, db, col, doc_id):
+        self._db, self._col, self.id = db, col, doc_id
+
+    def _store(self):
+        return self._db.data.setdefault(self._col, {})
+
+    def get(self, transaction=None):
+        return _MemSnap(self.id, self._db.data.get(self._col, {}).get(self.id))
+
+    def set(self, data, merge=False):
+        if merge:
+            _apply_fields(self._store().setdefault(self.id, {}), data)
+        else:
+            fresh: dict = {}
+            _apply_fields(fresh, data)
+            self._store()[self.id] = fresh
+
+    def update(self, fields):
+        if self.id not in self._store():
+            raise KeyError(f"update on missing doc {self._col}/{self.id}")
+        self._store()[self.id].update(fields)
+
+
+class _MemQuery:
+    def __init__(self, db, col, filters=(), order=None, limit_n=None):
+        self._db, self._col = db, col
+        self._filters, self._order, self._limit = tuple(filters), order, limit_n
+
+    def where(self, filter):
+        # ``FieldFilter(f, "==", None)`` becomes the unary IS_NULL operator
+        if filter.op_string == _gfs.FieldFilter("x", "==", None).op_string:
+            value = None
+        else:
+            assert filter.op_string == "==", filter.op_string
+            value = filter.value
+        return _MemQuery(self._db, self._col,
+                         self._filters + ((filter.field_path, value),),
+                         self._order, self._limit)
+
+    def order_by(self, field, direction=None):
+        return _MemQuery(self._db, self._col, self._filters,
+                         (field, direction == _gfs.Query.DESCENDING), self._limit)
+
+    def limit(self, n):
+        return _MemQuery(self._db, self._col, self._filters, self._order, n)
+
+    def stream(self, transaction=None):
+        if self._db.composite_missing and self._order and len(self._filters) > 1:
+            raise RuntimeError("400 The query requires an index")
+        self._db.streams.append((self._col, self._filters, self._order))
+        rows = [(i, d) for i, d in self._db.data.get(self._col, {}).items()
+                if all(d.get(f) == v for f, v in self._filters)]
+        if self._order:
+            field, desc = self._order
+            rows.sort(key=lambda r: r[1].get(field) or "", reverse=desc)
+        if self._limit is not None:
+            rows = rows[: self._limit]
+        return [_MemSnap(i, d) for i, d in rows]
+
+
+class _MemCol(_MemQuery):
+    def document(self, doc_id):
+        return _MemDoc(self._db, self._col, doc_id)
+
+
+class _MemDb:
+    def __init__(self):
+        self.data: dict[str, dict[str, dict]] = {}
+        self.streams: list = []
+        self.composite_missing = False
+
+    def collection(self, name):
+        return _MemCol(self, name)
+
+
+class _MemTxn:
+    def __init__(self):
+        self.ops: list = []
+
+    def set(self, ref, data, merge=False):
+        self.ops.append(lambda: ref.set(data, merge=merge))
+
+    def update(self, ref, fields):
+        self.ops.append(lambda: ref.update(fields))
+
+
+class _FakeBucket:
+    def __init__(self, uploads):
+        self._uploads = uploads
+
+    def blob(self, path):
+        uploads = self._uploads
+
+        class _Blob:
+            def upload_from_string(self, data, content_type=None, timeout=None):
+                uploads[path] = (data, content_type)
+        return _Blob()
+
+
+@pytest.fixture()
+def brand_store(monkeypatch):
+    """In-memory Firestore + GCS for the self-serve brand store."""
+    from app.config import settings
+
+    db = _MemDb()
+    uploads: dict = {}
+
+    def _transact(fn):
+        txn = _MemTxn()
+        result = fn(txn)
+        for op in txn.ops:
+            op()
+        return result
+
+    monkeypatch.setattr(firestore_repo, "_db", lambda: db)
+    monkeypatch.setattr(firestore_repo, "_transact", _transact)
+    monkeypatch.setattr(firestore_repo, "_brands_cache", None)
+    monkeypatch.setattr(firestore_repo, "_references_index_missing_at", None)
+    monkeypatch.setattr(storage, "is_configured", lambda: True)
+    monkeypatch.setattr(settings, "gcs_bucket_name", "test-bucket", raising=False)
+    monkeypatch.setattr(storage, "_storage",
+                        lambda: type("C", (), {"bucket": lambda self, n: _FakeBucket(uploads)})())
+    db.uploads = uploads
+    return db
+
+
+_KIT = {"primary_colors": ["#1a2b3c"], "secondary_colors": ["#24B9CE"],
+        "accent_colors": [], "fonts": ["Inter Bold"], "tone_of_voice": "calm"}
+
+
+def _version(db) -> int:
+    return db.data.get("meta", {}).get("brands", {}).get("version", 0)
+
+
+def test_create_brand_writes_slug_id_and_the_pipeline_metadata_shape(brand_store):
+    doc = firestore_repo.create_brand(
+        "Acme Co", _KIT | {"gd_spec": {"id": "wrong", "palette": {}}},
+        created_by="Vishal@Example.com")
+
+    stored = brand_store.data["brands"]["acme-co"]
+    assert doc["id"] == "acme-co" and stored["slug"] == "acme-co"
+    assert stored["name"] == stored["brand_name"] == "Acme Co"
+    assert stored["brand_name_lower"] == "acme co"
+    assert stored["source"] == "user" and stored["archived_at"] is None
+    assert stored["created_by"] == "vishal@example.com" and stored["logo_uri"] is None
+    meta = stored["brand_metadata"]
+    assert meta["primary_colors"] == ["#1A2B3C"] and meta["fonts"] == ["Inter Bold"]
+    assert meta["enrichment"] == {"palette": {}, "logo_files": [], "font_files": [],
+                                  "guideline_files": []}
+    # the pack id, the Firestore id and the reference brand_id are one string
+    assert meta["gd_spec"]["id"] == meta["gd_spec"]["firestore_brand_id"] == "acme-co"
+    assert _version(brand_store) == 1
+
+
+@pytest.mark.parametrize("name", ["Legal Soft", "LegalSoft", "MedVirtual",
+                                  "Remote Attorneys", "remote_attorneys"])
+def test_create_brand_refuses_a_built_in_pack(brand_store, name):
+    with pytest.raises(firestore_repo.BrandExists):
+        firestore_repo.create_brand(name, {}, created_by="a@b.com")
+    assert "brands" not in brand_store.data and _version(brand_store) == 0
+
+
+def test_create_brand_refuses_an_existing_slug_or_a_legacy_doc_with_the_same_name(brand_store):
+    firestore_repo.create_brand("Acme Co", {}, created_by="a@b.com")
+    with pytest.raises(firestore_repo.BrandExists):
+        firestore_repo.create_brand("acme  co!", {}, created_by="c@d.com")
+
+    brand_store.data["brands"]["9f00uuid"] = {"brand_name": "Globex",
+                                              "brand_name_lower": "globex"}
+    with pytest.raises(firestore_repo.BrandExists):
+        firestore_repo.create_brand("GLOBEX", {}, created_by="c@d.com")
+    assert set(brand_store.data["brands"]) == {"acme-co", "9f00uuid"}
+    assert _version(brand_store) == 1
+
+
+@pytest.mark.parametrize("name,kit", [
+    ("!!!", {}),
+    ("Acme", {"primary_colors": ["blue"]}),
+    ("Acme", {"logo": "x.png"}),
+    ("Acme", {"fonts": "Inter"}),
+])
+def test_create_brand_refuses_bad_input_before_writing(brand_store, name, kit):
+    with pytest.raises(ValueError):
+        firestore_repo.create_brand(name, kit, created_by="a@b.com")
+    assert "brands" not in brand_store.data
+
+
+def test_update_brand_merges_and_keeps_the_slug(brand_store):
+    firestore_repo.create_brand("Acme Co", _KIT, created_by="a@b.com")
+    firestore_repo.update_brand("acme-co", {
+        "name": "Acme Corporation", "accent_colors": ["#fff"],
+        "enrichment": {"palette": {"primary": "#1A2B3C"}},
+        "gd_spec": {"id": "evil", "palette": {"primary": "#1A2B3C"}},
+    })
+    stored = brand_store.data["brands"]["acme-co"]
+    meta = stored["brand_metadata"]
+    assert stored["name"] == stored["brand_name"] == "Acme Corporation"
+    assert meta["primary_colors"] == ["#1A2B3C"]            # untouched key kept
+    assert meta["accent_colors"] == ["#FFF"]                 # patched key replaced
+    assert meta["enrichment"]["palette"] == {"primary": "#1A2B3C"}
+    assert meta["enrichment"]["logo_files"] == []            # enrichment merged, not replaced
+    assert meta["gd_spec"]["id"] == "acme-co"                # pack id pinned to the slug
+    assert _version(brand_store) == 2
+
+
+def test_update_and_archive_refuse_archived_legacy_and_unknown_brands(brand_store):
+    firestore_repo.create_brand("Acme Co", {}, created_by="a@b.com")
+    brand_store.data["brands"]["9f00uuid"] = {"brand_name": "Legacy"}
+    with pytest.raises(firestore_repo.BrandNotEditable):
+        firestore_repo.update_brand("9f00uuid", {"fonts": ["X"]})
+    with pytest.raises(firestore_repo.BrandNotFound):
+        firestore_repo.update_brand("nope", {"fonts": ["X"]})
+
+    firestore_repo.archive_brand("acme-co")
+    with pytest.raises(firestore_repo.BrandNotEditable):
+        firestore_repo.update_brand("acme-co", {"fonts": ["X"]})
+    with pytest.raises(firestore_repo.BrandNotEditable):
+        firestore_repo.archive_brand("acme-co")
+    assert "acme-co" in brand_store.data["brands"]           # soft: never deleted
+
+
+def test_list_brands_hides_archived_unless_asked(brand_store):
+    firestore_repo.create_brand("Acme Co", {}, created_by="a@b.com")
+    firestore_repo.create_brand("Beta", {}, created_by="a@b.com")
+    brand_store.data["brands"]["9f00uuid"] = {"brand_name": "Legacy"}  # no archived_at
+    firestore_repo.archive_brand("beta")
+
+    assert {b["id"] for b in firestore_repo.list_brands()} == {"acme-co", "9f00uuid"}
+    assert {b["id"] for b in firestore_repo.list_brands(include_archived=True)} == {
+        "acme-co", "beta", "9f00uuid"}
+
+
+def test_brand_asset_paths_are_content_hashed_and_typed():
+    data = b"\x89PNG logo bytes"
+    h = storage.content_hash(data)
+    assert len(h) == 16
+    assert storage.brand_asset_object_path("acme-co", "logo", data, ".PNG") == \
+        f"brands/acme-co/logos/{h}.png"
+    assert storage.brand_asset_object_path("acme-co", "font", data, "ttf") == \
+        f"brands/acme-co/fonts/{h}.ttf"
+    assert storage.reference_object_path("acme-co", data, "jpg") == \
+        f"reference_library/acme-co/{h}.jpg"
+    with pytest.raises(ValueError):
+        storage.brand_asset_object_path("acme-co", "logo", data, "exe")
+    with pytest.raises(ValueError):
+        storage.brand_asset_object_path("acme-co", "video", data, "png")
+
+
+def test_put_brand_asset_refuses_when_storage_is_unconfigured():
+    # conftest's GCS guard reports unconfigured: nothing may reach a bucket
+    with pytest.raises(RuntimeError, match="not configured"):
+        storage.put_brand_asset("acme-co", "logo", b"x", "png")
+
+
+def test_add_brand_asset_records_uri_and_logo_uri_once(brand_store):
+    firestore_repo.create_brand("Acme Co", {}, created_by="a@b.com")
+    logo = firestore_repo.add_brand_asset("acme-co", "logo", b"logo-bytes", "png")
+    again = firestore_repo.add_brand_asset("acme-co", "logo", b"logo-bytes", "png")
+    firestore_repo.add_brand_asset("acme-co", "font", b"font-bytes", "ttf")
+    firestore_repo.add_brand_asset("acme-co", "guidelines", b"pdf-bytes", "pdf")
+
+    h = storage.content_hash(b"logo-bytes")
+    assert logo["uri"] == again["uri"] == f"gs://test-bucket/brands/acme-co/logos/{h}.png"
+    assets = firestore_repo.list_brand_assets("acme-co")
+    assert assets["logo_uri"] == logo["uri"]
+    assert assets["logo_files"] == [logo["uri"]]             # same bytes = one entry
+    assert len(assets["font_files"]) == 1 and len(assets["guideline_files"]) == 1
+    assert brand_store.uploads[f"brands/acme-co/logos/{h}.png"][1] == "image/png"
+
+
+def test_add_brand_asset_refuses_before_uploading_to_an_archived_brand(brand_store):
+    firestore_repo.create_brand("Acme Co", {}, created_by="a@b.com")
+    firestore_repo.archive_brand("acme-co")
+    with pytest.raises(firestore_repo.BrandNotEditable):
+        firestore_repo.add_brand_asset("acme-co", "logo", b"x", "png")
+    assert brand_store.uploads == {}
+
+
+def test_add_reference_writes_one_doc_per_reference_and_is_idempotent(brand_store):
+    firestore_repo.create_brand("Acme Co", {}, created_by="a@b.com")
+    ref = firestore_repo.add_reference(
+        "acme-co", data=b"img-1", ext="png", kind="creative", uploaded_by="A@B.com",
+        width=1080, height=1080, note="Spring promo")
+    firestore_repo.add_reference(
+        "acme-co", data=b"img-1", ext="png", kind="creative", uploaded_by="x@y.com")
+
+    h = storage.content_hash(b"img-1")
+    assert ref["ref_id"] == h and ref["id"] == f"acme-co__{h}"
+    assert ref["object_path"] == f"reference_library/acme-co/{h}.png"
+    assert ref["gs_uri"] == f"gs://test-bucket/reference_library/acme-co/{h}.png"
+    assert ref["content_type"] == "image/png" and ref["deleted_at"] is None
+    assert ref["uploaded_by"] == "a@b.com" and (ref["width"], ref["height"]) == (1080, 1080)
+    assert list(brand_store.data["brand_references"]) == [f"acme-co__{h}"]
+    assert brand_store.data["brand_reference_counts"]["acme-co"]["active"] == 1
+
+
+def test_add_reference_enforces_the_cap_before_uploading(brand_store):
+    firestore_repo.create_brand("Acme Co", {}, created_by="a@b.com")
+    brand_store.data["brand_reference_counts"] = {"acme-co": {"active": 200}}
+    with pytest.raises(firestore_repo.ReferenceCapReached):
+        firestore_repo.add_reference("acme-co", data=b"one-more", ext="png",
+                                     kind="reference", uploaded_by="a@b.com")
+    assert brand_store.uploads == {} and "brand_references" not in brand_store.data
+
+
+def test_soft_delete_frees_a_slot_hides_the_reference_and_readding_revives_it(brand_store):
+    firestore_repo.create_brand("Acme Co", {}, created_by="a@b.com")
+    ref = firestore_repo.add_reference("acme-co", data=b"img-1", ext="png",
+                                       kind="creative", uploaded_by="a@b.com")
+    firestore_repo.soft_delete_reference("acme-co", ref["ref_id"])
+    firestore_repo.soft_delete_reference("acme-co", ref["ref_id"])   # no-op, no double decrement
+
+    assert brand_store.data["brand_reference_counts"]["acme-co"]["active"] == 0
+    assert firestore_repo.list_references("acme-co") == []
+    assert brand_store.data["brand_references"][ref["id"]]["deleted_at"]  # kept, not deleted
+    with pytest.raises(firestore_repo.BrandNotFound):
+        firestore_repo.soft_delete_reference("other-brand", ref["ref_id"])
+
+    firestore_repo.add_reference("acme-co", data=b"img-1", ext="png",
+                                 kind="creative", uploaded_by="a@b.com")
+    assert [r["id"] for r in firestore_repo.list_references("acme-co")] == [ref["id"]]
+    assert brand_store.data["brand_reference_counts"]["acme-co"]["active"] == 1
+
+
+def test_references_attach_to_built_in_packs_but_not_unknown_brands(brand_store):
+    firestore_repo.add_reference("legalsoft", data=b"ls", ext="jpg",
+                                 kind="reference", uploaded_by="a@b.com")
+    assert len(firestore_repo.list_references("legalsoft")) == 1
+    with pytest.raises(firestore_repo.BrandNotFound):
+        firestore_repo.add_reference("ghost", data=b"g", ext="png",
+                                     kind="reference", uploaded_by="a@b.com")
+
+
+def test_list_references_is_newest_first_on_the_indexed_query(brand_store):
+    brand_store.data["brand_references"] = {
+        "acme-co__a": {"brand_id": "acme-co", "created_at": "2026-09-01", "deleted_at": None},
+        "acme-co__b": {"brand_id": "acme-co", "created_at": "2026-09-03", "deleted_at": None},
+        "acme-co__c": {"brand_id": "acme-co", "created_at": "2026-09-02", "deleted_at": "x"},
+        "other__d": {"brand_id": "other", "created_at": "2026-09-04", "deleted_at": None},
+    }
+    assert [r["id"] for r in firestore_repo.list_references("acme-co")] == [
+        "acme-co__b", "acme-co__a"]
+    col, filters, order = brand_store.streams[-1]
+    assert col == "brand_references"
+    assert filters == (("brand_id", "acme-co"), ("deleted_at", None))
+    assert order == ("created_at", True)
+
+
+def test_list_references_falls_back_in_process_when_the_index_is_missing(brand_store):
+    brand_store.composite_missing = True
+    brand_store.data["brand_references"] = {
+        "acme-co__a": {"brand_id": "acme-co", "created_at": "2026-09-01", "deleted_at": None},
+        "acme-co__b": {"brand_id": "acme-co", "created_at": "2026-09-03", "deleted_at": None},
+        "acme-co__c": {"brand_id": "acme-co", "created_at": "2026-09-05", "deleted_at": "x"},
+    }
+    assert [r["id"] for r in firestore_repo.list_references("acme-co")] == [
+        "acme-co__b", "acme-co__a"]
+
+
+def test_references_for_brand_merges_uploads_with_the_legacy_index(brand_store):
+    firestore_repo.add_reference("remote_attorneys", data=b"ra", ext="png",
+                                 kind="creative", uploaded_by="a@b.com",
+                                 creative_type="social_post", note="Hiring push")
+    legacy = [
+        {"id": "l1", "brand_id": "remoteattorneys", "gs_uri": "gs://b/reference_library/x.png"},
+        {"id": "l2", "brand_id": "legalsoft", "gs_uri": "gs://b/reference_library/y.png"},
+    ]
+    refs = firestore_repo.references_for_brand("remote_attorneys", legacy_records=legacy)
+
+    assert [r.get("source") for r in refs] == ["upload", None]
+    assert refs[1]["id"] == "l1"                           # separator-free match, untouched
+    upload = refs[0]
+    assert upload["creative_type"] == "social_post"
+    assert upload["file_name"].endswith(".png") and upload["gs_uri"].startswith("gs://")
+    assert "hiring" in upload["tags"]
+
+
+def test_references_for_brand_reads_no_legacy_index_when_storage_is_off(brand_store, monkeypatch):
+    monkeypatch.setattr(storage, "is_configured", lambda: False)
+    assert firestore_repo.references_for_brand("acme-co") == []

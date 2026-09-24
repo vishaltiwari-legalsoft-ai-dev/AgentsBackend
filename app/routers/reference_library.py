@@ -197,8 +197,7 @@ def list_references(
     """List indexed reference creatives, optionally filtered by brand and type."""
     records = rl.load_index(_base_dir())
     if brand:
-        bslug = rl.brand_slug(brand)
-        records = [r for r in records if r.get("brand_id") == bslug]
+        records = [r for r in records if rl.same_brand(r.get("brand_id"), brand)]
     if type:
         records = [r for r in records if r.get("creative_type") == type]
     return {"count": len(records), "references": [_public(r) for r in records]}

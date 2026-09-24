@@ -60,9 +60,11 @@ def _empty_stage() -> dict:
 
 def create_run(user_id: str, brand_id: str | None = None) -> dict:
     # Resolve the selected brand's pack so every factory default (font, copy,
-    # element styles, sub-headings) starts from that brand's identity. Falls back
-    # to Legal Soft for None/unknown ids. Imported lazily to avoid an import cycle
-    # (registry imports the content modules that ultimately import runs' siblings).
+    # element styles, sub-headings) starts from that brand's identity. None means
+    # Legal Soft; an unknown id raises ``registry.UnknownBrand`` (the router
+    # answers 404) — a run must never silently start as a different brand.
+    # Imported lazily to avoid an import cycle (registry imports the content
+    # modules that ultimately import runs' siblings).
     from . import registry
 
     pack = registry.get_pack(brand_id)

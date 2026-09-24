@@ -21,6 +21,7 @@ from app.routers import (
     canva,
     creative_agent,
     cron,
+    gd_brands,
     geo,
     graphics_designer,
     health,
@@ -33,6 +34,7 @@ from app.routers import (
     seo_geo,
 )
 from app.scopes import deny_outside_geo
+from app.services import firestore_repo
 from app.services.gd_brand_source import firestore_spec_source
 from graphics_designer_agent import registry as gd_registry
 # Imported after the routers so the agent roots app/__init__ registers are
@@ -142,6 +144,7 @@ for router in (
     admin,
     canva,
     graphics_designer,
+    gd_brands,
     creative_agent,
     cron,
     marketing_research,
@@ -164,6 +167,10 @@ for router in (
 # Unconditional and harmless when the flag is unset: firestore_spec_source is
 # simply never invoked.
 gd_registry.register_dynamic_source(firestore_spec_source)
+# ...and the version those brands are at, so a brand created on one Cloud Run
+# instance is picked up by every other within registry.VERSION_CHECK_SECONDS
+# instead of only by the instance that served the create.
+gd_registry.register_version_source(firestore_repo.brands_version)
 
 
 @app.get("/")

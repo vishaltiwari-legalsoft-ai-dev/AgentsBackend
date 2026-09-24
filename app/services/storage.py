@@ -7,6 +7,7 @@ is not yet set up.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import timedelta
 from typing import Optional
@@ -190,6 +191,100 @@ def upload_brand_asset(
         return f"gs://{bucket_name}/{object_path}"
     except Exception as exc:  # noqa: BLE001 - surface storage errors with context
         raise RuntimeError(f'GCS upload failed for "{object_path}": {exc}') from exc
+
+
+# --- Self-serve brand kit + reference uploads --------------------------------
+# Object names are the first 16 hex chars of the content's SHA-256, never the
+# uploaded file name: a user-supplied name is untrusted input (path tricks,
+# collisions between two people's "logo.png"), and a content hash makes a
+# re-upload of the same bytes land on the same object — idempotent by
+# construction, so a retried request can never mint a second copy.
+
+#: Allowed extensions per asset kind. Anything else is refused before any
+#: bytes move — the upload router surfaces the ValueError as a 4xx.
+BRAND_ASSET_EXTS: dict[str, frozenset[str]] = {
+    "logo": frozenset({"png", "svg", "jpg", "jpeg", "webp"}),
+    "font": frozenset({"ttf", "otf", "woff", "woff2"}),
+    "guidelines": frozenset({"pdf", "png", "jpg", "jpeg", "webp"}),
+}
+REFERENCE_EXTS = frozenset({"png", "jpg", "jpeg", "webp", "gif", "pdf"})
+
+_CONTENT_TYPE_BY_EXT = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "webp": "image/webp", "gif": "image/gif", "svg": "image/svg+xml",
+    "pdf": "application/pdf", "ttf": "font/ttf", "otf": "font/otf",
+    "woff": "font/woff", "woff2": "font/woff2",
+}
+
+
+def content_hash(data: bytes) -> str:
+    """The 16-hex-char content key used in every self-serve object name."""
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def _clean_ext(ext: str, allowed: frozenset[str]) -> str:
+    cleaned = (ext or "").strip().lower().lstrip(".")
+    if cleaned not in allowed:
+        raise ValueError(
+            f"file type {ext!r} is not allowed here (allowed: {', '.join(sorted(allowed))})")
+    return cleaned
+
+
+def content_type_for_ext(ext: str) -> str:
+    return _CONTENT_TYPE_BY_EXT.get((ext or "").lower().lstrip("."), "application/octet-stream")
+
+
+def _put_object(object_path: str, data: bytes, content_type: str) -> str:
+    """Upload bytes and return the durable ``gs://`` URI (no signed URL —
+    Firestore stores durable URIs, never time-limited links). Raises on a
+    missing bucket or a failed upload: a self-serve upload that did not land
+    must never be recorded as if it had."""
+    if not data:
+        raise ValueError("refusing to store an empty file")
+    if not is_configured():
+        # Also what keeps these writers behind the suite's GCS guard.
+        raise RuntimeError("Cloud Storage is not configured — cannot store the upload")
+    bucket_name = settings.require("gcs_bucket_name")
+    try:
+        blob = _storage().bucket(bucket_name).blob(object_path)
+        blob.upload_from_string(
+            data, content_type=content_type, timeout=_TRANSFER_TIMEOUT_SECONDS
+        )
+    except Exception as exc:  # noqa: BLE001 - surface storage errors with context
+        raise RuntimeError(f'GCS upload failed for "{object_path}": {exc}') from exc
+    return f"gs://{bucket_name}/{object_path}"
+
+
+def brand_asset_object_path(brand_id: str, kind: str, data: bytes, ext: str) -> str:
+    """``brands/<brand_id>/<kind>s/<sha256[:16]>.<ext>`` — pure, no I/O."""
+    if kind not in BRAND_ASSET_EXTS:
+        raise ValueError(f"unknown brand asset kind {kind!r}")
+    clean = _clean_ext(ext, BRAND_ASSET_EXTS[kind])
+    return f"brands/{brand_id}/{kind}s/{content_hash(data)}.{clean}"
+
+
+def put_brand_asset(brand_id: str, kind: str, data: bytes, ext: str) -> str:
+    """Store one brand-kit file (``kind`` = logo | font | guidelines) at its
+    content-hash path and return its ``gs://`` URI. Storage only — recording it
+    on the brand doc is ``firestore_repo.add_brand_asset``'s job."""
+    object_path = brand_asset_object_path(brand_id, kind, data, ext)
+    return _put_object(object_path, data, content_type_for_ext(ext))
+
+
+def reference_object_path(brand_id: str, data: bytes, ext: str) -> str:
+    """``reference_library/<brand_id>/<sha256[:16]>.<ext>`` — pure, no I/O.
+
+    Sits beside the Drive-synced ``reference_library/<brand>/<type>/…`` tree
+    but never inside a ``<type>/`` folder, so the Drive sync (which rebuilds
+    the legacy index from its own folders) cannot collide with these."""
+    clean = _clean_ext(ext, REFERENCE_EXTS)
+    return f"{REFERENCE_LIBRARY_PREFIX}/{brand_id}/{content_hash(data)}.{clean}"
+
+
+def put_reference_file(brand_id: str, data: bytes, ext: str) -> str:
+    """Store one uploaded reference at its content-hash path; ``gs://`` URI."""
+    object_path = reference_object_path(brand_id, data, ext)
+    return _put_object(object_path, data, content_type_for_ext(ext))
 
 
 # Cloud Storage namespace for the Brand Reference Library (Drive-synced
