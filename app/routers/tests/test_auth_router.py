@@ -279,9 +279,42 @@ def test_the_geo_editor_roster_is_pinned(monkeypatch):
         "marian.p@legalsoft.com",
         "mahmoud.e@legalsoft.com",
         "michael.tayco@legalsoft.com",
-    } | EXTERNAL_GEO_EDITORS
+        # Whole domain, by owner decision 2026-09-24 — every aivirtual.com
+        # mailbox edits GEO; lynie.t is covered by it, not listed twice.
+        "@aivirtual.com",
+    } | (EXTERNAL_GEO_EDITORS - {"lynie.t@aivirtual.com"})
     # Every outside-domain editor must also be able to reach the door.
     assert EXTERNAL_GEO_EDITORS <= defaults.allowed_email_set
+
+
+def test_every_aivirtual_mailbox_edits_geo_and_is_not_scoped(_harness, monkeypatch):
+    """Owner decision 2026-09-24: aivirtual.com gets the whole hub — every
+    agent, GEO editing, and admin. Admin comes from ADMIN_EMAILS on the
+    service (env), GEO editing and the lifted scope from the shipped defaults.
+    """
+    from app.security import is_admin, is_geo_editor, is_geo_only
+
+    pristine = _pristine_settings(monkeypatch)
+    for field in ("allowed_email_domains", "allowed_emails",
+                  "geo_editor_emails", "geo_only_emails"):
+        monkeypatch.setattr(settings, field, getattr(pristine, field))
+    monkeypatch.setattr(settings, "admin_emails", "brix@legalsoft.com,@aivirtual.com")
+
+    for member in ("lynie.t@aivirtual.com", "new.hire@aivirtual.com", "Ops@AIVirtual.com"):
+        body = login(_harness, member).json()["user"]
+        assert body["is_admin"] is True, member
+        assert body["is_geo_editor"] is True, member
+        assert body["is_geo_only"] is False, member
+        assert body["is_creator"] is False, member
+
+    # The domain rule is exact: a subdomain gets nothing from it.
+    assert not is_admin("x@mail.aivirtual.com")
+    assert not is_geo_editor("x@mail.aivirtual.com")
+    # The other outside editors are unchanged: editor, still GEO-only, not admin.
+    assert is_geo_editor("miguel@usimmigration.ai") is True
+    assert is_admin("miguel@usimmigration.ai") is False
+    assert is_geo_only("miguel@usimmigration.ai") is True
+    assert is_geo_only("lynie.t@aivirtual.com") is False
 
 
 def test_the_other_outside_domains_were_not_admitted_wholesale(monkeypatch):

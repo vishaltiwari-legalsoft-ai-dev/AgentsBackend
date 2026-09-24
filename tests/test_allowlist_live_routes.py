@@ -466,26 +466,26 @@ def test_a_de_provisioned_geo_only_account_is_refused_at_the_door_first(client, 
     assert _mr(client, headers).status_code == 401
 
 
-#: The eight people the scope was built for, by full address. Four are
+#: The people the scope was built for, by full address. Four are
 #: @legalsoft.com — the domain ALLOWED_EMAIL_DOMAINS admits wholesale — which is
 #: why the list is addresses and never domains: a domain rule would have scoped
-#: the entire company to the GEO panel.
-THE_EIGHT = (
+#: the entire company to the GEO panel. It was eight until 2026-09-24, when the
+#: owner gave every aivirtual.com mailbox the whole hub; lynie.t left the scope.
+THE_SEVEN = (
     "nino.b@legalsoft.com",
     "marian.p@legalsoft.com",
     "mahmoud.e@legalsoft.com",
     "michael.tayco@legalsoft.com",
-    "lynie.t@aivirtual.com",
     "miguel@usimmigration.ai",
     "yans.suarez@medvirtual.ai",
     "franceska@aianswering.ai",
 )
 
 
-def test_the_eight_are_scoped_by_the_shipped_default_with_no_env_change(monkeypatch):
+def test_the_seven_are_scoped_by_the_shipped_default_with_no_env_change(monkeypatch):
     """Read off the CLASS default, not off ``settings``.
 
-    A deployment that never sets GEO_ONLY_EMAILS must still scope these eight,
+    A deployment that never sets GEO_ONLY_EMAILS must still scope these seven,
     because "we will set the env var" is the step that gets skipped — and the
     skip is silent and fails open. ``model_fields`` is the value baked into the
     image, so a developer's ``.env`` cannot make this pass.
@@ -503,7 +503,7 @@ def test_the_eight_are_scoped_by_the_shipped_default_with_no_env_change(monkeypa
     monkeypatch.setattr(settings, "creator_emails", "")
     monkeypatch.setattr(settings, "admin_emails", "")
 
-    for email in THE_EIGHT:
+    for email in THE_SEVEN:
         assert is_geo_only(email), f"{email} is not scoped by the shipped default"
         # …and the scope is not a substitute for the sign-in allowlist: every one
         # of them must still be admitted at the door, or they are simply locked
@@ -511,8 +511,10 @@ def test_the_eight_are_scoped_by_the_shipped_default_with_no_env_change(monkeypa
         assert is_allowed_email(email), f"{email} cannot sign in at all"
 
     # Non-vacuity, and the boundary: a colleague on the same domain as four of
-    # them keeps the whole workspace.
+    # them keeps the whole workspace — and so does every aivirtual.com mailbox.
     assert not is_geo_only("colleague@legalsoft.com")
+    assert not is_geo_only("lynie.t@aivirtual.com")
+    assert not is_geo_only("anyone@aivirtual.com")
 
 
 def test_the_scope_wall_does_not_authenticate_anything(client, monkeypatch):

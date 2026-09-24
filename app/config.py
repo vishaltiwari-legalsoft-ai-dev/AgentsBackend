@@ -23,6 +23,19 @@ CREATOR_EMAILS_DEFAULT: frozenset[str] = frozenset(
 )
 
 
+def email_in(email: str, entries: set[str]) -> bool:
+    """Whether an address matches a role/scope list.
+
+    An entry is either a full address (``ana@x.com``) or a whole domain written
+    with a leading ``@`` (``@aivirtual.com``), which matches every mailbox at
+    exactly that domain — subdomains are NOT implied. Case-insensitive.
+    """
+    address = email.strip().lower()
+    if not address or "@" not in address:
+        return False
+    return address in entries or "@" + address.rpartition("@")[2] in entries
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
@@ -45,6 +58,10 @@ class Settings(BaseSettings):
     # frontend button and as the audience when verifying ID tokens here.
     google_client_id: str = ""
     # Comma-separated emails granted Super Admin (analytics + user directory).
+    # Entries are full addresses or ``@domain`` for every mailbox at a domain
+    # (see ``email_in``). ``@aivirtual.com`` is on both Cloud Run services'
+    # ADMIN_EMAILS since 2026-09-24 by owner decision — that env var overrides
+    # this default, so the list that matters live is the service's.
     admin_emails: str = ""
     # Comma-separated emails granted the Creator role (Super Admin + secrets /
     # integration management). The CREATOR_EMAILS_DEFAULT owners are always
@@ -69,7 +86,7 @@ class Settings(BaseSettings):
         "marian.p@legalsoft.com,"
         "mahmoud.e@legalsoft.com,"
         "michael.tayco@legalsoft.com,"
-        "lynie.t@aivirtual.com,"
+        "@aivirtual.com,"
         "miguel@usimmigration.ai,"
         "yans.suarez@medvirtual.ai,"
         "franceska@aianswering.ai"
@@ -83,13 +100,17 @@ class Settings(BaseSettings):
     # This is a SCOPE, not a role, and it is the opposite direction of travel
     # from ``geo_editor_emails`` directly above: that one ADDS nine routes to
     # an account, this one REMOVES every route outside one workspace. The two
-    # lists carry the same eight addresses today and still mean different
+    # lists overlap heavily today and still mean different
     # things — an address here with no GEO editor role gets a read-only GEO
     # panel and nothing else; an address in both gets the editable panel and
     # nothing else. Keeping them separate is what lets either move alone.
     #
+    # aivirtual.com is deliberately NOT here: since 2026-09-24 every mailbox
+    # there is an admin and a GEO editor with the full hub (owner decision),
+    # and admins are never GEO-only.
+    #
     # The addresses are full addresses, never domains, because four of the
-    # eight are @legalsoft.com — the domain that ``allowed_email_domains``
+    # seven are @legalsoft.com — the domain that ``allowed_email_domains``
     # admits wholesale — so a domain rule here would scope the whole company
     # to the GEO panel. The other four are outside contractors, which is the
     # exposure that made this necessary: before it, being in ALLOWED_EMAILS
@@ -103,7 +124,6 @@ class Settings(BaseSettings):
         "marian.p@legalsoft.com,"
         "mahmoud.e@legalsoft.com,"
         "michael.tayco@legalsoft.com,"
-        "lynie.t@aivirtual.com,"
         "miguel@usimmigration.ai,"
         "yans.suarez@medvirtual.ai,"
         "franceska@aianswering.ai"
