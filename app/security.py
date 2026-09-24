@@ -141,6 +141,10 @@ def is_geo_only(email: str) -> bool:
     they administer. It is the same "the people who could already do this keep
     doing it" implication ``is_admin`` and ``is_geo_editor`` carry, stated once
     here rather than re-derived at the guard.
+
+    Strictly opt-in and per exact address: the shipped default names nobody,
+    and ``settings.geo_only_email_set`` has already dropped any ``@domain``
+    entry, so ``email_in`` can only ever match a full address here.
     """
     if is_creator(email) or is_admin(email):
         return False

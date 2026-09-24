@@ -275,30 +275,44 @@ def test_the_geo_editor_roster_is_pinned(monkeypatch):
     """
     defaults = _pristine_settings(monkeypatch)
     assert defaults.geo_editor_email_set == {
-        "nino.b@legalsoft.com",
-        "marian.p@legalsoft.com",
-        "mahmoud.e@legalsoft.com",
-        "michael.tayco@legalsoft.com",
-        # Whole domain, by owner decision 2026-09-24 — every aivirtual.com
-        # mailbox edits GEO; lynie.t is covered by it, not listed twice.
+        # Whole domains, by owner decision 2026-09-25 — every mailbox at an
+        # allowed domain edits GEO, current and future, with no per-person
+        # entry to forget. Individual legalsoft/aivirtual names do not belong
+        # here any more: the domain rule already covers them.
+        "@legalsoft.com",
         "@aivirtual.com",
     } | (EXTERNAL_GEO_EDITORS - {"lynie.t@aivirtual.com"})
     # Every outside-domain editor must also be able to reach the door.
     assert EXTERNAL_GEO_EDITORS <= defaults.allowed_email_set
 
 
+#: The five lists that decide who gets what. Pinned together so a test about
+#: "what ships" reads every one of them off the class defaults and none off the
+#: developer's ``.env``.
+_ACCESS_FIELDS = (
+    "allowed_email_domains", "allowed_emails", "admin_emails",
+    "geo_editor_emails", "geo_only_emails",
+)
+
+
+def _ship_the_defaults(monkeypatch):
+    pristine = _pristine_settings(monkeypatch)
+    for field in _ACCESS_FIELDS:
+        monkeypatch.setattr(settings, field, getattr(pristine, field))
+    monkeypatch.setattr(settings, "creator_emails", "")
+
+
 def test_every_aivirtual_mailbox_edits_geo_and_is_not_scoped(_harness, monkeypatch):
     """Owner decision 2026-09-24: aivirtual.com gets the whole hub — every
-    agent, GEO editing, and admin. Admin comes from ADMIN_EMAILS on the
-    service (env), GEO editing and the lifted scope from the shipped defaults.
+    agent, GEO editing, and admin — from the shipped defaults alone.
+
+    Admin is the one that ALSO has to be on the service: both Cloud Run
+    services set ADMIN_EMAILS as an env var, and env replaces the default
+    rather than merging with it (see the field's comment in ``app.config``).
     """
     from app.security import is_admin, is_geo_editor, is_geo_only
 
-    pristine = _pristine_settings(monkeypatch)
-    for field in ("allowed_email_domains", "allowed_emails",
-                  "geo_editor_emails", "geo_only_emails"):
-        monkeypatch.setattr(settings, field, getattr(pristine, field))
-    monkeypatch.setattr(settings, "admin_emails", "brix@legalsoft.com,@aivirtual.com")
+    _ship_the_defaults(monkeypatch)
 
     for member in ("lynie.t@aivirtual.com", "new.hire@aivirtual.com", "Ops@AIVirtual.com"):
         body = login(_harness, member).json()["user"]
@@ -310,11 +324,44 @@ def test_every_aivirtual_mailbox_edits_geo_and_is_not_scoped(_harness, monkeypat
     # The domain rule is exact: a subdomain gets nothing from it.
     assert not is_admin("x@mail.aivirtual.com")
     assert not is_geo_editor("x@mail.aivirtual.com")
-    # The other outside editors are unchanged: editor, still GEO-only, not admin.
+    # The outside editors: editor, not admin, and — since 2026-09-25 — not
+    # scoped by any default either. Scoping is opt-in via GEO_ONLY_EMAILS on
+    # the service (tests/test_allowlist_live_routes.py pins the mechanism).
     assert is_geo_editor("miguel@usimmigration.ai") is True
     assert is_admin("miguel@usimmigration.ai") is False
-    assert is_geo_only("miguel@usimmigration.ai") is True
+    assert is_geo_only("miguel@usimmigration.ai") is False
     assert is_geo_only("lynie.t@aivirtual.com") is False
+
+
+def test_a_fresh_mailbox_at_either_allowed_domain_gets_the_whole_hub(_harness, monkeypatch):
+    """Owner decision 2026-09-25, and the reason: a production screenshot of
+    an aivirtual.com account on a "GEO ONLY" console, after a code default had
+    quietly named it. Every user at legalsoft.com and aivirtual.com — the two
+    domains the door admits wholesale — gets the full platform by default,
+    with zero per-user diagnosis: sign-in, every agent, GEO editing. Nobody
+    is GEO-only unless GEO_ONLY_EMAILS on the service names their exact
+    address, so the class default is pinned EMPTY here; a developer's .env
+    cannot make this pass.
+    """
+    from app.config import Settings
+
+    assert Settings.model_fields["geo_only_emails"].default == ""
+    _ship_the_defaults(monkeypatch)
+
+    # Nobody has ever heard of these two — that is the point.
+    for newcomer in ("someone.new@aivirtual.com", "someone.new@legalsoft.com"):
+        resp = login(_harness, newcomer)
+        assert resp.status_code == 200, (newcomer, resp.text)
+        body = resp.json()["user"]
+        assert body["is_geo_editor"] is True, newcomer
+        assert "is_geo_only" in body and body["is_geo_only"] is False, newcomer
+        assert body["is_creator"] is False, newcomer
+
+    # Admin differs by domain, on purpose: aivirtual.com is admin wholesale
+    # (2026-09-24); legalsoft.com admins are named on the service's
+    # ADMIN_EMAILS, so a fresh legalsoft mailbox is a member, not an admin.
+    assert login(_harness, "someone.new@aivirtual.com").json()["user"]["is_admin"] is True
+    assert login(_harness, "someone.new@legalsoft.com").json()["user"]["is_admin"] is False
 
 
 def test_the_other_outside_domains_were_not_admitted_wholesale(monkeypatch):

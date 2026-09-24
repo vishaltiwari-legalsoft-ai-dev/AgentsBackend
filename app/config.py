@@ -7,6 +7,7 @@ required configuration (see `require`).
 
 from __future__ import annotations
 
+import logging
 import os
 from functools import lru_cache
 
@@ -59,10 +60,12 @@ class Settings(BaseSettings):
     google_client_id: str = ""
     # Comma-separated emails granted Super Admin (analytics + user directory).
     # Entries are full addresses or ``@domain`` for every mailbox at a domain
-    # (see ``email_in``). ``@aivirtual.com`` is on both Cloud Run services'
-    # ADMIN_EMAILS since 2026-09-24 by owner decision — that env var overrides
-    # this default, so the list that matters live is the service's.
-    admin_emails: str = ""
+    # (see ``email_in``). ``@aivirtual.com`` is the shipped default by owner
+    # decision (2026-09-24): every mailbox there is an admin. Both Cloud Run
+    # services set ADMIN_EMAILS as an env var, and an env value REPLACES this
+    # default rather than merging with it — so the list that matters live is
+    # the service's, and it has to carry ``@aivirtual.com`` itself.
+    admin_emails: str = "@aivirtual.com"
     # Comma-separated emails granted the Creator role (Super Admin + secrets /
     # integration management). The CREATOR_EMAILS_DEFAULT owners are always
     # Creators even when this is empty.
@@ -81,11 +84,14 @@ class Settings(BaseSettings):
     # Creators are GEO editors implicitly (see ``security.is_geo_editor``), so
     # they are not repeated here. Emptying this leaves GEO editing exactly
     # where it was before the role existed: Creator-only.
+    #
+    # Since 2026-09-25 (owner decision) every mailbox at an allowed domain is
+    # an editor by default — current and future, with no per-user entry to
+    # forget. The domain rules are what deliver that; the three outside
+    # contractors stay named one address at a time because their domains are
+    # not admitted wholesale anywhere (see ``allowed_emails``).
     geo_editor_emails: str = (
-        "nino.b@legalsoft.com,"
-        "marian.p@legalsoft.com,"
-        "mahmoud.e@legalsoft.com,"
-        "michael.tayco@legalsoft.com,"
+        "@legalsoft.com,"
         "@aivirtual.com,"
         "miguel@usimmigration.ai,"
         "yans.suarez@medvirtual.ai,"
@@ -100,34 +106,30 @@ class Settings(BaseSettings):
     # This is a SCOPE, not a role, and it is the opposite direction of travel
     # from ``geo_editor_emails`` directly above: that one ADDS nine routes to
     # an account, this one REMOVES every route outside one workspace. The two
-    # lists overlap heavily today and still mean different
-    # things — an address here with no GEO editor role gets a read-only GEO
-    # panel and nothing else; an address in both gets the editable panel and
-    # nothing else. Keeping them separate is what lets either move alone.
+    # mean different things — an address here with no GEO editor role gets a
+    # read-only GEO panel and nothing else; an address in both gets the
+    # editable panel and nothing else. Keeping them separate is what lets
+    # either move alone.
     #
-    # aivirtual.com is deliberately NOT here: since 2026-09-24 every mailbox
-    # there is an admin and a GEO editor with the full hub (owner decision),
-    # and admins are never GEO-only.
+    # The shipped default is EMPTY and must stay empty: scoping is strictly
+    # opt-in, per exact address, via the GEO_ONLY_EMAILS env var on the
+    # service. Owner decision 2026-09-25, after a production screenshot showed
+    # an aivirtual.com mailbox landing on a "GEO ONLY" console: every mailbox
+    # at an allowed domain — current and future — gets the whole hub by
+    # default, and nobody falls into this scope because a code default
+    # happened to name them. A non-empty default here is the defect, not a
+    # convenience. To scope somebody, set the env var with their address.
     #
-    # The addresses are full addresses, never domains, because four of the
-    # seven are @legalsoft.com — the domain that ``allowed_email_domains``
-    # admits wholesale — so a domain rule here would scope the whole company
-    # to the GEO panel. The other four are outside contractors, which is the
-    # exposure that made this necessary: before it, being in ALLOWED_EMAILS
-    # meant the entire workspace, including the company marketing tracker.
+    # Entries are exact addresses ONLY. ``@domain`` entries are ignored (see
+    # ``geo_only_email_set``) and logged at startup, because the two domains
+    # ``allowed_email_domains`` admits wholesale are the companies this
+    # service exists for, and a single domain rule here would scope an entire
+    # company to one panel.
     #
     # Creators and admins are never GEO-only regardless of what is listed here
     # (see ``security.is_geo_only``), so an owner cannot lock themselves out of
     # their own panel with a typo.
-    geo_only_emails: str = (
-        "nino.b@legalsoft.com,"
-        "marian.p@legalsoft.com,"
-        "mahmoud.e@legalsoft.com,"
-        "michael.tayco@legalsoft.com,"
-        "miguel@usimmigration.ai,"
-        "yans.suarez@medvirtual.ai,"
-        "franceska@aianswering.ai"
-    )
+    geo_only_emails: str = ""
 
     # --- Sign-in allowlist -------------------------------------------------
     # Cloud Run runs --allow-unauthenticated, so /api/auth/google is the ONLY
@@ -271,16 +273,30 @@ class Settings(BaseSettings):
         """
         return {e.strip().lower() for e in self.geo_editor_emails.split(",") if e.strip()}
 
+    def _geo_only_entries(self) -> set[str]:
+        return {e.strip().lower() for e in self.geo_only_emails.split(",") if e.strip()}
+
     @property
     def geo_only_email_set(self) -> set[str]:
-        """Addresses scoped to the GEO workspace by config.
+        """Exact addresses scoped to the GEO workspace by config.
 
-        Parsed exactly like ``geo_editor_email_set``, and like it the
-        Creator/admin exemption is NOT folded in here — that belongs in
+        Parsed like ``geo_editor_email_set`` with one deliberate difference:
+        ``@domain`` entries are DROPPED, never honoured. The scope takes reach
+        away, and the only domains anyone would write here are the ones the
+        sign-in door admits wholesale — so a domain entry would scope a whole
+        company to one panel in a single typo. They surface through
+        ``geo_only_ignored_entries`` and a startup warning instead.
+
+        The Creator/admin exemption is NOT folded in here — that belongs in
         ``security.is_geo_only``, beside the same kind of implication for the
         other roles, so one place decides and one place explains.
         """
-        return {e.strip().lower() for e in self.geo_only_emails.split(",") if e.strip()}
+        return {e for e in self._geo_only_entries() if not e.startswith("@")}
+
+    @property
+    def geo_only_ignored_entries(self) -> set[str]:
+        """The ``@domain`` entries in GEO_ONLY_EMAILS that are not honoured."""
+        return {e for e in self._geo_only_entries() if e.startswith("@")}
 
     @property
     def allowed_email_domain_set(self) -> set[str]:
@@ -313,6 +329,16 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+# Loud, once, at import: a domain in GEO_ONLY_EMAILS is a configuration
+# mistake that would otherwise be silently inert — say so where the deploy
+# logs are read, not only in a test.
+if settings.geo_only_ignored_entries:
+    logging.getLogger(__name__).warning(
+        "GEO_ONLY_EMAILS: %s ignored — the GEO-only scope is per exact address, "
+        "never per domain",
+        ", ".join(sorted(settings.geo_only_ignored_entries)),
+    )
 
 # Google's client libraries read GOOGLE_APPLICATION_CREDENTIALS from the OS
 # environment (not from .env), so export the configured path for local dev. On
