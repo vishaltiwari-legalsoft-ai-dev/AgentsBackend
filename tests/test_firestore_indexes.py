@@ -62,6 +62,9 @@ def test_the_composites_the_code_requires_today_are_recorded(spec):
         "plus an ordering on a different field. Without it the console's Runs "
         "panel falls back to reading unordered and sorting in process, which is "
         "correct but capped at 3000 rows per caller")
+    assert _has(spec, "brand_references", "brand_id", "deleted_at", "created_at"), (
+        "firestore_repo.list_references needs this one - two equality filters "
+        "(brand_id, deleted_at == null) plus an ordering on created_at")
 
 
 def test_the_mr_read_path_queries_stayed_index_free():

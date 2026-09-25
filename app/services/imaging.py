@@ -134,25 +134,92 @@ def _svg_to_png(data: bytes, file_name: str) -> bytes | None:
     drawing = svg2rlg(io.BytesIO(_flatten_svg_gradients(data)))
     if drawing is None:
         return None
+    # renderPM paints the SVG's declared size; a viewBox of 100000 units would
+    # allocate a 100000-px canvas. Scale the drawing down to the working size.
+    longest = max(float(drawing.width or 0), float(drawing.height or 0))
+    if longest > LOGO_WORK_PX:
+        factor = LOGO_WORK_PX / longest
+        drawing.scale(factor, factor)
+        drawing.width, drawing.height = drawing.width * factor, drawing.height * factor
     out = io.BytesIO()
     renderPM.drawToFile(drawing, out, fmt="PNG")
     return out.getvalue()
+
+
+#: Largest raster side accepted at logo upload. A 4096² logo is already far
+#: beyond any composite; past it the only thing that grows is decode cost.
+LOGO_MAX_SIDE_PX = 4096
+#: Working size every logo is reduced to BEFORE keying/compositing, so no path
+#: ever touches more than ~4M pixels whatever the upload's dimensions.
+LOGO_WORK_PX = 2048
+#: Flood-fill tolerance for the white-background key (1-norm over RGB), the
+#: value ``ImageDraw.floodfill(thresh=30)`` used before the fill moved to numpy.
+_KEY_THRESH = 30
+
+_SVG_EMBEDDED_RE = re.compile(rb"<image\b|data:", re.IGNORECASE)
+
+
+class LogoRejected(ValueError):
+    """A logo upload the service refuses; ``code`` is the stable client code
+    (``image_too_large`` / ``unsupported_file_type``)."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def _is_svg(data: bytes, file_name: str = "", mime: str = "") -> bool:
+    if mime == "image/svg+xml" or file_name.lower().endswith(".svg"):
+        return True
+    head = data[:2048].lstrip(b"\xef\xbb\xbf \t\r\n")
+    return (head.startswith(b"<?xml") or head.startswith(b"<svg")) and b"<svg" in data[:65536]
+
+
+def validate_logo_upload(data: bytes, *, file_name: str = "", mime: str = "") -> None:
+    """Refuse a logo before any decode work happens; raises :class:`LogoRejected`.
+
+    Rasters: the header alone (no pixel decode) must say at most
+    ``LOGO_MAX_SIDE_PX`` per side — a 21 KB 9000×9000 1-bit PNG passes every
+    byte-size check and would otherwise cost seconds of CPU per Stage-4 call.
+    SVGs: no ``<image>`` element and no ``data:`` URI — those smuggle a raster
+    (or worse) past the size cap through the vector renderer.
+    """
+    if _is_svg(data, file_name, mime):
+        if _SVG_EMBEDDED_RE.search(data):
+            raise LogoRejected("unsupported_file_type")
+        return
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(data)) as im:  # header only; nothing is decoded
+            width, height = im.size
+    except Image.DecompressionBombError as exc:
+        raise LogoRejected("image_too_large") from exc
+    except Exception as exc:  # noqa: BLE001 - magic bytes matched, image did not
+        raise LogoRejected("unsupported_file_type") from exc
+    if width > LOGO_MAX_SIDE_PX or height > LOGO_MAX_SIDE_PX:
+        raise LogoRejected("image_too_large")
 
 
 def to_png_logo(data: bytes, file_name: str = "", mime: str = "") -> bytes | None:
     """Return PNG bytes for a logo, or None if it can't be rendered.
 
     SVG is rasterized with cairosvg when available, else svglib with gradient
-    flattening; raster formats are normalized to PNG via Pillow.
+    flattening; raster formats are normalized to PNG via Pillow. Every path
+    downscales to ``LOGO_WORK_PX`` before the white-background key runs, so
+    the cost is bounded by the working size, never by the upload.
     """
-    is_svg = mime == "image/svg+xml" or file_name.lower().endswith(".svg")
     try:
-        if is_svg:
+        if _is_svg(data, file_name, mime):
             return _svg_to_png(data, file_name)
 
         from PIL import Image
 
-        image = Image.open(io.BytesIO(data)).convert("RGBA")
+        image = Image.open(io.BytesIO(data))
+        # Downscale FIRST (on the source mode, cheap in C) — converting a
+        # 9000×9000 upload to RGBA before shrinking is the decode bomb.
+        image.thumbnail((LOGO_WORK_PX, LOGO_WORK_PX))
+        image = image.convert("RGBA")
         # Raster logos are frequently delivered on a solid white box (JPEG/PNG
         # without alpha). Knock that background out so Stage 4 doesn't composite
         # an ugly white rectangle behind the mark. Safe: _key_white_background
@@ -166,6 +233,44 @@ def to_png_logo(data: bytes, file_name: str = "", mime: str = "") -> bytes | Non
         return None
 
 
+def _background_mask(rgb, seeds: list[tuple[int, int]], thresh: int):
+    """4-connected region reachable from each seed through pixels whose 1-norm
+    distance from THAT seed's colour is ≤ ``thresh`` — exactly what
+    ``ImageDraw.floodfill(thresh=...)`` fills, computed as row spans on a numpy
+    array instead of one Python set operation per pixel (43 s → ~50 ms on a
+    2048² white-background logo)."""
+    import numpy as np
+
+    h, w, _ = rgb.shape
+    out = np.zeros((h, w), dtype=bool)
+    for x0, y0 in seeds:
+        if out[y0, x0]:
+            continue  # already inside an earlier seed's fill
+        # An earlier seed's fill is a wall for this one (Pillow had already
+        # painted it the sentinel colour), so seed order changes nothing.
+        near = (np.abs(rgb.astype(np.int16) - rgb[y0, x0].astype(np.int16)).sum(axis=2) <= thresh) & ~out
+        filled = np.zeros((h, w), dtype=bool)
+        stack = [(x0, y0)]
+        while stack:
+            x, y = stack.pop()
+            if filled[y, x] or not near[y, x]:
+                continue
+            row = near[y]
+            blocked = np.flatnonzero(~row[:x])
+            left = int(blocked[-1]) + 1 if blocked.size else 0
+            blocked = np.flatnonzero(~row[x + 1:])
+            right = x + 1 + int(blocked[0]) if blocked.size else w   # exclusive
+            filled[y, left:right] = True
+            for ny in (y - 1, y + 1):
+                if 0 <= ny < h:
+                    idx = np.flatnonzero(near[ny, left:right] & ~filled[ny, left:right])
+                    if idx.size:
+                        starts = idx[np.concatenate(([True], np.diff(idx) > 1))]
+                        stack.extend((left + int(s), ny) for s in starts)
+        out |= filled
+    return out
+
+
 def _key_white_background(logo: "Image.Image") -> "Image.Image":
     """Make a logo's white background transparent (only when it clearly has one).
 
@@ -175,7 +280,8 @@ def _key_white_background(logo: "Image.Image") -> "Image.Image":
     white *inside* the mark is preserved. If the logo already has real
     transparency, or its corners aren't white, we leave it untouched.
     """
-    from PIL import Image, ImageDraw
+    import numpy as np
+    from PIL import Image
 
     rgba = logo.convert("RGBA")
     # Already has meaningful transparency -> trust the source alpha.
@@ -194,17 +300,10 @@ def _key_white_background(logo: "Image.Image") -> "Image.Image":
     if not white_corners:
         return rgba  # logo sits on a colored bg -> don't risk keying
 
-    rgb = rgba.convert("RGB")
-    sentinel = (255, 0, 255)
-    for c in white_corners:
-        ImageDraw.floodfill(rgb, c, sentinel, thresh=30)
-
-    keyed = [
-        (r, g, b, 0) if (rr, gg, bb) == sentinel else (r, g, b, a)
-        for (r, g, b, a), (rr, gg, bb) in zip(rgba.getdata(), rgb.getdata())
-    ]
-    rgba.putdata(keyed)
-    return rgba
+    arr = np.array(rgba)                       # (h, w, 4) uint8 copy
+    background = _background_mask(arr[:, :, :3], white_corners, _KEY_THRESH)
+    arr[:, :, 3][background] = 0
+    return Image.fromarray(arr, "RGBA")
 
 
 # Must match the reserved zone in prompts.with_reserved_logo_space_instruction().

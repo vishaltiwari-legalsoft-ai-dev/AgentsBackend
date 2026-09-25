@@ -471,32 +471,35 @@ def test_a_de_provisioned_geo_only_account_is_refused_at_the_door_first(client, 
     assert _mr(client, headers).status_code == 401
 
 
-#: The eight people the scope was built for, by full address. Four are
-#: @legalsoft.com — the domain ALLOWED_EMAIL_DOMAINS admits wholesale — which is
-#: why the list is addresses and never domains: a domain rule would have scoped
-#: the entire company to the GEO panel.
-THE_EIGHT = (
+#: The people the scope was originally built for, by full address. Until
+#: 2026-09-25 the shipped default scoped them; it scopes NOBODY now (owner
+#: decision, after an aivirtual.com mailbox was found on a "GEO ONLY" console
+#: in production because a code default had named it). Scoping is opt-in: set
+#: GEO_ONLY_EMAILS on the service, one exact address at a time.
+FORMERLY_SCOPED_BY_DEFAULT = (
     "nino.b@legalsoft.com",
     "marian.p@legalsoft.com",
     "mahmoud.e@legalsoft.com",
     "michael.tayco@legalsoft.com",
-    "lynie.t@aivirtual.com",
     "miguel@usimmigration.ai",
     "yans.suarez@medvirtual.ai",
     "franceska@aianswering.ai",
 )
 
 
-def test_the_eight_are_scoped_by_the_shipped_default_with_no_env_change(monkeypatch):
+def test_the_shipped_default_scopes_nobody(monkeypatch):
     """Read off the CLASS default, not off ``settings``.
 
-    A deployment that never sets GEO_ONLY_EMAILS must still scope these eight,
-    because "we will set the env var" is the step that gets skipped — and the
-    skip is silent and fails open. ``model_fields`` is the value baked into the
-    image, so a developer's ``.env`` cannot make this pass.
+    A deployment that never sets GEO_ONLY_EMAILS — which is both services
+    today — must scope nobody: the direction that fails badly is a code
+    default quietly naming someone, because no per-user diagnosis ever finds
+    it. ``model_fields`` is the value baked into the image, so a developer's
+    ``.env`` cannot make this pass.
     """
     from app.config import Settings
     from app.security import is_geo_only
+
+    assert Settings.model_fields["geo_only_emails"].default == ""
 
     # The sign-in lists come from the same place and for the same reason: the
     # module fixture blanks them to assert guards in isolation, and this one
@@ -508,16 +511,37 @@ def test_the_eight_are_scoped_by_the_shipped_default_with_no_env_change(monkeypa
     monkeypatch.setattr(settings, "creator_emails", "")
     monkeypatch.setattr(settings, "admin_emails", "")
 
-    for email in THE_EIGHT:
-        assert is_geo_only(email), f"{email} is not scoped by the shipped default"
-        # …and the scope is not a substitute for the sign-in allowlist: every one
-        # of them must still be admitted at the door, or they are simply locked
-        # out and "GEO panel only" means "nothing at all".
+    for email in FORMERLY_SCOPED_BY_DEFAULT + (
+        "colleague@legalsoft.com", "lynie.t@aivirtual.com", "anyone@aivirtual.com",
+    ):
+        assert not is_geo_only(email), f"{email} is scoped by the shipped default"
         assert is_allowed_email(email), f"{email} cannot sign in at all"
 
-    # Non-vacuity, and the boundary: a colleague on the same domain as four of
-    # them keeps the whole workspace.
-    assert not is_geo_only("colleague@legalsoft.com")
+    # Non-vacuity: the mechanism still bites when a deployment opts in, and
+    # only for the address it names.
+    monkeypatch.setattr(settings, "geo_only_emails", "miguel@usimmigration.ai")
+    assert is_geo_only("miguel@usimmigration.ai")
+    assert not is_geo_only("yans.suarez@medvirtual.ai")
+
+
+def test_a_domain_entry_in_geo_only_emails_scopes_nobody(client, monkeypatch):
+    """The scope is per exact address, never per domain — enforced, not just
+    documented.
+
+    The only domains anyone would write into GEO_ONLY_EMAILS are the two the
+    sign-in door admits wholesale, and one such entry would scope an entire
+    company to a single panel. So ``@domain`` entries are dropped by
+    ``geo_only_email_set`` (and reported via ``geo_only_ignored_entries`` for
+    the startup warning) while exact addresses beside them keep working.
+    """
+    monkeypatch.setattr(settings, "geo_only_emails", " @legalsoft.com , ext@legalsoft.com")
+    assert settings.geo_only_email_set == {"ext@legalsoft.com"}
+    assert settings.geo_only_ignored_entries == {"@legalsoft.com"}
+
+    scoped = {"Authorization": f"Bearer {create_token('u-ext', 'ext@legalsoft.com')}"}
+    colleague = {"Authorization": f"Bearer {create_token('u-col', 'colleague@legalsoft.com')}"}
+    assert _mr(client, scoped).status_code == 403
+    assert _mr(client, colleague).status_code != 403
 
 
 def test_the_scope_wall_does_not_authenticate_anything(client, monkeypatch):

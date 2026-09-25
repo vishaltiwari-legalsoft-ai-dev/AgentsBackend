@@ -587,6 +587,9 @@ def test_the_cron_polls_members_with_their_current_address_and_disconnects_every
     monkeypatch.setenv("INBOX_CRON_KEY", "test-only-key")
     monkeypatch.setattr(settings, "allowed_emails", "contractor@aivirtual.com")
     monkeypatch.setattr(settings, "geo_only_emails", "contractor@aivirtual.com")
+    # Same as ``real_auth``: the shipped ADMIN_EMAILS default is "@aivirtual.com"
+    # and admins are never GEO-only, so the scope only bites with it blanked.
+    monkeypatch.setattr(settings, "admin_emails", "")
     _member(store, OWNER)
     store.users[OWNER["email"]]["email"] = "her.new@legalsoft.com"   # renamed since connecting
     store.connections["user-deleted"] = _connected_doc()              # no user record at all

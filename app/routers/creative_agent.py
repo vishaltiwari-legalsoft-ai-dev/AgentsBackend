@@ -37,6 +37,7 @@ from app.services.run_tracking import JOB, Activity, ActivityTrail, silent
 
 # On sys.path via app.__init__ (agent root registered there).
 from graphics_designer_agent import reference_library as rl
+from graphics_designer_agent import registry
 from graphics_designer_agent.creative import document_builder as db
 from graphics_designer_agent.creative import pipeline
 from graphics_designer_agent.creative import runs as cruns
@@ -124,11 +125,14 @@ def create(body: CreateBody, user: dict = Depends(get_current_user),
             f"'{body.creative_type}' is a standard social post — use the Graphics "
             f"Studio editor, not the Creative Agent.",
         )
-    run = cruns.create_run(
-        str(user["id"]), body.creative_type,
-        brand_id=body.brand_id, brief=body.brief, autonomous=body.autonomous,
-        text_mode=body.text_mode,
-    )
+    try:
+        run = cruns.create_run(
+            str(user["id"]), body.creative_type,
+            brand_id=body.brand_id, brief=body.brief, autonomous=body.autonomous,
+            text_mode=body.text_mode,
+        )
+    except registry.UnknownBrand as exc:
+        raise HTTPException(404, "brand_not_found") from exc
     act.note(f"{body.creative_type} — “{body.brief[:160]}”" if body.brief else body.creative_type,
              brand_id=run.get("brand_id"), run_id=run.get("id"))
     return _to_client(run)

@@ -11,10 +11,12 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from pathlib import Path
 from typing import Callable
 
 from app.services.brand_folder_scanner import BrandFolder
-from app.services.brand_kit_extractor import BrandKitProfile, fonts_from_files
+from app.services.brand_kit_extractor import (BrandKitProfile, derive_palette,
+                                              fonts_from_files)
 
 _SLUG_SEP_RE = re.compile(r"[ _]+")
 _SLUG_INVALID_RE = re.compile(r"[^a-z0-9-]")
@@ -218,3 +220,133 @@ def build_gd_spec(profile: BrandKitProfile, folder: BrandFolder,
         "hooks": {},
         "stage2_variants": list(GENERIC_STAGE2_VARIANTS),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Self-serve brands (created in the browser: colours typed in, files uploaded)
+# --------------------------------------------------------------------------- #
+# Same output contract as ``build_gd_spec`` and the same ``derive_palette`` path;
+# the only difference is where the inputs come from. Pure: no I/O.
+
+_WHITE = (255, 255, 255)
+_BLACK = (0, 0, 0)
+#: Tints/shades tried, in order, until ``derive_palette`` has its three colours.
+_PAD_STEPS = ((_WHITE, 0.6), (_BLACK, 0.45), (_WHITE, 0.3), (_BLACK, 0.7),
+              (_WHITE, 0.15), (_BLACK, 0.85))
+_STYLE_WEIGHTS = (("thin", 100), ("extralight", 200), ("ultralight", 200),
+                  ("light", 300), ("medium", 500), ("semibold", 600),
+                  ("demibold", 600), ("extrabold", 800), ("ultrabold", 800),
+                  ("heavy", 900), ("black", 900), ("bold", 700))
+
+
+def normalize_hex(value: str) -> str:
+    """``#abc`` / ``#AABBCC`` -> ``#AABBCC``; raises ValueError otherwise."""
+    h = (value or "").strip().upper()
+    if re.fullmatch(r"#[0-9A-F]{3}", h):
+        h = "#" + "".join(c * 2 for c in h[1:])
+    if not re.fullmatch(r"#[0-9A-F]{6}", h):
+        raise ValueError(f"{value!r} is not a #RGB/#RRGGBB hex colour")
+    return h
+
+
+def _mix(hex_color: str, toward: tuple[int, int, int], amount: float) -> str:
+    rgb = tuple(int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    mixed = tuple(round(c + (t - c) * amount) for c, t in zip(rgb, toward))
+    return "#%02X%02X%02X" % mixed
+
+
+def palette_from_hexes(hexes: list[str]) -> dict:
+    """``derive_palette`` over the user's colours, exactly as typed.
+
+    ``derive_palette`` needs three colours and a self-serve brand may give one
+    or two, so the set is padded with tints/shades OF THE FIRST PRIMARY until
+    there are three. Padding is derived from the user's colour and added
+    beside it — every hex the user typed is in the input set unchanged, and
+    nothing here substitutes a house colour for theirs.
+    """
+    clean: list[str] = []
+    for value in hexes:
+        h = normalize_hex(value)
+        if h not in clean:
+            clean.append(h)
+    if not clean:
+        raise ValueError("at least one brand colour is needed")
+    base = clean[0]
+    for toward, amount in _PAD_STEPS:
+        if len(clean) >= 3:
+            break
+        candidate = _mix(base, toward, amount)
+        if candidate not in clean:
+            clean.append(candidate)
+    return derive_palette(clean)
+
+
+def font_variant_for_upload(original_name: str, stored_file: str) -> dict:
+    """One ``font_variants[]`` entry for an uploaded font file.
+
+    The display name comes from the ORIGINAL file name (``Inter-Bold.ttf`` ->
+    ``Inter Bold``) through the extractor's ``fonts_from_files`` parser; the
+    ``file`` is the content-hash object name the upload was stored under, so
+    ``gd_brand_source`` can match it to the recorded ``gs://`` URI by basename
+    — which is the only way the pipeline ever loads it.
+    """
+    from pathlib import Path as _Path
+
+    stem = _Path(original_name or "font").name or "font"
+    hit = fonts_from_files([_Path(stem)])[0]
+    style_key = hit.style.lower().replace(" ", "")
+    weight = next((w for token, w in _STYLE_WEIGHTS if token in style_key), 400)
+    return {
+        "name": f"{hit.family} {hit.style}".strip(),
+        "family": hit.family,
+        "file": stored_file,
+        "weight": weight,
+        "style": "oblique" if "italic" in style_key or "oblique" in style_key else "normal",
+        "source_name": stem,
+    }
+
+
+def build_self_serve_spec(
+    name: str,
+    slug: str,
+    *,
+    primary_colors: list[str],
+    secondary_colors: list[str] | None = None,
+    accent_colors: list[str] | None = None,
+    tone_of_voice: str | None = None,
+    font_variants: list[dict] | None = None,
+) -> dict:
+    """The ``build_templated_pack`` spec for a self-serve brand.
+
+    Goes through ``build_gd_spec`` so a browser-made brand and a CLI-ingested
+    one produce the same shape (generic Stage-2 subjects, generic copy, the Be
+    Vietnam font set when no font files were uploaded). ``slug`` is the pack id
+    AND ``firestore_brand_id`` — one string, three roles; it never changes on
+    rename, which is why it is passed in rather than re-derived from ``name``.
+    """
+    palette = palette_from_hexes(
+        [*primary_colors, *(secondary_colors or []), *(accent_colors or [])])
+    profile = BrandKitProfile(
+        brand_name=name, colors=[], fonts=[],
+        primary_colors=[normalize_hex(h) for h in primary_colors],
+        secondary_colors=[normalize_hex(h) for h in (secondary_colors or [])],
+        accent_colors=[normalize_hex(h) for h in (accent_colors or [])],
+        font_family=None, tone_of_voice=tone_of_voice, palette=palette,
+        confidence="high",
+        provenance={"kit_pdf": None, "svg_files": [], "image_files_sampled": 0,
+                    "pages_scanned": 0, "source": "self_serve"},
+    )
+    folder = BrandFolder(brand_name=name, root=Path("."), kit_pdf=None)
+    spec = build_gd_spec(profile, folder, brand_id=slug)
+    assert spec is not None  # palette_from_hexes always yields three colours
+    spec["id"] = slug
+    spec["firestore_brand_id"] = slug
+    if font_variants:
+        variants = [dict(v) for v in font_variants]
+        families = Counter(v.get("family") or v["name"].rsplit(" ", 1)[0] for v in variants)
+        bold = next((v for v in variants if "bold" in v["name"].lower()), variants[0])
+        spec["font_variants"] = variants
+        spec["font_family"] = families.most_common(1)[0][0]
+        spec["default_font"] = bold["name"]
+        spec["font_fallback"] = False
+    return spec

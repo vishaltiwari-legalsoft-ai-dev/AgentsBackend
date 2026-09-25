@@ -121,6 +121,34 @@ def _materialize_fonts(spec: dict, font_file_uris: list[str]) -> dict:
     return spec
 
 
+def brand_logo_record(firestore_brand_id: str | None) -> dict | None:
+    """The logo Stage 4 should composite for a brand, as a creative-shaped
+    record (``file_url`` / ``file_name`` / ``file_type``) or ``None``.
+
+    Two truths used to exist: the brand doc's ``logo_uri`` (what self-serve
+    uploads and enrichment write) and a filename heuristic over the
+    ``creatives`` collection (what Stage 4 read). The doc wins now — it is the
+    logo somebody chose — and the creatives guess remains the fallback for
+    brands ingested before ``logo_uri`` existed. Reading the doc is best-effort
+    so a brand without one, or a doc read that fails, still reaches the guess.
+    """
+    if not firestore_brand_id:
+        return None
+    try:
+        brand = firestore_repo.get_brand(firestore_brand_id)
+    except Exception as exc:  # noqa: BLE001 - fall through to the creatives guess
+        logger.warning("brand doc read failed for %r; using the creatives guess: %s",
+                       firestore_brand_id, exc)
+        brand = None
+    uri = (brand or {}).get("logo_uri")
+    if isinstance(uri, str) and uri.startswith("gs://"):
+        name = uri.rsplit("/", 1)[-1]
+        ext = name.rsplit(".", 1)[-1] if "." in name else ""
+        return {"file_url": uri, "file_name": name,
+                "file_type": storage.content_type_for_ext(ext), "source": "logo_uri"}
+    return firestore_repo.find_brand_logo(firestore_brand_id)
+
+
 def firestore_spec_source() -> list[dict]:
     """``registry.register_dynamic_source`` callable: Firestore brand docs
     with a baked ``brand_metadata.gd_spec`` -> spec dicts with locally-present

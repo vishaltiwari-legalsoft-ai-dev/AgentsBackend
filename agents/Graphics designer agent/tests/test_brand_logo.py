@@ -46,3 +46,71 @@ def test_find_brand_logo_none_when_no_brand_or_no_candidates(monkeypatch):
     assert fr.find_brand_logo("") is None
     monkeypatch.setattr(fr, "list_creatives_by_brand", lambda bid, limit=500: [])
     assert fr.find_brand_logo("brand-x") is None
+
+
+# --------------------------------------------------------------------------- #
+# Stage 4 logo resolution (2026-09-25): the brand doc's ``logo_uri`` wins over
+# the creatives-collection guess.
+# --------------------------------------------------------------------------- #
+
+def _png_bytes() -> bytes:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGBA", (8, 8), (20, 80, 200, 255)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_brand_logo_record_prefers_the_docs_logo_uri(monkeypatch):
+    from app.services import gd_brand_source as src
+
+    def guess_must_not_run(_bid):
+        raise AssertionError("the creatives guess ran although logo_uri was set")
+
+    monkeypatch.setattr(fr, "get_brand", lambda bid: {
+        "id": bid, "logo_uri": "gs://b/brands/acme-co/logos/0123456789abcdef.png"})
+    monkeypatch.setattr(fr, "find_brand_logo", guess_must_not_run)
+    assert src.brand_logo_record("acme-co") == {
+        "file_url": "gs://b/brands/acme-co/logos/0123456789abcdef.png",
+        "file_name": "0123456789abcdef.png",
+        "file_type": "image/png",
+        "source": "logo_uri",
+    }
+
+
+def test_brand_logo_record_falls_back_to_the_creatives_guess(monkeypatch):
+    from app.services import gd_brand_source as src
+
+    monkeypatch.setattr(fr, "get_brand", lambda bid: {"id": bid, "logo_uri": None})
+    monkeypatch.setattr(fr, "find_brand_logo",
+                        lambda bid: {"file_url": "gs://b/2", "file_name": "Brand Logo.svg"})
+    assert src.brand_logo_record("x")["file_url"] == "gs://b/2"
+    assert src.brand_logo_record(None) is None
+    assert src.brand_logo_record("") is None
+
+
+def test_brand_logo_record_survives_a_failed_doc_read(monkeypatch):
+    from app.services import gd_brand_source as src
+
+    def boom(_bid):
+        raise RuntimeError("firestore down")
+
+    monkeypatch.setattr(fr, "get_brand", boom)
+    monkeypatch.setattr(fr, "find_brand_logo", lambda bid: None)
+    assert src.brand_logo_record("x") is None  # degraded to the guess, never raised
+
+
+def test_stage4_composites_the_docs_logo(monkeypatch):
+    """``pipeline.brand_logo_png`` goes through the same resolver, so an
+    uploaded logo reaches the composite without a creatives-collection entry."""
+    from app.services import gd_brand_source, storage
+    from graphics_designer_agent import pipeline
+
+    png = _png_bytes()
+    monkeypatch.setattr(gd_brand_source, "brand_logo_record", lambda fid: {
+        "file_url": "gs://b/brands/x/logos/h.png", "file_name": "h.png", "file_type": "image/png"})
+    monkeypatch.setattr(storage, "download_bytes", lambda uri: png)
+    out = pipeline.brand_logo_png("medvirtual")  # a pack that maps to a Firestore brand
+    assert out is not None and out.startswith(b"\x89PNG")

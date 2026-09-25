@@ -171,6 +171,7 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("GET", "/api/admin/image-library"): (ADMIN_ONLY, INTERNAL_ONLY),
     ("GET", "/api/admin/image-library/{run_id}/image"): (ADMIN_ONLY, INTERNAL_ONLY),
     ("GET", "/api/admin/users"): (ADMIN_ONLY, INTERNAL_ONLY),
+    ("DELETE", "/api/gd/brands/{brand_id}"): (ADMIN_ONLY, INTERNAL_ONLY),
     ("POST", "/api/ref-library/ingest"): (ADMIN_ONLY, INTERNAL_ONLY),
     ("POST", "/api/ref-library/sync-drive"): (ADMIN_ONLY, INTERNAL_ONLY),
     ("GET", "/api/admin/agents"): (CREATOR_ONLY, INTERNAL_ONLY),
@@ -225,7 +226,6 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("GET", "/api/brands/{brand_id}"): (SHARED_CATALOG, INTERNAL_ONLY),
     ("GET", "/api/brands/{brand_id}/kit"): (SHARED_CATALOG, INTERNAL_ONLY),
     ("GET", "/api/creative/types"): (SHARED_CATALOG, INTERNAL_ONLY),
-    ("GET", "/api/gd/brands"): (SHARED_CATALOG, INTERNAL_ONLY),
     ("GET", "/api/gd/config"): (SHARED_CATALOG, INTERNAL_ONLY),
     ("GET", "/api/gd/elements"): (SHARED_CATALOG, INTERNAL_ONLY),
     ("GET", "/api/gd/fonts/{font_name}"): (SHARED_CATALOG, INTERNAL_ONLY),
@@ -353,6 +353,16 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     # account authorised last. The file says so itself.
     ("GET", "/api/canva/authorize"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("POST", "/api/canva/import"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    # Graphics Designer brands: ONE company-wide set by owner decision
+    # (2026-09-25) — any signed-in member creates, edits and uploads; the doc
+    # id is the brand slug and carries no user or workspace key on purpose.
+    ("GET", "/api/gd/brands"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/gd/brands"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/gd/brands/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("PATCH", "/api/gd/brands/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/gd/brands/{brand_id}/assets"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/gd/brands/{brand_id}/references"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("DELETE", "/api/gd/brands/{brand_id}/references/{ref_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     # GEO: every doc id is ``…-{brand_id}``; no user or workspace key exists.
     ("GET", "/api/geo/brands"): (WORKSPACE_SHARED, EXTERNAL_OK),
     ("GET", "/api/geo/brands/{brand_id}/answers"): (WORKSPACE_SHARED, EXTERNAL_OK),
@@ -570,7 +580,13 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
 #: ledgered on 2026-09-02 but the route never actually mounted (see the note at
 #: its old place in the ledger), so the count described a service one route
 #: larger than the one running.
-WORKSPACE_SHARED_BASELINE = 69
+#:
+#: 69 → 76 on 2026-09-25: self-serve Graphics Designer brands. Seven routes
+#: (``/api/gd/brands`` list/create/detail/patch, kit-asset and reference
+#: uploads, reference delete) serve one company-wide brand set to every member
+#: by the owner's decision; the picker ``GET /api/gd/brands`` moved here from
+#: SHARED_CATALOG because it now lists rows members write. Archive is ADMIN_ONLY.
+WORKSPACE_SHARED_BASELINE = 76
 
 #: The GEO editor surface, BY NAME. Not a count — a count would let a future
 #: route join the role while another left it and say nothing, and the thing

@@ -14,9 +14,11 @@ import logging
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from app.security import get_current_user
 from app.services import firestore_repo, imaging, storage
+from app.services.gd_brand_source import brand_logo_record
 from app.services.run_tracking import (CHANGE, JOB, ActivityTrail, StagedActivity,
                                        silent)
 
@@ -59,8 +61,23 @@ MAX_PROMPT_IMAGES = 3
 
 
 def _pack_for_run(run: dict):
-    """The brand pack backing a run (defaults to Legal Soft for legacy runs)."""
-    return registry.get_pack(run.get("brand_id"))
+    """The brand pack backing a run (legacy runs with no brand are Legal Soft).
+
+    A run whose brand has since been archived or removed answers 409 rather
+    than rendering as a different brand.
+    """
+    try:
+        return registry.get_pack(run.get("brand_id"))
+    except registry.UnknownBrand as exc:
+        raise HTTPException(409, "brand_unavailable") from exc
+
+
+def _pack_or_404(brand_id: str | None):
+    """A brand named by the request (query/body), 404 when it does not exist."""
+    try:
+        return registry.get_pack(brand_id)
+    except registry.UnknownBrand as exc:
+        raise HTTPException(404, "brand_not_found") from exc
 
 
 #: The Graphics Designer's trail, in the STAGED shape — one document per run,
@@ -269,6 +286,10 @@ def _guard(fn):
         return fn()
     except PipelineError as exc:
         raise HTTPException(409, str(exc)) from exc
+    except registry.UnknownBrand as exc:
+        # The run's brand vanished under it (archived / flag flipped). Not a
+        # server fault, and never a silent switch to another brand.
+        raise HTTPException(409, "brand_unavailable") from exc
     except providers.ImageProviderUnavailable as exc:
         # The agent refuses to pass a placeholder off as a generation, and the
         # reason names the actual cause (no key / key unreadable). Unmapped it
@@ -496,15 +517,13 @@ def _apply_layout(cfg: dict, patch: dict | None) -> None:
 
 
 # ── brand selection (multi-brand hub) ─────────────────────────────────────────
-@router.get("/gd/brands")
-def gd_brands(_user: dict = Depends(get_current_user)) -> dict:
-    """Brands the studio can produce creatives for (drives the left-panel picker)."""
-    return {"brands": registry.list_packs(), "default": registry.DEFAULT_BRAND_ID}
+# ``GET /gd/brands`` (the picker) lives in ``app/routers/gd_brands.py`` with the
+# rest of the self-serve brand surface.
 
 
 def _ingested_logo_url(brand_id: str) -> str | None:
-    """Signed view URL for a brand's ingested logo (None if absent/unsignable)."""
-    rec = firestore_repo.find_brand_logo(brand_id)
+    """Signed view URL for a brand's logo (None if absent/unsignable)."""
+    rec = brand_logo_record(brand_id)
     if not rec:
         return None
     return storage.signed_url_for_gs_uri(rec["file_url"])
@@ -574,7 +593,7 @@ def gd_ingested_brands(_user: dict = Depends(get_current_user)) -> dict:
 # ── static config for the studio UI (per selected brand) ───────────────────────
 @router.get("/gd/config")
 def gd_config(brand: str | None = None, _user: dict = Depends(get_current_user)) -> dict:
-    pack = registry.get_pack(brand)
+    pack = _pack_or_404(brand)
     return {
         "brand_id": pack.id,
         "brand_name": pack.name,
@@ -631,9 +650,7 @@ def gd_font_endpoint(font_name: str, brand: str | None = None,
     (no path traversal); files are immutable, so cache hard."""
     from fastapi import Response
 
-    from graphics_designer_agent import registry
-
-    pack = registry.get_pack(brand)
+    pack = _pack_or_404(brand)
     if font_name not in set(pack.font_names()):
         raise HTTPException(404, f"Unknown font '{font_name}'")
     path = pack.fonts_dir / pack.font_file(font_name)
@@ -646,7 +663,7 @@ def gd_font_endpoint(font_name: str, brand: str | None = None,
 @router.get("/gd/prompts")
 def gd_prompts(brand: str | None = None, _user: dict = Depends(get_current_user)) -> dict:
     """Canonical prompt integrity report (audit panel) for the selected brand."""
-    pack = registry.get_pack(brand)
+    pack = _pack_or_404(brand)
     return {
         "prompts": [
             {"filename": name, "hash": pack.prompt_hash(name), "expected": expected,
@@ -679,7 +696,10 @@ def create_run_endpoint(body: CreateRunBody = Body(default=CreateRunBody()),
     if body.aspect_ratio is not None and body.aspect_ratio not in ASPECT_RATIOS:
         raise HTTPException(400, f"Unknown aspect ratio '{body.aspect_ratio}'")
 
-    run = create_run(user_id=str(user["id"]), brand_id=body.brand_id)
+    try:
+        run = create_run(user_id=str(user["id"]), brand_id=body.brand_id)
+    except registry.UnknownBrand as exc:
+        raise HTTPException(404, "brand_not_found") from exc
     changed = False
     if body.aspect_ratio is not None:
         run["config"]["aspect_ratio"] = body.aspect_ratio
@@ -1047,7 +1067,7 @@ def _brand_logo_png(run: dict, logo_id: str | None = None) -> bytes | None:
             logger.exception("GD: failed to read picked logo variant %s", variant)
     fb_id = pack.firestore_brand_id
     if fb_id:
-        rec = firestore_repo.find_brand_logo(fb_id)
+        rec = brand_logo_record(fb_id)
         if rec:
             try:
                 raw = storage.download_bytes(rec["file_url"])
@@ -1069,7 +1089,7 @@ def brand_logo_status(run_id: str, user: dict = Depends(get_current_user)) -> di
     run = _owned_run(run_id, user)
     pack = _pack_for_run(run)
     fb_id = pack.firestore_brand_id
-    rec = firestore_repo.find_brand_logo(fb_id) if fb_id else None
+    rec = brand_logo_record(fb_id) if fb_id else None
     if rec:
         view_url = None
         try:
@@ -1118,21 +1138,32 @@ async def stage4_endpoint(
     run = _owned_run(run_id, user)
     # An uploaded file always wins (override); otherwise fall back to the brand's
     # logo from Firestore so the user isn't forced to re-supply it every run.
+    # This handler is async only for ``logo.read()``; everything that decodes,
+    # downloads or composites is CPU/IO-bound and runs on the threadpool — a
+    # 2000² white-background logo keyed on the event loop stalled every other
+    # request for tens of seconds.
     png: bytes | None = None
     if logo is not None:
         raw = await logo.read()
         if raw:
-            png = imaging.to_png_logo(raw, file_name=logo.filename or "", mime=logo.content_type or "")
+            name, mime = logo.filename or "", logo.content_type or ""
+            try:
+                imaging.validate_logo_upload(raw, file_name=name, mime=mime)
+            except imaging.LogoRejected as exc:
+                if exc.code == "image_too_large":
+                    raise HTTPException(415, exc.code) from exc
+                raise HTTPException(415, f"Couldn't read '{logo.filename}' as an image (PNG/JPG/SVG).") from exc
+            png = await run_in_threadpool(imaging.to_png_logo, raw, file_name=name, mime=mime)
             if not png:
                 raise HTTPException(415, f"Couldn't read '{logo.filename}' as an image (PNG/JPG/SVG).")
     if png is None:
-        png = _brand_logo_png(run, logo_id=logo_id)
+        png = await run_in_threadpool(_brand_logo_png, run, logo_id=logo_id)
     if png is None:
         raise HTTPException(
             400,
             "No logo available — upload one, or pick a brand that has a logo in its kit.",
         )
-    attempt = _guard(lambda: pipeline.generate_stage4(run, png, use_ai=use_ai))
+    attempt = await run_in_threadpool(_guard, lambda: pipeline.generate_stage4(run, png, use_ai=use_ai))
     _advance_run(act, run, stage=4, stage_status="generated", attempt=attempt)
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
 

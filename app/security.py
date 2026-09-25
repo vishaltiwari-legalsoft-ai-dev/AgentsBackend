@@ -16,7 +16,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
 
-from app.config import settings
+from app.config import email_in, settings
 
 logger = logging.getLogger("agentos.auth")
 _bearer = HTTPBearer(auto_error=False)
@@ -106,7 +106,7 @@ def is_creator(email: str) -> bool:
 
 def is_admin(email: str) -> bool:
     # Creators are a superset of Super Admins — they keep all admin access.
-    return email.lower() in settings.admin_email_set or is_creator(email)
+    return email_in(email, settings.admin_email_set) or is_creator(email)
 
 
 def is_geo_editor(email: str) -> bool:
@@ -121,7 +121,7 @@ def is_geo_editor(email: str) -> bool:
     could already do this keep doing it, and the implication is stated once
     here rather than re-derived at each guard.
     """
-    return email.lower() in settings.geo_editor_email_set or is_creator(email)
+    return email_in(email, settings.geo_editor_email_set) or is_creator(email)
 
 
 def is_geo_only(email: str) -> bool:
@@ -141,10 +141,14 @@ def is_geo_only(email: str) -> bool:
     they administer. It is the same "the people who could already do this keep
     doing it" implication ``is_admin`` and ``is_geo_editor`` carry, stated once
     here rather than re-derived at the guard.
+
+    Strictly opt-in and per exact address: the shipped default names nobody,
+    and ``settings.geo_only_email_set`` has already dropped any ``@domain``
+    entry, so ``email_in`` can only ever match a full address here.
     """
     if is_creator(email) or is_admin(email):
         return False
-    return email.lower() in settings.geo_only_email_set
+    return email_in(email, settings.geo_only_email_set)
 
 
 def create_token(

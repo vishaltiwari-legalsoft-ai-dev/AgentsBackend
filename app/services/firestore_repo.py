@@ -4,6 +4,7 @@ Collections:
 - brands               brand detail objects
 - creatives            files linked to a brand (stores GCS URLs, not bytes)
 - reference_creatives  user-uploaded reference material
+- brand_references     self-serve GD brand references (one doc each)
 - users                application accounts
 
 The client is created lazily so the server can boot before GCP is configured.
@@ -11,11 +12,13 @@ The client is created lazily so the server can boot before GCP is configured.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from google.cloud import firestore
 
@@ -49,14 +52,22 @@ def _now() -> str:
 # Brands
 # --------------------------------------------------------------------------- #
 
-def list_brands(*, use_cache: bool = True) -> list[dict[str, Any]]:
+def list_brands(
+    *, use_cache: bool = True, include_archived: bool = False
+) -> list[dict[str, Any]]:
+    """Every brand, ordered by name. Soft-archived brands (``archived_at`` set)
+    are left out unless ``include_archived`` — legacy docs have no such field
+    and always count as active. The cache holds the unfiltered list."""
     global _brands_cache
     if use_cache and _brands_cache and (time.monotonic() - _brands_cache[0]) < _BRANDS_TTL_SECONDS:
-        return _brands_cache[1]
-    docs = _db().collection("brands").order_by("brand_name").stream()
-    brands = [doc.to_dict() | {"id": doc.id} for doc in docs]
-    _brands_cache = (time.monotonic(), brands)
-    return brands
+        brands = _brands_cache[1]
+    else:
+        docs = _db().collection("brands").order_by("brand_name").stream()
+        brands = [doc.to_dict() | {"id": doc.id} for doc in docs]
+        _brands_cache = (time.monotonic(), brands)
+    if include_archived:
+        return brands
+    return [b for b in brands if not b.get("archived_at")]
 
 
 def get_brand(brand_id: str) -> Optional[dict[str, Any]]:
@@ -106,6 +117,562 @@ def update_brand_metadata(brand_id: str, patch: dict[str, Any]) -> dict[str, Any
     _db().collection("brands").document(brand_id).set(
         {"brand_metadata": patch}, merge=True)
     return get_brand(brand_id) or {}
+
+
+# --------------------------------------------------------------------------- #
+# Self-serve Graphics Designer brands (company-wide; any signed-in member)
+# --------------------------------------------------------------------------- #
+#
+# Owner decisions (2026-09-25): brands are ONE company-wide set — no per-user
+# scoping, by decision, not by omission; any signed-in member may create and
+# edit; archive is soft and nothing here ever hard-deletes.
+#
+# One string, three roles: a self-serve brand's slug is its Firestore doc id,
+# its GD pack id (``brand_metadata.gd_spec.id``, forced here) and the
+# ``brand_id`` on each of its ``brand_references``. It is derived ONCE, at
+# create, by ``gd_spec_builder._slug`` — the helper enrichment already uses for
+# pack ids — and never changes on rename. The legacy reference index keys
+# brands by ``reference_library.brand_slug`` (separators dropped: ``legalsoft``);
+# ``_slug_key`` compares in that compacted form so the two agree.
+#
+# Collections / docs:
+#   brands/<slug>                     source="user" brand doc (legacy docs keep uuid ids)
+#   meta/brands                       {version:int} — bumped on EVERY self-serve brand write
+#   brand_references/<slug>__<hash>   one doc per uploaded reference
+#   brand_reference_counts/<slug>     {active:int} — the cap counter, same txn as the ref
+
+#: The GD packs that ship in code (``registry.py`` + ``templated_brands.py``).
+#: A constant rather than an import: the GD package root imports the whole
+#: pipeline. ``tests/test_dynamic_brands.py`` pins this against the registry.
+BUILTIN_GD_PACK_IDS: tuple[str, ...] = ("legalsoft", "medvirtual", "remote_attorneys")
+
+BRAND_REFERENCE_CAP = 200
+_BRANDS_META_DOC = ("meta", "brands")
+_REFERENCES_COLLECTION = "brand_references"
+_REFERENCE_COUNTS_COLLECTION = "brand_reference_counts"
+_KIT_LIST_KEYS = ("primary_colors", "secondary_colors", "accent_colors")
+_KIT_KEYS = frozenset(_KIT_LIST_KEYS + ("fonts", "tone_of_voice", "enrichment", "gd_spec"))
+_ENRICHMENT_FILE_KEYS = ("logo_files", "font_files", "guideline_files")
+_ASSET_KIND_KEY = {"logo": "logo_files", "font": "font_files", "guidelines": "guideline_files"}
+_HEX_RE = re.compile(r"^#(?:[0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$")
+
+
+class BrandStoreError(Exception):
+    """Base for the self-serve brand store's refusals (the router maps to 4xx)."""
+
+
+class BrandExists(BrandStoreError):
+    """The slug (or name) is taken by a built-in pack or an existing brand — 409."""
+
+
+class BrandNotFound(BrandStoreError):
+    """No brand doc (or no such reference) under that id — 404."""
+
+
+class BrandNotEditable(BrandStoreError):
+    """Archived, built-in, or CLI-ingested: not writable through self-serve — 409."""
+
+
+class ReferenceCapReached(BrandStoreError):
+    """The brand already holds ``BRAND_REFERENCE_CAP`` active references — 409."""
+
+
+def brand_slug_for(name: str) -> str:
+    """The canonical self-serve slug (``Acme Co`` -> ``acme-co``)."""
+    from app.services.gd_spec_builder import _slug  # pure module, no GCP imports
+
+    return _slug(name or "")
+
+
+def _slug_key(value: str) -> str:
+    """Separator-free comparison key: ``remote_attorneys``, ``remote-attorneys``
+    and the legacy index's ``remoteattorneys`` are the same brand."""
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def _transact(fn: Callable[[Any], Any]) -> Any:
+    """Run ``fn(txn)`` in a Firestore transaction (retried on contention, so
+    ``fn`` reads before it writes and is safe to re-run). The one seam the
+    tests replace — every self-serve write goes through here."""
+    return firestore.transactional(fn)(_db().transaction())
+
+
+def _meta_ref():
+    return _db().collection(_BRANDS_META_DOC[0]).document(_BRANDS_META_DOC[1])
+
+
+def _bump_brands_version(txn, now: str) -> None:
+    """Every self-serve brand write bumps ``meta/brands.version`` in the SAME
+    transaction, so an instance compares one small doc instead of racing a TTL."""
+    txn.set(_meta_ref(), {"version": firestore.Increment(1), "updated_at": now}, merge=True)
+
+
+def brands_version() -> int:
+    """Current brand-set version (0 before the first self-serve write)."""
+    snap = _meta_ref().get()
+    return int((snap.to_dict() or {}).get("version", 0)) if snap.exists else 0
+
+
+def _clean_hex_list(key: str, value: Any) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ValueError(f"{key} must be a list of hex colour strings")
+    bad = [v for v in value if not _HEX_RE.match(v.strip())]
+    if bad:
+        raise ValueError(f"{key} has values that are not #RGB/#RRGGBB hex: {bad}")
+    return [v.strip().upper() for v in value]
+
+
+def _clean_kit(kit: dict[str, Any] | None) -> dict[str, Any]:
+    """Validate a kit / patch into the ``brand_metadata`` shape the GD pipeline
+    reads. Unknown keys are refused rather than silently stored."""
+    kit = dict(kit or {})
+    unknown = sorted(set(kit) - _KIT_KEYS)
+    if unknown:
+        raise ValueError(f"unknown brand kit fields: {unknown}")
+    out: dict[str, Any] = {}
+    for key in _KIT_LIST_KEYS:
+        if key in kit:
+            out[key] = _clean_hex_list(key, kit[key])
+    if "fonts" in kit:
+        fonts = kit["fonts"]
+        if not isinstance(fonts, list) or not all(isinstance(f, str) and f.strip() for f in fonts):
+            raise ValueError("fonts must be a list of non-empty strings")
+        out["fonts"] = [f.strip() for f in fonts]
+    if "tone_of_voice" in kit:
+        tone = kit["tone_of_voice"]
+        if tone is not None and not isinstance(tone, str):
+            raise ValueError("tone_of_voice must be a string")
+        out["tone_of_voice"] = tone
+    if "enrichment" in kit:
+        enr = kit["enrichment"]
+        if not isinstance(enr, dict):
+            raise ValueError("enrichment must be an object")
+        out["enrichment"] = dict(enr)
+    if "gd_spec" in kit:
+        spec = kit["gd_spec"]
+        if spec is not None and not isinstance(spec, dict):
+            raise ValueError("gd_spec must be an object")
+        out["gd_spec"] = dict(spec) if spec else None
+    return out
+
+
+def _pin_gd_spec(meta: dict[str, Any], slug: str, name: str) -> None:
+    """A self-serve brand's pack id IS its slug — whatever the caller sent."""
+    spec = meta.get("gd_spec")
+    if spec:
+        meta["gd_spec"] = dict(spec) | {"id": slug, "firestore_brand_id": slug, "name": name}
+
+
+def create_brand(name: str, kit: dict[str, Any] | None, *, created_by: str) -> dict[str, Any]:
+    """Create a company-wide brand; its slug is derived here, once.
+
+    Raises ``BrandExists`` if the slug (compared separator-free) matches a
+    built-in pack, or a brand doc with that id or that exact name exists — the
+    latter two checked inside the transaction that writes, so two people
+    creating "Acme" at once get one brand and one 409, never two brands.
+    """
+    display = (name or "").strip()
+    slug = brand_slug_for(display)
+    if not display or not slug:
+        raise ValueError("a brand name needs at least one letter or digit")
+    if _slug_key(slug) in {_slug_key(b) for b in BUILTIN_GD_PACK_IDS}:
+        raise BrandExists(f"{display!r} collides with a built-in brand pack")
+
+    meta = _clean_kit(kit)
+    enrichment = {"palette": {}} | (meta.get("enrichment") or {})
+    for key in _ENRICHMENT_FILE_KEYS:
+        enrichment[key] = list(enrichment.get(key) or [])
+    meta["enrichment"] = enrichment
+    for key in _KIT_LIST_KEYS + ("fonts",):
+        meta.setdefault(key, [])
+    meta.setdefault("tone_of_voice", None)
+    meta.setdefault("gd_spec", None)
+    _pin_gd_spec(meta, slug, display)
+
+    ref = _db().collection("brands").document(slug)
+    same_name = (
+        _db().collection("brands")
+        .where(filter=firestore.FieldFilter("brand_name_lower", "==", display.lower()))
+        .limit(1)
+    )
+
+    def _apply(txn) -> dict[str, Any]:
+        if ref.get(transaction=txn).exists:
+            raise BrandExists(f"a brand with id {slug!r} already exists")
+        if any(True for _ in same_name.stream(transaction=txn)):
+            raise BrandExists(f"a brand named {display!r} already exists")
+        now = _now()
+        doc = {
+            "name": display,
+            "slug": slug,
+            # The legacy readers order/look up by these two; without
+            # ``brand_name``, ``order_by("brand_name")`` silently drops the doc.
+            "brand_name": display,
+            "brand_name_lower": display.lower(),
+            "created_at": now,
+            "updated_at": now,
+            "created_by": (created_by or "").lower(),
+            "archived_at": None,
+            "source": "user",
+            "logo_uri": None,
+            "brand_metadata": meta,
+        }
+        txn.set(ref, doc)
+        _bump_brands_version(txn, now)
+        return doc | {"id": slug}
+
+    result = _transact(_apply)
+    _invalidate_brands_cache()
+    return result
+
+
+def _require_user_brand(snap, brand_id: str) -> dict[str, Any]:
+    if not snap.exists:
+        raise BrandNotFound(f"no brand {brand_id!r}")
+    doc = snap.to_dict() or {}
+    if brand_id in BUILTIN_GD_PACK_IDS or doc.get("source") != "user":
+        raise BrandNotEditable(f"{brand_id!r} is not a self-serve brand")
+    if doc.get("archived_at"):
+        raise BrandNotEditable(f"{brand_id!r} is archived")
+    return doc
+
+
+def _merge_meta(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """Top-level kit keys replace; ``enrichment`` merges key-by-key."""
+    merged = dict(current)
+    for key, value in patch.items():
+        if key == "enrichment":
+            merged["enrichment"] = dict(current.get("enrichment") or {}) | value
+        else:
+            merged[key] = value
+    return merged
+
+
+def update_brand(brand_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+    """Merge a kit patch (and optionally a new display ``name``) into a
+    self-serve brand. The slug/id never changes. Refuses archived, built-in and
+    CLI-ingested brands with ``BrandNotEditable``."""
+    patch = dict(patch or {})
+    new_name = patch.pop("name", None)
+    if new_name is not None and not str(new_name).strip():
+        raise ValueError("a brand name cannot be blank")
+    meta_patch = _clean_kit(patch)
+    ref = _db().collection("brands").document(brand_id)
+
+    def _apply(txn) -> dict[str, Any]:
+        doc = _require_user_brand(ref.get(transaction=txn), brand_id)
+        name = str(new_name).strip() if new_name is not None else doc.get("name")
+        meta = _merge_meta(doc.get("brand_metadata") or {}, meta_patch)
+        _pin_gd_spec(meta, brand_id, name)
+        now = _now()
+        fields: dict[str, Any] = {"brand_metadata": meta, "updated_at": now}
+        if new_name is not None:
+            fields |= {"name": name, "brand_name": name, "brand_name_lower": name.lower()}
+        txn.update(ref, fields)
+        _bump_brands_version(txn, now)
+        return doc | fields | {"id": brand_id}
+
+    result = _transact(_apply)
+    _invalidate_brands_cache()
+    return result
+
+
+def archive_brand(brand_id: str) -> dict[str, Any]:
+    """Soft-archive: sets ``archived_at``. The doc, its assets and references
+    all stay; ``list_brands`` stops returning it. Never hard-deletes."""
+    ref = _db().collection("brands").document(brand_id)
+
+    def _apply(txn) -> dict[str, Any]:
+        doc = _require_user_brand(ref.get(transaction=txn), brand_id)
+        now = _now()
+        fields = {"archived_at": now, "updated_at": now}
+        txn.update(ref, fields)
+        _bump_brands_version(txn, now)
+        return doc | fields | {"id": brand_id}
+
+    result = _transact(_apply)
+    _invalidate_brands_cache()
+    return result
+
+
+def add_brand_asset(brand_id: str, kind: str, data: bytes, ext: str) -> dict[str, Any]:
+    """Upload a kit file (``logo`` | ``font`` | ``guidelines``) to
+    ``brands/<id>/<kind>s/<sha256[:16]>.<ext>`` and record its ``gs://`` URI
+    under ``brand_metadata.enrichment.{logo,font,guideline}_files``; a logo
+    also becomes ``logo_uri``. The same bytes twice is one entry.
+
+    Font caveat for whoever builds ``gd_spec``: ``gd_brand_source`` matches
+    ``font_variants[].file`` to these URIs by BASENAME, i.e. the hash name.
+    """
+    from app.services import storage
+
+    if kind not in _ASSET_KIND_KEY:
+        raise ValueError(f"unknown brand asset kind {kind!r}")
+    ref = _db().collection("brands").document(brand_id)
+    _require_user_brand(ref.get(), brand_id)  # refuse before any bytes move
+    uri = storage.put_brand_asset(brand_id, kind, data, ext)
+    list_key = _ASSET_KIND_KEY[kind]
+
+    def _apply(txn) -> dict[str, Any]:
+        doc = _require_user_brand(ref.get(transaction=txn), brand_id)
+        meta = dict(doc.get("brand_metadata") or {})
+        enrichment = dict(meta.get("enrichment") or {})
+        files = list(enrichment.get(list_key) or [])
+        if uri not in files:
+            files.append(uri)
+        enrichment[list_key] = files
+        meta["enrichment"] = enrichment
+        now = _now()
+        fields: dict[str, Any] = {"brand_metadata": meta, "updated_at": now}
+        if kind == "logo":
+            fields["logo_uri"] = uri
+        txn.update(ref, fields)
+        _bump_brands_version(txn, now)
+        return {"brand_id": brand_id, "kind": kind, "uri": uri}
+
+    result = _transact(_apply)
+    _invalidate_brands_cache()
+    return result
+
+
+def list_brand_assets(brand_id: str) -> dict[str, Any]:
+    """The brand's recorded kit files, read from its Firestore doc (1 read —
+    the doc is the record; a bucket listing would also show orphans)."""
+    brand = get_brand(brand_id)
+    if brand is None:
+        raise BrandNotFound(f"no brand {brand_id!r}")
+    enrichment = (brand.get("brand_metadata") or {}).get("enrichment") or {}
+    return {
+        "brand_id": brand_id,
+        "logo_uri": brand.get("logo_uri"),
+        **{key: list(enrichment.get(key) or []) for key in _ENRICHMENT_FILE_KEYS},
+    }
+
+
+# --- References: one doc per reference ---------------------------------------
+
+def _reference_doc_id(brand_id: str, ref_id: str) -> str:
+    return f"{brand_id}__{ref_id}"
+
+
+def _require_reference_target(brand_id: str, snap) -> None:
+    """References attach to a built-in pack id or an active self-serve brand."""
+    if brand_id in BUILTIN_GD_PACK_IDS:
+        return
+    _require_user_brand(snap, brand_id)
+
+
+def _active_count(snap) -> int:
+    return int(((snap.to_dict() or {}) if snap.exists else {}).get("active", 0))
+
+
+def add_reference(
+    brand_id: str,
+    *,
+    data: bytes,
+    ext: str,
+    kind: str,
+    uploaded_by: str,
+    width: int | None = None,
+    height: int | None = None,
+    note: str = "",
+    creative_type: str | None = None,
+) -> dict[str, Any]:
+    """Store one reference file and its doc; returns the doc.
+
+    ``ref_id`` is the content hash, so the same bytes uploaded twice are one
+    reference (re-adding a soft-deleted one revives it). Raises
+    ``ReferenceCapReached`` at ``BRAND_REFERENCE_CAP`` active references —
+    enforced on a counter doc written in the same transaction as the
+    reference, so parallel uploads cannot overshoot. Legacy Drive-synced
+    references do not count toward the cap.
+    """
+    from app.services import storage
+
+    if kind not in ("creative", "reference"):
+        raise ValueError("kind must be 'creative' or 'reference'")
+    ref_id = storage.content_hash(data)
+    object_path = storage.reference_object_path(brand_id, data, ext)  # validates ext
+    brand_ref = _db().collection("brands").document(brand_id)
+    counter_ref = _db().collection(_REFERENCE_COUNTS_COLLECTION).document(brand_id)
+    doc_ref = _db().collection(_REFERENCES_COLLECTION).document(_reference_doc_id(brand_id, ref_id))
+
+    def _refuse_if_full(existing_snap, count_snap) -> dict[str, Any] | None:
+        current = (existing_snap.to_dict() or {}) if existing_snap.exists else None
+        if current is not None and not current.get("deleted_at"):
+            return current  # same bytes, already active
+        if _active_count(count_snap) >= BRAND_REFERENCE_CAP:
+            raise ReferenceCapReached(
+                f"{brand_id!r} already has {BRAND_REFERENCE_CAP} references — remove one first")
+        return None
+
+    # Pre-flight (non-transactional) so an unknown or full brand never uploads.
+    if brand_id not in BUILTIN_GD_PACK_IDS:
+        _require_reference_target(brand_id, brand_ref.get())
+    _refuse_if_full(doc_ref.get(), counter_ref.get())
+    gs_uri = storage.put_reference_file(brand_id, data, ext)
+
+    def _apply(txn) -> dict[str, Any]:
+        if brand_id not in BUILTIN_GD_PACK_IDS:
+            _require_reference_target(brand_id, brand_ref.get(transaction=txn))
+        active = _refuse_if_full(doc_ref.get(transaction=txn), counter_ref.get(transaction=txn))
+        if active is not None:
+            return active | {"id": doc_ref.id}
+        now = _now()
+        doc = {
+            "brand_id": brand_id,
+            "ref_id": ref_id,
+            "kind": kind,
+            "creative_type": creative_type,
+            "object_path": object_path,
+            "gs_uri": gs_uri,
+            "content_type": storage.content_type_for_ext(ext),
+            "width": width,
+            "height": height,
+            "note": note or "",
+            "uploaded_by": (uploaded_by or "").lower(),
+            "created_at": now,
+            "deleted_at": None,
+        }
+        txn.set(doc_ref, doc)
+        txn.set(counter_ref, {"active": firestore.Increment(1), "updated_at": now}, merge=True)
+        return doc | {"id": doc_ref.id}
+
+    return _transact(_apply)
+
+
+#: Same back-off as the runs index fallback: once refused, don't retry the
+#: ordered read for ``_RUNS_INDEX_RETRY_SECONDS``.
+_references_index_missing_at: float | None = None
+
+
+def list_references(brand_id: str, limit: int = BRAND_REFERENCE_CAP) -> list[dict[str, Any]]:
+    """Active references for one brand, newest first.
+
+    Needs the composite ``brand_references (brand_id ASC, deleted_at ASC,
+    created_at DESC)`` recorded in ``firestore.indexes.json``. Until it is
+    built, the refused query falls back to ``brand_id ==`` alone, filtered and
+    sorted here — correct, but it also reads the soft-deleted docs.
+    """
+    global _references_index_missing_at
+    scoped = _db().collection(_REFERENCES_COLLECTION).where(
+        filter=firestore.FieldFilter("brand_id", "==", brand_id))
+    now = time.monotonic()
+    known_missing = (
+        _references_index_missing_at is not None
+        and (now - _references_index_missing_at) < _RUNS_INDEX_RETRY_SECONDS
+    )
+    if not known_missing:
+        try:
+            docs = (
+                scoped.where(filter=firestore.FieldFilter("deleted_at", "==", None))
+                .order_by("created_at", direction=firestore.Query.DESCENDING)
+                .limit(limit)
+                .stream()
+            )
+            rows = [doc.to_dict() | {"id": doc.id} for doc in docs]
+            _references_index_missing_at = None
+            return rows
+        except Exception:
+            _references_index_missing_at = now
+            logger.warning(
+                "brand_references: ordered read refused — build the composite "
+                "(brand_id ASC, deleted_at ASC, created_at DESC). Filtering in process.",
+                exc_info=True,
+            )
+    rows = [
+        data | {"id": doc.id}
+        for doc in scoped.stream()
+        if not (data := doc.to_dict() or {}).get("deleted_at")
+    ]
+    rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    return rows[:limit]
+
+
+def reference_counts(brand_ids: list[str]) -> dict[str, int]:
+    """Active (uploaded) reference count per brand, in ONE batched read of the
+    counter docs — the brand picker lists every brand and must not pay a
+    query per row. A brand with no counter doc counts 0."""
+    ids = [b for b in dict.fromkeys(brand_ids) if b]
+    if not ids:
+        return {}
+    refs = [_db().collection(_REFERENCE_COUNTS_COLLECTION).document(b) for b in ids]
+    out = {b: 0 for b in ids}
+    for snap in _db().get_all(refs):
+        if snap.exists:
+            out[snap.id] = _active_count(snap)
+    return out
+
+
+def soft_delete_reference(brand_id: str, ref_id: str) -> dict[str, Any]:
+    """Mark one reference deleted and release its cap slot. The GCS object
+    and the doc stay. Deleting an already-deleted reference is a no-op."""
+    doc_ref = _db().collection(_REFERENCES_COLLECTION).document(_reference_doc_id(brand_id, ref_id))
+    counter_ref = _db().collection(_REFERENCE_COUNTS_COLLECTION).document(brand_id)
+
+    def _apply(txn) -> dict[str, Any]:
+        snap = doc_ref.get(transaction=txn)
+        doc = (snap.to_dict() or {}) if snap.exists else None
+        if doc is None or doc.get("brand_id") != brand_id:
+            raise BrandNotFound(f"no reference {ref_id!r} for brand {brand_id!r}")
+        if doc.get("deleted_at"):
+            return doc | {"id": doc_ref.id}
+        now = _now()
+        txn.update(doc_ref, {"deleted_at": now})
+        txn.set(counter_ref, {"active": firestore.Increment(-1), "updated_at": now}, merge=True)
+        return doc | {"deleted_at": now, "id": doc_ref.id}
+
+    return _transact(_apply)
+
+
+def _legacy_reference_records() -> list[dict[str, Any]]:
+    """The Drive-synced ``reference_library/reference_index.json`` records
+    (GCS copy). ``[]`` when GCS is unconfigured or the index is absent."""
+    from app.services import storage
+
+    if not storage.is_configured():
+        return []
+    try:
+        raw = storage.read_reference_index()
+        return list(json.loads(raw.decode("utf-8")).get("records", [])) if raw else []
+    except Exception:  # noqa: BLE001 - legacy refs are additive; Firestore refs still serve
+        logger.warning("could not read the legacy reference index", exc_info=True)
+        return []
+
+
+def references_for_brand(
+    brand_id: str, *, legacy_records: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    """Every reference generation may use for one brand: its Firestore docs
+    (newest first), then the legacy index's records for the same brand.
+
+    Firestore docs also carry the legacy record keys (``file_name``,
+    ``creative_type``, ``tags``, ``palette``, ``ingested_at``,
+    ``source="upload"``, plus ``gs_uri``) so ``reference_library.retrieve`` and
+    ``load_reference_bytes`` accept both. Legacy records pass through untouched,
+    matched separator-free (``remote_attorneys`` == ``remoteattorneys``).
+
+    ``legacy_records``: pass ``reference_library.load_index(...)`` to include
+    a local-disk index (dev); omitted, the GCS copy is read.
+    """
+    key = _slug_key(brand_id)
+    uploaded = []
+    for doc in list_references(brand_id):
+        uploaded.append(doc | {
+            "file_name": (doc.get("object_path") or "").rsplit("/", 1)[-1],
+            "creative_type": doc.get("creative_type") or doc.get("kind"),
+            "tags": [t for t in re.split(r"[^a-z0-9]+", (doc.get("note") or "").lower())
+                     if len(t) > 2],
+            "palette": [],
+            "ingested_at": doc.get("created_at"),
+            "source": "upload",
+        })
+    seen = {r["gs_uri"] for r in uploaded if r.get("gs_uri")}
+    legacy = legacy_records if legacy_records is not None else _legacy_reference_records()
+    return uploaded + [
+        r for r in legacy
+        if _slug_key(str(r.get("brand_id", ""))) == key and r.get("gs_uri") not in seen
+    ]
 
 
 # --------------------------------------------------------------------------- #

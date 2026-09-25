@@ -73,6 +73,16 @@
         { "fieldPath": "kind", "order": "ASCENDING" },
         { "fieldPath": "generated_at", "order": "DESCENDING" }
       ]
+    },
+    {
+      "_why": "firestore_repo.list_references (self-serve GD brand references, 2026-09-25) - where(brand_id ==) + where(deleted_at == null) + order_by(created_at DESC) + limit(200). REQUIRED before the upload UI ships; NOT yet built in any database. Until it is, the code falls back to where(brand_id ==) alone, filtered and sorted in process (correct, but it also reads soft-deleted docs).",
+      "collectionGroup": "brand_references",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "brand_id", "order": "ASCENDING" },
+        { "fieldPath": "deleted_at", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

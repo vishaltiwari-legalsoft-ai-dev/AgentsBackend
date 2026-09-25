@@ -2,13 +2,19 @@
 
 import threading
 
+import pytest
+
 from graphics_designer_agent import registry, templated_brands
 
 
-def test_default_none_and_unknown_resolve_to_legalsoft():
+def test_default_and_none_resolve_to_legalsoft_but_unknown_raises():
+    """No brand = Legal Soft (runs from before brands existed). An unknown id
+    is an error, not a silent Legal Soft: a run must never render as a brand
+    the caller did not pick."""
     assert registry.get_pack().id == "legalsoft"
     assert registry.get_pack(None).id == "legalsoft"
-    assert registry.get_pack("does-not-exist").id == registry.DEFAULT_BRAND_ID
+    with pytest.raises(registry.UnknownBrand):
+        registry.get_pack("does-not-exist")
 
 
 def test_list_packs_includes_registered_brands():

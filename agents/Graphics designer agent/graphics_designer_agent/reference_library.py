@@ -266,6 +266,13 @@ def brand_slug(brand_name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (brand_name or "").lower()) or "brand"
 
 
+def same_brand(a: Any, b: Any) -> bool:
+    """Whether two brand ids name one brand, separators ignored: the Drive
+    index writes ``acmeco``, the self-serve store ``acme-co``, templated packs
+    ``remote_attorneys`` — every comparison goes through here."""
+    return brand_slug(str(a or "")) == brand_slug(str(b or ""))
+
+
 def tokenize(text: str) -> list[str]:
     """Lowercase content words from arbitrary text (drops stopwords/short bits)."""
     words = re.split(r"[^a-z0-9]+", (text or "").lower())
@@ -836,8 +843,7 @@ def retrieve(
     brief_tokens = tokenize(brief)
     pool = records
     if brand_id:
-        bslug = brand_slug(brand_id) if " " in brand_id else brand_id
-        pool = [r for r in pool if r.get("brand_id") == bslug or r.get("brand_id") == brand_slug(brand_id)]
+        pool = [r for r in pool if same_brand(r.get("brand_id"), brand_id)]
     if creative_type:
         pool = [r for r in pool if r.get("creative_type") == creative_type]
 
@@ -858,14 +864,28 @@ def retrieve_for_generation(
     brief: str = "",
     k: int = 3,
     style_k: int = 2,
+    include_sources: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     """Retrieval tuned for grounding a generation.
 
     Returns the top-``k`` references of the requested creative type, then appends
     up to ``style_k`` brand *style* references (gradients/newsletter precedent) so
     the generator is grounded on both the right format AND the brand's signature
-    look. Style refs are de-duplicated against the primary hits."""
+    look. Style refs are de-duplicated against the primary hits.
+
+    ``include_sources``: records whose ``source`` is listed (``"upload"`` — a
+    reference a member attached to the brand on purpose) lead the primary hits
+    whatever their ``creative_type``, up to ``k`` of them; a brand whose only
+    precedent is what the sheet uploaded is otherwise never grounded at all.
+    An upload typed as a style category takes the style route below instead."""
     primary = retrieve(records, creative_type=creative_type, brief=brief, brand_id=brand_id, k=k)
+    if include_sources:
+        seen = {r.get("id") for r in primary}
+        chosen = [r for r in records
+                  if r.get("source") in include_sources and r.get("id") not in seen
+                  and r.get("creative_type") not in REFERENCE_CATEGORIES]
+        if chosen:
+            primary = retrieve(chosen, brief=brief, brand_id=brand_id, k=k) + primary
     seen = {r.get("id") for r in primary}
 
     style_pool = [
@@ -873,8 +893,7 @@ def retrieve_for_generation(
         if r.get("creative_type") in REFERENCE_CATEGORIES and r.get("id") not in seen
     ]
     if brand_id:
-        bslug = brand_slug(brand_id)
-        style_pool = [r for r in style_pool if r.get("brand_id") == bslug]
+        style_pool = [r for r in style_pool if same_brand(r.get("brand_id"), brand_id)]
     styles = retrieve(style_pool, brief=brief, k=style_k) if style_pool else []
     return primary + styles
 
