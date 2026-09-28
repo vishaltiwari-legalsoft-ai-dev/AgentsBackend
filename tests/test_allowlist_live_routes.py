@@ -528,7 +528,7 @@ def test_a_domain_entry_in_geo_only_emails_scopes_nobody(client, monkeypatch):
     """The scope is per exact address, never per domain — enforced, not just
     documented.
 
-    The only domains anyone would write into GEO_ONLY_EMAILS are the two the
+    The only domains anyone would write into GEO_ONLY_EMAILS are the ones the
     sign-in door admits wholesale, and one such entry would scope an entire
     company to a single panel. So ``@domain`` entries are dropped by
     ``geo_only_email_set`` (and reported via ``geo_only_ignored_entries`` for

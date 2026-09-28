@@ -240,7 +240,10 @@ def test_the_geo_only_flag_is_derived_not_carried_in_the_token(_harness, monkeyp
     assert "geo_only" not in claims and "is_geo_only" not in claims
 
 
-#: The GEO editors on outside domains, admitted one address at a time.
+#: The four named editors kept on the exception list. Every one of them is now
+#: covered by a domain rule too (their companies were admitted wholesale); the
+#: entries stay so nobody's access hinges on a domain rule staying — the
+#: lynie.t precedent, applied to all four.
 EXTERNAL_GEO_EDITORS = {
     "lynie.t@aivirtual.com",
     "miguel@usimmigration.ai",
@@ -250,16 +253,25 @@ EXTERNAL_GEO_EDITORS = {
 
 
 #: Domains admitted wholesale. legalsoft.com is the company; aivirtual.com was
-#: added by owner decision on 2026-09-24 so every mailbox there gets the hub.
-ALLOWED_DOMAINS = {"legalsoft.com", "aivirtual.com"}
+#: added by owner decision on 2026-09-24. The three .ai brands followed on
+#: 2026-09-28 (owner decision, CEO sign-off): they are Legal Soft internal
+#: brands, and every mailbox at each gets the hub exactly like legalsoft.com.
+ALLOWED_DOMAINS = {
+    "legalsoft.com",
+    "aivirtual.com",
+    "aianswering.ai",
+    "medvirtual.ai",
+    "usimmigration.ai",
+}
 
 
 def test_allowlist_defaults_are_closed(monkeypatch):
     defaults = _pristine_settings(monkeypatch)
     assert defaults.allowed_email_domain_set == ALLOWED_DOMAINS
-    # Named individuals, not more domains. The exception list growing is
-    # expected — it is the mechanism for contractors and clients — so this
-    # pins WHO is on it rather than that it is empty.
+    # The exception list is pinned by WHO is on it rather than that it is
+    # empty: its entries are deliberate keep-alives for the named editors (see
+    # EXTERNAL_GEO_EDITORS), not the sign-in mechanism for their companies —
+    # that is the domain rules above since 2026-09-28.
     assert defaults.allowed_email_set == EXTERNAL_GEO_EDITORS
 
 
@@ -275,14 +287,17 @@ def test_the_geo_editor_roster_is_pinned(monkeypatch):
     """
     defaults = _pristine_settings(monkeypatch)
     assert defaults.geo_editor_email_set == {
-        # Whole domains, by owner decision 2026-09-25 — every mailbox at an
-        # allowed domain edits GEO, current and future, with no per-person
-        # entry to forget. Individual legalsoft/aivirtual names do not belong
-        # here any more: the domain rule already covers them.
+        # Whole domains only, by owner decisions 2026-09-25 and 2026-09-28 —
+        # every mailbox at an allowed domain edits GEO, current and future,
+        # with no per-person entry to forget. Individual names do not belong
+        # here any more: a domain rule covers every one of them.
         "@legalsoft.com",
         "@aivirtual.com",
-    } | (EXTERNAL_GEO_EDITORS - {"lynie.t@aivirtual.com"})
-    # Every outside-domain editor must also be able to reach the door.
+        "@usimmigration.ai",
+        "@medvirtual.ai",
+        "@aianswering.ai",
+    }
+    # Every named editor must also be able to reach the door.
     assert EXTERNAL_GEO_EDITORS <= defaults.allowed_email_set
 
 
@@ -333,23 +348,24 @@ def test_every_aivirtual_mailbox_edits_geo_and_is_not_scoped(_harness, monkeypat
     assert is_geo_only("lynie.t@aivirtual.com") is False
 
 
-def test_a_fresh_mailbox_at_either_allowed_domain_gets_the_whole_hub(_harness, monkeypatch):
-    """Owner decision 2026-09-25, and the reason: a production screenshot of
-    an aivirtual.com account on a "GEO ONLY" console, after a code default had
-    quietly named it. Every user at legalsoft.com and aivirtual.com — the two
-    domains the door admits wholesale — gets the full platform by default,
-    with zero per-user diagnosis: sign-in, every agent, GEO editing. Nobody
-    is GEO-only unless GEO_ONLY_EMAILS on the service names their exact
-    address, so the class default is pinned EMPTY here; a developer's .env
-    cannot make this pass.
+def test_a_fresh_mailbox_at_any_allowed_domain_gets_the_whole_hub(_harness, monkeypatch):
+    """Owner decisions 2026-09-25 and 2026-09-28, same principle both times:
+    every user at a wholesale-admitted domain gets the full platform by
+    default, with zero per-user diagnosis — sign-in, every agent, GEO editing.
+    The 2026-09-28 decision (CEO sign-off) extends that from legalsoft.com and
+    aivirtual.com to the three Legal Soft internal brands. Nobody is GEO-only
+    unless GEO_ONLY_EMAILS on the service names their exact address, so the
+    class default is pinned EMPTY here; a developer's .env cannot make this
+    pass.
     """
     from app.config import Settings
 
     assert Settings.model_fields["geo_only_emails"].default == ""
     _ship_the_defaults(monkeypatch)
 
-    # Nobody has ever heard of these two — that is the point.
-    for newcomer in ("someone.new@aivirtual.com", "someone.new@legalsoft.com"):
+    # Nobody has ever heard of any of these — that is the point.
+    for domain in sorted(ALLOWED_DOMAINS):
+        newcomer = f"someone.new@{domain}"
         resp = login(_harness, newcomer)
         assert resp.status_code == 200, (newcomer, resp.text)
         body = resp.json()["user"]
@@ -358,54 +374,56 @@ def test_a_fresh_mailbox_at_either_allowed_domain_gets_the_whole_hub(_harness, m
         assert body["is_creator"] is False, newcomer
 
     # Admin differs by domain, on purpose: aivirtual.com is admin wholesale
-    # (2026-09-24); legalsoft.com admins are named on the service's
-    # ADMIN_EMAILS, so a fresh legalsoft mailbox is a member, not an admin.
-    assert login(_harness, "someone.new@aivirtual.com").json()["user"]["is_admin"] is True
-    assert login(_harness, "someone.new@legalsoft.com").json()["user"]["is_admin"] is False
+    # (2026-09-24); every other domain's admins are named on the service's
+    # ADMIN_EMAILS, so a fresh mailbox there is a member, not an admin.
+    for domain in sorted(ALLOWED_DOMAINS):
+        is_admin = login(_harness, f"someone.new@{domain}").json()["user"]["is_admin"]
+        assert is_admin is (domain == "aivirtual.com"), domain
 
 
-def test_the_other_outside_domains_were_not_admitted_wholesale(monkeypatch):
-    """Only the domains the owner chose are open; the rest stay named addresses.
+def test_the_named_editors_do_not_hinge_on_the_domain_rules(monkeypatch):
+    """The exception list must keep working with every domain rule gone.
 
-    Three GEO editors are at usimmigration.ai, medvirtual.ai and aianswering.ai.
-    Adding those DOMAINS would open sign-in to every mailbox at three companies
-    whose accounts nobody here provisions or de-provisions — on a service
-    Cloud Run serves --allow-unauthenticated, where this list is the only door.
-    aivirtual.com is the one exception, by decision, and is pinned above.
+    Since 2026-09-28 all four named editors are covered twice: by their entry
+    in ALLOWED_EMAILS and by their company's domain rule. The entries exist so
+    that pruning a domain never silently off-boards a named person — which is
+    only true while each address really is on the exception list, so that is
+    what gets pinned, with the domain rules stripped away.
     """
     defaults = _pristine_settings(monkeypatch)
-    assert defaults.allowed_email_domain_set == ALLOWED_DOMAINS
-    for address in EXTERNAL_GEO_EDITORS - {"lynie.t@aivirtual.com"}:
-        domain = address.rpartition("@")[2]
-        assert domain not in defaults.allowed_email_domain_set
+    for address in EXTERNAL_GEO_EDITORS:
+        assert address in defaults.allowed_email_set
 
 
-def test_shipped_domains_admit_aivirtual_but_no_other_outside_company(
+def test_shipped_domains_admit_every_brand_but_nobody_else(
     _harness, monkeypatch,
 ):
-    """The same statement at the door instead of in the config.
+    """The 2026-09-28 decision at the door instead of in the config.
 
     The harness pins a one-domain allowlist; this restores the SHIPPED defaults
     (read from a pristine ``Settings``, never retyped here) so the assertion is
-    about what the service actually deploys with.
+    about what the service actually deploys with: any mailbox at any of the
+    five brand domains signs in, and the door stays shut to everyone else —
+    subdomains included, because Cloud Run serves this --allow-unauthenticated
+    and this list is the only membership check in the system.
     """
     pristine = _pristine_settings(monkeypatch)
     monkeypatch.setattr(settings, "allowed_email_domains", pristine.allowed_email_domains)
     monkeypatch.setattr(settings, "allowed_emails", pristine.allowed_emails)
 
-    # Anyone at aivirtual.com — not just the named editor — gets in.
-    for member in ("lynie.t@aivirtual.com", "someone.else@aivirtual.com",
-                   "Billing@AIVirtual.com"):
+    # Anyone at each brand — not just the named editors — gets in.
+    members = ["lynie.t@aivirtual.com", "someone.else@aivirtual.com",
+               "Billing@AIVirtual.com", "ceo@usimmigration.ai",
+               "intern@medvirtual.ai", "Support@AIAnswering.ai"]
+    for member in members:
         assert login(_harness, member).status_code == 200, member
 
-    # A colleague of the other named outside editors still does not.
-    for stranger in ("ceo@usimmigration.ai", "intern@medvirtual.ai",
-                     "support@aianswering.ai", "attacker@mail.aivirtual.com"):
+    # A stranger, a lookalike domain and a subdomain still do not.
+    for stranger in ("randomperson@gmail.com", "attacker@evil-medvirtual.ai",
+                     "attacker@mail.aivirtual.com", "x@mail.usimmigration.ai"):
         assert login(_harness, stranger).status_code == 403, stranger
     # Refused before the upsert, so no junk user document either.
-    assert _harness["created"] == [
-        "lynie.t@aivirtual.com", "someone.else@aivirtual.com", "Billing@AIVirtual.com",
-    ]
+    assert _harness["created"] == members
 
 
 def test_app_env_defaults_to_production(monkeypatch):

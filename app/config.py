@@ -87,15 +87,18 @@ class Settings(BaseSettings):
     #
     # Since 2026-09-25 (owner decision) every mailbox at an allowed domain is
     # an editor by default — current and future, with no per-user entry to
-    # forget. The domain rules are what deliver that; the three outside
-    # contractors stay named one address at a time because their domains are
-    # not admitted wholesale anywhere (see ``allowed_emails``).
+    # forget. The domain rules are what deliver that. The three editors who
+    # used to be named one address at a time (miguel, yans.suarez, franceska)
+    # now ride their domain rules too: on 2026-09-28 the owner admitted their
+    # companies wholesale as Legal Soft internal brands (see
+    # ``allowed_email_domains``), so per-person entries here would only be a
+    # second copy of the same grant.
     geo_editor_emails: str = (
         "@legalsoft.com,"
         "@aivirtual.com,"
-        "miguel@usimmigration.ai,"
-        "yans.suarez@medvirtual.ai,"
-        "franceska@aianswering.ai"
+        "@usimmigration.ai,"
+        "@medvirtual.ai,"
+        "@aianswering.ai"
     )
 
     # Comma-separated emails whose reach is LIMITED to the GEO workspace: the
@@ -121,7 +124,7 @@ class Settings(BaseSettings):
     # convenience. To scope somebody, set the env var with their address.
     #
     # Entries are exact addresses ONLY. ``@domain`` entries are ignored (see
-    # ``geo_only_email_set``) and logged at startup, because the two domains
+    # ``geo_only_email_set``) and logged at startup, because the domains
     # ``allowed_email_domains`` admits wholesale are the companies this
     # service exists for, and a single domain rule here would scope an entire
     # company to one panel.
@@ -140,20 +143,32 @@ class Settings(BaseSettings):
     #
     # aivirtual.com was admitted as a whole domain on 2026-09-24 by owner
     # decision: every mailbox there gets the full Agent Hub, provisioned and
-    # de-provisioned by that company, not here. The production and staging
-    # services carry this same value as a plain ALLOWED_EMAIL_DOMAINS env var,
-    # which overrides this default — change both or neither.
-    allowed_email_domains: str = "legalsoft.com,aivirtual.com"
+    # de-provisioned by that company, not here.
+    #
+    # aianswering.ai, medvirtual.ai and usimmigration.ai were admitted the
+    # same way on 2026-09-28 (owner decision, with CEO sign-off): they are
+    # Legal Soft internal brands adopting the platform, and every mailbox at
+    # each of them — current and future — gets exactly what a legalsoft.com
+    # mailbox gets: sign-in, the whole hub, every agent at full capacity, and
+    # the GEO editor role via the domain rules in ``geo_editor_emails``.
+    # Nothing about the GEO-only scope changed: it still names nobody by
+    # default and remains opt-in per exact address (``geo_only_emails``).
+    #
+    # The production and staging services carry this same value as a plain
+    # ALLOWED_EMAIL_DOMAINS env var, which overrides this default — change
+    # both or neither.
+    allowed_email_domains: str = (
+        "legalsoft.com,aivirtual.com,aianswering.ai,medvirtual.ai,usimmigration.ai"
+    )
     # Comma-separated individual addresses allowed regardless of domain — the
     # exception list for contractors/clients. Fillable via env, no code change.
     #
-    # The entries below are the GEO editors on outside domains, listed ONE
-    # ADDRESS AT A TIME on purpose: usimmigration.ai, medvirtual.ai and
-    # aianswering.ai are NOT admitted wholesale, because that would open a
-    # service Cloud Run serves --allow-unauthenticated to every mailbox at
-    # companies nobody here provisions or de-provisions. lynie.t is kept even
-    # though her domain now signs in on its own, so her access does not hinge
-    # on the domain rule staying.
+    # Every entry below is now REDUNDANT with a domain rule above: all four
+    # domains sign in wholesale since 2026-09-28. They are kept on purpose,
+    # the way lynie.t was kept when aivirtual.com was admitted, so no named
+    # editor's access hinges on a domain rule staying — pruning a domain from
+    # the list above must never silently off-board the people this platform
+    # was opened up for.
     allowed_emails: str = (
         "lynie.t@aivirtual.com,"
         "miguel@usimmigration.ai,"
