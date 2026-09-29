@@ -1609,6 +1609,23 @@ def test_a_check_that_is_not_a_poll_never_moves_a_row():
     assert "batchUpdate:order" not in sheets.names()
 
 
+def test_a_poll_for_someone_who_does_not_own_the_sheet_never_sorts_it():
+    """Tried on the throwaway sheet with the real Drive lookup: ownership is
+    settled before set-up, and the sort is the last step of set-up — so a
+    poll allowed to reorder still moves nothing on a sheet that is not the
+    caller's, and leaves no marker claiming it did."""
+    sheets = split_sheet()
+    before = copy.deepcopy(sheets.grid["Inbox"])
+    drive = FakeDrive({"owners": [{"emailAddress": "someone.else@legalsoft.com"}], "permissions": []})
+
+    result = sheet_writer.check(SID, caller_email=CALLER, svc=sheets, drive=drive, reorder=True)
+
+    assert (result.status, result.title, result.ordering) == (sheet_writer.CHECK_NOT_YOURS, "", "")
+    assert sheets.names() == ["get"], "the metadata read, and not one write"
+    assert sheets.grid["Inbox"] == before and _order_markers(sheets) == []
+    assert len(drive.calls) == 1
+
+
 def test_a_new_sheet_is_marked_newest_first_with_nothing_to_move():
     sheets = FakeSheets()
     assert _check_as_a_poll(sheets).ordering == sheet_writer.ORDER_APPLIED

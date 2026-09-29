@@ -1309,6 +1309,64 @@ def test_two_overlapping_fires_cannot_both_take_the_lease(connected, mailbox, sh
     assert connected.connections[UID]["lease_until"] is None
 
 
+def test_a_fire_that_starts_while_another_is_writing_its_rows_touches_neither_mail_nor_sheet(
+    connected, mailbox, sheet, monkeypatch
+):
+    """The write is one read of where the rows are and one batch addressed by
+    what was read. A second fire between the two would move the rows under
+    it, so inside the lease it must not get as far as the sheet at all."""
+    connected.connections[UID]["backfill"]["state"] = "done"
+    mailbox.messages = {"m1": _message("m1")}
+    mailbox.history_added = ["m1"]
+    inner: list = []
+    seen: dict = {}
+    real_write = sheet.write_rows
+
+    def write_with_an_overlap(sid, new_rows, updates=None, *, svc=None):
+        if not seen:  # the first fire's write only: a fire let in must not start another
+            seen["mail"], seen["sheet"] = None, None
+            mail, cells = len(mailbox.events), len(sheet.events)
+            inner.append(pipeline.fire(
+                UID, email=EMAIL, now=NOW + timedelta(seconds=pipeline.LEASE_SECONDS - 1)))
+            seen["mail"], seen["sheet"] = mailbox.events[mail:], sheet.events[cells:]
+        return real_write(sid, new_rows, updates, svc=svc)
+    monkeypatch.setattr(sheet_writer, "write_rows", write_with_an_overlap)
+
+    first = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert first.ok and first.new_rows == 1
+    assert len(inner) == 1 and inner[0].skipped == "previous fire still running"
+    assert seen == {"mail": [], "sheet": []}, "the second fire read no mail and asked the sheet nothing"
+    assert sheet.events.count("write_rows") == 1 and [row[ID] for row in sheet.inserted] == ["m1"]
+    assert connected.events.count("lease") == 1 and connected.events.count("messages") == 1
+
+
+def test_a_fire_that_starts_during_the_one_time_reorder_is_skipped_and_never_asks_for_a_second_sort(
+    connected, mailbox, sheet, monkeypatch
+):
+    """The sort moves every row. It runs inside the fire, under the lease,
+    so a poll that arrives while it is running does not run one of its own."""
+    connected.connections[UID]["sheet"].pop("ordering")  # stored before the rule existed
+    sheet.check_result = SheetCheck("ok", "Her inbox", "", "ours", "applied")
+    inner: list = []
+    overlapped: list = []
+
+    def check_with_an_overlap(sid, *, caller_email, reorder=False):
+        if not overlapped:  # the first fire's check only
+            overlapped.append(True)
+            inner.append(pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(seconds=30)))
+        return sheet.check(sid, caller_email=caller_email, reorder=reorder)
+    monkeypatch.setattr(sheet_writer, "check", check_with_an_overlap)
+
+    first = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert first.ok and first.skipped is None
+    assert len(inner) == 1 and inner[0].skipped == "previous fire still running"
+    assert sheet.reorders == [True], "one check, by the fire that holds the lease"
+    assert connected.connections[UID]["sheet"]["ordering"] == "applied"
+    assert connected.events.count("lease") == 1
+
+
 def test_a_raw_sheets_refusal_reaches_the_panel_without_the_sheet_id_and_the_log_without_the_user(
     connected, mailbox, sheet, monkeypatch, caplog
 ):
