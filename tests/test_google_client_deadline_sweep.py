@@ -218,3 +218,128 @@ def test_the_deadline_list_covers_every_module_that_builds_a_google_client():
         "these modules build a Google client but declare no deadline constant "
         f"this file checks: {sorted(unchecked)}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# No credential in a request URL.
+#
+# httpx logs every request URL at INFO (`app/main.py` sets the root logger to
+# INFO, and that log line is kept on purpose - it is the only signal for an
+# OpenRouter 402). So a credential sent as a query parameter is a credential
+# written to the service log: the Gemini key was, until it moved to the
+# `x-goog-api-key` header. Credentials belong in a header or the body.
+#
+# What this matches, in every non-test backend source file:
+#
+#   1. a dict literal passed as `params=` to any call, or assigned to a variable
+#      named `params` / `query` / `query_params`, that has a key in
+#      `_CREDENTIAL_PARAM_NAMES` - e.g. `httpx.post(url, params={"key": k})`;
+#   2. a string or f-string containing `?<name>=` or `&<name>=` for one of those
+#      names - e.g. `f"{base}/search?api_key={k}"`.
+#
+# Names match whole and case-insensitively, so `pageToken`, `login_hint` and
+# `client_id` are not flagged. It is a reader of source, not of behaviour: a
+# query dict built key-by-key, or under another variable name, is not seen.
+# --------------------------------------------------------------------------- #
+import re  # noqa: E402 - belongs to this section only
+
+_CREDENTIAL_PARAM_NAMES = frozenset({
+    "key", "api_key", "apikey", "api-key", "x-api-key",
+    "token", "access_token", "refresh_token", "id_token",
+    "secret", "client_secret", "password", "passwd",
+    "auth", "authorization",
+})
+_QUERY_DICT_NAMES = {"params", "query", "query_params"}
+_CREDENTIAL_IN_URL = re.compile(
+    r"[?&](" + "|".join(re.escape(n) for n in sorted(_CREDENTIAL_PARAM_NAMES)) + r")=",
+    re.IGNORECASE,
+)
+
+
+def _credential_keys(node: ast.AST | None) -> list[str]:
+    if not isinstance(node, ast.Dict):
+        return []
+    return [
+        k.value for k in node.keys
+        if isinstance(k, ast.Constant) and isinstance(k.value, str)
+        and k.value.lower() in _CREDENTIAL_PARAM_NAMES
+    ]
+
+
+def credential_in_url_sites(tree: ast.AST) -> list[tuple[int, str]]:
+    """``[(line, what), ...]`` for every credential this source puts in a URL."""
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if kw.arg == "params":
+                    found += [(kw.value.lineno, f"params= carries {name!r}")
+                              for name in _credential_keys(kw.value)]
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(t, ast.Name) and t.id in _QUERY_DICT_NAMES for t in targets):
+                found += [(node.lineno, f"query dict carries {name!r}")
+                          for name in _credential_keys(node.value)]
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            hit = _CREDENTIAL_IN_URL.search(node.value)
+            if hit:
+                found.append((node.lineno, f"URL text carries {hit.group(0)!r}"))
+    return sorted(set(found))
+
+
+def _is_test_file(path: Path) -> bool:
+    return "tests" in path.parts or path.name.startswith("test_") or path.name == "conftest.py"
+
+
+def test_no_backend_source_sends_a_credential_in_a_url():
+    offenders = {}
+    for path in _source_files():
+        if _is_test_file(path):
+            continue
+        sites = credential_in_url_sites(ast.parse(path.read_text(encoding="utf-8-sig")))
+        if sites:
+            offenders[str(path.relative_to(BACKEND)).replace("\\", "/")] = sites
+    assert offenders == {}, (
+        "credential sent as a URL query parameter - httpx logs the request URL, "
+        "so this writes the secret to the service log. Send it in a header "
+        "(Gemini: `x-goog-api-key`) or the request body:\n"
+        + "\n".join(f"  {f}: {sites}" for f, sites in sorted(offenders.items()))
+    )
+
+
+@pytest.mark.parametrize("source", [
+    'httpx.post(url, params={"key": key}, json=body)',
+    'client.get(url, params={"q": q, "API_KEY": k})',
+    'params = {"access_token": token}\nhttpx.get(url, params=params)',
+    'url = f"https://api.example.com/v1/search?q={q}&api_key={k}"',
+    'url = "https://api.example.com/v1/models?key=" + key',
+])
+def test_the_detector_flags_a_credential_in_a_url(source):
+    """The matcher must be able to say no - these are the shapes it exists for,
+    the first being the exact line that leaked."""
+    assert credential_in_url_sites(ast.parse(source)) != []
+
+
+@pytest.mark.parametrize("source", [
+    'httpx.post(url, headers={"x-goog-api-key": key}, json=body)',
+    'httpx.post(url, data={"token": refresh_token})',
+    'session.get(url, params={"pageToken": page_token})',
+    'params = {"client_id": cid, "state": state, "login_hint": hint}',
+    'url = f"https://docs.google.com/spreadsheets/d/{sid}/export?format=csv&gid={gid}"',
+    'row = {"key": entity, "name": name}',
+])
+def test_the_detector_accepts_header_and_body_credentials(source):
+    assert credential_in_url_sites(ast.parse(source)) == []
+
+
+def test_the_credential_sweep_reads_the_modules_that_leaked():
+    """Non-vacuity: the two Gemini call sites are inside the sweep, and carry
+    the key the way the rule demands."""
+    swept = {str(p.relative_to(BACKEND)).replace("\\", "/"): p
+             for p in _source_files() if not _is_test_file(p)}
+    for module in (
+        "agents/Final GEO agent/final_geo_agent/geo_engines.py",
+        "agents/Final GEO agent/final_geo_agent/opt_semantic.py",
+    ):
+        assert module in swept, module
+        assert '"x-goog-api-key"' in swept[module].read_text(encoding="utf-8-sig"), module

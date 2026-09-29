@@ -83,7 +83,7 @@ class GeminiEmbedder:
             batch = texts[start:start + EMBED_BATCH]
             resp = httpx.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:batchEmbedContents",
-                params={"key": key},
+                headers={"x-goog-api-key": key},
                 json={"requests": [
                     {"model": f"models/{self.model}", "content": {"parts": [{"text": t}]}}
                     for t in batch

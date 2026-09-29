@@ -667,3 +667,83 @@ def test_the_serp_engine_set_is_derivable_from_what_is_published():
     assert [e for e, s in shapes.items() if s["kind"] == "serp"] == list(
         geo_engines.SERP_ENGINES
     )
+
+
+# --------------------------------------------------------------------------- #
+# The Gemini key travels in the ``x-goog-api-key`` header, never in the URL.
+#
+# httpx logs the full request URL at INFO, so ``params={"key": ...}`` wrote the
+# key into the service log on every poll. These tests send the adapter's call
+# through a real httpx client on a MockTransport: what is asserted is the
+# request httpx itself builds - the URL it would log - not the kwargs the
+# adapter happened to pass. Offline; the key below is a made-up string.
+# --------------------------------------------------------------------------- #
+
+FAKE_GEMINI_KEY = "test-gemini-key-not-a-real-one"
+
+
+def wire_post(monkeypatch, respond) -> list[httpx.Request]:
+    """Route ``httpx.post`` through httpx's own request building; ``respond``
+    is a ``(request) -> httpx.Response`` handler. Returns the requests seen."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return respond(request)
+
+    def post(url, **kwargs):
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            return client.post(url, **kwargs)
+
+    monkeypatch.setattr(geo_engines.httpx, "post", post)
+    return seen
+
+
+def test_gemini_sends_the_key_in_the_header(monkeypatch):
+    seen = wire_post(monkeypatch, lambda r: httpx.Response(200, json=GEMINI_OK))
+    ans = geo_engines.poll_gemini("q", FAKE_GEMINI_KEY)
+    assert ans.error is None
+    assert ans.text == "Here are the best options.\nMore detail."
+    (request,) = seen
+    assert request.headers["x-goog-api-key"] == FAKE_GEMINI_KEY
+
+
+def test_gemini_url_and_query_string_carry_no_key(monkeypatch):
+    seen = wire_post(monkeypatch, lambda r: httpx.Response(200, json=GEMINI_OK))
+    geo_engines.poll_gemini("q", FAKE_GEMINI_KEY)
+    (request,) = seen
+    assert request.url.query == b""
+    assert FAKE_GEMINI_KEY not in str(request.url)
+    # same endpoint, same payload as before the key moved
+    assert request.url.host == "generativelanguage.googleapis.com"
+    assert request.url.path == f"/v1beta/models/{geo_engines.GEMINI_MODEL}:generateContent"
+    assert json.loads(request.content) == {
+        "contents": [{"parts": [{"text": "q"}]}],
+        "tools": [{"google_search": {}}],
+    }
+
+
+def test_gemini_failures_do_not_put_the_key_in_the_error_text(monkeypatch):
+    """``answer.error`` is stored and shown. Both failure shapes - a refused
+    call and a transport exception - must describe the failure without the key."""
+    wire_post(monkeypatch, lambda r: httpx.Response(403, text="forbidden"))
+    refused = geo_engines.poll_gemini("q", FAKE_GEMINI_KEY)
+    assert refused.error == "HTTP 403: forbidden"
+
+    def unreachable(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    wire_post(monkeypatch, unreachable)
+    down = geo_engines.poll_gemini("q", FAKE_GEMINI_KEY)
+    assert down.error and "ConnectError" in down.error
+    assert FAKE_GEMINI_KEY not in down.error
+
+
+def test_gemini_without_a_key_still_fails_loudly_and_sends_nothing(monkeypatch):
+    seen = wire_post(monkeypatch, lambda r: httpx.Response(200, json=GEMINI_OK))
+    monkeypatch.setattr(geo_engines, "engine_key", lambda e: "")
+    monkeypatch.setattr(geo_engines, "openrouter_key", lambda: "")
+    ans = geo_engines.poll_engine("gemini", "q")
+    assert ans.error == "no API key configured"
+    assert ans.text == ""
+    assert seen == []

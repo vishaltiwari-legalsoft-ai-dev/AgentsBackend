@@ -232,7 +232,7 @@ def poll_gemini(prompt: str, key: str) -> EngineAnswer:
     try:
         resp = httpx.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-            params={"key": key},
+            headers={"x-goog-api-key": key},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
                 "tools": [{"google_search": {}}],

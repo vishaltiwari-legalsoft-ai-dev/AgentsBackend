@@ -172,3 +172,75 @@ def test_auto_embedder_openai_first_gemini_fallback(monkeypatch):
     keys.update(openai_api_key="", gemini_api_key="")
     with pytest.raises(CredentialMissing):
         auto.embed(["x"])                          # no key -> honest degradation upstream
+
+
+# --------------------------------------------------------------------------- #
+# The Gemini embedding key travels in the ``x-goog-api-key`` header, never in
+# the URL. httpx logs the request URL at INFO and ``raise_for_status`` quotes it
+# in the exception text, so a ``?key=`` parameter leaked by both routes. The
+# call goes through a real httpx client on a MockTransport, so the assertions
+# are on the request httpx builds. Offline; the key is a made-up string.
+# --------------------------------------------------------------------------- #
+
+FAKE_GEMINI_KEY = "test-gemini-key-not-a-real-one"
+
+
+def _wire_gemini(monkeypatch, respond, key: str = FAKE_GEMINI_KEY) -> list:
+    import httpx
+
+    seen: list = []
+
+    def handler(request):
+        seen.append(request)
+        return respond(request)
+
+    def post(url, **kwargs):
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            return client.post(url, **kwargs)
+
+    monkeypatch.setattr(opt_semantic.httpx, "post", post)
+    monkeypatch.setattr(opt_semantic.runtime_config, "get",
+                        lambda k, *a, **kw: key if k == "gemini_api_key" else "")
+    return seen
+
+
+def test_gemini_embedder_sends_the_key_in_the_header_not_the_url(monkeypatch):
+    import json
+
+    import httpx
+
+    seen = _wire_gemini(monkeypatch, lambda r: httpx.Response(
+        200, json={"embeddings": [{"values": [0.1, 0.2]}, {"values": [0.3, 0.4]}]}))
+    vectors = opt_semantic.GeminiEmbedder("gemini-embedding-001").embed(["a", "b"])
+    assert vectors == [[0.1, 0.2], [0.3, 0.4]]
+    (request,) = seen
+    assert request.headers["x-goog-api-key"] == FAKE_GEMINI_KEY
+    assert request.url.query == b""
+    assert FAKE_GEMINI_KEY not in str(request.url)
+    # same endpoint, same payload as before the key moved
+    assert request.url.host == "generativelanguage.googleapis.com"
+    assert request.url.path == "/v1beta/models/gemini-embedding-001:batchEmbedContents"
+    assert json.loads(request.content) == {"requests": [
+        {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": "a"}]}},
+        {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": "b"}]}},
+    ]}
+
+
+def test_gemini_embedder_http_error_still_raises_and_names_no_key(monkeypatch):
+    import httpx
+
+    _wire_gemini(monkeypatch, lambda r: httpx.Response(429, text="quota"))
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        opt_semantic.GeminiEmbedder("gemini-embedding-001").embed(["a"])
+    assert "429" in str(caught.value)
+    assert FAKE_GEMINI_KEY not in str(caught.value)   # the message quotes the URL
+
+
+def test_gemini_embedder_needs_key(monkeypatch):
+    import httpx
+    from seo_geo_agent.sources import CredentialMissing
+
+    seen = _wire_gemini(monkeypatch, lambda r: httpx.Response(200, json={}), key="")
+    with pytest.raises(CredentialMissing):
+        opt_semantic.GeminiEmbedder("gemini-embedding-001").embed(["hello"])
+    assert seen == []
