@@ -12,9 +12,23 @@ that is as old as it or older (:func:`place`), so the newest mail is the
 first data row and an older message found later still lands where its date
 puts it. Inserting never overwrites a cell: every existing row, hers
 included, moves down intact. The agent sorts the tab exactly ONCE per sheet
-(:func:`order_requests`) — whole rows, every column — to bring a sheet
-written before this rule into the same order, and records that it did in a
-developer-metadata marker so it never does it again.
+(:func:`sort_requests`) — whole rows, every column — to bring a sheet
+written before this rule into the same order, and records that it did
+(:func:`order_marker_requests`) only after reading the tab back and finding
+it newest first (:func:`first_out_of_order`). A tab the sort cannot put right
+(:func:`sort_blocker`) is left exactly as it is, and says why.
+
+**One reading of a date.** Placement, the newest-first check and the decision
+to sort all read a Date cell through :func:`date_key`, on the value Sheets
+STORES — the agent's text, or the number behind a real date — never on how
+the column happens to be displayed.
+
+**One writer at a time, proved on the sheet.** Every batch that moves rows
+carries a stamp (:func:`rows_stamp`): a developer-metadata entry whose id is
+the next in a sequence. Sheets refuses to create an id that exists, and a
+batch is atomic, so of two batches planned from the same reading of the tab
+exactly one is applied — whether the second is another fire's or this one's
+own, sent again after a reply was lost.
 
 "Upcoming" is a formula view over "Inbox": nearest deadline first, blanks
 excluded, rows she has marked Done hidden, overdue ones marked and listed
@@ -26,7 +40,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from .triage import NEEDS_REVIEW
 
@@ -220,10 +234,63 @@ ORDER_VERSION = "newest-first/1"
 #: How :func:`agent_values` writes the Date cell. ISO text, so comparing two
 #: cells as text is comparing them as dates.
 _DATE_CELL = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+_DATE_FORMAT = "%Y-%m-%d %H:%M"
+#: Day zero of the number Sheets stores for a real date.
+_SERIAL_EPOCH = datetime(1899, 12, 30)
+#: Serial numbers read as dates: 1954-10-03 to 2173-10-13. A number outside
+#: that is a number she typed, not a date.
+_SERIAL_RANGE = (20000.0, 100000.0)
 
 
-def is_date_cell(cell: str) -> bool:
-    return bool(_DATE_CELL.match(str(cell or "").strip()))
+def date_key(cell) -> datetime | None:
+    """When a Date cell says its message arrived, or ``None`` when it does
+    not say.
+
+    Read from the value Sheets STORES (``UNFORMATTED_VALUE``), so the answer
+    does not depend on how she has the column displayed: the agent's own
+    text (``2026-09-12 09:00``) is parsed, and a real date — a cell she
+    re-typed, or a column she converted — arrives as the number of days
+    since 1899-12-30 and is read as that. Anything else (blank, a line she
+    typed, a date typed as other text) has no key: it is neither older nor
+    newer than anything."""
+    if isinstance(cell, bool):
+        return None
+    if isinstance(cell, (int, float)):
+        if not _SERIAL_RANGE[0] <= cell <= _SERIAL_RANGE[1]:
+            return None
+        return _SERIAL_EPOCH + timedelta(seconds=round(float(cell) * 86400))
+    text = str(cell or "").strip()
+    if not _DATE_CELL.match(text):
+        return None
+    try:
+        return datetime.strptime(text, _DATE_FORMAT)
+    except ValueError:  # 2026-02-31 09:00 has the shape and is no date
+        return None
+
+
+def is_date_cell(cell) -> bool:
+    return date_key(cell) is not None
+
+
+def is_real_date(cell) -> bool:
+    """A date held as a number, not as the agent's text."""
+    return not isinstance(cell, str) and date_key(cell) is not None
+
+
+def first_out_of_order(dates: list) -> int | None:
+    """The 1-based sheet row of the first dated row that is NEWER than the
+    dated row above it; ``None`` when the column is newest first. ``dates``
+    is the Date column as read, header included. Rows with no date are not
+    part of the order and are passed over."""
+    above: datetime | None = None
+    for index in range(1, len(dates)):
+        key = date_key(dates[index])
+        if key is None:
+            continue
+        if above is not None and key > above:
+            return index + 1
+        above = key
+    return None
 
 
 def is_newest_first(meta: dict) -> bool:
@@ -236,9 +303,9 @@ def is_newest_first(meta: dict) -> bool:
     )
 
 
-def order_requests(meta: dict, inbox_sheet_id: int) -> list[dict]:
-    """The one-time correction as ONE atomic batch: sort every row below the
-    header by Date, newest first, then write the marker.
+def sort_requests(inbox_sheet_id: int) -> list[dict]:
+    """The one-time correction: sort every row below the header by Date,
+    newest first.
 
     The range names no columns, so it is the whole width of the tab: a row
     moves with every cell in it — her Status and Notes, and any column she
@@ -246,11 +313,11 @@ def order_requests(meta: dict, inbox_sheet_id: int) -> list[dict]:
     Message ID breaks a tie inside one minute (Gmail's ids grow with time and
     are all the same length), which costs nothing when there is no tie.
 
-    The marker is the LAST request of the same batch, so it exists exactly
-    when the sort happened: a refusal leaves the sheet as it was and
-    unmarked, and the next attempt starts from the beginning — which is also
-    where it would have to start, because a sort has no half-way state."""
-    requests: list[dict] = [{
+    No marker here. Sheets sorts around rows it is not showing and puts every
+    text cell above every number, so that the sort was APPLIED does not mean
+    the tab is in order: the marker is written only once the tab has been
+    read back and found newest first."""
+    return [{
         "sortRange": {
             "range": {"sheetId": inbox_sheet_id, "startRowIndex": 1},
             "sortSpecs": [
@@ -259,7 +326,13 @@ def order_requests(meta: dict, inbox_sheet_id: int) -> list[dict]:
             ],
         }
     }]
-    requests += [
+
+
+def order_marker_requests(meta: dict) -> list[dict]:
+    """Record that the tab is newest first: any marker of another version
+    dropped, this version's written. Sent only after the order was read off
+    the sheet."""
+    requests: list[dict] = [
         {"deleteDeveloperMetadata": {"dataFilter": {
             "developerMetadataLookup": {"metadataId": entry["metadataId"]}}}}
         for entry in (meta or {}).get("developerMetadata") or []
@@ -274,6 +347,191 @@ def order_requests(meta: dict, inbox_sheet_id: int) -> list[dict]:
     return requests
 
 
+# --------------------------------------------------------------------------- #
+# What the one-time sort cannot put right, in words she can act on
+# --------------------------------------------------------------------------- #
+
+_NOTE_HEAD = "The Inbox tab has not been put in newest-first order yet: "
+#: How every note ends: what is still happening, and when the sort is tried
+#: again. ``{retry}`` is filled by the writer, which owns the interval.
+_NOTE_TAIL = (
+    " New mail is still added at the top. The agent tries the sort again {retry}."
+)
+
+
+def a1_range(grid_range: dict) -> str:
+    """A ``GridRange`` as she would read it in the sheet (``K3:K4``)."""
+    first_col = int(grid_range.get("startColumnIndex") or 0)
+    last_col = grid_range.get("endColumnIndex")
+    first_row = int(grid_range.get("startRowIndex") or 0)
+    last_row = grid_range.get("endRowIndex")
+    left = f"{column_letter(first_col + 1)}{first_row + 1}"
+    right = (
+        f"{column_letter(int(last_col)) if last_col else ''}{int(last_row) if last_row else ''}"
+    )
+    return left if left == right or not right else f"{left}:{right}"
+
+
+def _row_spans(rows: list[int]) -> str:
+    """1-based rows as she would say them: ``4-5, 9``. At most four spans."""
+    spans: list[list[int]] = []
+    for row in sorted(rows):
+        if spans and row == spans[-1][1] + 1:
+            spans[-1][1] = row
+        else:
+            spans.append([row, row])
+    words = [str(a) if a == b else f"{a}-{b}" for a, b in spans[:4]]
+    return ", ".join(words) + (" and more" if len(spans) > 4 else "")
+
+
+def vertical_merges(merges: list[dict] | None, *, from_row: int = 1) -> list[dict]:
+    """The merges that span more than one row and reach below ``from_row``
+    (0-based) — the ones Sheets refuses to sort or to move a row through."""
+    return [
+        merge for merge in merges or []
+        if int(merge.get("endRowIndex") or 0) - int(merge.get("startRowIndex") or 0) > 1
+        and int(merge.get("endRowIndex") or 0) > from_row
+    ]
+
+
+def sort_blocker(
+    dates: list, *, merges: list[dict] | None, hidden_by_filter: list[int],
+    hidden_by_user: list[int],
+) -> str | None:
+    """Why ``sortRange`` would not leave this tab newest first — the first
+    reason that applies, as the middle of a sentence — or ``None`` when it
+    would. Each was seen on a real sheet: Sheets refuses a range holding a
+    vertical merge; it sorts AROUND rows a filter or she has hidden, leaving
+    them where they were; and sorted descending it puts every text cell above
+    every number, so a column of both comes out as two runs.
+
+    ``hidden_*`` are 1-based sheet rows. The words name what to change and
+    where."""
+    vertical = vertical_merges(merges)
+    if vertical:
+        where = ", ".join(a1_range(merge) for merge in vertical[:4])
+        more = " and more" if len(vertical) > 4 else ""
+        return (
+            f"it has merged cells at {where}{more}, and Google Sheets cannot sort rows that "
+            "are merged together. Unmerge them (Format > Merge cells > Unmerge)."
+        )
+    if hidden_by_filter:
+        count = len(hidden_by_filter)
+        return (
+            f"a filter is hiding {count} row{'s' if count != 1 else ''} "
+            f"(rows {_row_spans(hidden_by_filter)}), and Google Sheets sorts around hidden "
+            "rows. Show every row (Data > Remove filter, or clear the filter's conditions)."
+        )
+    if hidden_by_user:
+        return (
+            f"rows {_row_spans(hidden_by_user)} are hidden, and Google Sheets sorts around "
+            "hidden rows. Unhide them (select the rows on either side, right-click > Unhide "
+            "rows)."
+        )
+    text = [i + 1 for i in range(1, len(dates)) if isinstance(dates[i], str) and is_date_cell(dates[i])]
+    real = [i + 1 for i in range(1, len(dates)) if is_real_date(dates[i])]
+    if text and real:
+        fewer = real if len(real) <= len(text) else text
+        kind = "real dates" if fewer is real else "text"
+        cells = ", ".join(f"A{row}" for row in fewer[:3]) + (" and more" if len(fewer) > 3 else "")
+        return (
+            "the Date column holds both dates written as text and real dates "
+            f"({len(fewer)} cell{'s are' if len(fewer) != 1 else ' is'} {kind}: {cells}), and "
+            "Google Sheets sorts the two apart. Make column A all one kind (select the "
+            "column, Format > Number > Plain text, then re-type those cells)."
+        )
+    return None
+
+
+def order_note(reason: str, *, retry: str) -> str:
+    """What the panel shows while the tab is not in order: what is in the
+    way, what to do about it, and what is still happening meanwhile."""
+    return _NOTE_HEAD + reason.rstrip() + _NOTE_TAIL.format(retry=retry)
+
+
+def unrecorded_note(why: str, *, retry: str) -> str:
+    """The tab IS newest first, and the marker that says so could not be
+    written — so the agent has to look again."""
+    return (
+        "The Inbox tab is in newest-first order, but Google Sheets did not let the agent "
+        f"record that ({why}), so it will look again. New mail is still added at the top. "
+        f"The agent tries again {retry}."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The stamp every row-moving batch carries
+# --------------------------------------------------------------------------- #
+
+#: One entry per batch that moved rows. Its metadata ID is
+#: :data:`ROWS_STAMP_BASE` plus a sequence number; its value is
+#: ``sequence@epoch seconds@token``.
+ROWS_STAMP_KEY = "agentos.a12.rows"
+ROWS_STAMP_BASE = 1_620_000_000
+#: Stamps older than this are dropped by the next batch. It bounds how late a
+#: batch sent earlier could still arrive and be refused by its own stamp; a
+#: request Google has held for an hour does not exist.
+ROWS_STAMP_KEEP_SECONDS = 3600
+
+
+def _stamps(meta: dict) -> list[tuple[int, int, str, int]]:
+    """``(sequence, epoch, token, metadata id)`` of every stamp, oldest first."""
+    out: list[tuple[int, int, str, int]] = []
+    for entry in (meta or {}).get("developerMetadata") or []:
+        if entry.get("metadataKey") != ROWS_STAMP_KEY or entry.get("metadataId") is None:
+            continue
+        parts = str(entry.get("metadataValue") or "").split("@")
+        try:
+            sequence, epoch = int(parts[0]), int(parts[1])
+        except (IndexError, ValueError):
+            sequence, epoch = int(entry["metadataId"]) - ROWS_STAMP_BASE, 0
+        out.append((sequence, epoch, parts[2] if len(parts) > 2 else "", int(entry["metadataId"])))
+    return sorted(out)
+
+
+def rows_sequence(meta: dict) -> int:
+    """How many row-moving batches the sheet says it has taken; 0 for none."""
+    stamps = _stamps(meta)
+    return stamps[-1][0] if stamps else 0
+
+
+def rows_stamped_by(meta: dict, token: str) -> bool:
+    """Is a batch carrying ``token`` on the sheet?"""
+    return bool(token) and any(stamp[2] == token for stamp in _stamps(meta))
+
+
+def rows_stamp(meta: dict, *, token: str, now_epoch: int) -> list[dict]:
+    """The requests that stamp a batch planned from ``meta``: FIRST in the
+    batch, create the next stamp in the sequence; then drop the stamps that
+    have aged out.
+
+    The ID is a function of what was read, so two batches planned from the
+    same reading ask for the same ID and Sheets applies one of them. An ID
+    some other metadata already holds is stepped over — by both, equally."""
+    taken = {
+        int(entry["metadataId"]) for entry in (meta or {}).get("developerMetadata") or []
+        if entry.get("metadataId") is not None
+    }
+    sequence = rows_sequence(meta) + 1
+    while ROWS_STAMP_BASE + sequence in taken:
+        sequence += 1
+    requests: list[dict] = [{"createDeveloperMetadata": {"developerMetadata": {
+        "metadataId": ROWS_STAMP_BASE + sequence,
+        "metadataKey": ROWS_STAMP_KEY,
+        "metadataValue": f"{sequence}@{int(now_epoch)}@{token}",
+        "location": {"spreadsheet": True},
+        "visibility": "DOCUMENT",
+    }}}]
+    stamps = _stamps(meta)
+    requests += [
+        {"deleteDeveloperMetadata": {"dataFilter": {
+            "developerMetadataLookup": {"metadataId": metadata_id}}}}
+        for _sequence, epoch, _token, metadata_id in stamps[:-1]  # the latest always stays
+        if now_epoch - epoch > ROWS_STAMP_KEEP_SECONDS
+    ]
+    return requests
+
+
 @dataclass(frozen=True)
 class Block:
     """New rows that go in at one place. ``at`` is the 0-based row index, in
@@ -284,28 +542,31 @@ class Block:
     rows: tuple[int, ...]
 
 
-def place(dates: list[str], new_dates: list[str], *, end: int) -> list[Block]:
+def place(dates: list, new_dates: list[str], *, end: int) -> list[Block]:
     """Where each new row goes: directly above the first existing row that is
     as old as it or older, and below the last row when none is.
 
-    ``dates`` is the Date column as read, header included (index 0 is row 1);
-    ``end`` is the index just past the last row that holds anything. A cell
-    that is not a date the agent wrote — blank, or a row she typed herself —
-    is neither older nor newer than anything and is simply passed over.
+    ``dates`` is the Date column as STORED, header included (index 0 is row
+    1) — text for the agent's own cells, a number for a real date, both read
+    by :func:`date_key`. ``end`` is the index just past the last row that
+    holds anything. A cell that says no date — blank, or a row she typed
+    herself — is neither older nor newer than anything and is simply passed
+    over.
 
     On a newest-first sheet that is the top for new mail, the bottom for the
     backfill, and the right place in between for mail that arrived while the
     inbox was disconnected. Blocks come back top to bottom."""
-    order = sorted(range(len(new_dates)), key=lambda i: new_dates[i], reverse=True)
+    wanted_keys = [date_key(value) or datetime.max for value in new_dates]
+    order = sorted(range(len(new_dates)), key=lambda i: wanted_keys[i], reverse=True)
+    keys = [date_key(cell) for cell in dates]
     blocks: list[tuple[int, list[int]]] = []
     pointer = 1
     for index in order:
-        wanted = new_dates[index]
+        wanted = wanted_keys[index]
         # The new rows are taken newest first, so the place for one is never
         # above the place for the one before it: one pass down the column.
         while pointer < end and not (
-            pointer < len(dates) and is_date_cell(dates[pointer])
-            and str(dates[pointer]).strip() <= wanted
+            pointer < len(keys) and keys[pointer] is not None and keys[pointer] <= wanted
         ):
             pointer += 1
         if blocks and blocks[-1][0] == pointer:
@@ -356,7 +617,10 @@ def update_requests(inbox_sheet_id: int, row_values: dict[int, list[str]]) -> li
     ]
 
 
-def insert_requests(inbox_sheet_id: int, blocks: list[Block], rows: list[list[str]]) -> list[dict]:
+def insert_requests(
+    inbox_sheet_id: int, blocks: list[Block], rows: list[list[str]], *,
+    grid_rows: int | None = None, merges: list[dict] | None = None,
+) -> list[dict]:
     """The blocks as structural requests, BOTTOM block first, so every index
     is the one that was read: an insert lower down never moves a row above it.
 
@@ -365,12 +629,43 @@ def insert_requests(inbox_sheet_id: int, blocks: list[Block], rows: list[list[st
     insert at its own first row and would start below the new rows, leaving
     them unbanded. So the new rows are inserted just BELOW the current first
     row — inside every such range, which therefore grows to take them — and
-    that one row is then moved, whole, to beneath them."""
+    that one row is then moved, whole, to beneath them.
+
+    Two sheets cannot take that, and mail must reach them all the same
+    (``grid_rows`` and ``merges`` are the tab's, read with the positions):
+
+    - **Row 2 is merged with the row below it.** Sheets will not move a row
+      out of a merge. The block is inserted AT row 2, above the merge, which
+      moves down whole with every row under it.
+    - **The grid ends at the header** — she deleted every empty row. There is
+      no row 2 to insert below; the block is added after row 1, which is the
+      one place Sheets allows, and its cells are given back the plain look
+      that an insert after the header would otherwise take from it."""
     requests: list[dict] = []
+    top_is_merged = any(
+        int(merge.get("startRowIndex") or 0) <= 1 for merge in vertical_merges(merges)
+    )
     for block in sorted(blocks, key=lambda b: b.at, reverse=True):
         count = len(block.rows)
         at = max(block.at, 1)
-        if at == 1:
+        if at == 1 and grid_rows is not None and grid_rows < 2:
+            requests.append({"insertDimension": {
+                "range": {"sheetId": inbox_sheet_id, "dimension": "ROWS",
+                          "startIndex": 1, "endIndex": 1 + count},
+                "inheritFromBefore": True,  # the only kind Sheets takes at the grid's end
+            }})
+            requests.append({"repeatCell": {
+                "range": {"sheetId": inbox_sheet_id, "startRowIndex": 1, "endRowIndex": 1 + count},
+                "cell": {"userEnteredFormat": {}},
+                "fields": "userEnteredFormat",
+            }})
+        elif at == 1 and top_is_merged:
+            requests.append({"insertDimension": {
+                "range": {"sheetId": inbox_sheet_id, "dimension": "ROWS",
+                          "startIndex": 1, "endIndex": 1 + count},
+                "inheritFromBefore": False,  # a data row's look, never the header's
+            }})
+        elif at == 1:
             requests.append({"insertDimension": {
                 "range": {"sheetId": inbox_sheet_id, "dimension": "ROWS",
                           "startIndex": 2, "endIndex": 2 + count},

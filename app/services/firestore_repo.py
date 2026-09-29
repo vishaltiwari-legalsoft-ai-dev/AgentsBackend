@@ -1494,12 +1494,33 @@ def inbox_lease_free(current: Optional[dict[str, Any]], now: datetime) -> bool:
     return until <= now
 
 
+def inbox_lease_held_by(current: Optional[dict[str, Any]], owner: str, held: str) -> bool:
+    """Is the lease still this fire's? Pure, like :func:`inbox_lease_free`, so
+    the fake store applies the same rule: the fire's token is on it, AND the
+    time on it is the one that fire last wrote (``held``, as stored).
+
+    Both, because a lease can change hands without the token changing: a
+    fire of a revision from before ``lease_owner`` existed takes the lease by
+    writing the time alone. A document with no token is held by no fire that
+    asks."""
+    doc = current or {}
+    return (
+        bool(owner) and bool(held)
+        and str(doc.get("lease_owner") or "") == owner
+        and str(doc.get("lease_until") or "") == held
+    )
+
+
 def take_inbox_lease(
-    user_id: str, *, now: datetime, until: datetime
+    user_id: str, *, now: datetime, until: datetime, owner: str = ""
 ) -> Optional[dict[str, Any]]:
     """Atomically take the fire lease on ``inbox_triage/{user_id}``: read and
     write ``lease_until`` inside ONE transaction, so two overlapping fires
     cannot both read "free" and both proceed (a read-then-``set`` could).
+
+    ``owner`` is the taking fire's own token, stored beside the time as
+    ``lease_owner``: a lease is extended or cleared only by the fire whose
+    token is on it (:func:`renew_inbox_lease`, :func:`release_inbox_lease`).
 
     Returns the document as read inside the transaction, with the new lease,
     when the lease was taken; ``None`` when another fire holds it or there is
@@ -1519,9 +1540,51 @@ def take_inbox_lease(
         current = snap.to_dict() or {}
         if not inbox_lease_free(current, now):
             return None
-        stamp = {"lease_until": until.isoformat(), "updated_at": _now()}
+        stamp = {"lease_until": until.isoformat(), "lease_owner": owner, "updated_at": _now()}
         txn.update(ref, stamp)
         return {**current, **stamp}
+
+    return _apply(transaction)
+
+
+def renew_inbox_lease(user_id: str, *, owner: str, held: str, until: datetime) -> bool:
+    """Extend the fire lease to ``until`` — only if it is still ``owner``'s
+    and still reads ``held``, read and written in ONE transaction. ``False``
+    when the lease is another fire's, was cleared (a disconnect), or the
+    document is gone: the caller no longer holds it and must stop writing.
+
+    A lease that ran out but that nobody took is still its owner's to extend.
+    The same transaction shape as :func:`take_inbox_lease`, with the same
+    caveat about emulator testing."""
+    ref = _db().collection(INBOX_CONNECTIONS).document(user_id)
+    transaction = _db().transaction()
+
+    @firestore.transactional
+    def _apply(txn) -> bool:
+        snap = ref.get(transaction=txn)
+        if not snap.exists or not inbox_lease_held_by(snap.to_dict() or {}, owner, held):
+            return False
+        txn.update(ref, {"lease_until": until.isoformat(), "updated_at": _now()})
+        return True
+
+    return _apply(transaction)
+
+
+def release_inbox_lease(user_id: str, *, owner: str, held: str) -> bool:
+    """Clear the fire lease — only if it is still ``owner``'s and still reads
+    ``held``, in ONE transaction. ``False``, and nothing written, when it is
+    not: a fire that overran must not free the inbox under the fire that
+    replaced it."""
+    ref = _db().collection(INBOX_CONNECTIONS).document(user_id)
+    transaction = _db().transaction()
+
+    @firestore.transactional
+    def _apply(txn) -> bool:
+        snap = ref.get(transaction=txn)
+        if not snap.exists or not inbox_lease_held_by(snap.to_dict() or {}, owner, held):
+            return False
+        txn.update(ref, {"lease_until": None, "lease_owner": None, "updated_at": _now()})
+        return True
 
     return _apply(transaction)
 

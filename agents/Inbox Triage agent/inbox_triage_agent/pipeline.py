@@ -10,8 +10,10 @@ One fire, in order:
    no sheet, or a sheet check that is not ``ok`` → skip. The sheet is
    re-checked — ownership included — when the last check failed, is over an
    hour old, was made for a different address than the one firing, or has
-   not yet put the Inbox tab in newest-first order (a one-time sort, done
-   here because the fire holds the lease).
+   not yet tried to put the Inbox tab in newest-first order (a one-time
+   sort, done here because the fire holds the lease). A tab that cannot be
+   sorted does not stop the fire: the reason is kept for the panel, the sort
+   is tried again an hour later, and mail is written to the top meanwhile.
 2. Open the sealed refresh token and mint an access token. ``invalid_grant``
    → the connection is marked revoked with the reason, and the fire stops.
 3. **New mail first**: history since the checkpoint (or, when Gmail no longer
@@ -24,7 +26,9 @@ One fire, in order:
    per fire, skipping ids already on the sheet.
 5. Write: one atomic batch — the retried rows rewritten where their ids are
    now, the new rows inserted newest first, each above the first row older
-   than it.
+   than it. The lease is proved with the store, and extended, before the
+   positions are read; a fire that finds the lease is no longer its own
+   writes nothing.
 5b. The **Worktree**: the sheet's rows grouped into one process per Gmail
    thread and written to their own tab — but only when something changed,
    and never in a way that touches an Inbox cell. It also carries the two
@@ -39,7 +43,8 @@ One fire, in order:
 Write-then-persist is duplicate-over-drop: a fire that dies between 5 and 6
 re-reads the same mail next time and the sheet's id map skips it, so nothing
 is lost and nothing doubles. A ``lease_until`` on the document keeps an
-overrunning fire and the next one from working the same inbox at once.
+overrunning fire and the next one from working the same inbox at once, and
+``lease_owner`` says whose it is: a fire extends and clears only its own.
 
 A failed fire moves nothing the next one depends on. The checkpoint — the
 history id and the time it was taken — is written only by a fire that worked
@@ -57,6 +62,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -69,8 +75,9 @@ from .gmail_client import GmailUnavailable, HistoryExpired, MessageGone
 from .gmail_oauth import ExchangeFailed, RevokedGrant, TokenKeyMissing, TokenRefreshFailed
 from .sheet_layout import RowFacts, agent_values, parse_sheet_ref, sheet_url
 from .sheet_writer import (
-    CHECK_MR_SOURCE, CHECK_OK, ORDER_SETTLED, WORKTREE_CLAIMED, WORKTREE_OURS, LayoutMismatch,
-    SheetCheck, SheetsUnavailable,
+    CHECK_MR_SOURCE, CHECK_OK, ORDER_BLOCKED, ORDER_RETRY_SECONDS, ORDER_SETTLED,
+    RETRIED_COVER_SECONDS, WORKTREE_CLAIMED, WORKTREE_OURS, LayoutMismatch, SheetCheck,
+    SheetsUnavailable,
 )
 from .summarise import ModelCallFailed, ModelUnavailable
 from .triage import NEEDS_REVIEW, TEAM_TIMEZONE, Rejected, Verdict
@@ -130,7 +137,13 @@ SENT_RECENT_LOOKBACK_SECONDS = 86400
 #: midnight and a thread crosses the chase threshold without any mail
 #: arriving. Hourly is well inside a day.
 WORKTREE_REFRESH_SECONDS = 3600
+#: How long a lease lasts from the moment it is taken or extended. It is
+#: extended before every write, so what it has to outlast is one write — two
+#: reads and a send, each under its own deadline — not the whole fire.
 LEASE_SECONDS = 300
+#: What a fire that lost its lease reports. Nothing was written after the
+#: loss, and the fire that holds the lease reads the same mail.
+SKIPPED_LEASE_LOST = "lease taken over by a later fire"
 POLL_INTERVAL_SECONDS = 300
 SHEET_RECHECK_SECONDS = 3600
 #: When the history checkpoint is unusable: re-list from the time that
@@ -220,6 +233,7 @@ def connect(user_id: str, *, code: str, state: str, email: str) -> dict:
         "recent_fires": [],
         "last_poll": None,
         "lease_until": None,
+        "lease_owner": None,
     })
     return _activate_backfill(user_id, doc)
 
@@ -265,19 +279,22 @@ def is_mr_sheet(spreadsheet_id: str) -> bool:
 
 def _check_and_store(
     user_id: str, spreadsheet_id: str, *, email: str, extra: dict | None = None,
-    reorder: bool = False,
+    reorder: bool = False, hold: "_Lease | None" = None,
 ) -> dict:
     """MR's sheets are refused before Google is asked anything; every other
     sheet goes through ``sheet_writer.check``, which proves the caller owns
     or edits it before its first write. ``checked_for`` records whose
     address the answer holds for, so a fire for anyone else re-checks.
 
-    ``reorder`` is passed by the fire and by nothing else: the one-time
-    newest-first sort moves rows, and only the holder of the lease may."""
+    ``reorder`` is passed by the fire and by nothing else, with its lease as
+    ``hold``: the one-time newest-first sort moves rows, and only the holder
+    of the lease may."""
     if is_mr_sheet(spreadsheet_id):
         result = SheetCheck(CHECK_MR_SOURCE, "")
     else:
-        result = sheet_writer.check(spreadsheet_id, caller_email=email, reorder=reorder)
+        result = sheet_writer.check(
+            spreadsheet_id, caller_email=email, reorder=reorder, hold=hold
+        )
     doc = firestore_repo.save_inbox_connection(user_id, {
         "sheet": {
             "id": spreadsheet_id,
@@ -296,11 +313,13 @@ def _check_and_store(
             # the key :func:`_worktree_pass` gates on: without it the tab is
             # created and styled and then never filled.
             "worktree": result.worktree,
-            # applied / already / pending — and "" for an answer that is not
-            # ``ok``. Until it is one of the first two, every fire re-checks
-            # (:func:`_ensure_sheet_checked`), so the sort is not left
-            # waiting for the hourly one.
+            # applied / already / pending / blocked — and "" for an answer
+            # that is not ``ok``. ``pending`` is re-checked by the next fire;
+            # ``blocked`` an hour later (:func:`_ensure_sheet_checked`).
             "ordering": result.ordering,
+            # Why the tab is not in newest-first order, in words for the
+            # panel; "" whenever it is, or has not been tried.
+            "ordering_note": result.ordering_note,
         },
         **(extra or {}),
     })
@@ -351,7 +370,10 @@ def disconnect(user_id: str) -> Disconnected:
             "needs_review": 0,
             "recent_fires": [],
             "last_poll": None,
+            # With the owner: a fire still running for the connection that
+            # was just removed finds the lease is not its own and stops.
             "lease_until": None,
+            "lease_owner": None,
             "backfill": _fresh_backfill(_utcnow()),
         },
         clear=("refresh_token_enc", "gmail", "checkpoint"),
@@ -432,6 +454,10 @@ def status_payload(user_id: str, *, now: datetime | None = None) -> dict:
             "title": sheet.get("title") or None,
             "check": sheet.get("check") or None,
             "checked_at": sheet.get("checked_at") or None,
+            # Both read with a default: a document stored before they existed
+            # has neither.
+            "ordering": sheet.get("ordering") or None,
+            "ordering_note": sheet.get("ordering_note") or None,
         },
         "backfill": {
             "state": backfill.get("state") or None,
@@ -611,6 +637,45 @@ def _message_doc(facts: RowFacts, *, attempts: int, sheet_row: int | None, addre
     }
 
 
+class LeaseLost(RuntimeError):
+    """The lease on this inbox is no longer this fire's: it ran out and a
+    later fire took it, or the connection was removed. Deliberately not a
+    ``SheetsUnavailable`` — nothing failed, and nothing may be written."""
+
+
+class _Lease:
+    """One fire's hold on its inbox, as ``sheet_writer.Hold``.
+
+    The fire's clock is ``now`` plus what has passed on the monotonic clock
+    since it started, so a lease is always measured against the same time
+    the store was given when it was taken."""
+
+    def __init__(self, user_id: str, *, owner: str, now: datetime, started: float, until: datetime):
+        self.user_id, self.owner = user_id, owner
+        self._now, self._started = now, started
+        self.until = until
+
+    def moment(self) -> datetime:
+        return self._now + timedelta(seconds=time.monotonic() - self._started)
+
+    def prove(self) -> None:
+        until = self.moment() + timedelta(seconds=LEASE_SECONDS)
+        if not firestore_repo.renew_inbox_lease(
+            self.user_id, owner=self.owner, held=self.until.isoformat(), until=until
+        ):
+            raise LeaseLost(SKIPPED_LEASE_LOST)
+        self.until = until
+
+    def cover(self, seconds: float) -> None:
+        if (self.until - self.moment()).total_seconds() < seconds:
+            self.prove()
+
+    def release(self) -> None:
+        firestore_repo.release_inbox_lease(
+            self.user_id, owner=self.owner, held=self.until.isoformat()
+        )
+
+
 def fire(
     user_id: str, *, email: str, budget_seconds: float = FIRE_BUDGET_SECONDS,
     now: datetime | None = None,
@@ -630,15 +695,27 @@ def fire(
         return report
     # Read-and-take in one transaction: two overlapping fires cannot both see
     # the lease free. The document it returns is the one the fire works from.
-    leased = firestore_repo.take_inbox_lease(
-        user_id, now=now, until=now + timedelta(seconds=LEASE_SECONDS)
-    )
+    until = now + timedelta(seconds=LEASE_SECONDS)
+    owner = uuid.uuid4().hex
+    leased = firestore_repo.take_inbox_lease(user_id, now=now, until=until, owner=owner)
     if leased is None:
         report.skipped = "previous fire still running"
         return report
     doc = leased
+    lease = _Lease(user_id, owner=owner, now=now, started=started, until=until)
     try:
-        _fire_leased(user_id, doc, report, email=email, deadline=started + budget_seconds, now=now)
+        _fire_leased(
+            user_id, doc, report, email=email, deadline=started + budget_seconds, now=now,
+            lease=lease,
+        )
+    except LeaseLost:
+        # Not a failure and not this fire's to record: the document belongs
+        # to the fire that holds the lease now, which reads the same mail.
+        logger.warning(
+            "a12 fire for user %s stopped: its lease was taken over; nothing was written "
+            "after that", user_label(user_id),
+        )
+        report.skipped = SKIPPED_LEASE_LOST
     except RevokedGrant as exc:
         _mark_revoked(user_id, doc, str(exc), now)
         report.ok, report.error = False, str(exc)
@@ -651,7 +728,7 @@ def fire(
         report.ok, report.error = False, reason
     finally:
         try:
-            firestore_repo.save_inbox_connection(user_id, {"lease_until": None})
+            lease.release()  # its own only: never a lease another fire has taken
         except Exception:  # noqa: BLE001 — the lease expires on its own; say so
             logger.exception("a12: could not clear the fire lease for user %s", user_label(user_id))
         report.seconds = round(time.monotonic() - started, 1)
@@ -669,9 +746,10 @@ def _panel_reason(exc: BaseException) -> str:
 
 
 def _fire_leased(
-    user_id: str, doc: dict, report: FireReport, *, email: str, deadline: float, now: datetime
+    user_id: str, doc: dict, report: FireReport, *, email: str, deadline: float, now: datetime,
+    lease: _Lease,
 ) -> None:
-    doc = _ensure_sheet_checked(user_id, doc, now, email=email)
+    doc = _ensure_sheet_checked(user_id, doc, now, email=email, hold=lease)
     sheet = doc.get("sheet") or {}
     if not sheet.get("id"):
         report.skipped = "no sheet set"
@@ -690,7 +768,7 @@ def _fire_leased(
         deadline=deadline - WRITE_RESERVE_SECONDS - WORKTREE_RESERVE_SECONDS,
         address=str((doc.get("gmail") or {}).get("address") or ""),
     )
-    id_map = _read_id_map(user_id, spreadsheet_id, sheets, email=email)
+    id_map = _read_id_map(user_id, spreadsheet_id, sheets, email=email, hold=lease)
     if id_map is None:
         report.skipped = "sheet check: set-up did not pass"
         return
@@ -729,13 +807,14 @@ def _fire_leased(
 
     # 5. write — one atomic batch. New rows go in newest first; the rows to
     # rewrite are named by message id, because the row numbers in the id map
-    # are as old as the start of this fire and the writer reads its own.
+    # are as old as the start of this fire and the writer reads its own. The
+    # writer proves the lease before it reads where the rows are.
     work.new_rows.sort(key=lambda facts: facts.received_at, reverse=True)
     written = sheet_writer.write_rows(
         spreadsheet_id,
         [agent_values(f) for f in work.new_rows],
         {f.message_id: agent_values(f) for f in work.updated_rows.values()},
-        svc=sheets,
+        svc=sheets, hold=lease,
     )
     if written.missing:
         logger.warning(
@@ -750,7 +829,7 @@ def _fire_leased(
     # data: it never fails the fire and never touches an Inbox cell.
     thread_backfill, sent_backfill, worktree_state = _worktree_pass(
         user_id, doc, work, spreadsheet_id=spreadsheet_id, sheets=sheets, now=now,
-        deadline=deadline - WRITE_RESERVE_SECONDS,
+        deadline=deadline - WRITE_RESERVE_SECONDS, lease=lease,
     )
 
     # 6. persist — tracking rows, counters, the poll, the checkpoint
@@ -823,30 +902,42 @@ def _fill_report(report: FireReport, work: _Work, backfill: dict) -> None:
     report.unreached = work.unreached
 
 
-def _ensure_sheet_checked(user_id: str, doc: dict, now: datetime, *, email: str) -> dict:
+def _ensure_sheet_checked(
+    user_id: str, doc: dict, now: datetime, *, email: str, hold: "_Lease | None" = None,
+) -> dict:
     """Re-check — MR refusal and ownership included — when the last check
     failed, is over an hour old, was made for another address (including
-    a document written before ``checked_for`` existed), or did not leave the
-    Inbox tab in newest-first order (including a document written before
-    ``ordering`` existed — every sheet connected before the rule). Otherwise
-    the stored ``ok`` stands: one Drive read an hour, not one per
+    a document written before ``checked_for`` existed), or has not yet tried
+    to put the Inbox tab in newest-first order (including a document written
+    before ``ordering`` existed — every sheet connected before the rule).
+    Otherwise the stored ``ok`` stands: one Drive read an hour, not one per
     five-minute fire.
 
     The one-time sort therefore happens on a sheet's first fire after the
-    rule shipped, before that fire reads or writes a row."""
+    rule shipped, before that fire reads or writes a row. A sort that was
+    tried and found the tab ``blocked`` is NOT tried again by the next fire:
+    it waits :data:`ORDER_RETRY_SECONDS`, so a sheet that cannot be sorted
+    costs the API nothing on the fires in between — and those fires write
+    their mail."""
     sheet = doc.get("sheet") or {}
     if not sheet.get("id"):
         return doc
     checked_at = _parse_iso(sheet.get("checked_at"))
-    stale = checked_at is None or (now - checked_at).total_seconds() > SHEET_RECHECK_SECONDS
+    age = None if checked_at is None else (now - checked_at).total_seconds()
+    stale = age is None or age > SHEET_RECHECK_SECONDS
     same_caller = sheet.get("checked_for") == str(email or "").strip().lower()
-    ordered = str(sheet.get("ordering") or "") in ORDER_SETTLED
-    if sheet.get("check") == CHECK_OK and not stale and same_caller and ordered:
+    ordering = str(sheet.get("ordering") or "")
+    settled = ordering in ORDER_SETTLED or (
+        ordering == ORDER_BLOCKED and age is not None and age <= ORDER_RETRY_SECONDS
+    )
+    if sheet.get("check") == CHECK_OK and not stale and same_caller and settled:
         return doc
-    return _check_and_store(user_id, str(sheet["id"]), email=email, reorder=True)
+    return _check_and_store(user_id, str(sheet["id"]), email=email, reorder=True, hold=hold)
 
 
-def _read_id_map(user_id: str, spreadsheet_id: str, sheets, *, email: str) -> dict[str, int] | None:
+def _read_id_map(
+    user_id: str, spreadsheet_id: str, sheets, *, email: str, hold: "_Lease | None" = None,
+) -> dict[str, int] | None:
     """The id → row map, read with row 1. A header that is not the current
     layout — the first fire after the Action column shipped, on a sheet set
     up before it — is not written into: set-up runs once more (the full
@@ -859,7 +950,7 @@ def _read_id_map(user_id: str, spreadsheet_id: str, sheets, *, email: str) -> di
         logger.warning(
             "a12: the Inbox layout for user %s is not current; re-running set-up", user_label(user_id)
         )
-    doc = _check_and_store(user_id, spreadsheet_id, email=email, reorder=True)
+    doc = _check_and_store(user_id, spreadsheet_id, email=email, reorder=True, hold=hold)
     if (doc.get("sheet") or {}).get("check") != CHECK_OK:
         return None
     return sheet_writer.id_rows(spreadsheet_id, svc=sheets)
@@ -1041,7 +1132,7 @@ def _fresh_sent_backfill() -> dict:
 
 def _worktree_pass(
     user_id: str, doc: dict, work: _Work, *, spreadsheet_id: str, sheets,
-    now: datetime, deadline: float,
+    now: datetime, deadline: float, lease: _Lease,
 ) -> tuple[dict, dict, dict]:
     """``(thread_backfill, sent_backfill, worktree)`` — the three
     sub-documents this pass owns.
@@ -1084,7 +1175,16 @@ def _worktree_pass(
             user_id, doc, work, thread_backfill=thread_backfill,
             sent_backfill=sent_backfill, previous=state,
             spreadsheet_id=spreadsheet_id, sheets=sheets, now=now, deadline=deadline,
+            lease=lease,
         )
+    except LeaseLost:
+        # The Inbox rows are written and are this fire's to record; only the
+        # tab's rewrite is given up, to the fire that holds the lease now.
+        logger.warning(
+            "a12: the Worktree for user %s was not rewritten: the fire's lease was taken over",
+            user_label(user_id),
+        )
+        return thread_backfill, sent_backfill, {**state, "error": SKIPPED_LEASE_LOST}
     except (SheetsUnavailable, GmailUnavailable, HttpError) as exc:
         reason = _panel_reason(exc)
         logger.warning(
@@ -1097,6 +1197,7 @@ def _worktree_pass(
 def _build_worktree(
     user_id: str, doc: dict, work: _Work, *, thread_backfill: dict, sent_backfill: dict,
     previous: dict, spreadsheet_id: str, sheets, now: datetime, deadline: float,
+    lease: _Lease,
 ) -> tuple[dict, dict, dict]:
     tracked = firestore_repo.list_inbox_messages(user_id)
     markers = {
@@ -1150,6 +1251,9 @@ def _build_worktree(
         state["rows"] = int(previous.get("rows") or 0)
         # Nothing moved; the tab already says this.
         return thread_backfill, sent_backfill, state
+    # The tab is replaced whole, so sending it twice says the same thing
+    # twice — but it is still a write, and only the lease's holder makes one.
+    lease.cover(RETRIED_COVER_SECONDS)
     work.worktree_rows = sheet_writer.write_worktree(
         spreadsheet_id, values, previous_rows=int(previous.get("rows") or 0), svc=sheets
     )

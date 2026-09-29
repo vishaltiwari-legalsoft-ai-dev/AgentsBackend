@@ -13,8 +13,17 @@ where every row is immediately before it writes, and writes in one batch.
 New rows are INSERTED, newest first (``sheet_layout.place``), never written
 over anything. And the tab is sorted exactly once per sheet
 (:func:`_order_once`), whole rows with every column of hers, to bring a sheet
-from before that rule into the same order; a marker on the sheet records it,
-and after that her row order is hers again.
+from before that rule into the same order; a marker on the sheet records it
+— written only after the tab was read back and found in order — and after
+that her row order is hers again. A tab the sort cannot put right is left as
+it is, with the reason recorded for the panel, and mail goes on landing.
+
+A batch that moves rows is sent ONCE (:func:`_send_once`), never retried as
+it stands: the same insert applied twice writes over another message's row.
+When the answer does not arrive, the sheet is asked whether the batch is on
+it (its stamp, ``sheet_layout.rows_stamp``), and the write is planned again
+from what the sheet then holds. The stamp also makes Sheets itself refuse
+the second of two batches planned from one reading of the tab.
 
 Upcoming and Worktree are different in kind: they are the agent's own views,
 with no cell of hers in them, so their headers are rewritten whole and
@@ -42,11 +51,17 @@ that starts with ``=`` as a formula, and subject lines are third-party text.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
+import time
+import uuid
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from app.services.google_http import (
-    _RETRY_ATTEMPTS, cached_credentials, execute_with_retry, refresh_if_stale, timed_http,
+    _RETRY_ATTEMPTS, _RETRY_BACKOFF_SECONDS, _is_transient, cached_credentials,
+    execute_with_retry, refresh_if_stale, timed_http,
 )
 
 from . import offline, refuse_if_offline, sheet_style
@@ -56,8 +71,10 @@ from .sheet_layout import (
     INBOX_HEADER_RANGE, INBOX_ROWS_RANGE, INBOX_TAB, LAST_AGENT_COL, LAST_COL, MESSAGE_ID_RANGE,
     MIGRATION_INSERTS, ORDER_VERSION, STATUS_OPTIONS, UPCOMING_FORMULA, UPCOMING_HEADERS,
     UPCOMING_TAB, WORKTREE_HEADER_RANGE, WORKTREE_HEADERS, WORKTREE_MARKER_KEY,
-    WORKTREE_ROWS_RANGE, WORKTREE_TAB, column_letter, header_state, insert_requests,
-    is_newest_first, landed, order_requests, place, pushed, same_formula, update_requests,
+    WORKTREE_ROWS_RANGE, WORKTREE_TAB, column_letter, first_out_of_order, header_state,
+    insert_requests, is_newest_first, landed, order_marker_requests, order_note, place, pushed,
+    rows_sequence, rows_stamp, rows_stamped_by, same_formula, sort_blocker, sort_requests,
+    unrecorded_note, update_requests,
 )
 from .triage import NEEDS_REVIEW
 
@@ -97,19 +114,37 @@ class LayoutMismatch(SheetsUnavailable):
     (which migrates a legacy sheet) and reads again."""
 
 
-class ReorderFailed(SheetsUnavailable):
-    """The one-time newest-first sort did not happen. The batch is atomic, so
-    no row moved and no marker was written; the next poll tries again."""
-
-
 class SheetsRefused(SheetsUnavailable):
     """Google answered a Sheets or Drive call with a non-transient HTTP
     status. ``status`` lets :func:`check` map 403/404 to the panel's words;
-    everyone else can treat it as the :class:`SheetsUnavailable` it is."""
+    everyone else can treat it as the :class:`SheetsUnavailable` it is.
 
-    def __init__(self, message: str, *, status: int | None):
+    ``detail`` is Google's own sentence for the refusal ("There is a vertical
+    merge at K3:K4"), with nothing in it that names the sheet. It is not part
+    of ``str()``: only a caller that means to show it reads it."""
+
+    def __init__(self, message: str, *, status: int | None, detail: str = ""):
         super().__init__(message)
         self.status = status
+        self.detail = detail
+
+
+class SheetsUnsure(SheetsUnavailable):
+    """A batch was sent and no answer came back — a timeout, a reset, a 5xx.
+    It may have been applied. Never an instruction to send it again: the
+    sheet is asked first."""
+
+
+class Hold(Protocol):
+    """The fire's lease, as the writer needs it. Both raise — the fire's own
+    exception, which is not a :class:`SheetsUnavailable` — when the lease is
+    no longer this fire's; nothing is sent after that."""
+
+    def prove(self) -> None:
+        """Ask the store: is the lease still this fire's? Extend it."""
+
+    def cover(self, seconds: float) -> None:
+        """Make sure the lease lasts ``seconds`` more, extending it if not."""
 
 
 #: What set-up did about the sheet's look (see ``sheet_style``). Recorded on
@@ -120,14 +155,38 @@ FORMAT_ALREADY = "already"
 FORMAT_FAILED = "failed"
 
 #: What set-up did about the Inbox tab's row order (see :func:`_order_once`).
-#: ``applied``: sorted newest first on this pass. ``already``: the marker says
-#: it was done before. ``pending``: not done yet, and this pass was not asked
-#: to — only a poll, which holds the connection's lease, may move rows.
+#: ``applied``: found newest first on this pass, sorted if it had to be, and
+#: marked. ``already``: the marker says it was done before. ``pending``: not
+#: done yet, and this pass was not asked to — only a poll, which holds the
+#: connection's lease, may move rows. ``blocked``: a poll tried and the tab
+#: could not be put in order; the note says why, the tab is as it was, mail
+#: still lands, and the sort is tried again after :data:`ORDER_RETRY_SECONDS`.
 ORDER_APPLIED = "applied"
 ORDER_ALREADY = "already"
 ORDER_PENDING = "pending"
+ORDER_BLOCKED = "blocked"
 #: The answers that mean the sheet is in newest-first order.
 ORDER_SETTLED = frozenset({ORDER_APPLIED, ORDER_ALREADY})
+#: How long after a blocked attempt the next one is made. An hour: the same
+#: beat as the sheet re-check the fire already makes, so a blocked sheet costs
+#: two reads an hour and nothing on the fires in between.
+ORDER_RETRY_SECONDS = 3600
+_ORDER_RETRY_WORDS = "every hour"
+
+#: Times one write is planned and sent before the fire gives up on it. A
+#: second or third pass happens only after an answer that did not arrive or
+#: a batch Sheets refused because another had landed first.
+WRITE_ATTEMPTS = 3
+#: Waits between those passes.
+WRITE_BACKOFF_SECONDS = (1.0, 3.0)
+#: What the lease must still have left when a row batch is sent: the socket
+#: deadline of the call, and room for the answer to be acted on.
+SEND_COVER_SECONDS = SHEETS_TIMEOUT_SECONDS + 15.0
+#: The same for a write that goes through the shared retry (:func:`_run`):
+#: every attempt's deadline, and the waits between them.
+RETRIED_COVER_SECONDS = (
+    _RETRY_ATTEMPTS * SHEETS_TIMEOUT_SECONDS + sum(_RETRY_BACKOFF_SECONDS) + 15.0
+)
 
 #: The Worktree tab is the agent's: it created it and may rewrite it.
 WORKTREE_OURS = "ours"
@@ -147,6 +206,8 @@ class Setup:
     worktree_sheet_id: int | None = None
     #: One of the ORDER_* values.
     ordering: str = ORDER_PENDING
+    #: Why the tab is not in order, for the panel; "" unless ``blocked``.
+    ordering_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -160,6 +221,8 @@ class SheetCheck:
     worktree: str = field(default="", compare=False)
     #: One of the ORDER_* values when set-up ran; "" otherwise. Same reason.
     ordering: str = field(default="", compare=False)
+    #: The sentence for the panel when ``ordering`` is ``blocked``; "" otherwise.
+    ordering_note: str = field(default="", compare=False)
 
 
 def service():
@@ -218,21 +281,66 @@ def _cause_of(exc: BaseException | None) -> str:
     return type(exc).__name__ if exc is not None else "unknown"
 
 
+#: Anything long enough to be a spreadsheet id. Google's refusals do not
+#: carry one, and this makes sure of it.
+_ID_LIKE = re.compile(r"[A-Za-z0-9_-]{25,}")
+_REQUEST_PATH = re.compile(r"^Invalid requests\[\d+\]\.\w+: ")
+
+
+def _detail_of(exc: BaseException) -> str:
+    """Google's sentence for a refusal, out of the response body — never
+    ``str(HttpError)``, which embeds the request URL."""
+    try:
+        body = json.loads(bytes(getattr(exc, "content", b"") or b"").decode("utf-8", "replace"))
+        message = str((body.get("error") or {}).get("message") or "")
+    except (ValueError, AttributeError, TypeError):
+        return ""
+    message = _REQUEST_PATH.sub("", " ".join(message.split()))
+    return _ID_LIKE.sub("(id)", message)[:300]
+
+
+def _refused(exc: BaseException, *, what: str, service: str) -> SheetsRefused:
+    status = _status_of(exc)
+    return SheetsRefused(
+        f"{service} {what} was refused: HTTP {status}", status=status, detail=_detail_of(exc)
+    )
+
+
 def _run(request, *, what: str, service: str = "Sheets"):
     """``execute`` with the shared retry, and every failure mapped to this
     module's exceptions — callers never see a raw ``HttpError`` (the same
-    contract as ``gmail_client._run``), and no message names the sheet."""
+    contract as ``gmail_client._run``), and no message names the sheet.
+
+    For reads, and for writes that say the same thing however often they are
+    sent. A batch that moves rows goes through :func:`_send_once`."""
     from googleapiclient.errors import HttpError
 
     try:
         return execute_with_retry(request, what=f"{service} {what}", unavailable=SheetsUnavailable)
     except HttpError as exc:
-        status = _status_of(exc)
-        raise SheetsRefused(f"{service} {what} was refused: HTTP {status}", status=status) from exc
+        raise _refused(exc, what=what, service=service) from exc
     except SheetsUnavailable as exc:
         raise SheetsUnavailable(
             f"{service} {what} failed after {_RETRY_ATTEMPTS} attempts ({_cause_of(exc.__cause__)})"
         ) from exc.__cause__
+
+
+def _send_once(request, *, what: str, service: str = "Sheets"):
+    """``execute`` exactly once. A refusal is :class:`SheetsRefused` — Sheets
+    applied none of the batch. No answer is :class:`SheetsUnsure` — it may
+    have applied all of it — and the caller asks the sheet which."""
+    from googleapiclient.errors import HttpError
+
+    try:
+        return request.execute()
+    except Exception as exc:  # noqa: BLE001 — sorted into the two kinds below
+        if _is_transient(exc):
+            raise SheetsUnsure(
+                f"{service} {what} got no answer ({_cause_of(exc)}); it may have been applied"
+            ) from exc
+        if isinstance(exc, HttpError):
+            raise _refused(exc, what=what, service=service) from exc
+        raise
 
 
 # --------------------------------------------------------------------------- #
@@ -241,6 +349,7 @@ def _run(request, *, what: str, service: str = "Sheets"):
 
 def check(
     spreadsheet_id: str, *, caller_email: str, svc=None, drive=None, reorder: bool = False,
+    hold: Hold | None = None,
 ) -> SheetCheck:
     """Is this the caller's sheet, and can the hub see and edit it?
 
@@ -258,8 +367,11 @@ def check(
     to read either.
 
     ``reorder`` lets set-up run the one-time newest-first sort. Only a poll
-    passes it: a poll holds the connection's lease, so no other write of the
-    agent's can be half-way through the rows while they move."""
+    passes it: a poll holds the connection's lease — ``hold``, proved before
+    the rows are moved — so no other write of the agent's can be half-way
+    through the rows while they move. A sort that could not be done is not a
+    failed check: the answer is still ``ok``, with ``ordering`` ``blocked``
+    and the reason in ``ordering_note``."""
     svc = svc or service()
     try:
         meta = _metadata(spreadsheet_id, svc)
@@ -273,12 +385,14 @@ def check(
         return SheetCheck(CHECK_NOT_YOURS, "")
     title = str((meta.get("properties") or {}).get("title") or "")
     try:
-        done = setup(spreadsheet_id, svc=svc, meta=meta, reorder=reorder)
+        done = setup(spreadsheet_id, svc=svc, meta=meta, reorder=reorder, hold=hold)
     except SheetsRefused as exc:
         if exc.status == 403:
             return SheetCheck(CHECK_NOT_EDITABLE, "")
         raise
-    return SheetCheck(CHECK_OK, title, done.formatting, done.worktree, done.ordering)
+    return SheetCheck(
+        CHECK_OK, title, done.formatting, done.worktree, done.ordering, done.ordering_note
+    )
 
 
 def caller_may_edit(spreadsheet_id: str, caller_email: str, *, drive=None) -> bool:
@@ -380,6 +494,7 @@ def _worktree_marker_requests(meta: dict, sheet_id: int) -> list[dict]:
 
 def setup(
     spreadsheet_id: str, *, svc=None, meta: dict | None = None, reorder: bool = False,
+    hold: Hold | None = None,
 ) -> Setup:
     """Idempotent: the three tabs exist, row 1 carries the headers, row 1 is
     frozen, the Message ID column is hidden, Status has its dropdown, and
@@ -400,9 +515,10 @@ def setup(
     this version. A refused formatting pass never raises.
 
     Very last, the row order (:func:`_order_once`) — once per sheet, and only
-    when ``reorder`` is passed. Unlike the look, a sort that fails RAISES
-    (:class:`ReorderFailed`): it is a correction to her data, not decoration,
-    and a fire that skipped it must not report itself a success.
+    when ``reorder`` is passed. A sort that could not be done never raises
+    and never stops the mail: the tab is left in the order it was in, and
+    the answer is ``blocked`` with the reason, which the connection document
+    keeps for the panel.
 
     Raises :class:`SheetsRefused` with the status so :func:`check` can map
     a 403 to ``not_editable``. Only :func:`check` calls this, after the
@@ -526,58 +642,205 @@ def setup(
         upcoming_sheet_id=tabs[UPCOMING_TAB], worktree_sheet_id=worktree_sheet_id,
         restyle=state == HEADER_LEGACY or worktree_created,
     )
-    ordering = _order_once(
-        spreadsheet_id, svc, meta, inbox_sheet_id=inbox_sheet_id, reorder=reorder
+    ordering, ordering_note = _order_once(
+        spreadsheet_id, svc, meta, inbox_sheet_id=inbox_sheet_id, reorder=reorder, hold=hold,
     )
     return Setup(
         formatting=formatting, worktree=worktree_state, worktree_sheet_id=worktree_sheet_id,
-        ordering=ordering,
+        ordering=ordering, ordering_note=ordering_note,
     )
 
 
+@dataclass(frozen=True)
+class _Shape:
+    """What the Inbox tab is made of, as far as moving its rows goes."""
+
+    #: The ``spreadsheets.get`` answer the stamp is planned from.
+    meta: dict
+    grid_rows: int | None
+    merges: list[dict]
+    #: 1-based sheet rows, header excluded.
+    hidden_by_filter: list[int]
+    hidden_by_user: list[int]
+
+
+_SHAPE_FIELDS = (
+    "developerMetadata(metadataId,metadataKey,metadataValue),"
+    "sheets(properties(sheetId,title,gridProperties.rowCount),merges"
+)
+
+
+def _inbox_of(meta: dict) -> dict:
+    for sheet in meta.get("sheets") or []:
+        if str((sheet.get("properties") or {}).get("title") or "") == INBOX_TAB:
+            return sheet
+    raise SheetsUnavailable("The Inbox tab is missing from the sheet; nothing was written.")
+
+
+def _shape(spreadsheet_id: str, svc, *, hidden_rows: bool) -> _Shape:
+    """One ``spreadsheets.get``. With ``hidden_rows`` it also asks which rows
+    are hidden — row metadata, and no cell of any row.
+
+    The range is the WHOLE tab, never a column of it: Sheets answers a get
+    that names a range with only the merges that touch the range, and the
+    merge that stops a sort is as likely to be in her Notes as anywhere
+    (seen on the throwaway sheet: asked about ``A:A``, it did not mention
+    ``K3:K4``)."""
+    if hidden_rows:
+        request = svc.spreadsheets().get(
+            spreadsheetId=spreadsheet_id, ranges=[INBOX_TAB],
+            fields=_SHAPE_FIELDS + ",data(rowMetadata(hiddenByUser,hiddenByFilter)))",
+        )
+    else:
+        request = svc.spreadsheets().get(spreadsheetId=spreadsheet_id, fields=_SHAPE_FIELDS + ")")
+    meta = _run(request, what="row layout read")
+    inbox = _inbox_of(meta)
+    rows = ((inbox.get("data") or [{}])[0].get("rowMetadata") or []) if hidden_rows else []
+    grid = ((inbox.get("properties") or {}).get("gridProperties") or {}).get("rowCount")
+    return _Shape(
+        meta=meta,
+        grid_rows=int(grid) if grid is not None else None,
+        merges=list(inbox.get("merges") or []),
+        hidden_by_filter=[i + 1 for i, row in enumerate(rows) if i and row.get("hiddenByFilter")],
+        hidden_by_user=[
+            i + 1 for i, row in enumerate(rows)
+            if i and row.get("hiddenByUser") and not row.get("hiddenByFilter")
+        ],
+    )
+
+
+def _stored(value_range: dict) -> list:
+    """One column as STORED: text stays text, a real date stays the number
+    Sheets keeps for it."""
+    out: list = []
+    for row in value_range.get("values") or []:
+        cell = row[0] if row else ""
+        out.append(cell.strip() if isinstance(cell, str) else cell)
+    return out
+
+
+def _date_column(spreadsheet_id: str, svc) -> list:
+    data = _run(
+        svc.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=DATE_RANGE,
+            valueRenderOption="UNFORMATTED_VALUE",
+        ),
+        what="date column read",
+    )
+    return _stored(data)
+
+
 def _order_once(
-    spreadsheet_id: str, svc, meta: dict, *, inbox_sheet_id: int, reorder: bool
-) -> str:
-    """Bring the Inbox tab into newest-first order, once per sheet.
+    spreadsheet_id: str, svc, meta: dict, *, inbox_sheet_id: int, reorder: bool,
+    hold: Hold | None = None,
+) -> tuple[str, str]:
+    """Bring the Inbox tab into newest-first order, once per sheet. Returns
+    ``(ORDER_* value, note for the panel)``.
 
     Sheets written before new rows were inserted newest-first hold them in
     two runs: the backfill newest-first from the top, and every message since
     appended oldest-first underneath. One ``sortRange`` over every row below
     the header — no columns named, so a row moves with every cell in it —
-    makes that one order, and the marker written by the same atomic batch
-    means it never runs again. After that her row order is hers.
+    makes that one order, and the marker means it never runs again. After
+    that her row order is hers.
 
-    One request, whatever the size of the sheet: Sheets sorts on its side, so
-    there is nothing to page through and nothing to resume half-way. What can
-    be interrupted is the ANSWER — the batch applied, the reply lost — so a
-    failure is checked against the sheet before it is believed: if the marker
-    is there, the sort is too. Otherwise :class:`ReorderFailed`, with the
-    sheet exactly as it was."""
+    The marker says the tab IS in order, so it is written only when the tab
+    has been read and found so: before the sort if there was nothing to move,
+    after it otherwise. Where the sort would not give that order — merged
+    rows, hidden rows, a Date column of text and real dates both — it is not
+    sent at all and nothing moves.
+
+    Never raises for a sheet that cannot be sorted, and neither does a fire
+    stop for one: the answer is ``blocked`` with the reason, and new mail is
+    written to the top of the tab as it stands."""
     if is_newest_first(meta):
-        return ORDER_ALREADY
+        return ORDER_ALREADY, ""
     if not reorder:
-        return ORDER_PENDING
+        return ORDER_PENDING, ""
     try:
-        _run(
-            svc.spreadsheets().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body={"requests": order_requests(meta, inbox_sheet_id)},
-            ),
-            what="row reorder",
-        )
+        note = _put_in_order(spreadsheet_id, svc, inbox_sheet_id=inbox_sheet_id, hold=hold)
+    except SheetsRefused as exc:
+        note = _not_sorted("Google Sheets refused the sort" + (
+            f": {exc.detail.rstrip('.')}." if exc.detail else f" (HTTP {exc.status})."
+        ))
     except SheetsUnavailable as exc:
+        note = _not_sorted(f"Google Sheets did not answer ({_cause_of(exc.__cause__)}).")
+    if note is None:
+        logger.info("a12: Inbox rows are newest first (%s)", ORDER_VERSION)
+        return ORDER_APPLIED, ""
+    logger.warning("a12: the Inbox tab is not marked newest first. %s", note)
+    return ORDER_BLOCKED, note
+
+
+def _not_sorted(reason: str) -> str:
+    return order_note(reason, retry=_ORDER_RETRY_WORDS)
+
+
+def _put_in_order(
+    spreadsheet_id: str, svc, *, inbox_sheet_id: int, hold: Hold | None
+) -> str | None:
+    """``None`` when the tab is newest first and marked; otherwise the note
+    for the panel."""
+    if hold is not None:
+        hold.prove()
+    shape = _shape(spreadsheet_id, svc, hidden_rows=True)
+    dates = _date_column(spreadsheet_id, svc)
+    if first_out_of_order(dates) is not None:
+        blocker = sort_blocker(
+            dates, merges=shape.merges, hidden_by_filter=shape.hidden_by_filter,
+            hidden_by_user=shape.hidden_by_user,
+        )
+        if blocker:
+            return _not_sorted(blocker)
+        token = uuid.uuid4().hex
+        requests = rows_stamp(shape.meta, token=token, now_epoch=int(time.time()))
+        requests += sort_requests(inbox_sheet_id)
+        if hold is not None:
+            hold.cover(SEND_COVER_SECONDS)
         try:
-            done = is_newest_first(_metadata(spreadsheet_id, svc))
-        except SheetsUnavailable:
-            done = False
-        if not done:
-            raise ReorderFailed(
-                "The one-time reorder of the Inbox tab (newest mail first) did not complete: "
-                f"{exc}. No row was moved; it is tried again on the next poll."
-            ) from exc
-        logger.warning("a12: the row reorder's reply was lost, but the sheet shows it applied")
-    logger.info("a12: Inbox rows sorted newest first (%s)", ORDER_VERSION)
-    return ORDER_APPLIED
+            _send_once(
+                svc.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id, body={"requests": requests}
+                ),
+                what="row reorder",
+            )
+        except SheetsUnsure:
+            if not rows_stamped_by(_metadata(spreadsheet_id, svc), token):
+                return _not_sorted("Google Sheets did not answer when asked to sort it.")
+            logger.warning("a12: the row reorder's reply was lost, but the sheet shows it applied")
+        except SheetsRefused:
+            if rows_sequence(_metadata(spreadsheet_id, svc)) != rows_sequence(shape.meta):
+                return _not_sorted("another write to the sheet landed while it was being sorted.")
+            raise
+        wrong = first_out_of_order(_date_column(spreadsheet_id, svc))
+        if wrong is not None:
+            return _not_sorted(
+                f"the agent sorted it, but row {wrong} is still newer than the row above it, "
+                "so the order could not be confirmed."
+            )
+    try:
+        _mark_in_order(spreadsheet_id, svc)
+    except SheetsRefused as exc:
+        return unrecorded_note(exc.detail.rstrip(".") or f"HTTP {exc.status}", retry=_ORDER_RETRY_WORDS)
+    except SheetsUnavailable as exc:
+        return unrecorded_note(_cause_of(exc.__cause__), retry=_ORDER_RETRY_WORDS)
+    return None
+
+
+def _mark_in_order(spreadsheet_id: str, svc) -> None:
+    """Write the order marker. Sent once: when no answer comes the sheet is
+    asked, so the marker is never written twice."""
+    meta = _metadata(spreadsheet_id, svc)
+    try:
+        _send_once(
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id, body={"requests": order_marker_requests(meta)}
+            ),
+            what="order marker",
+        )
+    except SheetsUnsure:
+        if not is_newest_first(_metadata(spreadsheet_id, svc)):
+            raise
 
 
 def _format_once(
@@ -856,94 +1119,177 @@ class Written:
 
 
 def _column(value_range: dict) -> list[str]:
-    return [str(row[0]).strip() if row else "" for row in value_range.get("values") or []]
+    return [_text(row[0]) if row else "" for row in value_range.get("values") or []]
+
+
+def _text(cell) -> str:
+    """A stored cell as the text it would be typed as: a whole number she
+    turned a Message ID into reads as its digits, not as ``1.9e+15``."""
+    if isinstance(cell, float) and cell.is_integer():
+        return str(int(cell))
+    return str(cell).strip()
 
 
 def _id_of(row: list[str]) -> str:
     return str(row[COL_MESSAGE_ID - 1]).strip() if len(row) >= COL_MESSAGE_ID else ""
 
 
-def _inbox_sheet_id(spreadsheet_id: str, svc) -> int:
-    meta = _run(
-        svc.spreadsheets().get(
-            spreadsheetId=spreadsheet_id, fields="sheets.properties(sheetId,title)"
-        ),
-        what="tab lookup",
-    )
-    for sheet in meta.get("sheets") or []:
-        props = sheet.get("properties") or {}
-        if str(props.get("title") or "") == INBOX_TAB:
-            return int(props.get("sheetId") or 0)
-    raise SheetsUnavailable("The Inbox tab is missing from the sheet; nothing was written.")
+@dataclass(frozen=True)
+class _Rows:
+    """Where everything is, read immediately before a write."""
+
+    shape: _Shape
+    inbox_sheet_id: int
+    #: The Date column as stored, header included.
+    dates: list
+    #: ``message id -> 0-based row index``, first occurrence.
+    where: dict[str, int]
+    #: The index just past the last row that holds a date or an id.
+    end: int
 
 
-def write_rows(
-    spreadsheet_id: str, new_rows: list[list[str]],
-    updates: dict[str, list[str]] | None = None, *, svc=None,
-) -> Written:
-    """Everything one fire writes to Inbox, as ONE atomic ``batchUpdate``.
-
-    ``new_rows`` are the agent's cells of messages not yet on the sheet;
-    ``updates`` is ``{message id: the agent's cells}`` for rows that are.
-
-    Nothing here trusts a row number from earlier in the fire. The Date and
-    Message ID columns are read now, immediately before the write, and from
-    that read alone: every update is addressed to the row its id is on at
-    this moment, and every new row is given its place newest-first
-    (``sheet_layout.place``). New rows are inserted, so no existing cell is
-    ever written over and a row of hers only ever moves down, whole. Only
-    columns A:I are written, as text that is never evaluated.
-
-    One batch means all of it lands or none of it does. A refusal or a lost
-    connection raises with the sheet as it was, and the fire — which persists
-    nothing until this returns — runs the same mail again next time.
-
-    A new row whose id turns out to be on the sheet already is not written a
-    second time; it is reported on the row it already has."""
-    updates = dict(updates or {})
-    if not new_rows and not updates:
-        return Written()
-    svc = svc or service()
-    inbox_sheet_id = _inbox_sheet_id(spreadsheet_id, svc)
+def _read_rows(spreadsheet_id: str, svc) -> _Rows:
+    """The tab's shape and stamp FIRST, then the positions: a batch of the
+    agent's that lands after the first read moves the stamp on, and Sheets
+    then refuses the batch planned from the second."""
+    shape = _shape(spreadsheet_id, svc, hidden_rows=False)
+    inbox = _inbox_of(shape.meta)
     data = _run(
         svc.spreadsheets().values().batchGet(
             spreadsheetId=spreadsheet_id,
             ranges=[INBOX_HEADER_RANGE, DATE_RANGE, MESSAGE_ID_RANGE],
+            # As stored, not as displayed: a Date she shows as 9/10/2026 is
+            # still the date it is.
+            valueRenderOption="UNFORMATTED_VALUE",
         ),
         what="row position read",
     )
     ranges = data.get("valueRanges") or []
     _require_current_header(_first_row(ranges[0] if ranges else {}))
-    dates = _column(ranges[1] if len(ranges) > 1 else {})
+    dates = _stored(ranges[1] if len(ranges) > 1 else {})
     ids = _column(ranges[2] if len(ranges) > 2 else {})
-    end = max(len(dates), len(ids), 1)
-    where: dict[str, int] = {}  # message id -> 0-based row index, first occurrence
+    where: dict[str, int] = {}
     for index, message_id in enumerate(ids):
         if index and message_id and message_id not in where:
             where[message_id] = index
+    return _Rows(
+        shape=shape, inbox_sheet_id=int((inbox.get("properties") or {}).get("sheetId") or 0),
+        dates=dates, where=where, end=max(len(dates), len(ids), 1),
+    )
 
-    fresh = [position for position, row in enumerate(new_rows) if _id_of(row) not in where]
-    blocks = place(dates, [str(new_rows[p][COL_DATE - 1]) for p in fresh], end=end)
-    found = {message_id: where[message_id] for message_id in updates if message_id in where}
-    requests = update_requests(
-        inbox_sheet_id, {index: updates[message_id] for message_id, index in found.items()}
-    ) + insert_requests(inbox_sheet_id, blocks, [new_rows[p] for p in fresh])
-    if requests:
-        _run(
-            svc.spreadsheets().batchUpdate(
-                spreadsheetId=spreadsheet_id, body={"requests": requests}
-            ),
-            what="row write",
-        )
 
-    rows_of_new = [0] * len(new_rows)
-    for position, row in zip(fresh, landed(blocks, len(fresh))):
-        rows_of_new[position] = row
-    for position, row in enumerate(new_rows):
-        if not rows_of_new[position]:
-            rows_of_new[position] = pushed(where[_id_of(row)], blocks) + 1
+def _as_found(rows: _Rows, new_rows: list[list[str]], updates: dict[str, list[str]]) -> Written:
+    """Where this write's rows are on a sheet that already holds them."""
     return Written(
-        new_rows=rows_of_new,
-        updated={message_id: pushed(index, blocks) + 1 for message_id, index in found.items()},
-        missing=[message_id for message_id in updates if message_id not in where],
+        new_rows=[rows.where.get(_id_of(row), -1) + 1 for row in new_rows],
+        updated={mid: rows.where[mid] + 1 for mid in updates if mid in rows.where},
+        missing=[mid for mid in updates if mid not in rows.where],
+    )
+
+
+def write_rows(
+    spreadsheet_id: str, new_rows: list[list[str]],
+    updates: dict[str, list[str]] | None = None, *, svc=None, hold: Hold | None = None,
+) -> Written:
+    """Everything one fire writes to Inbox, as ONE atomic ``batchUpdate``.
+
+    ``new_rows`` are the agent's cells of messages not yet on the sheet;
+    ``updates`` is ``{message id: the agent's cells}`` for rows that are.
+    ``hold`` is the fire's lease: proved with the store before the positions
+    are read, and required to outlast the send.
+
+    Nothing here trusts a row number from earlier in the fire. The Date and
+    Message ID columns are read now, immediately before the write — nothing
+    but the planning stands between that read and the send — and from that
+    read alone: every update is addressed to the row its id is on at this
+    moment, and every new row is given its place newest-first
+    (``sheet_layout.place``). New rows are inserted, so no existing cell is
+    ever written over and a row of hers only ever moves down, whole. Only
+    columns A:I are written, as text that is never evaluated.
+
+    One batch means all of it lands or none of it does, and the batch is
+    sent ONCE. It is addressed by row index, so the same batch applied twice
+    would put a message on another message's row; it is therefore never sent
+    again as it stands. When no answer comes back, the sheet is read again:
+    a batch that did land is recognised by its stamp and reported where its
+    rows are, and one that did not is planned afresh from what the sheet
+    holds now. The stamp's ID is taken from the reading the batch was
+    planned on, so if the first send lands late after all — or another
+    fire's batch got in first — Sheets refuses the second, whole.
+
+    Safe to repeat: a new row whose id is on the sheet already is not
+    written a second time; it is reported on the row it already has."""
+    updates = dict(updates or {})
+    if not new_rows and not updates:
+        return Written()
+    svc = svc or service()
+    token = uuid.uuid4().hex
+    sent_before: int | None = None  # the sequence an unanswered or refused send was planned on
+    refusal: SheetsRefused | None = None
+    for attempt in range(WRITE_ATTEMPTS):
+        if attempt:
+            time.sleep(WRITE_BACKOFF_SECONDS[min(attempt, len(WRITE_BACKOFF_SECONDS)) - 1])
+        if hold is not None:
+            hold.prove()
+        rows = _read_rows(spreadsheet_id, svc)
+        if rows_stamped_by(rows.shape.meta, token):
+            logger.warning("a12: a row write's reply was lost, but the sheet shows it applied")
+            return _as_found(rows, new_rows, updates)
+        if refusal is not None and rows_sequence(rows.shape.meta) == sent_before:
+            raise refusal  # nothing else was written: the sheet refused the batch itself
+
+        fresh = [pos for pos, row in enumerate(new_rows) if _id_of(row) not in rows.where]
+        blocks = place(rows.dates, [str(new_rows[p][COL_DATE - 1]) for p in fresh], end=rows.end)
+        found = {mid: rows.where[mid] for mid in updates if mid in rows.where}
+        rows_of_new = [0] * len(new_rows)
+        for position, row in zip(fresh, landed(blocks, len(fresh))):
+            rows_of_new[position] = row
+        for position, row in enumerate(new_rows):
+            if not rows_of_new[position]:
+                rows_of_new[position] = pushed(rows.where[_id_of(row)], blocks) + 1
+        written = Written(
+            new_rows=rows_of_new,
+            updated={mid: pushed(index, blocks) + 1 for mid, index in found.items()},
+            missing=[mid for mid in updates if mid not in rows.where],
+        )
+        requests = update_requests(
+            rows.inbox_sheet_id, {index: updates[mid] for mid, index in found.items()}
+        ) + insert_requests(
+            rows.inbox_sheet_id, blocks, [new_rows[p] for p in fresh],
+            grid_rows=rows.shape.grid_rows, merges=rows.shape.merges,
+        )
+        if not requests:
+            return written
+        requests = rows_stamp(rows.shape.meta, token=token, now_epoch=int(time.time())) + requests
+        if hold is not None:
+            hold.cover(SEND_COVER_SECONDS)
+        sent_before, refusal = rows_sequence(rows.shape.meta), None
+        try:
+            _send_once(
+                svc.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id, body={"requests": requests}
+                ),
+                what="row write",
+            )
+        except SheetsUnsure as exc:
+            logger.warning("a12: %s; reading the sheet before anything is sent again", exc)
+            continue
+        except SheetsRefused as exc:
+            # Atomic: none of it was applied. Whether it was the stamp that
+            # was refused — a batch landed since the read — is on the sheet.
+            refusal = exc
+            continue
+        return written
+
+    if hold is not None:
+        hold.prove()
+    rows = _read_rows(spreadsheet_id, svc)
+    if rows_stamped_by(rows.shape.meta, token):
+        logger.warning("a12: a row write's reply was lost, but the sheet shows it applied")
+        return _as_found(rows, new_rows, updates)
+    if refusal is not None:
+        raise refusal
+    raise SheetsUnavailable(
+        f"Sheets row write got no answer in {WRITE_ATTEMPTS} attempts and the sheet does not "
+        "show it; nothing was written."
     )

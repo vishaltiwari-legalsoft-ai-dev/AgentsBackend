@@ -115,6 +115,28 @@ def resp_text(body) -> str:
     return json.dumps(body)
 
 
+def test_status_carries_why_the_sheet_is_not_sorted_to_the_panel_and_nothing_when_it_is(as_user, store):
+    """Pinned 2026-09-30. A sheet that cannot be sorted still gets its mail,
+    so the reason cannot travel as a failed poll: it has a field of its own,
+    and an older document without it reads as no note."""
+    as_user(OWNER)
+    store.connections[OWNER["id"]] = _connected_doc()
+    sheet = client.get("/api/inbox/status").json()["sheet"]
+    assert (sheet["ordering"], sheet["ordering_note"]) == ("already", None)
+
+    note = ("The Inbox tab has not been put in newest-first order yet: it has merged cells at "
+            "K3:K4, and Google Sheets cannot sort rows that are merged together. Unmerge them "
+            "(Format > Merge cells > Unmerge). New mail is still added at the top. The agent "
+            "tries the sort again every hour.")
+    store.connections[OWNER["id"]]["sheet"].update(ordering="blocked", ordering_note=note)
+    store.connections[OWNER["id"]]["last_poll"] = {
+        "at": "2026-09-30T04:00:00+00:00", "ok": True, "messages_read": 2, "error": None}
+    body = client.get("/api/inbox/status").json()
+    assert (body["sheet"]["ordering"], body["sheet"]["ordering_note"]) == ("blocked", note)
+    assert body["sheet"]["check"] == "ok" and body["last_poll"]["ok"] is True
+    assert set(body) == STATUS_KEYS and SID not in note
+
+
 def test_status_needs_a_signed_in_caller():
     assert client.get("/api/inbox/status").status_code == 401
 
@@ -525,7 +547,7 @@ def test_sheet_routes_check_ownership_against_the_callers_signed_in_address(as_u
     as_user(OWNER)
     seen: list[str] = []
     monkeypatch.setattr(sheet_writer, "check",
-                        lambda sid, *, caller_email, reorder=False:
+                        lambda sid, *, caller_email, reorder=False, hold=None:
                         seen.append(caller_email) or SheetCheck("not_yours", ""))
     body = client.put("/api/inbox/sheet", json={"ref": SID}).json()
     assert body["sheet"]["check"] == "not_yours" and body["sheet"]["title"] is None

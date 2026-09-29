@@ -687,4 +687,284 @@ def test_the_order_marker_is_read_by_key_and_version():
         {"metadataId": 9, "metadataKey": sl.ORDER_MARKER_KEY, "metadataValue": "something-older"}]}
     assert not sl.is_newest_first(stale)
     assert {"deleteDeveloperMetadata": {"dataFilter": {"developerMetadataLookup": {"metadataId": 9}}}} \
-        in sl.order_requests(stale, 1), "a marker of another version is replaced, not added to"
+        in sl.order_marker_requests(stale), "a marker of another version is replaced, not added to"
+
+
+# --------------------------------------------------------------------------- #
+# Pinned 2026-09-30: what the independent verification of the newest-first
+# change found. A date is read from what Sheets STORES; the sort is only
+# marked done when the tab was read back in order; a batch that moves rows
+# carries a stamp that lets only one of two batches land.
+# --------------------------------------------------------------------------- #
+
+def _serial(when: str) -> float:
+    """The number Sheets stores for a real date."""
+    from datetime import datetime
+
+    moment = datetime.strptime(when, "%Y-%m-%d %H:%M")
+    return (moment - datetime(1899, 12, 30)).total_seconds() / 86400
+
+
+def test_a_date_is_read_from_what_sheets_stores_whatever_the_column_shows():
+    from datetime import datetime
+
+    ten = datetime(2026, 9, 10, 10, 0)
+    assert sl.date_key("2026-09-10 10:00") == ten, "the agent's own text"
+    assert sl.date_key(" 2026-09-10 10:00 ") == ten
+    assert sl.date_key(46275.416666666664) == ten, "a real date: days since 1899-12-30"
+    assert sl.date_key(_serial("2026-09-10 10:00")) == ten
+    assert sl.date_key(46275) == datetime(2026, 9, 10), "a real date with no time of day"
+    for not_a_date in ("", None, "call the landlord", "9/10/2026 10:00:00", "20/09/2026",
+                       "2026-02-31 09:00", True, False, 12, 3.5, 1e15):
+        assert sl.date_key(not_a_date) is None, not_a_date
+    assert sl.is_real_date(46275.5) and not sl.is_real_date("2026-09-10 10:00")
+
+
+def test_new_mail_is_the_first_data_row_when_the_date_column_is_shown_in_another_format():
+    """Seen live (W4b): the cells are real dates shown as m/d/yyyy h:mm:ss,
+    and read as they are SHOWN every one was passed over, so new mail went
+    under the last row - the very thing the change exists to stop. Read as
+    they are stored they are dates like any other."""
+    dates = ["Date", _serial("2026-09-10 10:00"), _serial("2026-09-08 10:00"),
+             _serial("2026-09-07 10:00")]
+    blocks = sl.place(dates, ["2026-09-12 09:00"], end=len(dates))
+    assert sl.landed(blocks, 1) == [2], f"today's mail was put on row {sl.landed(blocks, 1)[0]}"
+    assert sl.landed(sl.place(dates, ["2026-09-08 10:00"], end=4), 1) == [3], "a tie goes above"
+    assert sl.landed(sl.place(dates, ["2026-06-01 10:00"], end=4), 1) == [5], "the oldest: the bottom"
+
+
+def test_text_dates_real_dates_and_a_mix_are_placed_and_checked_by_one_rule():
+    text = ["Date", "2026-09-20 09:00", "2026-09-18 09:00", "2026-09-16 09:00"]
+    real = ["Date"] + [_serial(cell) for cell in text[1:]]
+    mixed = ["Date", text[1], real[2], text[3]]
+    for dates in (text, real, mixed):
+        assert sl.first_out_of_order(dates) is None
+        assert sl.place(dates, ["2026-09-29 10:00"], end=4) == [sl.Block(at=1, rows=(0,))]
+        assert sl.place(dates, ["2026-09-19 10:00"], end=4) == [sl.Block(at=2, rows=(0,))]
+        assert sl.place(dates, ["2026-09-17 10:00"], end=4) == [sl.Block(at=3, rows=(0,))]
+        assert sl.place(dates, ["2026-06-01 10:00"], end=4) == [sl.Block(at=4, rows=(0,))]
+    # What the placement calls in order, the check calls in order - and what
+    # it would put a row above, the check calls out of order.
+    assert sl.first_out_of_order(["Date", text[3], real[1]]) == 3
+    assert sl.first_out_of_order(["Date", real[3], text[1]]) == 3
+
+
+def test_the_newest_first_check_names_the_first_row_out_of_order_and_passes_over_her_rows():
+    assert sl.first_out_of_order(["Date"]) is None and sl.first_out_of_order([]) is None
+    assert sl.first_out_of_order(["Date", "2026-09-20 09:00"]) is None
+    assert sl.first_out_of_order(
+        ["Date", "2026-09-20 09:00", "2026-09-20 09:00", "2026-09-01 09:00"]) is None, "a tie is in order"
+    assert sl.first_out_of_order(
+        ["Date", "CALL BACK Anil", "2026-09-20 09:00", "", "2026-09-18 09:00", ""]) is None
+    assert sl.first_out_of_order(
+        ["Date", "2026-09-18 09:00", "", "her line", "2026-09-20 09:00"]) == 5
+    # The live sheets as they stand: the backfill newest first, then what
+    # came since oldest first underneath.
+    split = ["Date", "2026-09-18 09:00", "2026-09-17 09:00", "2026-09-19 08:00", "2026-09-20 08:00"]
+    assert sl.first_out_of_order(split) == 4
+
+
+def test_the_sort_is_the_sort_and_the_marker_is_a_batch_of_its_own():
+    requests = sl.sort_requests(7)
+    assert [name for r in requests for name in r] == ["sortRange"], \
+        "no marker rides with the sort: that it was applied does not say the tab is in order"
+    sort = requests[0]["sortRange"]
+    assert sort["range"] == {"sheetId": 7, "startRowIndex": 1}, \
+        "below the header, to the end, and NO column bounds: a row moves with every cell in it"
+    assert sort["sortSpecs"] == [
+        {"dimensionIndex": 0, "sortOrder": "DESCENDING"},                      # Date
+        {"dimensionIndex": sl.COL_MESSAGE_ID - 1, "sortOrder": "DESCENDING"},  # a tie inside a minute
+    ]
+    marker = sl.order_marker_requests({})
+    assert [name for r in marker for name in r] == ["createDeveloperMetadata"]
+    entry = marker[0]["createDeveloperMetadata"]["developerMetadata"]
+    assert (entry["metadataKey"], entry["metadataValue"]) == (sl.ORDER_MARKER_KEY, sl.ORDER_VERSION)
+    assert entry["location"] == {"spreadsheet": True}
+
+
+MERGE_K3_K4 = {"sheetId": 1, "startRowIndex": 2, "endRowIndex": 4,
+               "startColumnIndex": 10, "endColumnIndex": 11}
+SPLIT = ["Date", "2026-09-18 09:00", "2026-09-17 09:00", "2026-09-19 08:00"]
+
+
+def _blocker(dates=None, **kw):
+    given = {"merges": [], "hidden_by_filter": [], "hidden_by_user": [], **kw}
+    return sl.sort_blocker(SPLIT if dates is None else dates, **given)
+
+
+def test_a_tab_the_sort_would_put_right_has_no_blocker():
+    assert _blocker() is None
+    assert _blocker(["Date"] + [_serial(cell) for cell in SPLIT[1:]]) is None, "all real dates sort"
+    assert _blocker(["Date", "her line", "", *SPLIT[1:]]) is None
+    wide = {"sheetId": 1, "startRowIndex": 6, "endRowIndex": 7,
+            "startColumnIndex": 0, "endColumnIndex": 11}
+    assert _blocker(merges=[wide]) is None, "a merge across ONE row sorts"
+    header = {"sheetId": 1, "startRowIndex": 0, "endRowIndex": 1,
+              "startColumnIndex": 9, "endColumnIndex": 11}
+    assert _blocker(merges=[header]) is None
+
+
+def test_a_blocker_names_what_to_change_and_where():
+    merged = _blocker(merges=[MERGE_K3_K4])
+    assert "merged cells at K3:K4" in merged and "Unmerge" in merged
+    assert sl.a1_range(MERGE_K3_K4) == "K3:K4"
+    two = _blocker(merges=[MERGE_K3_K4, {**MERGE_K3_K4, "startColumnIndex": 12,
+                                         "endColumnIndex": 13, "startRowIndex": 5, "endRowIndex": 8}])
+    assert "K3:K4, M6:M8" in two
+
+    filtered = _blocker(hidden_by_filter=[3, 4, 6, 9])
+    assert "a filter is hiding 4 rows (rows 3-4, 6, 9)" in filtered and "Remove filter" in filtered
+    assert "a filter is hiding 1 row (rows 7)" in _blocker(hidden_by_filter=[7])
+
+    hidden = _blocker(hidden_by_user=[4, 5])
+    assert "rows 4-5 are hidden" in hidden and "Unhide" in hidden
+
+    mixed = _blocker(["Date", "2026-09-18 09:00", _serial("2026-09-17 09:00"),
+                      "2026-09-19 08:00", _serial("2026-09-20 08:00"), "2026-09-21 08:00"])
+    assert "2 cells are real dates: A3, A5" in mixed and "Plain text" in mixed
+    mostly_real = _blocker(["Date", _serial("2026-09-18 09:00"), _serial("2026-09-17 09:00"),
+                            "2026-09-19 08:00"])
+    assert "1 cell is text: A4" in mostly_real
+
+    # What Sheets refuses outright is said before what it would merely do wrongly.
+    assert "merged cells" in _blocker(merges=[MERGE_K3_K4], hidden_by_filter=[3])
+
+
+def test_the_note_says_what_is_wrong_that_mail_still_lands_and_when_it_is_tried_again():
+    note = sl.order_note(_blocker(merges=[MERGE_K3_K4]), retry="every hour")
+    assert note == (
+        "The Inbox tab has not been put in newest-first order yet: it has merged cells at "
+        "K3:K4, and Google Sheets cannot sort rows that are merged together. Unmerge them "
+        "(Format > Merge cells > Unmerge). New mail is still added at the top. The agent "
+        "tries the sort again every hour."
+    )
+    unrecorded = sl.unrecorded_note("HTTP 400", retry="every hour")
+    assert unrecorded.startswith("The Inbox tab is in newest-first order, but")
+    assert "New mail is still added at the top" in unrecorded and "every hour" in unrecorded
+
+
+def _stamp_of(requests: list[dict]) -> dict:
+    return requests[0]["createDeveloperMetadata"]["developerMetadata"]
+
+
+def _on_sheet(requests: list[dict]) -> dict:
+    """The metadata a sheet holds once a batch carrying this stamp landed."""
+    return dict(_stamp_of(requests))
+
+
+def test_the_stamp_is_first_in_the_batch_and_its_id_is_the_next_in_the_sequence():
+    first = sl.rows_stamp({}, token="aaa", now_epoch=1000)
+    assert [name for r in first for name in r] == ["createDeveloperMetadata"]
+    stamp = _stamp_of(first)
+    assert stamp["metadataId"] == sl.ROWS_STAMP_BASE + 1
+    assert stamp["metadataKey"] == sl.ROWS_STAMP_KEY and stamp["metadataValue"] == "1@1000@aaa"
+    assert stamp["location"] == {"spreadsheet": True}
+
+    meta = {"developerMetadata": [_on_sheet(first)]}
+    assert sl.rows_sequence({}) == 0 and sl.rows_sequence(meta) == 1
+    assert sl.rows_stamped_by(meta, "aaa") and not sl.rows_stamped_by(meta, "bbb")
+    assert not sl.rows_stamped_by(meta, ""), "no token is no batch"
+    assert _stamp_of(sl.rows_stamp(meta, token="bbb", now_epoch=1010))["metadataId"] == \
+        sl.ROWS_STAMP_BASE + 2
+
+
+def test_two_batches_planned_from_one_reading_ask_for_the_same_id():
+    """Which is the whole of it: Sheets creates an ID once, and refuses the
+    batch that asks for it second - another fire's, or this one's own sent
+    again."""
+    meta = {"developerMetadata": [_on_sheet(sl.rows_stamp({}, token="aaa", now_epoch=1000))]}
+    mine = _stamp_of(sl.rows_stamp(meta, token="mine", now_epoch=1500))
+    theirs = _stamp_of(sl.rows_stamp(meta, token="theirs", now_epoch=1501))
+    assert mine["metadataId"] == theirs["metadataId"]
+    assert mine["metadataValue"] != theirs["metadataValue"], "and the sheet says whose landed"
+
+
+def test_an_id_some_other_metadata_holds_is_stepped_over_by_every_writer_alike():
+    taken = {"developerMetadata": [
+        {"metadataId": sl.ROWS_STAMP_BASE + 1, "metadataKey": "someone.elses", "metadataValue": "x"},
+    ]}
+    for token in ("mine", "theirs"):
+        assert _stamp_of(sl.rows_stamp(taken, token=token, now_epoch=1))["metadataId"] == \
+            sl.ROWS_STAMP_BASE + 2
+
+
+def test_stamps_are_dropped_after_an_hour_and_the_latest_never_is():
+    hour = sl.ROWS_STAMP_KEEP_SECONDS
+    meta = {"developerMetadata": [
+        {"metadataId": sl.ROWS_STAMP_BASE + 1, "metadataKey": sl.ROWS_STAMP_KEY,
+         "metadataValue": "1@1000@a"},
+        {"metadataId": sl.ROWS_STAMP_BASE + 2, "metadataKey": sl.ROWS_STAMP_KEY,
+         "metadataValue": "2@5000@b"},
+        {"metadataId": sl.ROWS_STAMP_BASE + 3, "metadataKey": sl.ROWS_STAMP_KEY,
+         "metadataValue": "3@5100@c"},
+        {"metadataId": 44, "metadataKey": sl.ORDER_MARKER_KEY, "metadataValue": sl.ORDER_VERSION},
+    ]}
+
+    def dropped(now_epoch: int) -> list[int]:
+        requests = sl.rows_stamp(meta, token="d", now_epoch=now_epoch)
+        assert "createDeveloperMetadata" in requests[0], "the stamp is always the first request"
+        return [r["deleteDeveloperMetadata"]["dataFilter"]["developerMetadataLookup"]["metadataId"]
+                for r in requests[1:]]
+
+    assert dropped(5200) == [sl.ROWS_STAMP_BASE + 1], "only the one older than an hour"
+    assert dropped(5000 + hour) == [sl.ROWS_STAMP_BASE + 1], "an hour to the second is kept"
+    assert dropped(5000 + hour + 1) == [sl.ROWS_STAMP_BASE + 1, sl.ROWS_STAMP_BASE + 2]
+    assert dropped(10 ** 9) == [sl.ROWS_STAMP_BASE + 1, sl.ROWS_STAMP_BASE + 2], \
+        "the latest stays however old: it is what the next batch is numbered from"
+    assert _stamp_of(sl.rows_stamp(meta, token="d", now_epoch=1))["metadataId"] == \
+        sl.ROWS_STAMP_BASE + 4
+
+
+def test_a_stamp_whose_value_cannot_be_read_is_numbered_from_its_id():
+    meta = {"developerMetadata": [
+        {"metadataId": sl.ROWS_STAMP_BASE + 6, "metadataKey": sl.ROWS_STAMP_KEY,
+         "metadataValue": "she edited this"},
+    ]}
+    assert sl.rows_sequence(meta) == 6
+
+
+NEW_ROWS = [["2026-09-29 08:00"] + ["x"] * 8, ["2026-09-29 07:00"] + ["y"] * 8]
+
+
+def test_rows_go_in_above_a_first_row_that_is_merged_with_the_row_below_it():
+    """Seen live (W3a): with K2:K3 merged, moving row 2 beneath the new rows
+    is refused - "not possible to move a row to a position that crosses a
+    merged cell" - and the whole write with it. Tried live (E4): inserting AT
+    row 2 is taken, and the merge moves down whole."""
+    merge = {"sheetId": 5, "startRowIndex": 1, "endRowIndex": 3,
+             "startColumnIndex": 10, "endColumnIndex": 11}
+    blocks = sl.place(SHEET_DATES, [row[0] for row in NEW_ROWS], end=4)
+    requests = sl.insert_requests(5, blocks, NEW_ROWS, grid_rows=1000, merges=[merge])
+    assert [name for r in requests for name in r] == ["insertDimension", "updateCells"], \
+        "no row is moved"
+    insert = requests[0]["insertDimension"]
+    assert insert["range"] == {"sheetId": 5, "dimension": "ROWS", "startIndex": 1, "endIndex": 3}
+    assert insert["inheritFromBefore"] is False, "a data row's look, never the header's"
+    assert requests[1]["updateCells"]["start"]["rowIndex"] == 1
+
+    lower = {**merge, "startRowIndex": 2, "endRowIndex": 4}  # K3:K4: row 2 is free to move
+    usual = sl.insert_requests(5, blocks, NEW_ROWS, grid_rows=1000, merges=[lower])
+    assert [name for r in usual for name in r] == ["insertDimension", "moveDimension", "updateCells"]
+    across = {**merge, "endRowIndex": 2, "endColumnIndex": 12}  # K2:L2, one row
+    usual = sl.insert_requests(5, blocks, NEW_ROWS, grid_rows=1000, merges=[across])
+    assert [name for r in usual for name in r] == ["insertDimension", "moveDimension", "updateCells"]
+
+
+def test_rows_go_in_after_the_header_when_the_grid_ends_there():
+    """Seen live (W8c): she deleted every empty row of an empty sheet, and
+    an insert below row 2 is "larger than current grid size (1)". Tried live
+    (E3): after the last row Sheets takes only an insert that inherits from
+    the row before - the header - so the look it takes from it is given back."""
+    blocks = sl.place(["Date"], [row[0] for row in NEW_ROWS], end=1)
+    requests = sl.insert_requests(5, blocks, NEW_ROWS, grid_rows=1, merges=[])
+    assert [name for r in requests for name in r] == ["insertDimension", "repeatCell", "updateCells"]
+    insert = requests[0]["insertDimension"]
+    assert insert["range"] == {"sheetId": 5, "dimension": "ROWS", "startIndex": 1, "endIndex": 3}
+    assert insert["inheritFromBefore"] is True
+    plain = requests[1]["repeatCell"]
+    assert plain["range"] == {"sheetId": 5, "startRowIndex": 1, "endRowIndex": 3}
+    assert plain["cell"] == {"userEnteredFormat": {}} and plain["fields"] == "userEnteredFormat"
+    assert requests[2]["updateCells"]["start"]["rowIndex"] == 1
+
+    roomy = sl.insert_requests(5, blocks, NEW_ROWS, grid_rows=2, merges=[])
+    assert [name for r in roomy for name in r] == ["insertDimension", "moveDimension", "updateCells"]

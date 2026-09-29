@@ -81,7 +81,7 @@ class FakeStore:
     def delete_inbox_connection(self, user_id):
         self.connections.pop(user_id, None)
 
-    def take_inbox_lease(self, user_id, *, now, until):
+    def take_inbox_lease(self, user_id, *, now, until, owner=""):
         """The real primitive's contract, with the real rule: one atomic
         read-and-take, the document back on success, ``None`` when held."""
         doc = self.connections.get(user_id)
@@ -89,8 +89,28 @@ class FakeStore:
         if doc is None or not firestore_repo.inbox_lease_free(doc, now):
             return None
         doc["lease_until"] = until.isoformat()
+        doc["lease_owner"] = owner
         self.events.append("lease")
         return copy.deepcopy(doc)
+
+    def renew_inbox_lease(self, user_id, *, owner, held, until):
+        """Extended only by the fire whose token is on it — the real rule."""
+        doc = self.connections.get(user_id)
+        if doc is None or not firestore_repo.inbox_lease_held_by(doc, owner, held):
+            self.events.append("renew refused")
+            return False
+        doc["lease_until"] = until.isoformat()
+        self.events.append("renew")
+        return True
+
+    def release_inbox_lease(self, user_id, *, owner, held):
+        doc = self.connections.get(user_id)
+        if doc is None or not firestore_repo.inbox_lease_held_by(doc, owner, held):
+            self.events.append("release refused")
+            return False
+        doc["lease_until"], doc["lease_owner"] = None, None
+        self.events.append("release")
+        return True
 
     def list_connected_inbox_user_ids(self):
         return [uid for uid, d in self.connections.items() if (d.get("gmail") or {}).get("connected")]
@@ -233,6 +253,7 @@ class FakeSheet:
         self.checked_for: list[str] = []
         #: whether each check was allowed to run the one-time reorder
         self.reorders: list[bool] = []
+        self.check_holds: list = []
         self.events: list[str] = []
         #: 1-based row number -> the eleven cells A..K, hers included
         self.grid: dict[int, list[str]] = {}
@@ -262,10 +283,12 @@ class FakeSheet:
     def worktree_column(self, name: str) -> list[str]:
         return [row[WORKTREE_HEADERS.index(name)] for row in self.worktree]
 
-    def check(self, spreadsheet_id, *, caller_email, reorder=False):
+    def check(self, spreadsheet_id, *, caller_email, reorder=False, hold=None):
         self.checks += 1
         self.checked_for.append(caller_email)
         self.reorders.append(reorder)
+        #: what a poll hands the writer so the sort can prove the lease
+        self.check_holds.append(hold)
         return self.check_result
 
     def top_to_bottom(self) -> list[str]:
@@ -280,10 +303,12 @@ class FakeSheet:
         self.events.append("blank_action_ids")
         return list(self.blank_actions)
 
-    def write_rows(self, spreadsheet_id, new_rows, updates=None, *, svc=None):
+    def write_rows(self, spreadsheet_id, new_rows, updates=None, *, svc=None, hold=None):
         updates = dict(updates or {})
         if not new_rows and not updates:
             return Written()
+        if hold is not None:
+            hold.prove()  # as the real writer does, before it reads a position
         self.events.append("write_rows")
         for message_id, values in updates.items():
             row = self.rows.get(message_id)
@@ -343,7 +368,8 @@ class FakeLLM:
 STORE_SEAMS = (
     "get_inbox_connection", "save_inbox_connection", "delete_inbox_connection",
     "list_inbox_messages", "save_inbox_messages", "delete_inbox_messages", "get_users_by_ids",
-    "take_inbox_lease", "list_connected_inbox_user_ids",
+    "take_inbox_lease", "renew_inbox_lease", "release_inbox_lease",
+    "list_connected_inbox_user_ids",
 )
 
 
@@ -709,7 +735,7 @@ def test_the_lease_is_taken_at_the_start_and_cleared_even_when_the_fire_fails(co
     real_save = connected.save_inbox_connection
 
     def spying_save(user_id, patch, *, clear=()):
-        seen.append(patch.get("lease_until", "absent"))
+        seen.append(sorted(patch))
         return real_save(user_id, patch, clear=clear)
     monkeypatch.setattr(firestore_repo, "save_inbox_connection", spying_save)
     monkeypatch.setattr(sheet_writer, "id_rows", lambda sid, svc=None: (_ for _ in ()).throw(
@@ -717,8 +743,12 @@ def test_the_lease_is_taken_at_the_start_and_cleared_even_when_the_fire_fails(co
     report = pipeline.fire(UID, email=EMAIL, now=NOW)
     assert report.ok is False and "Sheets" in report.error
     assert connected.lease_attempts == [(NOW + timedelta(seconds=pipeline.LEASE_SECONDS)).isoformat()]
-    assert seen[-1] is None
-    assert connected.connections[UID]["last_poll"]["ok"] is False
+    assert connected.events[0] == "lease" and connected.events[-1] == "release"
+    doc = connected.connections[UID]
+    assert doc["lease_until"] is None and doc["lease_owner"] is None
+    assert not any("lease_until" in patch for patch in seen), \
+        "the lease is cleared by its owner's release, never by a blind save"
+    assert doc["last_poll"]["ok"] is False
 
 
 # --------------------------------------------------------------------------- #
@@ -802,7 +832,8 @@ def test_status_for_a_user_who_never_connected_is_enabled_with_nulls(store, shee
     assert payload == {
         "enabled": True, "service_account_email": "hub@project.iam.gserviceaccount.com",
         "gmail": {"connected": False, "address": None, "connected_at": None},
-        "sheet": {"id": None, "url": None, "title": None, "check": None, "checked_at": None},
+        "sheet": {"id": None, "url": None, "title": None, "check": None, "checked_at": None,
+                  "ordering": None, "ordering_note": None},
         "backfill": {"state": None, "done": 0, "total": None},
         "last_poll": {"at": None, "ok": None, "messages_read": 0, "error": None},
         "next_poll_at": None, "rows_24h": 0, "needs_review": 0, "generated_at": NOW.isoformat(),
@@ -913,9 +944,9 @@ def _timeline_patches(store: FakeStore, sheet: FakeSheet) -> tuple[list[str], di
         timeline.append("id_rows")
         return real_id_rows(sid, svc=svc)
 
-    def write_rows(sid, new_rows, updates=None, *, svc=None):
+    def write_rows(sid, new_rows, updates=None, *, svc=None, hold=None):
         timeline.append(f"write:{len(new_rows)}+{len(updates or {})}")
-        return real_write(sid, new_rows, updates, svc=svc)
+        return real_write(sid, new_rows, updates, svc=svc, hold=hold)
 
     def save_messages(user_id, docs):
         timeline.append("persist:messages")
@@ -1322,14 +1353,14 @@ def test_a_fire_that_starts_while_another_is_writing_its_rows_touches_neither_ma
     seen: dict = {}
     real_write = sheet.write_rows
 
-    def write_with_an_overlap(sid, new_rows, updates=None, *, svc=None):
+    def write_with_an_overlap(sid, new_rows, updates=None, *, svc=None, hold=None):
         if not seen:  # the first fire's write only: a fire let in must not start another
             seen["mail"], seen["sheet"] = None, None
             mail, cells = len(mailbox.events), len(sheet.events)
             inner.append(pipeline.fire(
                 UID, email=EMAIL, now=NOW + timedelta(seconds=pipeline.LEASE_SECONDS - 1)))
             seen["mail"], seen["sheet"] = mailbox.events[mail:], sheet.events[cells:]
-        return real_write(sid, new_rows, updates, svc=svc)
+        return real_write(sid, new_rows, updates, svc=svc, hold=hold)
     monkeypatch.setattr(sheet_writer, "write_rows", write_with_an_overlap)
 
     first = pipeline.fire(UID, email=EMAIL, now=NOW)
@@ -1351,11 +1382,11 @@ def test_a_fire_that_starts_during_the_one_time_reorder_is_skipped_and_never_ask
     inner: list = []
     overlapped: list = []
 
-    def check_with_an_overlap(sid, *, caller_email, reorder=False):
+    def check_with_an_overlap(sid, *, caller_email, reorder=False, hold=None):
         if not overlapped:  # the first fire's check only
             overlapped.append(True)
             inner.append(pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(seconds=30)))
-        return sheet.check(sid, caller_email=caller_email, reorder=reorder)
+        return sheet.check(sid, caller_email=caller_email, reorder=reorder, hold=hold)
     monkeypatch.setattr(sheet_writer, "check", check_with_an_overlap)
 
     first = pipeline.fire(UID, email=EMAIL, now=NOW)
@@ -1363,6 +1394,8 @@ def test_a_fire_that_starts_during_the_one_time_reorder_is_skipped_and_never_ask
     assert first.ok and first.skipped is None
     assert len(inner) == 1 and inner[0].skipped == "previous fire still running"
     assert sheet.reorders == [True], "one check, by the fire that holds the lease"
+    assert [type(hold).__name__ for hold in sheet.check_holds] == ["_Lease"], \
+        "and the sort is handed that lease to prove before it moves a row"
     assert connected.connections[UID]["sheet"]["ordering"] == "applied"
     assert connected.events.count("lease") == 1
 
@@ -2190,37 +2223,64 @@ def test_a_sheet_not_yet_newest_first_is_checked_by_its_next_fire_and_only_a_fir
     assert connected.connections[UID]["sheet"]["ordering"] == "applied"
 
 
-def test_a_reorder_that_fails_fails_the_fire_loudly_writes_nothing_and_is_tried_again(
-    connected, mailbox, sheet, monkeypatch
+def test_a_sheet_that_could_not_be_sorted_gets_its_mail_and_the_sort_waits_an_hour(
+    connected, mailbox, sheet
 ):
+    """The owner's decision: mail keeps flowing. A sheet Sheets will not sort
+    is not a reason to stop writing to it, and it is not asked again on
+    every five-minute fire."""
+    note = (
+        "The Inbox tab has not been put in newest-first order yet: it has merged cells at "
+        "K3:K4, and Google Sheets cannot sort rows that are merged together. Unmerge them "
+        "(Format > Merge cells > Unmerge). New mail is still added at the top. The agent "
+        "tries the sort again every hour."
+    )
     connected.connections[UID]["sheet"]["ordering"] = "pending"
-    before = copy.deepcopy(connected.connections[UID])
+    connected.connections[UID]["backfill"]["state"] = "done"
+    sheet.check_result = SheetCheck("ok", "Her inbox", "", "ours", "blocked", note)
     mailbox.messages = {"m1": _message("m1")}
     mailbox.history_added = ["m1"]
 
-    def refused(sid, *, caller_email, reorder=False):
-        raise sheet_writer.ReorderFailed(
-            "The one-time reorder of the Inbox tab (newest mail first) did not complete: "
-            "Sheets row reorder was refused: HTTP 400. No row was moved; it is tried again on "
-            "the next poll."
-        )
-    monkeypatch.setattr(sheet_writer, "check", refused)
-
     report = pipeline.fire(UID, email=EMAIL, now=NOW)
 
-    assert report.ok is False and "did not complete" in report.error
-    assert mailbox.fetched == [] and sheet.inserted == [] and connected.messages == {}
+    assert report.ok and report.skipped is None and report.error is None
+    assert report.new_rows == 1 and [row[ID] for row in sheet.inserted] == ["m1"], "mail landed"
     doc = connected.connections[UID]
-    assert doc["last_poll"] == {"at": NOW.isoformat(), "ok": False, "messages_read": 0,
-                                "error": report.error}
-    assert doc["checkpoint"] == before["checkpoint"], "the mail it did not read is still ahead of it"
-    assert doc["sheet"] == before["sheet"], "nothing claims the reorder happened"
-    assert doc["lease_until"] is None
+    assert doc["sheet"]["check"] == "ok"
+    assert (doc["sheet"]["ordering"], doc["sheet"]["ordering_note"]) == ("blocked", note)
+    assert doc["last_poll"]["ok"] is True and doc["last_poll"]["error"] is None, \
+        "the read did not fail, and is not reported as if it had"
+    assert doc["checkpoint"]["history_id"] == mailbox.history_id
+    shown = pipeline.status_payload(UID, now=NOW)["sheet"]
+    assert (shown["ordering"], shown["ordering_note"]) == ("blocked", note), "where the panel reads"
 
-    monkeypatch.setattr(sheet_writer, "check", sheet.check)
+    # The fires of the next hour write their mail and ask the sheet nothing
+    # about its order.
+    assert pipeline.ORDER_RETRY_SECONDS == 3600
+    checked_at = pipeline._parse_iso(doc["sheet"]["checked_at"])
+    for minutes in (5, 30, 59):
+        mailbox.messages[f"n{minutes}"] = _message(f"n{minutes}")
+        mailbox.history_added = [f"n{minutes}"]
+        later = pipeline.fire(UID, email=EMAIL, now=checked_at + timedelta(minutes=minutes))
+        assert later.ok and later.new_rows == 1
+    assert sheet.checks == 1 and sheet.reorders == [True]
+
+    # After it, the sort is tried again, by a fire, under its lease.
     sheet.check_result = SheetCheck("ok", "Her inbox", "", "ours", "applied")
-    report = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
-    assert report.ok and report.new_rows == 1 and sheet.reorders == [True]
+    pipeline.fire(UID, email=EMAIL, now=checked_at + timedelta(minutes=61))
+    assert sheet.checks == 2 and sheet.reorders == [True, True]
+    doc = connected.connections[UID]
+    assert (doc["sheet"]["ordering"], doc["sheet"]["ordering_note"]) == ("applied", "")
+    assert pipeline.status_payload(UID, now=NOW)["sheet"]["ordering_note"] is None
+
+
+def test_a_connection_stored_before_the_note_existed_reads_as_no_note(connected, sheet):
+    stored = connected.connections[UID]["sheet"]
+    assert "ordering_note" not in stored
+    shown = pipeline.status_payload(UID, now=NOW)["sheet"]
+    assert shown["ordering"] == "already" and shown["ordering_note"] is None
+    stored.pop("ordering")
+    assert pipeline.status_payload(UID, now=NOW)["sheet"]["ordering"] is None
 
 
 def _listing_that_honours_after(mailbox, monkeypatch) -> list[int]:
@@ -2377,3 +2437,506 @@ def test_a_connection_with_no_checkpoint_time_counts_back_from_when_it_was_conne
     pipeline.fire(UID, email=EMAIL, now=NOW)
 
     assert asked == [int(connected_at.timestamp()) - 86400]
+
+
+# --------------------------------------------------------------------------- #
+# Pinned 2026-09-30: what the independent verification of the newest-first
+# change found, at the level of a whole fire. The lease is proved before a
+# row is written and cleared only by the fire that owns it; a row batch whose
+# reply is lost is one copy on the sheet; a sheet that cannot be sorted still
+# gets its mail.
+# --------------------------------------------------------------------------- #
+
+def _sheet_of_three(monkeypatch, store):
+    """The real writer over a newest-first sheet of three, her cells on each."""
+    from inbox_triage_agent.tests.test_sheet_writer import newest_first_sheet
+
+    grid = newest_first_sheet()
+    _real_sheet(monkeypatch, grid)
+    monkeypatch.setattr(sheet_writer.time, "sleep", lambda _seconds: None)  # the waits between passes
+    store.connections[UID] = _connected_doc()
+    store.connections[UID]["backfill"]["state"] = "done"
+    store.connections[UID]["retriage"] = {"state": "done", "skipped": []}
+    return grid
+
+
+def test_a_row_write_whose_reply_was_lost_is_one_copy_on_the_sheet_and_the_fire_records_it(
+    store, mailbox, model, grant, monkeypatch
+):
+    """Seen live (R1) with the fire's own writer: the batch was applied, the
+    reply lost, the batch sent again - the new message twice, another
+    message gone, and her notes on the wrong message, reported as a success."""
+    from inbox_triage_agent.tests.test_sheet_writer import _body, _lose_the_reply
+
+    grid = _sheet_of_three(monkeypatch, store)
+    for col, value in ((CAT, UNREAD), (SUMMARY, ""), (ACTION, "")):
+        grid.put("Inbox", 2, col, value)  # "b" is waiting for another try
+    before = {row[ID]: row for row in _body(grid)}
+    store.messages[f"{UID}__b"] = {
+        "user_id": UID, "message_id": "b", "status": "needs_review", "attempts": 1,
+        "retry_due": True, "sheet_row": 3,
+    }
+    mailbox.messages = {
+        "b": _message("b", subject="Now readable", at=_at(18)),
+        "new": _message("new", at=_at(21, 8)),
+    }
+    mailbox.history_added = ["new"]
+    mailbox.history_id = "950"
+    requests_sent = _lose_the_reply(grid)
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok and report.error is None
+    assert report.new_rows == 1 and report.retried_rows == 1
+    assert len(requests_sent) == 1 and requests_sent[0].sent == 1, "sent once"
+    body = _body(grid)
+    assert [row[ID] for row in body] == ["new", "c", "b", "a"], "one copy, and nobody written over"
+    rows = {row[ID]: row for row in body}
+    for message_id in ("c", "b", "a"):
+        assert rows[message_id][9:] == before[message_id][9:], \
+            f"her cells on {message_id!r} are still her cells on {message_id!r}"
+    assert rows["b"][CAT] == ASKS and rows["b"][SUMMARY], "the retried row was rewritten"
+    assert rows["c"][:9] == before["c"][:9] and rows["a"][:9] == before["a"][:9]
+    # What the fire persists is what is on the sheet.
+    assert store.messages[f"{UID}__new"]["sheet_row"] == 2
+    assert store.messages[f"{UID}__b"]["sheet_row"] == 4
+    doc = store.connections[UID]
+    assert doc["last_poll"]["ok"] is True and doc["checkpoint"]["history_id"] == "950"
+    assert doc["lease_until"] is None
+
+    # And the next fire, offered the same mail, writes nothing.
+    calls = len(grid.calls)
+    store.connections[UID]["checkpoint"]["history_id"] = "800"
+    again = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
+    assert again.ok and again.new_rows == 0
+    assert not any(name.startswith("batchUpdate") for name in grid.names()[calls:])
+    assert [row[ID] for row in _body(grid)] == ["new", "c", "b", "a"]
+
+
+def test_a_row_write_that_never_gets_an_answer_fails_the_fire_and_the_next_one_writes_the_mail(
+    store, mailbox, model, grant, monkeypatch
+):
+    from inbox_triage_agent.tests.test_sheet_writer import _body
+
+    grid = _sheet_of_three(monkeypatch, store)
+    mailbox.messages = {"new": _message("new", at=_at(21, 8))}
+    mailbox.history_added = ["new"]
+    mailbox.history_id = "950"
+    grid.fail["batchUpdate:rows"] = TimeoutError("The read operation timed out")
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok is False and "got no answer" in report.error and SID not in report.error
+    assert store.messages == {}, "nothing is recorded that is not on the sheet"
+    doc = store.connections[UID]
+    assert doc["checkpoint"]["history_id"] == "800", "the mail is still ahead of the next fire"
+    assert doc["last_poll"]["ok"] is False and doc["lease_until"] is None
+
+    del grid.fail["batchUpdate:rows"]
+    report = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
+    assert report.ok and report.new_rows == 1
+    assert [row[ID] for row in _body(grid)] == ["new", "c", "b", "a"]
+
+
+def test_a_fire_still_writing_when_its_lease_runs_out_is_not_joined_by_the_next_one(
+    store, mailbox, model, grant, monkeypatch
+):
+    """Every Sheets call may take 3 x 30 s plus back-off, and the fire's
+    budget does not count them: by the time a fire writes, the lease it took
+    when it started can be all but spent. The next poll then found the lease
+    free while this one was between its position read and its batch.
+
+    With the fire's own writer: the first lease has a second left when the
+    write begins, the reads take two, and the next poll arrives just before
+    the batch is sent."""
+    from inbox_triage_agent.tests.test_sheet_writer import _body
+
+    grid = _sheet_of_three(monkeypatch, store)
+    clock = _Clock()
+    monkeypatch.setattr(pipeline.time, "monotonic", clock.monotonic)
+    mailbox.messages = {"m1": _message("m1", at=_at(21, 8))}
+    mailbox.history_added = ["m1"]
+    real_fetch, real_read, real_batch = mailbox.fetch, grid._values_batch_get, grid._batch_update
+    inner: list = []
+
+    def slow_fetch(svc, message_id):
+        clock.t += pipeline.LEASE_SECONDS - 1
+        return real_fetch(svc, message_id)
+
+    def slow_read(**kw):
+        if "valueRenderOption" in kw:  # the writer's position read
+            clock.t += 2
+        return real_read(**kw)
+
+    def batch_with_the_next_poll_arriving(**kw):
+        if any("insertDimension" in r for r in kw["body"]["requests"]) and not inner:
+            inner.append(None)
+            later = NOW + timedelta(seconds=pipeline.LEASE_SECONDS + 1)
+            inner[0] = pipeline.fire(UID, email=EMAIL, now=later)
+        return real_batch(**kw)
+
+    monkeypatch.setattr(gmail_client, "fetch", slow_fetch)
+    grid._values_batch_get, grid._batch_update = slow_read, batch_with_the_next_poll_arriving
+
+    first = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert first.ok and first.new_rows == 1
+    assert len(inner) == 1 and inner[0].skipped == "previous fire still running", (
+        f"a second fire ran to the end inside the first one's write "
+        f"(new_rows={inner[0].new_rows}, skipped={inner[0].skipped!r}); "
+        f"the sheet now reads {[row[ID] for row in _body(grid)]}"
+    )
+    assert [row[ID] for row in _body(grid)] == ["m1", "c", "b", "a"]
+    assert grid.names().count("batchUpdate:rows") == 1
+    assert store.events.count("lease") == 1 and store.events.count("renew") >= 1
+    assert store.connections[UID]["lease_until"] is None, "its own lease, cleared at the end"
+
+
+def _taken_over(store: FakeStore, *, at: datetime) -> str:
+    """The next poll takes the lease, as ``take_inbox_lease`` would."""
+    until = at + timedelta(seconds=pipeline.LEASE_SECONDS)
+    assert store.take_inbox_lease(UID, now=at, until=until, owner="the-next-fire") is not None, \
+        "the lease had run out, so it was there to take"
+    return until.isoformat()
+
+
+def test_a_fire_that_overran_does_not_clear_the_lease_of_the_fire_that_replaced_it(
+    connected, mailbox, sheet, monkeypatch
+):
+    connected.connections[UID]["backfill"]["state"] = "done"
+    mailbox.messages = {"m1": _message("m1")}
+    mailbox.history_added = ["m1"]
+    real_persist = connected.save_inbox_messages
+    theirs: list[str] = []
+
+    def persist_during_which_the_lease_changes_hands(user_id, docs):
+        # The rows are written. The lease ran out and the next poll took it.
+        theirs.append(_taken_over(connected, at=NOW + timedelta(seconds=2 * pipeline.LEASE_SECONDS)))
+        return real_persist(user_id, docs)
+
+    monkeypatch.setattr(firestore_repo, "save_inbox_messages", persist_during_which_the_lease_changes_hands)
+
+    pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    doc = connected.connections[UID]
+    assert theirs and (doc["lease_until"], doc["lease_owner"]) == (theirs[0], "the-next-fire"), (
+        "the finished fire cleared a lease that was no longer its own, so a third fire "
+        "can start while the second is still writing"
+    )
+    assert connected.events[-1] == "release refused"
+    third = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(seconds=2 * pipeline.LEASE_SECONDS + 5))
+    assert third.skipped == "previous fire still running"
+
+
+def test_a_fire_whose_lease_was_taken_over_before_it_wrote_writes_nothing_and_records_nothing(
+    connected, mailbox, sheet, monkeypatch, caplog
+):
+    """It read its mail and paid for its summaries; none of that is a reason
+    to write under a lease that is another fire's. The fire that holds the
+    lease reads the same mail."""
+    import logging
+
+    connected.connections[UID]["backfill"]["state"] = "done"
+    mailbox.messages = {"m1": _message("m1")}
+    mailbox.history_added = ["m1"]
+    before = copy.deepcopy(connected.connections[UID])
+    real_write = sheet.write_rows
+    theirs: list[str] = []
+
+    def write_after_the_lease_changed_hands(sid, new_rows, updates=None, *, svc=None, hold=None):
+        theirs.append(_taken_over(connected, at=NOW + timedelta(seconds=2 * pipeline.LEASE_SECONDS)))
+        return real_write(sid, new_rows, updates, svc=svc, hold=hold)
+
+    monkeypatch.setattr(sheet_writer, "write_rows", write_after_the_lease_changed_hands)
+
+    with caplog.at_level(logging.WARNING):
+        report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.skipped == pipeline.SKIPPED_LEASE_LOST and report.error is None
+    assert sheet.inserted == [] and "write_rows" not in sheet.events, "not a row"
+    assert connected.messages == {}, "not a tracking document"
+    doc = connected.connections[UID]
+    assert (doc["lease_until"], doc["lease_owner"]) == (theirs[0], "the-next-fire")
+    for key in ("checkpoint", "last_poll", "backfill", "needs_review", "recent_fires"):
+        assert doc.get(key) == before.get(key), f"{key} belongs to the fire that holds the lease"
+    assert "its lease was taken over" in caplog.text and UID not in caplog.text
+
+
+def test_a_disconnect_in_the_middle_of_a_fire_stops_that_fire_from_writing(
+    connected, mailbox, sheet, monkeypatch
+):
+    connected.connections[UID]["backfill"]["state"] = "done"
+    mailbox.messages = {"m1": _message("m1")}
+    mailbox.history_added = ["m1"]
+    real_write = sheet.write_rows
+
+    def write_after_she_disconnected(sid, new_rows, updates=None, *, svc=None, hold=None):
+        pipeline.disconnect(UID)
+        return real_write(sid, new_rows, updates, svc=svc, hold=hold)
+
+    monkeypatch.setattr(sheet_writer, "write_rows", write_after_she_disconnected)
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.skipped == pipeline.SKIPPED_LEASE_LOST
+    assert sheet.inserted == [] and connected.messages == {}
+    doc = connected.connections[UID]
+    assert "checkpoint" not in doc and "gmail" not in doc, "what the disconnect removed stays removed"
+    assert doc["lease_until"] is None and doc["lease_owner"] is None
+
+
+def test_the_lease_is_extended_from_the_fires_own_clock_and_only_when_it_has_to_be(
+    connected, mailbox, sheet, monkeypatch
+):
+    clock = _Clock()
+    monkeypatch.setattr(pipeline.time, "monotonic", clock.monotonic)
+    connected.connections[UID]["backfill"]["state"] = "done"
+    mailbox.messages = {"m1": _message("m1")}
+    mailbox.history_added = ["m1"]
+    real_fetch = mailbox.fetch
+    seen: list[str] = []
+    real_renew = connected.renew_inbox_lease
+
+    def slow_fetch(svc, message_id):
+        clock.t += 100.0
+        return real_fetch(svc, message_id)
+
+    def renew(user_id, *, owner, held, until):
+        seen.append((held, until.isoformat()))
+        return real_renew(user_id, owner=owner, held=held, until=until)
+
+    monkeypatch.setattr(gmail_client, "fetch", slow_fetch)
+    monkeypatch.setattr(firestore_repo, "renew_inbox_lease", renew)
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok and report.new_rows == 1
+    assert seen == [(
+        (NOW + timedelta(seconds=pipeline.LEASE_SECONDS)).isoformat(),
+        (NOW + timedelta(seconds=100 + pipeline.LEASE_SECONDS)).isoformat(),
+    )], "once, before the write: from when the write began, and enough for the tab's rewrite too"
+    assert sheet.worktree_writes == 1
+
+
+def test_the_worktree_is_not_rewritten_by_a_fire_that_lost_its_lease_after_its_rows_landed(
+    connected, mailbox, sheet, monkeypatch
+):
+    """The rows are on the sheet and are this fire's to record. The tab's
+    rewrite is a write like any other, and is left to the lease's holder."""
+    clock = _Clock()
+    monkeypatch.setattr(pipeline.time, "monotonic", clock.monotonic)
+    connected.connections[UID]["backfill"]["state"] = "done"
+    mailbox.messages = {"m1": _message("m1")}
+    mailbox.history_added = ["m1"]
+    real_read = sheet.read_inbox
+
+    def read_that_outlasts_the_lease(sid, *, svc=None):
+        clock.t += 2 * pipeline.LEASE_SECONDS
+        _taken_over(connected, at=NOW + timedelta(seconds=2 * pipeline.LEASE_SECONDS))
+        return real_read(sid, svc=svc)
+
+    monkeypatch.setattr(sheet_writer, "read_inbox", read_that_outlasts_the_lease)
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok and report.new_rows == 1 and [row[ID] for row in sheet.inserted] == ["m1"]
+    assert sheet.worktree_writes == 0 and report.worktree_rows == 0
+    doc = connected.connections[UID]
+    assert doc["worktree"]["error"] == pipeline.SKIPPED_LEASE_LOST
+    assert connected.messages[f"{UID}__m1"]["sheet_row"] == 2, "the rows it wrote are recorded"
+    assert doc["lease_owner"] == "the-next-fire"
+
+
+def test_the_lease_rules_are_the_ones_the_store_applies():
+    held = firestore_repo.inbox_lease_held_by
+    mine = (NOW + timedelta(seconds=60)).isoformat()
+    theirs = (NOW + timedelta(seconds=400)).isoformat()
+    assert held({"lease_owner": "abc", "lease_until": mine}, "abc", mine)
+    assert held({"lease_owner": "abc", "lease_until": NOW.isoformat()}, "abc", NOW.isoformat()), \
+        "a lease that ran out and that nobody took is still its owner's to extend"
+    assert not held({"lease_owner": "xyz", "lease_until": mine}, "abc", mine)
+    assert not held({"lease_owner": "abc", "lease_until": theirs}, "abc", mine), \
+        "taken by a fire that writes no token: the time moved, so it changed hands"
+    assert not held({"lease_owner": "abc", "lease_until": None}, "abc", mine), "cleared"
+    for nobody in ({"lease_owner": None, "lease_until": mine}, {"lease_until": mine}, {}, None):
+        assert not held(nobody, "abc", mine), \
+            "a lease taken before owners existed is nobody's to extend or clear"
+    assert not held({"lease_owner": "", "lease_until": mine}, "", mine), "no token holds nothing"
+    assert not held({"lease_owner": "abc", "lease_until": ""}, "abc", "")
+
+
+class _Transaction:
+    """As much of a Firestore transaction as ``firestore.transactional``
+    drives: writes are held until the commit, and a commit is all of them."""
+
+    _max_attempts = 1
+    _read_only = False
+
+    def __init__(self, docs: dict):
+        self.docs, self.pending, self._id = docs, [], None
+
+    def _clean_up(self):
+        self.pending, self._id = [], None
+
+    def _begin(self, retry_id=None):
+        self._id = b"txn"
+
+    def _rollback(self):
+        self.pending = []
+
+    def _commit(self):
+        for key, patch in self.pending:
+            self.docs[key].update(patch)
+        return []
+
+    def update(self, ref, patch):
+        self.pending.append((ref.key, dict(patch)))
+
+
+class _Document:
+    def __init__(self, docs: dict, key: str):
+        self.docs, self.key = docs, key
+
+    def get(self, transaction=None):
+        from types import SimpleNamespace
+
+        doc = self.docs.get(self.key)
+        return SimpleNamespace(exists=doc is not None, to_dict=lambda: copy.deepcopy(doc))
+
+
+class _Database:
+    def __init__(self, docs: dict):
+        self.docs = docs
+
+    def collection(self, name):
+        from types import SimpleNamespace
+
+        assert name == firestore_repo.INBOX_CONNECTIONS
+        return SimpleNamespace(document=lambda key: _Document(self.docs, key))
+
+    def transaction(self):
+        return _Transaction(self.docs)
+
+
+def test_the_stores_own_lease_primitives_extend_and_clear_only_the_callers_lease(monkeypatch):
+    """The real ``firestore_repo`` functions, over a transaction that holds
+    its writes until the commit. No Firestore is reached."""
+    docs = {UID: {"gmail": {"connected": True}, "lease_until": None}}
+    monkeypatch.setattr(firestore_repo, "_db", lambda: _Database(docs))
+    first = NOW + timedelta(seconds=300)
+
+    taken = firestore_repo.take_inbox_lease(UID, now=NOW, until=first, owner="fire-1")
+    assert taken["lease_owner"] == "fire-1" and taken["lease_until"] == first.isoformat()
+    assert (docs[UID]["lease_until"], docs[UID]["lease_owner"]) == (first.isoformat(), "fire-1")
+    assert firestore_repo.take_inbox_lease(
+        UID, now=NOW + timedelta(seconds=10), until=first, owner="fire-2") is None
+    assert docs[UID]["lease_owner"] == "fire-1", "a lease that is held is not taken"
+
+    # Extended by its owner, and by nobody else.
+    second = NOW + timedelta(seconds=500)
+    assert not firestore_repo.renew_inbox_lease(
+        UID, owner="fire-2", held=first.isoformat(), until=second)
+    assert not firestore_repo.renew_inbox_lease(
+        UID, owner="fire-1", held=second.isoformat(), until=second), "not the time it wrote"
+    assert docs[UID]["lease_until"] == first.isoformat(), "a refusal writes nothing"
+    assert firestore_repo.renew_inbox_lease(
+        UID, owner="fire-1", held=first.isoformat(), until=second)
+    assert (docs[UID]["lease_until"], docs[UID]["lease_owner"]) == (second.isoformat(), "fire-1")
+
+    # It runs out and the next fire takes it: the first can do nothing to it.
+    later = NOW + timedelta(seconds=600)
+    third = later + timedelta(seconds=300)
+    assert firestore_repo.take_inbox_lease(UID, now=later, until=third, owner="fire-2") is not None
+    assert not firestore_repo.renew_inbox_lease(
+        UID, owner="fire-1", held=second.isoformat(), until=third)
+    assert not firestore_repo.release_inbox_lease(UID, owner="fire-1", held=second.isoformat())
+    assert (docs[UID]["lease_until"], docs[UID]["lease_owner"]) == (third.isoformat(), "fire-2")
+
+    # Cleared by its owner.
+    assert firestore_repo.release_inbox_lease(UID, owner="fire-2", held=third.isoformat())
+    assert docs[UID]["lease_until"] is None and docs[UID]["lease_owner"] is None
+    assert not firestore_repo.release_inbox_lease(UID, owner="fire-2", held=third.isoformat())
+
+    # No document, no lease.
+    assert not firestore_repo.renew_inbox_lease("nobody", owner="x", held="y", until=third)
+    assert not firestore_repo.release_inbox_lease("nobody", owner="x", held="y")
+    assert firestore_repo.take_inbox_lease("nobody", now=NOW, until=first, owner="x") is None
+
+
+def test_a_lease_taken_by_a_revision_that_writes_no_owner_is_not_written_under_or_cleared(
+    connected, mailbox, sheet, monkeypatch
+):
+    """While two revisions serve at once, a fire of the older one takes the
+    lease by writing the time alone; the token on the document is still this
+    fire's. The time is not."""
+    connected.connections[UID]["backfill"]["state"] = "done"
+    mailbox.messages = {"m1": _message("m1")}
+    mailbox.history_added = ["m1"]
+    real_write = sheet.write_rows
+    theirs = (NOW + timedelta(seconds=2 * pipeline.LEASE_SECONDS)).isoformat()
+
+    def write_during_which_the_lease_changes_hands(sid, new_rows, updates=None, *, svc=None, hold=None):
+        connected.connections[UID]["lease_until"] = theirs
+        return real_write(sid, new_rows, updates, svc=svc, hold=hold)
+
+    monkeypatch.setattr(sheet_writer, "write_rows", write_during_which_the_lease_changes_hands)
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.skipped == pipeline.SKIPPED_LEASE_LOST and sheet.inserted == []
+    assert connected.connections[UID]["lease_until"] == theirs, (
+        "the finished fire cleared a lease that was no longer its own, so a third fire "
+        "can start while the second is still writing"
+    )
+
+
+def test_a_sheet_that_cannot_be_sorted_still_gets_its_mail_and_says_why_where_the_panel_reads(
+    store, mailbox, model, grant, monkeypatch
+):
+    """Seen live (B4), with the fire's own writer: a vertical merge below the
+    header made Sheets refuse the sort, the fire failed, and so did every
+    fire after it - no mail at all for that user."""
+    from inbox_triage_agent.tests.test_sheet_writer import MERGE_K3_K4, _body, split_sheet
+
+    grid = split_sheet()
+    grid.merges = [dict(MERGE_K3_K4)]
+    order = [row[ID] for row in _body(grid)]
+    before = {row[ID]: row for row in _body(grid)}
+    _real_sheet(monkeypatch, grid)
+    store.connections[UID] = _connected_doc()
+    store.connections[UID]["sheet"].pop("ordering")  # connected before the rule
+    store.connections[UID]["backfill"]["state"] = "done"
+    store.connections[UID]["retriage"] = {"state": "done", "skipped": []}
+    mailbox.messages = {"today": _message("today", at=_at(29, 10))}
+    mailbox.history_added = ["today"]
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok and report.error is None and report.new_rows == 1
+    body = _body(grid)
+    assert [row[ID] for row in body] == ["today", *order], \
+        "new mail at the top, and the sheet in the order it was in"
+    assert {row[ID]: row for row in body if row[ID] != "today"} == before
+    assert "batchUpdate:order" not in grid.names()
+    shown = pipeline.status_payload(UID, now=NOW)
+    assert shown["sheet"]["check"] == "ok" and shown["sheet"]["ordering"] == "blocked"
+    assert shown["sheet"]["ordering_note"] == (
+        "The Inbox tab has not been put in newest-first order yet: it has merged cells at "
+        "K3:K4, and Google Sheets cannot sort rows that are merged together. Unmerge them "
+        "(Format > Merge cells > Unmerge). New mail is still added at the top. The agent "
+        "tries the sort again every hour."
+    )
+    assert shown["last_poll"]["ok"] is True and shown["last_poll"]["error"] is None
+
+    # She unmerges. Within the hour nothing is asked; after it the tab is sorted.
+    grid.merges = []
+    mailbox.history_added = []
+    checked_at = pipeline._parse_iso(store.connections[UID]["sheet"]["checked_at"])
+    pipeline.fire(UID, email=EMAIL, now=checked_at + timedelta(minutes=30))
+    assert "batchUpdate:order" not in grid.names()
+    pipeline.fire(UID, email=EMAIL, now=checked_at + timedelta(minutes=61))
+    assert grid.names().count("batchUpdate:order") == 1
+    ids = [row[ID] for row in _body(grid)]
+    assert ids[:3] == ["today", "n4", "n3"] and ids[-1] == "b7"
+    shown = pipeline.status_payload(UID, now=NOW)["sheet"]
+    assert (shown["ordering"], shown["ordering_note"]) == ("applied", None)
