@@ -1,8 +1,9 @@
 """The sheet writes against a fake Sheets service that keeps a real grid —
-cells, inserted columns, hidden columns, dropdowns — and records every
-request. So "never sorts, never deletes, never writes outside A:I", "set-up
-is idempotent" and "a legacy sheet migrates in place with nothing lost" are
-asserted on the cells, not described."""
+cells, inserted columns and rows, moved and sorted rows, hidden columns,
+dropdowns — and records every request. So "sorts once and never again",
+"never deletes, never writes outside A:I", "set-up is idempotent" and "a
+legacy sheet migrates in place with nothing lost" are asserted on the cells,
+not described."""
 
 from __future__ import annotations
 
@@ -100,6 +101,10 @@ class FakeSheets:
         self.metadata: list[dict] = []
         self.styled: list[dict] = []  # repeatCell / widths / heights / freezes
         self._next_meta_id = 1
+        #: tab id -> the 0-based row its banding begins on
+        self.band_start: dict[int, int] = {}
+        #: a developer-metadata key Sheets will refuse to create (a test's)
+        self.refuse_metadata_key: str | None = None
 
     # -- grid helpers ---------------------------------------------------- #
     def rows(self, tab: str) -> list[list[str]]:
@@ -151,8 +156,7 @@ class FakeSheets:
     def _values(self):
         return SimpleNamespace(
             get=self._values_get, batchGet=self._values_batch_get,
-            append=self._values_append, batchUpdate=self._values_batch_update,
-            update=self._values_update,
+            batchUpdate=self._values_batch_update, update=self._values_update,
         )
 
     def _answer(self, name: str, kw: dict, result_fn):
@@ -188,12 +192,23 @@ class FakeSheets:
                 for r in requests
             )
 
+        def moves_rows(request) -> bool:
+            if "moveDimension" in request:
+                return True
+            if "insertDimension" in request:
+                return request["insertDimension"]["range"]["dimension"] == "ROWS"
+            return "updateCells" in request and request["updateCells"]["start"]["rowIndex"] > 0
+
         if any("addSheet" in r for r in requests):
             name = "batchUpdate:addSheet"
         elif creates(sheet_style.FORMAT_MARKER_KEY):
             # The layout batch writes a marker too — the Worktree tab's — so
             # it is the FORMAT marker that names the formatting batch.
             name = "batchUpdate:format"
+        elif any("sortRange" in r for r in requests):
+            name = "batchUpdate:order"
+        elif any(moves_rows(r) for r in requests):
+            name = "batchUpdate:rows"
         else:
             name = "batchUpdate:layout"
 
@@ -222,13 +237,19 @@ class FakeSheets:
                 if any(band["bandedRangeId"] in b for b in self.bandings.values()):
                     refuse("banding id exists")
                 self.bandings[sheet_id] = [band["bandedRangeId"]]
+                self.band_start[sheet_id] = band["range"]["startRowIndex"]
             elif "deleteBanding" in request:
                 wanted = request["deleteBanding"]["bandedRangeId"]
                 if not any(wanted in b for b in self.bandings.values()):
                     refuse("no such banding")
+                for sheet_id, ids in self.bandings.items():
+                    if wanted in ids:
+                        self.band_start.pop(sheet_id, None)
                 self.bandings = {k: [x for x in v if x != wanted] for k, v in self.bandings.items()}
             elif "createDeveloperMetadata" in request:
                 entry = dict(request["createDeveloperMetadata"]["developerMetadata"])
+                if entry["metadataKey"] == self.refuse_metadata_key:
+                    refuse("metadata refused")
                 entry["metadataId"] = self._next_meta_id
                 self._next_meta_id += 1
                 self.metadata.append(entry)
@@ -257,7 +278,22 @@ class FakeSheets:
                     self.rows(title)
                     replies.append({"addSheet": {"properties": {"title": title, "sheetId": self._next_sheet_id}}})
                     continue
-                if "insertDimension" in request:
+                if "insertDimension" in request and (
+                    request["insertDimension"]["range"]["dimension"] == "ROWS"
+                ):
+                    rng = request["insertDimension"]["range"]
+                    at, n = rng["startIndex"], rng["endIndex"] - rng["startIndex"]
+                    grid = self.rows("Inbox")
+                    while len(grid) < at:
+                        grid.append([])
+                    grid[at:at] = [[] for _ in range(n)]
+                    # As the throwaway sheet did it: a range that BEGINS at
+                    # (or below) the insert is pushed down; one the insert
+                    # falls inside of simply grows.
+                    start = self.band_start.get(rng["sheetId"])
+                    if start is not None and at <= start:
+                        self.band_start[rng["sheetId"]] = start + n
+                elif "insertDimension" in request:
                     rng = request["insertDimension"]["range"]
                     at, n = rng["startIndex"], rng["endIndex"] - rng["startIndex"]
                     for row in self.rows("Inbox"):
@@ -265,12 +301,45 @@ class FakeSheets:
                             row[at:at] = [""] * n
                     self.hidden = {c + n if c >= at else c for c in self.hidden}
                     self.dropdowns = {c + n if c >= at else c: v for c, v in self.dropdowns.items()}
+                elif "moveDimension" in request:
+                    source = request["moveDimension"]["source"]
+                    a, b = source["startIndex"], source["endIndex"]
+                    to = request["moveDimension"]["destinationIndex"]
+                    grid = self.rows("Inbox")
+                    while len(grid) < max(b, to):
+                        grid.append([])
+                    moved = grid[a:b]
+                    del grid[a:b]
+                    to = to - (b - a) if to > a else to  # named before the rows left
+                    grid[to:to] = moved
+                elif "sortRange" in request:
+                    sort = request["sortRange"]
+                    assert "startColumnIndex" not in sort["range"], "whole rows or nothing"
+                    first = sort["range"].get("startRowIndex", 0)
+                    grid = self.rows("Inbox")
+                    body = grid[first:]
+
+                    def at_col(row, col):
+                        return row[col] if col < len(row) else ""
+
+                    # Least significant key first; a stable sort keeps the
+                    # rest. Blank cells sort last in either direction.
+                    for spec in reversed(sort["sortSpecs"]):
+                        col = spec["dimensionIndex"]
+                        filled = [r for r in body if at_col(r, col) != ""]
+                        blank = [r for r in body if at_col(r, col) == ""]
+                        filled.sort(key=lambda r: at_col(r, col),
+                                    reverse=spec["sortOrder"] == "DESCENDING")
+                        body = filled + blank
+                    grid[first:] = body
                 elif "updateCells" in request:
                     start = request["updateCells"]["start"]
                     for dr, row in enumerate(request["updateCells"]["rows"]):
                         for dc, value in enumerate(row["values"]):
+                            entered = value.get("userEnteredValue") or {}
+                            assert set(entered) <= {"stringValue"}, "text only, never a formula"
                             self.put("Inbox", start["rowIndex"] + dr, start["columnIndex"] + dc,
-                                     value["userEnteredValue"]["stringValue"])
+                                     entered.get("stringValue", ""))
                 elif "updateDimensionProperties" in request:
                     rng = request["updateDimensionProperties"]["range"]
                     self.hidden.update(range(rng["startIndex"], rng["endIndex"]))
@@ -285,12 +354,12 @@ class FakeSheets:
         if name in self.fail:
             return _Req(error=self.fail[name])
         snapshot = copy.deepcopy((self.grid, self.tabs, self.hidden, self.dropdowns, self.rules,
-                                  self.bandings, self.metadata, self.styled))
+                                  self.bandings, self.metadata, self.styled, self.band_start))
         try:
             return _Req(apply())
         except _Refused:
             (self.grid, self.tabs, self.hidden, self.dropdowns, self.rules,
-             self.bandings, self.metadata, self.styled) = snapshot
+             self.bandings, self.metadata, self.styled, self.band_start) = snapshot
             return _Req(error=_http_error(400))
 
     def _values_get(self, **kw):
@@ -300,18 +369,6 @@ class FakeSheets:
         return self._answer("values.batchGet", kw, lambda: {
             "valueRanges": [self._read(a1) for a1 in kw["ranges"]],
         })
-
-    def _values_append(self, **kw):
-        def apply():
-            rows = kw["body"]["values"]
-            grid = self.rows("Inbox")
-            first = len(grid) + 1
-            for offset, row in enumerate(rows):
-                for c, value in enumerate(row):
-                    self.put("Inbox", first - 1 + offset, c, value)
-            return {"updates": {"updatedRange": f"Inbox!A{first}:I{first + len(rows) - 1}"}}
-
-        return self._answer("values.append", kw, apply)
 
     def _values_batch_update(self, **kw):
         def apply():
@@ -634,28 +691,6 @@ def test_blank_action_ids_skips_filled_actions_needs_review_and_rows_without_a_c
     assert sheet_writer.blank_action_ids(SID, svc=sheets) == ["a", "f"]
 
 
-def test_append_is_one_raw_insert_in_a_to_i_and_returns_the_row_numbers():
-    sheets = current_sheet()
-    sheets.put("Inbox", 1, COL_MESSAGE_ID - 1, "m1")
-    rows = [["d", "f", "s", "c", "sum", "act", "", "link", "m2"], ["d", "f", "s", "c", "sum", "act", "", "link", "m3"]]
-    assert sheet_writer.append(SID, rows, svc=sheets) == [3, 4]
-    name, kw = sheets.calls[0]
-    assert name == "values.append" and kw["range"] == "Inbox!A:I"
-    assert kw["valueInputOption"] == "RAW" and kw["insertDataOption"] == "INSERT_ROWS"
-    assert sheet_writer.append(SID, [], svc=sheets) == []
-    assert len(sheets.calls) == 1, "an empty append must not call the API"
-
-
-def test_update_is_one_raw_batch_over_the_agents_cells_only():
-    sheets = current_sheet()
-    count = sheet_writer.update(SID, {7: ["a"] * 9, 3: ["b"] * 9}, svc=sheets)
-    assert count == 2
-    name, kw = sheets.calls[0]
-    assert name == "values.batchUpdate" and kw["body"]["valueInputOption"] == "RAW"
-    assert [d["range"] for d in kw["body"]["data"]] == ["Inbox!A3:I3", "Inbox!A7:I7"]
-    assert sheet_writer.update(SID, {}, svc=sheets) == 0 and len(sheets.calls) == 1
-
-
 def test_the_writer_refuses_to_build_offline_and_reports_no_identity():
     with pytest.raises(InboxOffline):
         sheet_writer.service()
@@ -705,8 +740,10 @@ def test_a_refused_row_call_is_sheets_unavailable_not_a_raw_http_error():
     for call, run in (
         ("values.batchGet", lambda s: sheet_writer.id_rows(SID, svc=s)),
         ("values.batchGet", lambda s: sheet_writer.blank_action_ids(SID, svc=s)),
-        ("values.append", lambda s: sheet_writer.append(SID, [["x"] * 9], svc=s)),
-        ("values.batchUpdate", lambda s: sheet_writer.update(SID, {5: ["x"] * 9}, svc=s)),
+        ("get", lambda s: sheet_writer.write_rows(SID, [["x"] * 9], svc=s)),
+        ("values.batchGet", lambda s: sheet_writer.write_rows(SID, [["x"] * 9], svc=s)),
+        ("batchUpdate:rows", lambda s: sheet_writer.write_rows(SID, [["x"] * 9], svc=s)),
+        ("batchUpdate:order", lambda s: sheet_writer.setup(SID, svc=s, reorder=True)),
     ):
         sheets = current_sheet()
         sheets.fail[call] = _http_error(403)
@@ -933,7 +970,9 @@ def test_a_refused_formatting_pass_is_recorded_logged_without_the_id_and_rows_st
     assert SID not in text and "googleapis" not in text
     assert format_markers(sheets) == [] and sheets.rules == {}, "no marker: the next check retries"
     assert sheet_writer.id_rows(SID, svc=sheets) == {}
-    assert sheet_writer.append(SID, [["d", "f", "s", "c", "sum", "act", "", "l", "m1"]], svc=sheets) == [2]
+    assert sheet_writer.write_rows(
+        SID, [["2026-09-17 10:05", "f", "s", "c", "sum", "act", "", "l", "m1"]], svc=sheets
+    ).new_rows == [2]
 
     del sheets.fail["batchUpdate:format"]
     assert _check(sheets).formatting == sheet_writer.FORMAT_APPLIED
@@ -1222,3 +1261,429 @@ def test_the_look_covers_the_worktree_tab_only_when_it_is_the_agents():
         r.get("updateDimensionProperties", {}).get("range", {}).get("sheetId") == 9
         for r in hers.styled
     ), "hers is not styled at all"
+
+
+# --------------------------------------------------------------------------- #
+# Newest first — where a new row goes (2026-09-29)
+#
+# Both live sheets held their rows in two runs: the backfill newest-first from
+# row 2, and every message since appended oldest-first underneath, so today's
+# mail sat thousands of rows down. New rows are now INSERTED where their date
+# puts them, and what the fake does to a range that begins on row 2 is what
+# the throwaway sheet did when it was tried.
+# --------------------------------------------------------------------------- #
+
+def _row(mid: str, when: str, *, status: str = "", notes: str = "", mine: str | None = None) -> list[str]:
+    """A whole Inbox row: the agent's nine cells, her Status and Notes, and —
+    when ``mine`` is given — a cell in column M, which is no column of the
+    layout's at all."""
+    cells = [when, f"{mid}@x.com", f"Subject {mid}", "Other", f"Summary {mid}.", "Do it.", "",
+             f"https://mail.google.com/mail/u/0/#inbox/{mid}", mid, status, notes]
+    return cells + (["", mine] if mine is not None else [])
+
+
+def _agent(mid: str, when: str) -> list[str]:
+    return _row(mid, when)[: len(AGENT_COLUMNS)]
+
+
+def _fill(sheets: FakeSheets, rows: list[list[str]]) -> FakeSheets:
+    for r, cells in enumerate(rows, start=1):
+        for c, value in enumerate(cells):
+            sheets.put("Inbox", r, c, value)
+    return sheets
+
+
+def _body(sheets: FakeSheets) -> list[list[str]]:
+    """Every row under the header that holds anything, as whole rows."""
+    rows = [sheets.row("Inbox", r, 13) for r in range(1, len(sheets.rows("Inbox")))]
+    return [row for row in rows if any(row)]
+
+
+def _ids(sheets: FakeSheets) -> list[str]:
+    return [row[COL_MESSAGE_ID - 1] for row in _body(sheets)]
+
+
+def newest_first_sheet() -> FakeSheets:
+    return _fill(current_sheet(), [
+        _row("c", "2026-09-20 09:00", status="In progress", notes="note c", mine="mine c"),
+        _row("b", "2026-09-18 09:00", notes="note b"),
+        _row("a", "2026-09-16 09:00", status="Done", mine="mine a"),
+    ])
+
+
+def split_sheet() -> FakeSheets:
+    """A live sheet as it was found: eight backfill rows newest-first, then
+    five appended since, oldest first — her Status, her Notes and a column of
+    her own on some of each."""
+    backfill = [
+        _row(f"b{i}", f"2026-09-{18 - i:02d} 09:00", status="Done" if i % 3 == 0 else "",
+             notes=f"note b{i}" if i % 2 else "", mine=f"mine b{i}" if i % 4 == 0 else None)
+        for i in range(8)
+    ]
+    since = [
+        _row(f"n{i}", f"2026-09-{19 + i:02d} 08:00", status="In progress" if i == 1 else "",
+             notes=f"note n{i}", mine=f"mine n{i}")
+        for i in range(5)
+    ]
+    return _fill(current_sheet(), backfill + since)
+
+
+def _row_batches(sheets: FakeSheets) -> list[list[dict]]:
+    return [kw["body"]["requests"] for name, kw in sheets.calls if name == "batchUpdate:rows"]
+
+
+def test_a_new_message_lands_in_the_first_data_row_and_every_older_row_moves_down_whole():
+    sheets = newest_first_sheet()
+    before = _body(sheets)
+
+    written = sheet_writer.write_rows(SID, [_agent("d", "2026-09-29 10:15")], svc=sheets)
+
+    assert written.new_rows == [2] and written.updated == {} and written.missing == []
+    assert sheets.names() == ["get", "values.batchGet", "batchUpdate:rows"], \
+        "where things are is read once, and everything is written once"
+    read = next(kw for name, kw in sheets.calls if name == "values.batchGet")
+    assert read["ranges"] == ["Inbox!A1:Z1", "Inbox!A:A", "Inbox!I:I"]
+    body = _body(sheets)
+    assert body[0] == _agent("d", "2026-09-29 10:15") + [""] * 4, \
+        "the agent's nine cells, and nothing in any column of hers"
+    assert body[1:] == before, "every older row is one row lower, with every cell it had"
+    assert sheets.row("Inbox", 0, 11) == list(HEADERS), "the header row never moves"
+    assert sheet_writer.id_rows(SID, svc=sheets) == {"d": 2, "c": 3, "b": 4, "a": 5}
+
+
+def test_two_messages_in_one_write_keep_newest_first_order():
+    sheets = newest_first_sheet()
+    older, newer = _agent("d", "2026-09-29 10:15"), _agent("e", "2026-09-29 10:40")
+
+    written = sheet_writer.write_rows(SID, [older, newer], svc=sheets)
+
+    assert _ids(sheets) == ["e", "d", "c", "b", "a"]
+    assert written.new_rows == [3, 2], "each row's number, in the order the rows were handed over"
+    assert len(_row_batches(sheets)) == 1
+
+
+def test_an_older_message_goes_where_its_date_puts_it_and_the_oldest_to_the_bottom():
+    """The backfill walks back in time, and a reconnect finds mail that came
+    in while the inbox was disconnected: neither belongs on top."""
+    sheets = newest_first_sheet()
+    rows = [
+        _agent("old", "2026-06-30 12:00"),      # older than everything: the bottom
+        _agent("gap", "2026-09-19 12:00"),      # between c and b
+        _agent("new", "2026-09-29 12:00"),      # newer than everything: the top
+        _agent("gap2", "2026-09-19 18:00"),     # the same gap, and newer than "gap"
+    ]
+
+    written = sheet_writer.write_rows(SID, rows, svc=sheets)
+
+    assert _ids(sheets) == ["new", "c", "gap2", "gap", "b", "a", "old"]
+    assert written.new_rows == [8, 5, 2, 4]
+    assert [row[9:] for row in _body(sheets) if row[8] in ("c", "b", "a")] == [
+        ["In progress", "note c", "", "mine c"], ["", "note b", "", ""], ["Done", "", "", "mine a"],
+    ], "her cells went with their rows"
+    dates = [row[0] for row in _body(sheets)]
+    assert dates == sorted(dates, reverse=True)
+
+
+def test_a_message_from_the_same_minute_as_the_top_row_still_goes_above_it():
+    sheets = newest_first_sheet()
+    sheet_writer.write_rows(SID, [_agent("d", "2026-09-20 09:00")], svc=sheets)
+    assert _ids(sheets)[:2] == ["d", "c"]
+
+
+def test_the_first_row_of_an_empty_sheet_is_row_two():
+    sheets = current_sheet()
+    written = sheet_writer.write_rows(
+        SID, [_agent("a", "2026-09-16 09:00"), _agent("b", "2026-09-18 09:00")], svc=sheets)
+    assert _ids(sheets) == ["b", "a"] and written.new_rows == [3, 2]
+
+
+def test_rows_she_typed_herself_are_passed_over_never_written_over():
+    sheets = newest_first_sheet()
+    sheets.grid["Inbox"].insert(1, ["call the landlord"])  # her own line, on top, no date, no id
+    sheets.put("Inbox", 7, 10, "a note of hers far below the last message")
+
+    sheet_writer.write_rows(
+        SID, [_agent("d", "2026-09-29 10:15"), _agent("old", "2026-06-30 12:00")], svc=sheets)
+
+    grid = sheets.grid["Inbox"]
+    assert grid[1] == ["call the landlord"], "a row that is not a message is not a place to insert"
+    assert [row[COL_MESSAGE_ID - 1] for row in _body(sheets)[1:]] == ["d", "c", "b", "a", "old", ""]
+    assert sheets.cell("Inbox", 9, 10) == "a note of hers far below the last message"
+
+
+def test_the_banding_still_begins_on_the_first_data_row_after_rows_go_in_on_top():
+    """Tried on the throwaway sheet: an insert AT row 2 pushes a range that
+    begins on row 2 down with it, so the new rows sat above the banding,
+    unbanded. The rows are inserted below the first row instead, inside the
+    range, and that row is moved beneath them."""
+    sheets = newest_first_sheet()
+    inbox = sheets.tabs["Inbox"]
+    assert sheets.band_start[inbox] == 1
+
+    sheet_writer.write_rows(
+        SID, [_agent("d", "2026-09-29 10:15"), _agent("e", "2026-09-29 10:40")], svc=sheets)
+
+    assert sheets.band_start[inbox] == 1, "the banding did not drift"
+    requests = _row_batches(sheets)[0]
+    assert [name for r in requests for name in r] == ["insertDimension", "moveDimension", "updateCells"]
+    insert, move, cells = requests
+    assert insert["insertDimension"]["range"] == {
+        "sheetId": inbox, "dimension": "ROWS", "startIndex": 2, "endIndex": 4}
+    assert insert["insertDimension"]["inheritFromBefore"] is True, "a data row's look, never the header's"
+    assert move["moveDimension"] == {
+        "source": {"sheetId": inbox, "dimension": "ROWS", "startIndex": 1, "endIndex": 2},
+        "destinationIndex": 4,
+    }
+    assert cells["updateCells"]["start"] == {"sheetId": inbox, "rowIndex": 1, "columnIndex": 0}
+    assert _ids(sheets) == ["e", "d", "c", "b", "a"]
+
+
+def test_cells_are_written_as_text_never_evaluated_and_an_empty_cell_is_left_blank():
+    sheets = newest_first_sheet()
+    row = _agent("d", "2026-09-29 10:15")
+    row[2] = '=HYPERLINK("https://evil.example","Invoice")'
+
+    sheet_writer.write_rows(SID, [row], svc=sheets)
+
+    cells = _row_batches(sheets)[0][-1]["updateCells"]
+    assert cells["fields"] == "userEnteredValue"
+    values = cells["rows"][0]["values"]
+    assert len(values) == len(AGENT_COLUMNS), "A..I and nothing to the right of it"
+    assert values[2] == {"userEnteredValue": {"stringValue": row[2]}}, \
+        "a string value is stored as typed; only a formulaValue is ever evaluated"
+    assert values[6] == {}, "no Deadline is no value, not an empty string"
+    assert all(set(v) <= {"userEnteredValue"} and "formulaValue" not in str(v) for v in values)
+
+
+def test_a_rewrite_finds_its_row_by_id_at_the_moment_it_writes_not_by_an_earlier_number():
+    sheets = newest_first_sheet()
+    assert sheet_writer.id_rows(SID, svc=sheets)["a"] == 4
+    # Between the fire's first read and its write she sorted the tab.
+    grid = sheets.grid["Inbox"]
+    grid[1], grid[3] = grid[3], grid[1]
+    before = _body(sheets)
+    again = _agent("a", "2026-09-16 09:00")
+    again[4] = "Now readable."
+
+    written = sheet_writer.write_rows(
+        SID, [], {"a": again, "gone": _agent("gone", "2026-09-01 09:00")}, svc=sheets)
+
+    assert written.updated == {"a": 2} and written.missing == ["gone"]
+    body = _body(sheets)
+    assert body[0][:9] == again and body[0][9:] == ["Done", "", "", "mine a"], \
+        "the agent's cells rewritten, hers on that row untouched"
+    assert body[1:] == before[1:], "no other row was written to"
+
+
+def test_a_rewrite_and_new_rows_in_one_fire_are_one_batch_and_each_reaches_its_own_row():
+    """The reason the rewrite is addressed by id: a row inserted on top moves
+    every row beneath it, so a number read before the insert names the row
+    above the one that was meant."""
+    sheets = newest_first_sheet()
+    again = _agent("b", "2026-09-18 09:00")
+    again[4] = "Now readable."
+
+    written = sheet_writer.write_rows(
+        SID, [_agent("d", "2026-09-29 10:15")], {"b": again}, svc=sheets)
+
+    assert len(_row_batches(sheets)) == 1
+    assert written.new_rows == [2] and written.updated == {"b": 4}
+    body = {row[8]: row for row in _body(sheets)}
+    assert body["b"][4] == "Now readable." and body["b"][10] == "note b"
+    assert body["c"][4] == "Summary c." and body["a"][4] == "Summary a."
+
+
+def test_a_refused_write_changes_nothing_at_all():
+    sheets = newest_first_sheet()
+    before = copy.deepcopy(sheets.grid["Inbox"])
+    sheets.fail["batchUpdate:rows"] = _http_error(400)
+    again = _agent("b", "2026-09-18 09:00")
+    with pytest.raises(SheetsUnavailable, match="row write was refused: HTTP 400"):
+        sheet_writer.write_rows(SID, [_agent("d", "2026-09-29 10:15")], {"b": again}, svc=sheets)
+    assert sheets.grid["Inbox"] == before, "one batch: all of it or none of it"
+
+
+def test_a_message_already_on_the_sheet_is_not_written_a_second_time():
+    sheets = newest_first_sheet()
+    written = sheet_writer.write_rows(
+        SID, [_agent("b", "2026-09-18 09:00"), _agent("d", "2026-09-29 10:15")], svc=sheets)
+    assert _ids(sheets) == ["d", "c", "b", "a"]
+    assert written.new_rows == [4, 2], "the row it already has, and the new one"
+
+
+def test_nothing_to_write_asks_sheets_nothing_and_a_foreign_layout_is_refused_unwritten():
+    sheets = newest_first_sheet()
+    assert sheet_writer.write_rows(SID, [], {}, svc=sheets) == sheet_writer.Written()
+    assert sheets.calls == []
+    legacy = legacy_sheet(3)
+    before = copy.deepcopy(legacy.grid["Inbox"])
+    with pytest.raises(LayoutMismatch):
+        sheet_writer.write_rows(SID, [_agent("d", "2026-09-29 10:15")], svc=legacy)
+    assert legacy.grid["Inbox"] == before and "batchUpdate:rows" not in legacy.names()
+
+
+def test_inserting_rows_cannot_move_the_upcoming_view():
+    """Upcoming reads whole columns of Inbox, so no insert and no sort can
+    shift what it points at; set-up finds nothing to repair afterwards."""
+    sheets = newest_first_sheet()
+    sheet_writer.write_rows(SID, [_agent("d", "2026-09-29 10:15")], svc=sheets)
+    sheets.calls.clear()
+    sheet_writer.setup(SID, svc=sheets, reorder=True)
+    assert sheets.cell("Upcoming", 1, 0) == UPCOMING_FORMULA and "values.update" not in sheets.names()
+
+
+# --------------------------------------------------------------------------- #
+# The one-time reorder — existing sheets brought into the same order, once
+# --------------------------------------------------------------------------- #
+
+def _order_markers(sheets: FakeSheets) -> list[dict]:
+    return [m for m in sheets.metadata if m["metadataKey"] == sheet_layout.ORDER_MARKER_KEY]
+
+
+def _check_as_a_poll(sheets: FakeSheets):
+    return sheet_writer.check(
+        SID, caller_email=CALLER, svc=sheets, drive=FakeDrive(), reorder=True)
+
+
+def test_the_reorder_is_one_sort_of_whole_rows_with_the_marker_last_in_the_same_batch():
+    requests = sheet_layout.order_requests({}, 7)
+    assert [name for r in requests for name in r] == ["sortRange", "createDeveloperMetadata"]
+    sort = requests[0]["sortRange"]
+    assert sort["range"] == {"sheetId": 7, "startRowIndex": 1}, \
+        "below the header, to the end, and NO column bounds: a row moves with every cell in it"
+    assert sort["sortSpecs"] == [
+        {"dimensionIndex": 0, "sortOrder": "DESCENDING"},                   # Date
+        {"dimensionIndex": COL_MESSAGE_ID - 1, "sortOrder": "DESCENDING"},  # a tie inside a minute
+    ]
+    marker = requests[-1]["createDeveloperMetadata"]["developerMetadata"]
+    assert (marker["metadataKey"], marker["metadataValue"]) == (
+        sheet_layout.ORDER_MARKER_KEY, sheet_layout.ORDER_VERSION)
+    assert marker["location"] == {"spreadsheet": True}
+
+
+def test_the_reorder_makes_a_split_sheet_newest_first_and_keeps_every_cell_of_a_row_together():
+    sheets = split_sheet()
+    before = {row[8]: row for row in _body(sheets)}
+    assert _ids(sheets)[:2] == ["b0", "b1"] and _ids(sheets)[-1] == "n4", "today's mail is last"
+
+    result = _check_as_a_poll(sheets)
+
+    assert result.status == "ok" and result.ordering == sheet_writer.ORDER_APPLIED
+    body = _body(sheets)
+    assert [row[8] for row in body] == [
+        "n4", "n3", "n2", "n1", "n0", "b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7"]
+    dates = [row[0] for row in body]
+    assert dates == sorted(dates, reverse=True) and len(set(dates)) == len(dates)
+    assert {row[8]: row for row in body} == before, \
+        "every row is the row it was: her Status, her Notes and her own column M included"
+    assert body[3][9:] == ["In progress", "note n1", "", "mine n1"]
+    assert sheets.row("Inbox", 0, 11) == list(HEADERS), "the header is not in the sort"
+    assert sheets.names().count("batchUpdate:order") == 1
+    assert [m["metadataValue"] for m in _order_markers(sheets)] == [sheet_layout.ORDER_VERSION]
+
+
+def test_the_reorder_runs_once_and_a_sort_of_her_own_afterwards_is_hers():
+    sheets = split_sheet()
+    _check_as_a_poll(sheets)
+    # She sorts the tab her own way (oldest first).
+    grid = sheets.grid["Inbox"]
+    grid[1:] = sorted((row for row in grid[1:] if any(row)), key=lambda row: row[0])
+    hers = copy.deepcopy(grid)
+    sheets.calls.clear()
+
+    for _ in range(3):
+        assert _check_as_a_poll(sheets).ordering == sheet_writer.ORDER_ALREADY
+
+    assert "batchUpdate:order" not in sheets.names() and sheets.grid["Inbox"] == hers
+    assert len(_order_markers(sheets)) == 1
+
+
+def test_a_check_that_is_not_a_poll_never_moves_a_row():
+    """Setting or re-checking the sheet from the panel can land in the middle
+    of a fire. Only the fire, which holds the lease, may move rows."""
+    sheets = split_sheet()
+    before = copy.deepcopy(sheets.grid["Inbox"])
+    result = _check(sheets)
+    assert result.status == "ok" and result.ordering == sheet_writer.ORDER_PENDING
+    assert sheets.grid["Inbox"] == before and _order_markers(sheets) == []
+    assert "batchUpdate:order" not in sheets.names()
+
+
+def test_a_new_sheet_is_marked_newest_first_with_nothing_to_move():
+    sheets = FakeSheets()
+    assert _check_as_a_poll(sheets).ordering == sheet_writer.ORDER_APPLIED
+    assert len(_order_markers(sheets)) == 1 and _body(sheets) == []
+
+
+def test_a_refused_reorder_fails_loudly_moves_nothing_marks_nothing_and_the_next_poll_does_it():
+    sheets = split_sheet()
+    before = copy.deepcopy(sheets.grid["Inbox"])
+    sheets.fail["batchUpdate:order"] = HttpError(
+        SimpleNamespace(status=400, reason="bad"), b"body",
+        uri=f"https://sheets.googleapis.com/v4/spreadsheets/{SID}:batchUpdate")
+
+    with pytest.raises(sheet_writer.ReorderFailed) as caught:
+        _check_as_a_poll(sheets)
+
+    text = str(caught.value)
+    assert "did not complete" in text and "HTTP 400" in text and "No row was moved" in text
+    assert SID not in text and "googleapis" not in text
+    assert isinstance(caught.value, SheetsUnavailable), "the fire's handler catches it"
+    assert sheets.grid["Inbox"] == before, "the sheet is exactly as it was"
+    assert _order_markers(sheets) == [], "and it is NOT marked done"
+
+    # The interruption over, the next poll starts again and finishes.
+    del sheets.fail["batchUpdate:order"]
+    assert _check_as_a_poll(sheets).ordering == sheet_writer.ORDER_APPLIED
+    dates = [row[0] for row in _body(sheets)]
+    assert dates == sorted(dates, reverse=True) and len(_order_markers(sheets)) == 1
+
+
+def test_a_reorder_cut_off_mid_batch_leaves_no_half_sorted_sheet():
+    """The batch is atomic in Sheets: a request it refuses takes the sort
+    back with it. Here the marker is what it refuses."""
+    sheets = split_sheet()
+    before = copy.deepcopy(sheets.grid["Inbox"])
+    sheets.refuse_metadata_key = sheet_layout.ORDER_MARKER_KEY
+
+    with pytest.raises(sheet_writer.ReorderFailed):
+        _check_as_a_poll(sheets)
+
+    assert sheets.grid["Inbox"] == before and _order_markers(sheets) == []
+    sheets.refuse_metadata_key = None
+    assert _check_as_a_poll(sheets).ordering == sheet_writer.ORDER_APPLIED
+
+
+def test_a_reorder_whose_reply_was_lost_is_found_on_the_sheet_and_not_reported_as_failed():
+    """The batch applied and the connection died before the answer arrived —
+    three times over, since the call is retried. What is true is on the
+    sheet, so the sheet is asked."""
+    sheets = split_sheet()
+    real_batch = sheets._batch_update
+
+    def applied_but_unanswered(**kw):
+        request = real_batch(**kw)
+        if any("sortRange" in r for r in kw["body"]["requests"]):
+            request.execute()
+            return _Req(error=TimeoutError("The write operation timed out"))
+        return request
+
+    sheets._batch_update = applied_but_unanswered
+
+    assert _check_as_a_poll(sheets).ordering == sheet_writer.ORDER_APPLIED
+
+    dates = [row[0] for row in _body(sheets)]
+    assert dates == sorted(dates, reverse=True) and len(dates) == 13, "no row lost or doubled"
+    assert _order_markers(sheets), "marked, so no later poll sorts again"
+    sheets._batch_update = real_batch
+    sheets.calls.clear()
+    assert _check_as_a_poll(sheets).ordering == sheet_writer.ORDER_ALREADY
+    assert "batchUpdate:order" not in sheets.names()
+
+
+def test_after_the_reorder_new_mail_lands_on_top_of_a_sheet_that_is_one_order():
+    sheets = split_sheet()
+    _check_as_a_poll(sheets)
+    sheet_writer.write_rows(SID, [_agent("today", "2026-09-29 10:15")], svc=sheets)
+    ids = _ids(sheets)
+    assert ids[0] == "today" and ids[1:6] == ["n4", "n3", "n2", "n1", "n0"] and ids[-1] == "b7"

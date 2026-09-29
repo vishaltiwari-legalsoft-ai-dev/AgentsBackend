@@ -23,8 +23,7 @@ def test_the_columns_and_their_indexes():
     )
     assert sl.AGENT_COLUMNS.index("Action") == sl.AGENT_COLUMNS.index("Summary") + 1
     assert (sl.COL_ACTION, sl.COL_DEADLINE, sl.COL_MESSAGE_ID, sl.COL_STATUS) == (6, 7, 9, 10)  # F G I J
-    assert sl.AGENT_RANGE.format(row=7) == "A7:I7"
-    assert sl.MESSAGE_ID_RANGE == "Inbox!I:I"
+    assert sl.MESSAGE_ID_RANGE == "Inbox!I:I" and sl.DATE_RANGE == "Inbox!A:A"
     assert sl.LEGACY_AGENT_COLUMNS + ("Status", "Notes") == (
         "Date", "From", "Subject", "Category", "Summary", "Deadline", "Link", "Message ID",
         "Status", "Notes",
@@ -420,6 +419,7 @@ def test_the_rows_are_capped_and_the_true_total_is_still_reported():
     messages = [_msg(f"m{i}", thread=f"t{i}", subject=f"S{i}") for i in range(wt.MAX_PROCESSES + 5)]
     tree = wt.build(messages, today=WT_TODAY)
     assert len(tree.processes) == wt.MAX_PROCESSES and tree.total == wt.MAX_PROCESSES + 5
+    assert len({p.thread_id for p in tree.processes}) == wt.MAX_PROCESSES, "no thread twice"
 
 
 def test_a_worktree_row_is_cells_in_header_order():
@@ -549,3 +549,142 @@ def test_the_build_reports_how_many_markers_it_actually_used():
         today=WT_TODAY,
     )
     assert tree.sent_used == 1, "the orphan thread is not a process, so its marker is not used"
+
+
+# --------------------------------------------------------------------------- #
+# Pinned 2026-09-29: a thread with fresh mail is on the tab however many
+# alarms there are. One live inbox had 453 open processes; the 200 rows were
+# all alarms two to four weeks old, and nothing that began today could appear.
+# --------------------------------------------------------------------------- #
+
+def _alarms(count: int) -> list:
+    """Threads we owe a reply on, silent for 5 to 25 days: every one an alarm."""
+    return [
+        _msg(f"old{i}", thread=f"alarm-{i:03d}", subject=f"Alarm {i:03d}", days_ago=5 + i % 21)
+        for i in range(count)
+    ]
+
+
+def test_a_thread_with_fresh_mail_is_on_the_tab_when_there_are_more_alarms_than_rows():
+    fresh = _msg("new", thread="fresh", subject="Started today", days_ago=0, deadline=None)
+    tree = wt.build(_alarms(453) + [fresh], today=WT_TODAY)
+
+    assert tree.total == 454 and len(tree.processes) == wt.MAX_PROCESSES
+    shown = {p.thread_id: p for p in tree.processes}
+    assert "fresh" in shown and shown["fresh"].status == wt.STATUS_WAITING_ON_US
+    assert shown["fresh"].waiting_since == "today"
+    assert sum(1 for p in tree.processes if p.chasing) >= wt.MAX_PROCESSES - wt.RECENT_RESERVED, \
+        "and the tab is still mostly what is most urgent"
+
+
+def test_the_reserve_is_for_the_fifty_threads_with_the_most_recent_mail():
+    assert wt.RECENT_RESERVED == 50
+    recent = [
+        _msg(f"r{i}", thread=f"recent-{i:02d}", subject=f"Recent {i:02d}", days_ago=i // 30)
+        for i in range(60)
+    ]  # thirty from today, thirty from yesterday
+    # Give the threads of one day different times, newest first by number.
+    recent = [
+        wt.ThreadMessage(**{**m.__dict__, "received_at": m.received_at - timedelta(minutes=i)})
+        for i, m in enumerate(recent)
+    ]
+    tree = wt.build(_alarms(300) + recent, today=WT_TODAY)
+
+    kept = {p.thread_id for p in tree.processes if p.thread_id.startswith("recent-")}
+    assert kept == {f"recent-{i:02d}" for i in range(50)}, "the fifty most recent, not any fifty"
+    assert len(tree.processes) == wt.MAX_PROCESSES
+    alarms = [p for p in tree.processes if p.chasing]
+    assert len(alarms) == 150 and min(p.waiting_days for p in alarms) >= 11, \
+        "the other rows go to the longest-ignored alarms, as before"
+
+
+def test_the_order_on_the_tab_is_the_same_whichever_rule_kept_a_row():
+    tree = wt.build(_alarms(300) + [_msg("new", thread="fresh", days_ago=0)], today=WT_TODAY)
+    assert tree.processes == sorted(tree.processes, key=wt.Process.sort_key)
+    assert tree.processes[-1].thread_id == "fresh", "alarms first; what is merely waiting after"
+    again = wt.build(list(reversed(_alarms(300))) + [_msg("new", thread="fresh", days_ago=0)],
+                     today=WT_TODAY)
+    assert again.processes == tree.processes, "the same facts always choose the same rows"
+
+
+def test_when_everything_fits_nothing_about_the_tab_changes():
+    messages = _alarms(120) + [
+        _msg(f"r{i}", thread=f"recent-{i}", subject=f"Recent {i}", days_ago=0) for i in range(80)
+    ]
+    tree = wt.build(messages, today=WT_TODAY)
+    assert len(tree.processes) == tree.total == 200
+    assert [p.chasing for p in tree.processes] == [True] * 120 + [False] * 80
+
+
+def test_a_thread_whose_date_could_not_be_read_never_takes_a_reserved_row():
+    unread = wt.ThreadMessage(
+        message_id="x", thread_id="undated", received_at=None, subject="Undated",
+        category="fyi", action=None, deadline=None, from_me=False,
+    )
+    fresh = [_msg(f"r{i}", thread=f"recent-{i:02d}", subject=f"Recent {i:02d}") for i in range(50)]
+    tree = wt.build(_alarms(300) + fresh + [unread], today=WT_TODAY)
+    assert "undated" not in {p.thread_id for p in tree.processes}
+
+
+# --------------------------------------------------------------------------- #
+# Pinned 2026-09-29: where a new row goes
+# --------------------------------------------------------------------------- #
+
+SHEET_DATES = ["Date", "2026-09-20 09:00", "2026-09-18 09:00", "2026-09-16 09:00"]
+
+
+def test_a_row_goes_above_the_first_row_as_old_as_it_or_older():
+    place = lambda *new: sl.place(SHEET_DATES, list(new), end=4)  # noqa: E731
+    assert place("2026-09-29 10:00") == [sl.Block(at=1, rows=(0,))], "new mail: the top"
+    assert place("2026-09-19 10:00") == [sl.Block(at=2, rows=(0,))], "in between"
+    assert place("2026-09-18 09:00") == [sl.Block(at=2, rows=(0,))], "a tie goes above"
+    assert place("2026-06-01 10:00") == [sl.Block(at=4, rows=(0,))], "older than all: the bottom"
+    assert sl.place(["Date"], ["2026-09-29 10:00"], end=1) == [sl.Block(at=1, rows=(0,))]
+
+
+def test_rows_for_one_place_are_one_block_newest_first_whatever_order_they_came_in():
+    blocks = sl.place(
+        SHEET_DATES,
+        ["2026-09-29 08:00", "2026-06-01 10:00", "2026-09-29 17:00", "2026-09-17 12:00"], end=4)
+    assert blocks == [
+        sl.Block(at=1, rows=(2, 0)), sl.Block(at=3, rows=(3,)), sl.Block(at=4, rows=(1,)),
+    ]
+    assert sl.landed(blocks, 4) == [3, 8, 2, 6]
+    # The rows that were there, by 0-based index as read -> where they are now.
+    assert [sl.pushed(i, blocks) for i in (1, 2, 3)] == [3, 4, 6]
+
+
+def test_a_cell_that_is_not_a_date_the_agent_wrote_is_passed_over():
+    dates = ["Date", "call the landlord", "", "2026-09-20 09:00", "20/09/2026", "2026-09-16 09:00"]
+    assert sl.place(dates, ["2026-09-29 10:00"], end=6) == [sl.Block(at=3, rows=(0,))]
+    assert sl.place(dates, ["2026-09-17 10:00"], end=6) == [sl.Block(at=5, rows=(0,))]
+    assert [sl.is_date_cell(c) for c in dates] == [False, False, False, True, False, True]
+
+
+def test_the_blocks_are_sent_bottom_first_so_every_index_is_the_one_that_was_read():
+    rows = [["2026-09-29 08:00"] + ["x"] * 8, ["2026-06-01 10:00"] + ["y"] * 8]
+    blocks = sl.place(SHEET_DATES, [row[0] for row in rows], end=4)
+    requests = sl.insert_requests(5, blocks, rows)
+    assert [name for r in requests for name in r] == [
+        "insertDimension", "updateCells",                    # the bottom block, at index 4
+        "insertDimension", "moveDimension", "updateCells",   # then the top one
+    ]
+    assert requests[0]["insertDimension"]["range"] == {
+        "sheetId": 5, "dimension": "ROWS", "startIndex": 4, "endIndex": 5}
+    assert requests[1]["updateCells"]["start"]["rowIndex"] == 4
+    assert requests[4]["updateCells"]["start"]["rowIndex"] == 1
+    assert all(r["insertDimension"]["inheritFromBefore"] for r in requests if "insertDimension" in r)
+
+
+def test_the_order_marker_is_read_by_key_and_version():
+    marked = {"developerMetadata": [
+        {"metadataId": 3, "metadataKey": sl.ORDER_MARKER_KEY, "metadataValue": sl.ORDER_VERSION}]}
+    assert sl.is_newest_first(marked)
+    assert not sl.is_newest_first({})
+    assert not sl.is_newest_first({"developerMetadata": [
+        {"metadataKey": "agentos.a12.format", "metadataValue": "2"}]})
+    stale = {"developerMetadata": [
+        {"metadataId": 9, "metadataKey": sl.ORDER_MARKER_KEY, "metadataValue": "something-older"}]}
+    assert not sl.is_newest_first(stale)
+    assert {"deleteDeveloperMetadata": {"dataFilter": {"developerMetadataLookup": {"metadataId": 9}}}} \
+        in sl.order_requests(stale, 1), "a marker of another version is replaced, not added to"

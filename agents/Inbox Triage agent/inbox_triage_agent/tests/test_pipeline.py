@@ -23,9 +23,9 @@ from inbox_triage_agent.gmail_client import HistoryExpired, Message, MessageGone
 from inbox_triage_agent.gmail_oauth import RevokedGrant, Tokens
 from inbox_triage_agent.sheet_layout import (
     CATEGORY_LABELS, COL_ACTION, COL_CATEGORY, COL_DEADLINE, COL_MESSAGE_ID, COL_STATUS,
-    COL_SUMMARY, HEADERS, WORKTREE_HEADERS, message_link,
+    COL_SUMMARY, HEADERS, WORKTREE_HEADERS, landed, message_link, place, pushed,
 )
-from inbox_triage_agent.sheet_writer import SheetCheck, SheetsUnavailable
+from inbox_triage_agent.sheet_writer import SheetCheck, SheetsUnavailable, Written
 from inbox_triage_agent.summarise import ModelCallFailed, ModelUnavailable
 from inbox_triage_agent.triage import TEAM_TIMEZONE, NEEDS_REVIEW, Rejected, Verdict
 
@@ -127,10 +127,11 @@ class FakeStore:
 def _message(
     message_id: str, subject: str = "Paralegal search", body: str = "Need two by Friday.",
     *, thread: str = "", sender: str = "gm@rathorelegal.in",
+    at: datetime = datetime(2026, 9, 17, 10, 5, tzinfo=TEAM_TIMEZONE),
 ) -> Message:
     return Message(
         id=message_id, thread_id=thread or ("t-" + message_id),
-        received_at=datetime(2026, 9, 17, 10, 5, tzinfo=TEAM_TIMEZONE),
+        received_at=at,
         from_=sender, to="her@firm.com",
         date_header="Thu, 17 Sep 2026 10:05:00 +0530", subject=subject, body_text=body,
     )
@@ -213,19 +214,25 @@ class FakeMailbox:
 
 
 class FakeSheet:
-    """What ``sheet_writer`` would do: an id map, appends, updates, the
-    Action column the one-time re-triage reads, and a real grid — her Status
-    column included — so the Worktree is built from cells, not from a stub."""
+    """What ``sheet_writer`` would do: an id map, the one write a fire makes
+    (rows rewritten where their ids are, new rows placed newest first by the
+    layout's own ``place``), the Action column the one-time re-triage reads,
+    and a real grid — her Status column included — so the Worktree is built
+    from cells, not from a stub."""
 
     def __init__(self):
         self.rows: dict[str, int] = {}
         #: ids whose row has a category but an empty Action (legacy rows)
         self.blank_actions: list[str] = []
-        self.appended: list[list[str]] = []
+        #: the new rows handed to the writer, in the order they were handed
+        self.inserted: list[list[str]] = []
+        #: row (as it stood when written) -> the cells it was rewritten with
         self.updated: dict[int, list[str]] = {}
         self.checks = 0
-        self.check_result = SheetCheck("ok", "Her inbox", "", "ours")
+        self.check_result = SheetCheck("ok", "Her inbox", "", "ours", "already")
         self.checked_for: list[str] = []
+        #: whether each check was allowed to run the one-time reorder
+        self.reorders: list[bool] = []
         self.events: list[str] = []
         #: 1-based row number -> the eleven cells A..K, hers included
         self.grid: dict[int, list[str]] = {}
@@ -255,10 +262,15 @@ class FakeSheet:
     def worktree_column(self, name: str) -> list[str]:
         return [row[WORKTREE_HEADERS.index(name)] for row in self.worktree]
 
-    def check(self, spreadsheet_id, *, caller_email):
+    def check(self, spreadsheet_id, *, caller_email, reorder=False):
         self.checks += 1
         self.checked_for.append(caller_email)
+        self.reorders.append(reorder)
         return self.check_result
+
+    def top_to_bottom(self) -> list[str]:
+        """The message ids in sheet order, first data row first."""
+        return [mid for mid, _row in sorted(self.rows.items(), key=lambda item: item[1])]
 
     def id_rows(self, spreadsheet_id, *, svc=None):
         self.events.append("id_rows")
@@ -268,29 +280,34 @@ class FakeSheet:
         self.events.append("blank_action_ids")
         return list(self.blank_actions)
 
-    def append(self, spreadsheet_id, rows, *, svc=None):
-        if not rows:
-            return []
-        self.events.append("append")
-        first = 2 + len(self.rows)
-        numbers = []
-        for offset, row in enumerate(rows):
-            self.rows[row[ID]] = first + offset
-            numbers.append(first + offset)
-            self.appended.append(row)
-            self._put(first + offset, row)
-        return numbers
-
-    def update(self, spreadsheet_id, row_values, *, svc=None):
-        if row_values:
-            self.events.append("update")
-        self.updated.update(row_values)
-        by_row = {row: mid for mid, row in self.rows.items()}
-        for row, values in row_values.items():
+    def write_rows(self, spreadsheet_id, new_rows, updates=None, *, svc=None):
+        updates = dict(updates or {})
+        if not new_rows and not updates:
+            return Written()
+        self.events.append("write_rows")
+        for message_id, values in updates.items():
+            row = self.rows.get(message_id)
+            if row is None:
+                continue  # she deleted it; reported as missing below
             self._put(row, values)
-            if values[ACTION] and by_row.get(row) in self.blank_actions:
-                self.blank_actions.remove(by_row[row])
-        return len(row_values)
+            self.updated[row] = values
+            if values[ACTION] and message_id in self.blank_actions:
+                self.blank_actions.remove(message_id)
+        last = max([1, *self.rows.values(), *self.grid])
+        dates = [""] + [(self.grid.get(row) or [""])[0] for row in range(2, last + 1)]
+        blocks = place(dates, [row[0] for row in new_rows], end=last)
+        self.rows = {mid: pushed(row - 1, blocks) + 1 for mid, row in self.rows.items()}
+        self.grid = {pushed(row - 1, blocks) + 1: cells for row, cells in self.grid.items()}
+        numbers = landed(blocks, len(new_rows))
+        for values, row in zip(new_rows, numbers):
+            self.rows[values[ID]] = row
+            self.inserted.append(values)
+            self._put(row, values)
+        return Written(
+            new_rows=numbers,
+            updated={mid: self.rows[mid] for mid in updates if mid in self.rows},
+            missing=[mid for mid in updates if mid not in self.rows],
+        )
 
 
 def _reply(
@@ -353,7 +370,7 @@ def sheet(monkeypatch) -> FakeSheet:
     fake = FakeSheet()
     monkeypatch.setattr(sheet_writer, "service", lambda: "sheets-service")
     monkeypatch.setattr(sheet_writer, "service_account_email", lambda: "hub@project.iam.gserviceaccount.com")
-    for name in ("check", "id_rows", "blank_action_ids", "append", "update",
+    for name in ("check", "id_rows", "blank_action_ids", "write_rows",
                  "read_inbox", "write_worktree"):
         monkeypatch.setattr(sheet_writer, name, getattr(fake, name))
     from marketing_research_agent import sources_registry
@@ -390,7 +407,7 @@ def _connected_doc(*, sheet_check="ok", checked_at=NOW - timedelta(minutes=5), h
         "checkpoint": {"history_id": history_id, "updated_at": (NOW - timedelta(minutes=5)).isoformat()},
         "sheet": {"id": SID, "url": "https://docs.google.com/spreadsheets/d/x/edit", "title": "Her inbox",
                   "check": sheet_check, "checked_at": checked_at.isoformat() if checked_at else None,
-                  "checked_for": EMAIL, "worktree": "ours"},
+                  "checked_for": EMAIL, "worktree": "ours", "ordering": "already"},
         "backfill": {"state": "running", "cursor": None, "done": 0, "total": None,
                      "since_epoch": int((NOW - timedelta(days=90)).timestamp())},
         "needs_review": 0, "recent_fires": [], "last_poll": None, "lease_until": None,
@@ -411,7 +428,7 @@ def test_a_fire_for_nobody_or_for_an_unconnected_user_skips(store, sheet, mailbo
     assert pipeline.fire("nobody", email=EMAIL, now=NOW).skipped == "gmail not connected"
     store.connections[UID] = {"gmail": {"connected": False}}
     assert pipeline.fire(UID, email=EMAIL, now=NOW).skipped == "gmail not connected"
-    assert mailbox.fetched == [] and sheet.appended == []
+    assert mailbox.fetched == [] and sheet.inserted == []
 
 
 def test_no_sheet_or_a_failed_check_skips_and_a_failed_check_is_retried(connected, sheet):
@@ -436,7 +453,7 @@ def test_a_check_older_than_an_hour_is_repeated_and_a_fresh_ok_one_is_not(connec
 # Order and duplicates
 # --------------------------------------------------------------------------- #
 
-def test_new_mail_is_worked_before_the_backfill_and_the_checkpoint_after_the_append(
+def test_new_mail_is_worked_before_the_backfill_and_the_checkpoint_after_the_write(
     connected, mailbox, sheet
 ):
     mailbox.messages = {m: _message(m) for m in ("new1", "new2", "old1", "old2")}
@@ -450,8 +467,8 @@ def test_new_mail_is_worked_before_the_backfill_and_the_checkpoint_after_the_app
     assert report.ok and report.new_rows == 4 and report.messages_read == 4
     fetches = [e for e in events if e.startswith("fetch:")]
     assert fetches == ["fetch:new1", "fetch:new2", "fetch:old1", "fetch:old2"]
-    assert events.index("append") < events.index("messages")
-    assert events.index("append") < [i for i, e in enumerate(events) if e.startswith("save:") and "checkpoint" in e][0]
+    assert events.index("write_rows") < events.index("messages")
+    assert events.index("write_rows") < [i for i, e in enumerate(events) if e.startswith("save:") and "checkpoint" in e][0]
     assert events.index("id_rows") < events.index("history")
     doc = connected.connections[UID]
     assert doc["checkpoint"]["history_id"] == "950"
@@ -459,9 +476,9 @@ def test_new_mail_is_worked_before_the_backfill_and_the_checkpoint_after_the_app
     assert doc["last_poll"] == {"at": NOW.isoformat(), "ok": True, "messages_read": 4, "error": None}
     assert doc["recent_fires"] == [{"at": NOW.isoformat(), "rows": 4}]
     assert doc["lease_until"] is None
-    assert [row[ID] for row in sheet.appended] == ["new1", "new2", "old1", "old2"]
-    assert sheet.appended[0][CAT] == ASKS and sheet.appended[0][DEADLINE] == "2026-09-18"
-    assert sheet.appended[0][ACTION] == "Send Rathore Legal a shortlist of two paralegals by 18 Sep."
+    assert [row[ID] for row in sheet.inserted] == ["new1", "new2", "old1", "old2"]
+    assert sheet.inserted[0][CAT] == ASKS and sheet.inserted[0][DEADLINE] == "2026-09-18"
+    assert sheet.inserted[0][ACTION] == "Send Rathore Legal a shortlist of two paralegals by 18 Sep."
     tracked = connected.messages[f"{UID}__new1"]
     assert tracked["status"] == "ok" and tracked["retry_due"] is False and tracked["sheet_row"] == 2
 
@@ -474,13 +491,13 @@ def test_the_id_map_makes_a_duplicate_row_impossible(connected, mailbox, sheet):
     report = pipeline.fire(UID, email=EMAIL, now=NOW)
     assert report.new_rows == 2
     assert mailbox.fetched == ["m2", "m3"]
-    assert [row[ID] for row in sheet.appended] == ["m2", "m3"]
+    assert [row[ID] for row in sheet.inserted] == ["m2", "m3"]
 
 
 def test_a_message_deleted_between_listing_and_fetch_is_simply_not_a_row(connected, mailbox, sheet):
     mailbox.history_added = ["gone"]
     report = pipeline.fire(UID, email=EMAIL, now=NOW)
-    assert report.ok and report.new_rows == 0 and sheet.appended == []
+    assert report.ok and report.new_rows == 0 and sheet.inserted == []
 
 
 # --------------------------------------------------------------------------- #
@@ -493,7 +510,7 @@ def test_an_unreadable_message_gets_its_row_and_at_most_three_later_tries(connec
 
     first = pipeline.fire(UID, email=EMAIL, now=NOW)
     assert first.new_rows == 1 and first.needs_review_added == 1
-    row = sheet.appended[0]
+    row = sheet.inserted[0]
     assert row[CAT] == UNREAD and row[SUMMARY] == "" and row[ACTION] == "" and row[DEADLINE] == ""
     tracked = connected.messages[f"{UID}__odd"]
     assert (tracked["status"], tracked["attempts"], tracked["retry_due"]) == ("needs_review", 1, True)
@@ -548,7 +565,7 @@ def test_a_tracked_row_she_deleted_stops_being_retried(connected, mailbox, sheet
 # Checkpoint fallback, revocation, the model being down
 # --------------------------------------------------------------------------- #
 
-def test_an_expired_checkpoint_re_lists_the_last_day_under_a_fresh_checkpoint(connected, mailbox, sheet):
+def test_an_expired_checkpoint_re_lists_under_a_fresh_checkpoint(connected, mailbox, sheet):
     mailbox.history_expired = True
     mailbox.history_id = "1200"
     mailbox.messages = {"m1": _message("m1")}
@@ -570,7 +587,7 @@ def test_a_revoked_grant_marks_the_connection_disconnected_with_the_reason(conne
     assert "refresh_token_enc" not in doc
     assert doc["last_poll"]["ok"] is False and "connect again" in doc["last_poll"]["error"]
     assert doc["lease_until"] is None
-    assert mailbox.fetched == [] and sheet.appended == []
+    assert mailbox.fetched == [] and sheet.inserted == []
     assert pipeline.fire(UID, email=EMAIL, now=NOW).skipped == "gmail not connected"
 
 
@@ -580,7 +597,7 @@ def test_a_model_that_is_down_fails_the_fire_loudly_with_no_rows(connected, mail
     mailbox.history_added = ["a", "b", "c", "d"]
     report = pipeline.fire(UID, email=EMAIL, now=NOW)
     assert report.ok is False and "abandoned" in report.error
-    assert sheet.appended == [] and connected.messages == {}
+    assert sheet.inserted == [] and connected.messages == {}
     assert mailbox.fetched == ["a", "b", "c"], "three failures in a row is the trip"
     doc = connected.connections[UID]
     assert doc["last_poll"]["ok"] is False and doc["checkpoint"]["history_id"] == "800"
@@ -592,7 +609,7 @@ def test_one_flaky_call_is_a_needs_review_row_not_a_failed_fire(connected, mailb
     mailbox.history_added = ["a", "b"]
     report = pipeline.fire(UID, email=EMAIL, now=NOW)
     assert report.ok and report.new_rows == 2 and report.needs_review_added == 1
-    assert sheet.appended[0][CAT] == UNREAD and sheet.appended[1][CAT] == ASKS
+    assert sheet.inserted[0][CAT] == UNREAD and sheet.inserted[1][CAT] == ASKS
 
 
 def test_no_model_key_fails_before_any_mail_is_read(connected, mailbox, sheet, monkeypatch):
@@ -633,7 +650,7 @@ def test_the_budget_stops_the_loop_keeps_the_checkpoint_and_reports_partial(conn
 
     assert report.unreached is True and report.ok is True
     assert report.new_rows == 2 and mailbox.fetched == ["m0", "m1"]
-    assert [row[ID] for row in sheet.appended] == ["m0", "m1"], "what was done is written"
+    assert [row[ID] for row in sheet.inserted] == ["m0", "m1"], "what was done is written"
     assert connected.connections[UID]["checkpoint"]["history_id"] == "800", "an unfinished pass keeps the old checkpoint"
     assert connected.connections[UID]["backfill"]["state"] == "running"
     # The Worktree's reserve is kept back from the same budget, so a work
@@ -889,20 +906,16 @@ def test_no_key_is_model_unavailable_naming_the_setting(monkeypatch):
 def _timeline_patches(store: FakeStore, sheet: FakeSheet) -> tuple[list[str], dict]:
     """One timeline across the seams that matter for write-then-persist."""
     timeline: list[str] = []
-    real_id_rows, real_append, real_update = sheet.id_rows, sheet.append, sheet.update
+    real_id_rows, real_write = sheet.id_rows, sheet.write_rows
     real_messages, real_save = store.save_inbox_messages, store.save_inbox_connection
 
     def id_rows(sid, *, svc=None):
         timeline.append("id_rows")
         return real_id_rows(sid, svc=svc)
 
-    def append(sid, rows, *, svc=None):
-        timeline.append(f"append:{len(rows)}")
-        return real_append(sid, rows, svc=svc)
-
-    def update(sid, row_values, *, svc=None):
-        timeline.append(f"update:{len(row_values)}")
-        return real_update(sid, row_values, svc=svc)
+    def write_rows(sid, new_rows, updates=None, *, svc=None):
+        timeline.append(f"write:{len(new_rows)}+{len(updates or {})}")
+        return real_write(sid, new_rows, updates, svc=svc)
 
     def save_messages(user_id, docs):
         timeline.append("persist:messages")
@@ -916,14 +929,13 @@ def _timeline_patches(store: FakeStore, sheet: FakeSheet) -> tuple[list[str], di
         return real_save(user_id, patch, clear=clear)
 
     return timeline, {
-        (sheet_writer, "id_rows"): id_rows, (sheet_writer, "append"): append,
-        (sheet_writer, "update"): update,
+        (sheet_writer, "id_rows"): id_rows, (sheet_writer, "write_rows"): write_rows,
         (firestore_repo, "save_inbox_messages"): save_messages,
         (firestore_repo, "save_inbox_connection"): save_connection,
     }
 
 
-def test_a_whole_fire_reads_ids_then_appends_then_persists_then_checkpoints_and_a_refire_appends_nothing(
+def test_a_whole_fire_reads_ids_then_writes_then_persists_then_checkpoints_and_a_refire_writes_nothing(
     connected, mailbox, sheet, monkeypatch
 ):
     mailbox.messages = {m: _message(m) for m in ("n1", "n2", "b1")}
@@ -938,7 +950,7 @@ def test_a_whole_fire_reads_ids_then_appends_then_persists_then_checkpoints_and_
 
     assert first.ok and first.new_rows == 3
     assert timeline == [
-        "id_rows", "append:3", "update:0", "persist:messages", "persist:checkpoint",
+        "id_rows", "write:3+0", "persist:messages", "persist:checkpoint",
     ], "the sheet is read first, written once, and only then is anything persisted"
 
     # The same mail offered again (history still reports it; the backfill is
@@ -948,12 +960,12 @@ def test_a_whole_fire_reads_ids_then_appends_then_persists_then_checkpoints_and_
     second = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
 
     assert second.ok and second.new_rows == 0 and second.messages_read == 0
-    assert timeline[0] == "id_rows" and "append:0" in timeline
-    assert [row[ID] for row in sheet.appended] == ["n1", "n2", "b1"], "no row was written twice"
+    assert timeline[0] == "id_rows" and "write:0+0" in timeline
+    assert [row[ID] for row in sheet.inserted] == ["n1", "n2", "b1"], "no row was written twice"
     assert mailbox.fetched == ["n1", "n2", "b1"], "nothing already on the sheet is re-read"
 
 
-def test_a_fire_that_died_between_append_and_persist_duplicates_nothing_next_time(
+def test_a_fire_that_died_between_write_and_persist_duplicates_nothing_next_time(
     connected, mailbox, sheet, monkeypatch
 ):
     mailbox.messages = {m: _message(m) for m in ("n1", "n2")}
@@ -966,25 +978,25 @@ def test_a_fire_that_died_between_append_and_persist_duplicates_nothing_next_tim
     monkeypatch.setattr(firestore_repo, "save_inbox_messages", dies)
     with pytest.raises(RuntimeError, match="killed"):
         pipeline.fire(UID, email=EMAIL, now=NOW)
-    assert [row[ID] for row in sheet.appended] == ["n1", "n2"]
+    assert [row[ID] for row in sheet.inserted] == ["n1", "n2"]
     assert connected.connections[UID]["checkpoint"] == before["checkpoint"], "the checkpoint did not move"
     assert connected.connections[UID]["lease_until"] is None, "the lease is cleared even for an unmapped error"
 
     monkeypatch.setattr(firestore_repo, "save_inbox_messages", connected.save_inbox_messages)
     report = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
     assert report.ok and report.new_rows == 0
-    assert [row[ID] for row in sheet.appended] == ["n1", "n2"], "duplicate-over-drop must not become a duplicate row"
+    assert [row[ID] for row in sheet.inserted] == ["n1", "n2"], "duplicate-over-drop must not become a duplicate row"
     assert connected.connections[UID]["checkpoint"]["history_id"] == "950"
 
 
-def test_reconnecting_after_a_disconnect_appends_nothing_already_on_the_sheet(
+def test_reconnecting_after_a_disconnect_writes_nothing_already_on_the_sheet(
     store, mailbox, sheet, model, grant, consent
 ):
     store.connections[UID] = _connected_doc()
     mailbox.messages = {m: _message(m) for m in ("a", "b", "c")}
     mailbox.listing = ["c", "b", "a"]
     pipeline.fire(UID, email=EMAIL, now=NOW)
-    assert [row[ID] for row in sheet.appended] == ["c", "b", "a"]
+    assert [row[ID] for row in sheet.inserted] == ["c", "b", "a"]
 
     pipeline.disconnect(UID)
     assert store.connections[UID]["sheet"]["id"] == SID and store.messages == {}
@@ -995,17 +1007,19 @@ def test_reconnecting_after_a_disconnect_appends_nothing_already_on_the_sheet(
     report = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
 
     assert report.ok and report.new_rows == 0
-    assert [row[ID] for row in sheet.appended] == ["c", "b", "a"], "a reconnect must not re-append her rows"
+    assert [row[ID] for row in sheet.inserted] == ["c", "b", "a"], "a reconnect must not write her rows again"
     assert mailbox.fetched == fetched_before, "rows already on the sheet are not re-read either"
     assert store.connections[UID]["backfill"]["state"] == "done"
 
 
-def test_the_fallback_takes_a_fresh_checkpoint_before_listing_from_last_poll_less_a_day(
+def test_the_fallback_takes_a_fresh_checkpoint_before_listing_from_the_checkpoints_time_less_a_day(
     connected, mailbox, sheet, monkeypatch
 ):
-    last_poll_at = NOW - timedelta(minutes=5)
+    checkpoint_at = datetime.fromisoformat(connected.connections[UID]["checkpoint"]["updated_at"])
+    # The last attempt is later than the checkpoint, and failed: not the anchor.
     connected.connections[UID]["last_poll"] = {
-        "at": last_poll_at.isoformat(), "ok": True, "messages_read": 0, "error": None,
+        "at": (NOW - timedelta(minutes=1)).isoformat(), "ok": False, "messages_read": 0,
+        "error": "Gmail history was refused: HTTP 503",
     }
     connected.connections[UID]["backfill"]["state"] = "done"
     mailbox.history_expired = True
@@ -1031,11 +1045,11 @@ def test_the_fallback_takes_a_fresh_checkpoint_before_listing_from_last_poll_les
 
     assert report.ok and report.new_rows == 1
     assert order == ["profile", "list"], "the fresh history id is taken BEFORE the re-listing"
-    assert listed_after == [int(last_poll_at.timestamp()) - 86400]
+    assert listed_after == [int(checkpoint_at.timestamp()) - 86400]
     assert connected.connections[UID]["checkpoint"]["history_id"] == "1200"
 
 
-def test_the_fallback_without_a_last_poll_counts_the_day_back_from_the_checkpoint_time(
+def test_the_fallback_on_a_connection_that_never_polled_counts_back_from_the_checkpoint_time(
     connected, mailbox, sheet, monkeypatch
 ):
     connected.connections[UID]["backfill"]["state"] = "done"
@@ -1060,7 +1074,7 @@ def test_the_lease_is_cleared_when_the_fire_dies_of_an_unmapped_error(connected,
     with pytest.raises(KeyError):
         pipeline.fire(UID, email=EMAIL, now=NOW)
     assert connected.connections[UID]["lease_until"] is None
-    assert sheet.appended == [] and connected.messages == {}
+    assert sheet.inserted == [] and connected.messages == {}
     # And the next fire is not locked out by it.
     monkeypatch.setattr(gmail_client, "history_since", mailbox.history_since)
     assert pipeline.fire(UID, email=EMAIL, now=NOW).skipped is None
@@ -1088,7 +1102,7 @@ def test_a_budget_cut_inside_a_backfill_page_reports_partial_and_keeps_the_curso
     assert report.ok and report.unreached is True
     assert report.backfill_state == "running" and report.new_rows == 2
     assert (backfill["cursor"], backfill["done"]) == (None, 0), "a page cut short does not advance"
-    assert [row[ID] for row in sheet.appended] == ["o0", "o1"]
+    assert [row[ID] for row in sheet.inserted] == ["o0", "o1"]
 
 
 def test_nothing_of_a_message_reaches_any_log_during_a_whole_fire(connected, mailbox, sheet, model, caplog):
@@ -1133,7 +1147,7 @@ def test_a_sheet_that_stopped_being_shared_between_checks_fails_the_fire_on_the_
     assert report.ok is False and report.error
     doc = connected.connections[UID]
     assert doc["last_poll"]["ok"] is False and doc["last_poll"]["error"]
-    assert doc["lease_until"] is None and sheet.appended == []
+    assert doc["lease_until"] is None and sheet.inserted == []
 
 
 # --------------------------------------------------------------------------- #
@@ -1185,7 +1199,7 @@ def test_the_fire_re_proves_ownership_for_a_check_made_for_someone_else_and_writ
     report = pipeline.fire(UID, email=EMAIL, now=NOW)
     assert sheet.checked_for == [EMAIL]
     assert report.skipped == "sheet check: not_yours"
-    assert sheet.appended == [] and mailbox.fetched == []
+    assert sheet.inserted == [] and mailbox.fetched == []
 
 
 def test_the_hourly_recheck_re_proves_ownership_and_an_mr_sheet_is_caught_there_too(
@@ -1318,8 +1332,11 @@ def test_a_raw_sheets_refusal_reaches_the_panel_without_the_sheet_id_and_the_log
 # --------------------------------------------------------------------------- #
 # Pinned 2026-09-19: the Action column ships to a sheet that already has rows.
 # The first live sheet had 83 rows in the first release's layout; the first
-# fire after the deploy must migrate it in place, append nothing it already
+# fire after the deploy must migrate it in place, add no row it already
 # holds, and fill Action on the old rows through the ordinary summarise path.
+# It is also the first fire to meet the sheet since rows became newest-first,
+# so the same set-up pass sorts it once: rows are compared by Message ID here,
+# never by where they sit.
 # --------------------------------------------------------------------------- #
 
 def _real_sheet(monkeypatch, grid):
@@ -1335,7 +1352,7 @@ def _real_sheet(monkeypatch, grid):
     monkeypatch.setattr(sources_registry, "find_source", lambda sid: None)
 
 
-def test_the_first_fire_after_the_deploy_migrates_the_live_sheet_and_re_offered_mail_appends_nothing(
+def test_the_first_fire_after_the_deploy_migrates_the_live_sheet_and_re_offered_mail_adds_no_row(
     store, mailbox, model, grant, monkeypatch
 ):
     from inbox_triage_agent.sheet_layout import HEADERS
@@ -1355,11 +1372,22 @@ def test_the_first_fire_after_the_deploy_migrates_the_live_sheet_and_re_offered_
     report = pipeline.fire(UID, email=EMAIL, now=NOW)
 
     assert report.ok, report.error
-    assert report.new_rows == 0 and "values.append" not in grid.names(), "dedupe held across the migration"
-    assert len(grid.grid["Inbox"]) == 84
+    assert report.new_rows == 0 and len(grid.grid["Inbox"]) == 84, "dedupe held across the migration"
+    assert not any(
+        "insertDimension" in request and request["insertDimension"]["range"]["dimension"] == "ROWS"
+        for name, kw in grid.calls if name.startswith("batchUpdate")
+        for request in kw["body"]["requests"]
+    ), "no row was inserted"
     assert grid.row("Inbox", 0, 11) == list(HEADERS)
+    hers = {row[7]: (row + ["", ""])[8:10] for row in before[1:]}  # legacy H is the id
     for r in range(1, 84):
-        assert grid.row("Inbox", r, 11)[9:] == (before[r] + ["", ""])[8:10], "her Status and Notes, intact"
+        cells = grid.row("Inbox", r, 11)
+        assert cells[9:] == hers[cells[ID]], "her Status and Notes, intact and on the same message"
+    # Newest first by the dates the rows held when they were sorted (the
+    # re-triage below rewrites the Date cell from this test's one fixture).
+    newest_first = sorted(before[1:], key=lambda row: (row[0], row[7]), reverse=True)
+    assert [grid.cell("Inbox", r, ID) for r in range(1, 84)] == [row[7] for row in newest_first]
+    assert grid.names().count("batchUpdate:order") == 1
     # The one-time re-triage: 50 this fire, through the same model path.
     assert report.retriaged_rows == 50 and report.retried_rows == 0
     filled = [r for r in range(1, 84) if grid.cell("Inbox", r, ACTION)]
@@ -1369,8 +1397,9 @@ def test_the_first_fire_after_the_deploy_migrates_the_live_sheet_and_re_offered_
     assert connected_retriage(store)["state"] == "running"
 
     report = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
-    assert report.ok and report.new_rows == 0 and "values.append" not in grid.names()
+    assert report.ok and report.new_rows == 0 and len(grid.grid["Inbox"]) == 84
     assert report.retriaged_rows == 33
+    assert grid.names().count("batchUpdate:order") == 1, "sorted once, not once a fire"
     assert all(grid.cell("Inbox", r, ACTION) for r in range(1, 84))
     assert connected_retriage(store) == {"state": "done", "skipped": []}
     assert model.invocations == 83, "one call per old row, no re-asks"
@@ -1434,7 +1463,7 @@ def test_a_header_set_up_cannot_fix_fails_the_fire_loudly_with_nothing_written(
 
     assert not report.ok and "header row does not match" in report.error
     assert sheet.checks == 1, "set-up was re-run once before giving up"
-    assert sheet.appended == [] and sheet.updated == {} and mailbox.fetched == []
+    assert sheet.inserted == [] and sheet.updated == {} and mailbox.fetched == []
     doc = connected.connections[UID]
     assert doc["last_poll"]["ok"] is False and doc["checkpoint"]["history_id"] == "800"
 
@@ -1642,7 +1671,7 @@ def test_a_refused_worktree_write_does_not_fail_the_fire_and_is_retried(
     report = pipeline.fire(UID, email=EMAIL, now=NOW)
 
     assert report.ok is True and report.new_rows == 1
-    assert [row[ID] for row in sheet.appended] == ["a"], "the Inbox row is written regardless"
+    assert [row[ID] for row in sheet.inserted] == ["a"], "the Inbox row is written regardless"
     doc = connected.connections[UID]
     assert doc["last_poll"]["ok"] is True and doc["last_poll"]["error"] is None
     assert "HTTP 400" in doc["worktree"]["error"]
@@ -1955,3 +1984,338 @@ def test_a_disconnect_clears_the_markers_with_everything_else(connected, mailbox
     pipeline.disconnect(UID)
 
     assert connected.messages == {}
+
+
+# --------------------------------------------------------------------------- #
+# Pinned 2026-09-29: newest mail is the first data row; sheets from before
+# that are put in the same order once; and a run of failed fires cannot move
+# the point the recovery starts from.
+# --------------------------------------------------------------------------- #
+
+def _at(day: int, hour: int = 9, minute: int = 0) -> datetime:
+    return datetime(2026, 9, day, hour, minute, tzinfo=TEAM_TIMEZONE)
+
+
+def test_new_mail_is_the_first_data_row_and_two_in_one_fire_keep_newest_first(
+    connected, mailbox, sheet
+):
+    connected.connections[UID]["backfill"]["state"] = "done"
+    mailbox.messages = {
+        "mon": _message("mon", at=_at(14)), "tue": _message("tue", at=_at(15)),
+    }
+    mailbox.history_added = ["mon", "tue"]  # history hands them over oldest first
+    pipeline.fire(UID, email=EMAIL, now=NOW)
+    assert sheet.top_to_bottom() == ["tue", "mon"]
+
+    mailbox.messages.update({
+        "wed-am": _message("wed-am", at=_at(16, 8)), "wed-pm": _message("wed-pm", at=_at(16, 17)),
+    })
+    mailbox.history_added = ["wed-am", "wed-pm"]
+    report = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
+
+    assert report.ok and report.new_rows == 2
+    assert sheet.top_to_bottom() == ["wed-pm", "wed-am", "tue", "mon"]
+    assert sheet.rows["wed-pm"] == 2, "the newest message is the first data row"
+    assert connected.messages[f"{UID}__wed-pm"]["sheet_row"] == 2
+    assert connected.messages[f"{UID}__wed-am"]["sheet_row"] == 3
+
+
+def test_two_messages_inside_one_minute_are_still_newest_first(connected, mailbox, sheet):
+    """The Date cell is to the minute; the order of a fire's own rows is
+    decided on the full timestamp before they are handed to the sheet."""
+    connected.connections[UID]["backfill"]["state"] = "done"
+    minute = _at(16, 10, 5)
+    mailbox.messages = {
+        "first": _message("first", at=minute.replace(second=10)),
+        "second": _message("second", at=minute.replace(second=50)),
+    }
+    mailbox.history_added = ["first", "second"]
+
+    pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert sheet.inserted[0][0] == sheet.inserted[1][0] == "2026-09-16 10:05"
+    assert sheet.top_to_bottom() == ["second", "first"]
+
+
+def test_the_backfill_goes_under_the_new_mail_not_over_it(connected, mailbox, sheet):
+    mailbox.messages = {
+        "today": _message("today", at=_at(17)),
+        "old1": _message("old1", at=_at(3)), "old2": _message("old2", at=_at(2)),
+    }
+    mailbox.history_added = ["today"]
+    mailbox.listing = ["today", "old1", "old2"]
+    pipeline.fire(UID, email=EMAIL, now=NOW)
+    assert sheet.top_to_bottom() == ["today", "old1", "old2"]
+
+    # Mail arrives while a later page of the backfill is still being walked.
+    mailbox.messages.update({
+        "tomorrow": _message("tomorrow", at=_at(18)), "old3": _message("old3", at=_at(1)),
+    })
+    connected.connections[UID]["backfill"].update(state="running", cursor=None)
+    mailbox.history_added = ["tomorrow"]
+    mailbox.listing = ["tomorrow", "today", "old1", "old2", "old3"]
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
+
+    assert sheet.top_to_bottom() == ["tomorrow", "today", "old1", "old2", "old3"]
+
+
+def test_a_retried_row_and_new_mail_in_the_same_fire_each_reach_their_own_row(
+    store, mailbox, model, grant, monkeypatch
+):
+    """With the real writer. The row to rewrite is found at row 3 when the
+    fire starts; the new mail then goes in above it. Addressed by the number,
+    the rewrite would land on the row above the one that was meant."""
+    from inbox_triage_agent.tests.test_sheet_writer import _body, _fill, _row, current_sheet
+
+    grid = _fill(current_sheet(), [
+        _row("keep", "2026-09-16 09:00", notes="hers"),
+        _row("odd", "2026-09-15 09:00", status="In progress", notes="chase Friday", mine="mine"),
+        _row("last", "2026-09-14 09:00"),
+    ])
+    for col, value in ((CAT, UNREAD), (SUMMARY, ""), (ACTION, "")):
+        grid.put("Inbox", 2, col, value)
+    before = {row[ID]: row for row in _body(grid)}
+    _real_sheet(monkeypatch, grid)
+    store.connections[UID] = _connected_doc()
+    store.connections[UID]["backfill"]["state"] = "done"
+    store.connections[UID]["retriage"] = {"state": "done", "skipped": []}
+    store.messages[f"{UID}__odd"] = {
+        "user_id": UID, "message_id": "odd", "status": "needs_review", "attempts": 1,
+        "retry_due": True, "sheet_row": 3,
+    }
+    mailbox.messages = {
+        "odd": _message("odd", subject="Now readable", at=_at(15)),
+        "new": _message("new", at=_at(18, 8)),
+    }
+    mailbox.history_added = ["new"]
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok and report.new_rows == 1 and report.retried_rows == 1
+    body = _body(grid)
+    assert [row[ID] for row in body] == ["new", "keep", "odd", "last"]
+    rows = {row[ID]: row for row in body}
+    assert rows["odd"][CAT] == ASKS and rows["odd"][SUMMARY], "the retried row was rewritten"
+    assert rows["odd"][9:] == ["In progress", "chase Friday", "", "mine"], "and her cells on it kept"
+    assert rows["keep"] == before["keep"] and rows["last"] == before["last"], \
+        "no other row was written to"
+    assert store.messages[f"{UID}__odd"]["sheet_row"] == 4
+    assert store.messages[f"{UID}__new"]["sheet_row"] == 2
+    assert [name for name in grid.names() if name.startswith("batchUpdate")] == ["batchUpdate:rows"], \
+        "one write for the whole fire"
+
+
+def test_a_sheet_not_yet_newest_first_is_checked_by_its_next_fire_and_only_a_fire_may_reorder(
+    connected, mailbox, sheet
+):
+    # A connection stored before the rule existed: no ``ordering`` on it.
+    connected.connections[UID]["sheet"].pop("ordering")
+    sheet.check_result = SheetCheck("ok", "Her inbox", "", "ours", "applied")
+
+    pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert sheet.checks == 1 and sheet.reorders == [True], "not left for the hourly check"
+    assert connected.connections[UID]["sheet"]["ordering"] == "applied"
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
+    assert sheet.checks == 1, "settled: nothing to check again until the hour is up"
+
+    # From the panel a check can land in the middle of a fire, so it is never
+    # allowed to move rows — and what it leaves pending, the next fire does.
+    sheet.check_result = SheetCheck("ok", "Her inbox", "", "ours", "pending")
+    pipeline.recheck_sheet(UID, email=EMAIL)
+    pipeline.set_sheet(UID, SID, email=EMAIL)
+    assert sheet.reorders == [True, False, False]
+    assert connected.connections[UID]["sheet"]["ordering"] == "pending"
+    sheet.check_result = SheetCheck("ok", "Her inbox", "", "ours", "applied")
+    pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=10))
+    assert sheet.reorders == [True, False, False, True]
+    assert connected.connections[UID]["sheet"]["ordering"] == "applied"
+
+
+def test_a_reorder_that_fails_fails_the_fire_loudly_writes_nothing_and_is_tried_again(
+    connected, mailbox, sheet, monkeypatch
+):
+    connected.connections[UID]["sheet"]["ordering"] = "pending"
+    before = copy.deepcopy(connected.connections[UID])
+    mailbox.messages = {"m1": _message("m1")}
+    mailbox.history_added = ["m1"]
+
+    def refused(sid, *, caller_email, reorder=False):
+        raise sheet_writer.ReorderFailed(
+            "The one-time reorder of the Inbox tab (newest mail first) did not complete: "
+            "Sheets row reorder was refused: HTTP 400. No row was moved; it is tried again on "
+            "the next poll."
+        )
+    monkeypatch.setattr(sheet_writer, "check", refused)
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok is False and "did not complete" in report.error
+    assert mailbox.fetched == [] and sheet.inserted == [] and connected.messages == {}
+    doc = connected.connections[UID]
+    assert doc["last_poll"] == {"at": NOW.isoformat(), "ok": False, "messages_read": 0,
+                                "error": report.error}
+    assert doc["checkpoint"] == before["checkpoint"], "the mail it did not read is still ahead of it"
+    assert doc["sheet"] == before["sheet"], "nothing claims the reorder happened"
+    assert doc["lease_until"] is None
+
+    monkeypatch.setattr(sheet_writer, "check", sheet.check)
+    sheet.check_result = SheetCheck("ok", "Her inbox", "", "ours", "applied")
+    report = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5))
+    assert report.ok and report.new_rows == 1 and sheet.reorders == [True]
+
+
+def _listing_that_honours_after(mailbox, monkeypatch) -> list[int]:
+    """The fake listing, made to do what Gmail's ``after:`` does: leave out
+    what is older. Returns the ``after`` of every call."""
+    asked: list[int] = []
+
+    def list_inbox(svc, *, after_epoch, page_token=None, max_results=100):
+        asked.append(after_epoch)
+        listing = [m for m in mailbox.listing
+                   if mailbox.messages[m].received_at.timestamp() > after_epoch]
+        start = int(page_token or 0)
+        token = str(start + max_results) if start + max_results < len(listing) else None
+        return listing[start:start + max_results], token, len(listing)
+    monkeypatch.setattr(gmail_client, "list_inbox", list_inbox)
+    return asked
+
+
+def test_after_days_of_failed_fires_the_fallback_re_lists_from_the_last_poll_that_got_through(
+    connected, mailbox, sheet, model, monkeypatch
+):
+    """2026-09-22: the model provider refused every call for 44 hours. Each
+    failed fire stamped ``last_poll``; had Gmail let go of the history in that
+    time, the re-listing would have begun a day before the LAST FAILED fire
+    and the first day and more of the outage would never have been a row."""
+    got_through = NOW - timedelta(minutes=5)
+    connected.connections[UID]["backfill"]["state"] = "done"
+    assert connected.connections[UID]["checkpoint"]["updated_at"] == got_through.isoformat()
+    # Thirteen messages across three days of outage, one every five hours.
+    outage = {
+        f"m{i:02d}": _message(f"m{i:02d}", at=(NOW + timedelta(hours=1 + 5 * i)).astimezone(TEAM_TIMEZONE))
+        for i in range(13)
+    }
+    mailbox.messages = dict(outage)
+    mailbox.history_added = sorted(outage)
+    model.always_fail = True
+    for hours in range(0, 72, 6):
+        failed = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(hours=hours))
+        assert failed.ok is False and "abandoned" in failed.error
+    doc = connected.connections[UID]
+    assert doc["last_poll"]["at"] == (NOW + timedelta(hours=66)).isoformat(), \
+        "the last ATTEMPT walked forward with every failure"
+    assert doc["checkpoint"] == {"history_id": "800", "updated_at": got_through.isoformat()}, \
+        "the last poll that got through did not"
+    assert sheet.inserted == []
+
+    # The provider is back, and Gmail no longer holds history that far back.
+    model.always_fail = False
+    mailbox.history_expired = True
+    mailbox.history_id = "5000"
+    mailbox.listing = sorted(outage, reverse=True)  # newest first, as Gmail lists
+    monkeypatch.setattr(gmail_client, "LIST_THREAD_PAGE_MAX", 2)  # seven pages
+    asked = _listing_that_honours_after(mailbox, monkeypatch)
+    back = NOW + timedelta(hours=72)
+
+    report = pipeline.fire(UID, email=EMAIL, now=back)
+
+    assert report.ok and report.new_rows == 13, "every message of the outage is a row"
+    assert set(asked) == {int(got_through.timestamp()) - 86400}, \
+        "listed from the last poll that got through, less a day — not from the last attempt"
+    assert len(asked) == 7, "and to the end of the listing, not to a page limit"
+    assert sheet.top_to_bottom() == sorted(outage, reverse=True), "newest first"
+    doc = connected.connections[UID]
+    assert doc["checkpoint"] == {"history_id": "5000", "updated_at": back.isoformat()}
+    assert doc["last_poll"]["ok"] is True
+
+
+def test_a_recovery_too_big_for_one_fire_keeps_its_anchor_and_the_next_fire_finishes_it(
+    connected, mailbox, sheet, monkeypatch
+):
+    clock = _Clock()
+    monkeypatch.setattr(pipeline.time, "monotonic", clock.monotonic)
+    real_fetch = mailbox.fetch
+
+    def slow_fetch(svc, message_id):
+        clock.t += 30.0
+        return real_fetch(svc, message_id)
+    monkeypatch.setattr(gmail_client, "fetch", slow_fetch)
+    connected.connections[UID]["backfill"]["state"] = "done"
+    anchor = dict(connected.connections[UID]["checkpoint"])
+    mailbox.history_expired = True
+    mailbox.history_id = "1200"
+    mailbox.messages = {f"m{i}": _message(f"m{i}", at=_at(17, 18 + i)) for i in range(5)}
+    mailbox.listing = ["m4", "m3", "m2", "m1", "m0"]
+    asked = _listing_that_honours_after(mailbox, monkeypatch)
+
+    # 125s less both reserves = 60s of work: two fetches.
+    first = pipeline.fire(UID, email=EMAIL, now=NOW, budget_seconds=125.0)
+
+    assert first.ok and first.unreached and first.new_rows == 2
+    assert connected.connections[UID]["checkpoint"] == anchor, \
+        "a poll that did not get through all of it does not become the new starting point"
+
+    clock.t = 5000.0
+    second = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5), budget_seconds=1000.0)
+
+    assert second.ok and second.new_rows == 3 and not second.unreached
+    assert asked[0] == asked[-1] == int(datetime.fromisoformat(anchor["updated_at"]).timestamp()) - 86400
+    assert mailbox.fetched == ["m4", "m3", "m2", "m1", "m0"], "what was done is not read again"
+    assert sheet.top_to_bottom() == ["m4", "m3", "m2", "m1", "m0"], \
+        "the older mail of the second fire goes UNDER the newer mail of the first"
+    assert connected.connections[UID]["checkpoint"]["history_id"] == "1200"
+
+
+def test_a_re_listing_cut_short_by_the_budget_never_saves_a_fresh_checkpoint(
+    connected, mailbox, sheet, monkeypatch
+):
+    clock = _Clock()
+    monkeypatch.setattr(pipeline.time, "monotonic", clock.monotonic)
+    connected.connections[UID]["backfill"]["state"] = "done"
+    anchor = dict(connected.connections[UID]["checkpoint"])
+    mailbox.history_expired = True
+    mailbox.history_id = "1200"
+    mailbox.messages = {f"m{i}": _message(f"m{i}", at=_at(10 + i)) for i in range(4)}
+    mailbox.listing = ["m3", "m2", "m1", "m0"]
+    monkeypatch.setattr(gmail_client, "LIST_THREAD_PAGE_MAX", 2)
+    real_list = mailbox.list_inbox
+
+    def slow_list(svc, *, after_epoch, page_token=None, max_results=100):
+        clock.t += 200.0
+        return real_list(svc, after_epoch=after_epoch, page_token=page_token, max_results=max_results)
+    monkeypatch.setattr(gmail_client, "list_inbox", slow_list)
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok and report.unreached, "said, not hidden"
+    assert connected.connections[UID]["checkpoint"] == anchor, \
+        "mail that was never even listed must not end up behind the checkpoint"
+
+    # And the listing says so itself, whatever the caller then does with it.
+    work = pipeline._Work(user_id=UID, gmail="gmail-service", llm=None, deadline=clock.t + 100.0)
+    ids, checkpoint = pipeline._new_mail_ids(work, connected.connections[UID], NOW)
+    assert ids == ["m3", "m2"] and checkpoint is None and work.unreached
+    work = pipeline._Work(user_id=UID, gmail="gmail-service", llm=None, deadline=clock.t + 1000.0)
+    ids, checkpoint = pipeline._new_mail_ids(work, connected.connections[UID], NOW)
+    assert ids == ["m3", "m2", "m1", "m0"] and checkpoint == "1200" and not work.unreached
+
+
+def test_a_connection_with_no_checkpoint_time_counts_back_from_when_it_was_connected(
+    connected, mailbox, sheet, monkeypatch
+):
+    """An older document may hold a checkpoint with no ``updated_at``; the
+    field is read with a default, and never falls back to the last attempt."""
+    connected.connections[UID]["backfill"]["state"] = "done"
+    connected.connections[UID]["checkpoint"] = {"history_id": "800"}
+    connected.connections[UID]["last_poll"] = {
+        "at": (NOW - timedelta(minutes=1)).isoformat(), "ok": False, "messages_read": 0,
+        "error": "The model failed on 3 messages in a row",
+    }
+    connected_at = datetime.fromisoformat(connected.connections[UID]["gmail"]["connected_at"])
+    mailbox.history_expired = True
+    asked = _listing_that_honours_after(mailbox, monkeypatch)
+
+    pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert asked == [int(connected_at.timestamp()) - 86400]

@@ -9,18 +9,22 @@ One fire, in order:
 1. Load the connection and take the lease (one transaction). Not connected,
    no sheet, or a sheet check that is not ``ok`` → skip. The sheet is
    re-checked — ownership included — when the last check failed, is over an
-   hour old, or was made for a different address than the one firing.
+   hour old, was made for a different address than the one firing, or has
+   not yet put the Inbox tab in newest-first order (a one-time sort, done
+   here because the fire holds the lease).
 2. Open the sealed refresh token and mint an access token. ``invalid_grant``
    → the connection is marked revoked with the reason, and the fire stops.
 3. **New mail first**: history since the checkpoint (or, when Gmail no longer
-   holds that history, a re-listing of the last day), fetched, summarised,
-   collected as rows.
+   holds that history, a re-listing of everything since the last poll that
+   finished its mail, less a day), fetched, summarised, collected as rows.
 4. Then the ``needs_review`` rows due for another try, then — once per
    sheet, until done — the **re-triage** of rows written before the Action
    column existed (up to 50 per fire), then the **backfill** with whatever
    budget is left: the 90-day inbox listing newest-first, up to 200 messages
    per fire, skipping ids already on the sheet.
-5. Write: one append for the new rows, one batch update for the retried rows.
+5. Write: one atomic batch — the retried rows rewritten where their ids are
+   now, the new rows inserted newest first, each above the first row older
+   than it.
 5b. The **Worktree**: the sheet's rows grouped into one process per Gmail
    thread and written to their own tab — but only when something changed,
    and never in a way that touches an Inbox cell. It also carries the two
@@ -36,6 +40,11 @@ Write-then-persist is duplicate-over-drop: a fire that dies between 5 and 6
 re-reads the same mail next time and the sheet's id map skips it, so nothing
 is lost and nothing doubles. A ``lease_until`` on the document keeps an
 overrunning fire and the next one from working the same inbox at once.
+
+A failed fire moves nothing the next one depends on. The checkpoint — the
+history id and the time it was taken — is written only by a fire that worked
+through all of its new mail, so however long a run of failures lasts, the
+first fire to get through starts from the last one that did.
 
 What fails the fire loudly with no rows written: no model key, a revoked
 grant, Gmail or Sheets refusing, or the model failing three messages in a
@@ -60,8 +69,8 @@ from .gmail_client import GmailUnavailable, HistoryExpired, MessageGone
 from .gmail_oauth import ExchangeFailed, RevokedGrant, TokenKeyMissing, TokenRefreshFailed
 from .sheet_layout import RowFacts, agent_values, parse_sheet_ref, sheet_url
 from .sheet_writer import (
-    CHECK_MR_SOURCE, CHECK_OK, WORKTREE_CLAIMED, WORKTREE_OURS, LayoutMismatch, SheetCheck,
-    SheetsUnavailable,
+    CHECK_MR_SOURCE, CHECK_OK, ORDER_SETTLED, WORKTREE_CLAIMED, WORKTREE_OURS, LayoutMismatch,
+    SheetCheck, SheetsUnavailable,
 )
 from .summarise import ModelCallFailed, ModelUnavailable
 from .triage import NEEDS_REVIEW, TEAM_TIMEZONE, Rejected, Verdict
@@ -124,10 +133,11 @@ WORKTREE_REFRESH_SECONDS = 3600
 LEASE_SECONDS = 300
 POLL_INTERVAL_SECONDS = 300
 SHEET_RECHECK_SECONDS = 3600
-#: When the history checkpoint is unusable: re-list from the last poll, less
-#: a day, and let the id map drop what is already on the sheet.
+#: When the history checkpoint is unusable: re-list from the time that
+#: checkpoint was taken — the last poll that got through all of its mail —
+#: less a day, and let the id map drop what is already on the sheet. The
+#: listing is followed to its end; it is ids only, 500 to a call.
 FALLBACK_LOOKBACK_SECONDS = 86400
-FALLBACK_PAGES = 5
 RECENT_FIRES_WINDOW_SECONDS = 86400
 
 BACKFILL_NOT_STARTED = "not_started"
@@ -254,16 +264,20 @@ def is_mr_sheet(spreadsheet_id: str) -> bool:
 
 
 def _check_and_store(
-    user_id: str, spreadsheet_id: str, *, email: str, extra: dict | None = None
+    user_id: str, spreadsheet_id: str, *, email: str, extra: dict | None = None,
+    reorder: bool = False,
 ) -> dict:
     """MR's sheets are refused before Google is asked anything; every other
     sheet goes through ``sheet_writer.check``, which proves the caller owns
     or edits it before its first write. ``checked_for`` records whose
-    address the answer holds for, so a fire for anyone else re-checks."""
+    address the answer holds for, so a fire for anyone else re-checks.
+
+    ``reorder`` is passed by the fire and by nothing else: the one-time
+    newest-first sort moves rows, and only the holder of the lease may."""
     if is_mr_sheet(spreadsheet_id):
         result = SheetCheck(CHECK_MR_SOURCE, "")
     else:
-        result = sheet_writer.check(spreadsheet_id, caller_email=email)
+        result = sheet_writer.check(spreadsheet_id, caller_email=email, reorder=reorder)
     doc = firestore_repo.save_inbox_connection(user_id, {
         "sheet": {
             "id": spreadsheet_id,
@@ -282,6 +296,11 @@ def _check_and_store(
             # the key :func:`_worktree_pass` gates on: without it the tab is
             # created and styled and then never filled.
             "worktree": result.worktree,
+            # applied / already / pending — and "" for an answer that is not
+            # ``ok``. Until it is one of the first two, every fire re-checks
+            # (:func:`_ensure_sheet_checked`), so the sort is not left
+            # waiting for the hourly one.
+            "ordering": result.ordering,
         },
         **(extra or {}),
     })
@@ -678,7 +697,7 @@ def _fire_leased(
     work.id_map = id_map
 
     # 3. new mail first
-    new_ids, new_history_id = _new_mail_ids(gmail, doc, now)
+    new_ids, new_history_id = _new_mail_ids(work, doc, now)
     checkpoint_advances = True
     for message_id in new_ids:
         if work.out_of_time():
@@ -708,13 +727,24 @@ def _fire_leased(
     if backfill.get("state") == BACKFILL_RUNNING:
         _backfill(work, backfill, now)
 
-    # 5. write — one append, one batch update
-    row_numbers = sheet_writer.append(
-        spreadsheet_id, [agent_values(f) for f in work.new_rows], svc=sheets
+    # 5. write — one atomic batch. New rows go in newest first; the rows to
+    # rewrite are named by message id, because the row numbers in the id map
+    # are as old as the start of this fire and the writer reads its own.
+    work.new_rows.sort(key=lambda facts: facts.received_at, reverse=True)
+    written = sheet_writer.write_rows(
+        spreadsheet_id,
+        [agent_values(f) for f in work.new_rows],
+        {f.message_id: agent_values(f) for f in work.updated_rows.values()},
+        svc=sheets,
     )
-    sheet_writer.update(
-        spreadsheet_id, {row: agent_values(f) for row, f in work.updated_rows.items()}, svc=sheets
-    )
+    if written.missing:
+        logger.warning(
+            "a12: %d row(s) for user %s left the sheet during the fire and were not rewritten",
+            len(written.missing), user_label(user_id),
+        )
+    for message_id, row in written.updated.items():
+        if message_id in work.retry_docs:
+            work.retry_docs[message_id]["sheet_row"] = row
 
     # 5b. the Worktree view, over the sheet the rows just landed in. Derived
     # data: it never fails the fire and never touches an Inbox cell.
@@ -725,7 +755,7 @@ def _fire_leased(
 
     # 6. persist — tracking rows, counters, the poll, the checkpoint
     _persist(
-        user_id, doc, work, backfill=backfill, retriage=retriage, row_numbers=row_numbers,
+        user_id, doc, work, backfill=backfill, retriage=retriage, row_numbers=written.new_rows,
         checkpoint=new_history_id if checkpoint_advances else None, now=now,
         thread_backfill=thread_backfill, sent_backfill=sent_backfill,
         worktree_state=worktree_state,
@@ -740,7 +770,11 @@ def _persist(
 ) -> None:
     """Step 6, after the sheet has the rows: what the next fire and the panel
     read. ``checkpoint`` is ``None`` when the new-mail pass was cut short, so
-    the old one stays and the id map does the de-duplication next time."""
+    the old one stays and the id map does the de-duplication next time.
+
+    ``sheet_row`` on a tracking document is where the row was when it was
+    written, for the record. It is never an address: every later row moves
+    it, and so may she."""
     message_docs: dict[str, dict] = {}
     for index, facts in enumerate(work.new_rows):
         row = row_numbers[index] if index < len(row_numbers) else None
@@ -791,18 +825,25 @@ def _fill_report(report: FireReport, work: _Work, backfill: dict) -> None:
 
 def _ensure_sheet_checked(user_id: str, doc: dict, now: datetime, *, email: str) -> dict:
     """Re-check — MR refusal and ownership included — when the last check
-    failed, is over an hour old, or was made for another address (including
-    a document written before ``checked_for`` existed). Otherwise the stored
-    ``ok`` stands: one Drive read an hour, not one per five-minute fire."""
+    failed, is over an hour old, was made for another address (including
+    a document written before ``checked_for`` existed), or did not leave the
+    Inbox tab in newest-first order (including a document written before
+    ``ordering`` existed — every sheet connected before the rule). Otherwise
+    the stored ``ok`` stands: one Drive read an hour, not one per
+    five-minute fire.
+
+    The one-time sort therefore happens on a sheet's first fire after the
+    rule shipped, before that fire reads or writes a row."""
     sheet = doc.get("sheet") or {}
     if not sheet.get("id"):
         return doc
     checked_at = _parse_iso(sheet.get("checked_at"))
     stale = checked_at is None or (now - checked_at).total_seconds() > SHEET_RECHECK_SECONDS
     same_caller = sheet.get("checked_for") == str(email or "").strip().lower()
-    if sheet.get("check") == CHECK_OK and not stale and same_caller:
+    ordered = str(sheet.get("ordering") or "") in ORDER_SETTLED
+    if sheet.get("check") == CHECK_OK and not stale and same_caller and ordered:
         return doc
-    return _check_and_store(user_id, str(sheet["id"]), email=email)
+    return _check_and_store(user_id, str(sheet["id"]), email=email, reorder=True)
 
 
 def _read_id_map(user_id: str, spreadsheet_id: str, sheets, *, email: str) -> dict[str, int] | None:
@@ -818,7 +859,7 @@ def _read_id_map(user_id: str, spreadsheet_id: str, sheets, *, email: str) -> di
         logger.warning(
             "a12: the Inbox layout for user %s is not current; re-running set-up", user_label(user_id)
         )
-    doc = _check_and_store(user_id, spreadsheet_id, email=email)
+    doc = _check_and_store(user_id, spreadsheet_id, email=email, reorder=True)
     if (doc.get("sheet") or {}).get("check") != CHECK_OK:
         return None
     return sheet_writer.id_rows(spreadsheet_id, svc=sheets)
@@ -848,9 +889,16 @@ def _mark_revoked(user_id: str, doc: dict, reason: str, now: datetime) -> None:
     )
 
 
-def _last_seen_epoch(doc: dict, now: datetime) -> int:
+def _last_complete_epoch(doc: dict, now: datetime) -> int:
+    """When mail was last known to be fully ingested: the moment the stored
+    checkpoint was taken, which only a fire that worked through all of its
+    new mail writes (and the connect, which starts from "now").
+
+    Deliberately NOT ``last_poll.at``. That is the last ATTEMPT — a failed
+    fire stamps it too — so through a run of failures it walks forward while
+    the mail behind it goes unread, and a re-listing anchored on it starts
+    after the mail it exists to recover."""
     for value in (
-        (doc.get("last_poll") or {}).get("at"),
         (doc.get("checkpoint") or {}).get("updated_at"),
         (doc.get("gmail") or {}).get("connected_at"),
     ):
@@ -860,29 +908,50 @@ def _last_seen_epoch(doc: dict, now: datetime) -> int:
     return int(now.timestamp())
 
 
-def _new_mail_ids(gmail, doc: dict, now: datetime) -> tuple[list[str], str | None]:
+def _new_mail_ids(work: _Work, doc: dict, now: datetime) -> tuple[list[str], str | None]:
     """``(ids added since the checkpoint, checkpoint to save)``.
 
     The fallback takes a FRESH checkpoint from the profile before it lists, so
     a message arriving between the two is in the next fire's history rather
-    than in nobody's.
+    than in nobody's. It lists everything since :func:`_last_complete_epoch`
+    less a day, to the END of the listing — newest first, so a page limit
+    would drop the oldest mail, which is exactly the mail that has waited
+    longest. The id map drops what the sheet already has, and what one fire
+    cannot work through the next one lists again, because the checkpoint
+    does not move until a fire gets through all of it.
+
+    The checkpoint comes back ``None`` when the listing itself was cut short
+    by the budget: a fresh one must not be saved over mail that was never
+    even listed.
     """
     checkpoint = (doc.get("checkpoint") or {}).get("history_id")
     if checkpoint:
         try:
-            return gmail_client.history_since(gmail, str(checkpoint))
+            return gmail_client.history_since(work.gmail, str(checkpoint))
         except HistoryExpired as exc:
-            logger.warning("a12: history checkpoint unusable (%s); re-listing the last day", exc)
-    fresh = gmail_client.profile(gmail)["history_id"]
-    since = _last_seen_epoch(doc, now) - FALLBACK_LOOKBACK_SECONDS
+            logger.warning(
+                "a12: history checkpoint unusable (%s); re-listing since the last complete poll",
+                exc,
+            )
+    fresh = gmail_client.profile(work.gmail)["history_id"]
+    since = _last_complete_epoch(doc, now) - FALLBACK_LOOKBACK_SECONDS
     ids: list[str] = []
     token: str | None = None
-    for _ in range(FALLBACK_PAGES):
-        page, token, _estimate = gmail_client.list_inbox(gmail, after_epoch=since, page_token=token)
+    while True:
+        page, token, _estimate = gmail_client.list_inbox(
+            work.gmail, after_epoch=since, page_token=token,
+            max_results=gmail_client.LIST_THREAD_PAGE_MAX,
+        )
         ids.extend(page)
         if not token:
-            break
-    return ids, fresh
+            return ids, fresh
+        if work.out_of_time():
+            logger.error(
+                "a12: the inbox re-listing for user %s was cut short by the budget after %d "
+                "ids; the checkpoint stays where it is and the next poll lists again",
+                user_label(work.user_id), len(ids),
+            )
+            return ids, None
 
 
 def _retry(work: _Work, due: list[dict], now: datetime) -> None:

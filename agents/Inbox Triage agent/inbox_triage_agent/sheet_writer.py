@@ -2,12 +2,19 @@
 scope). She shares her sheet with the service account as an editor; the hub
 never holds her Google identity for Sheets.
 
-What this module never does on the Inbox tab: sort, delete, or write outside
-the agent's columns A:I (the header row is the one exception, written once and
-repaired only in A:I). Her Status and Notes columns and her row order are
-hers — :func:`read_inbox` reads them, nothing writes them. Rows are found
-again through the hidden Message ID column — the reconciliation key — never by
-remembered row numbers, because she reorders freely.
+What this module never does on the Inbox tab: delete, or write outside the
+agent's columns A:I (the header row is the one exception, written once and
+repaired only in A:I). Her Status and Notes columns are hers —
+:func:`read_inbox` reads them, nothing writes them. Rows are found again
+through the hidden Message ID column — the reconciliation key — never by
+remembered row numbers, because she reorders freely: :func:`write_rows` reads
+where every row is immediately before it writes, and writes in one batch.
+
+New rows are INSERTED, newest first (``sheet_layout.place``), never written
+over anything. And the tab is sorted exactly once per sheet
+(:func:`_order_once`), whole rows with every column of hers, to bring a sheet
+from before that rule into the same order; a marker on the sheet records it,
+and after that her row order is hers again.
 
 Upcoming and Worktree are different in kind: they are the agent's own views,
 with no cell of hers in them, so their headers are rewritten whole and
@@ -18,9 +25,9 @@ is never written to at all.
 One structural write exists: a sheet still in the first release's layout
 (no Action column) gets the column INSERTED in place, with its header, in
 one atomic ``batchUpdate`` — every existing cell, hers included, shifts
-right intact. Nothing is ever appended to a sheet whose row 1 does not
-match the current layout: :func:`id_rows` checks it on every fire and
-raises :class:`LayoutMismatch` instead.
+right intact. Nothing is ever written to a sheet whose row 1 does not
+match the current layout: :func:`id_rows` and :func:`write_rows` check it
+and raise :class:`LayoutMismatch` instead.
 
 Before the first write to any sheet — and again on every re-check — the hub
 proves the sheet is the CALLER's: Drive metadata, read as the service
@@ -36,7 +43,6 @@ that starts with ``=`` as a formula, and subject lines are third-party text.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 
 from app.services.google_http import (
@@ -45,12 +51,13 @@ from app.services.google_http import (
 
 from . import offline, refuse_if_offline, sheet_style
 from .sheet_layout import (
-    AGENT_COLUMNS, AGENT_RANGE, CATEGORY_LABELS, COL_ACTION, COL_CATEGORY, COL_MESSAGE_ID,
-    COL_STATUS, HEADER_CURRENT, HEADER_EMPTY, HEADER_LEGACY, HEADERS, INBOX_HEADER_RANGE,
-    INBOX_ROWS_RANGE, INBOX_TAB, LAST_AGENT_COL, LAST_COL, MESSAGE_ID_RANGE, MIGRATION_INSERTS,
-    STATUS_OPTIONS, UPCOMING_FORMULA, UPCOMING_HEADERS, UPCOMING_TAB, WORKTREE_HEADER_RANGE,
-    WORKTREE_HEADERS, WORKTREE_MARKER_KEY, WORKTREE_ROWS_RANGE, WORKTREE_TAB, column_letter,
-    header_state, same_formula,
+    AGENT_COLUMNS, CATEGORY_LABELS, COL_ACTION, COL_CATEGORY, COL_DATE, COL_MESSAGE_ID,
+    COL_STATUS, DATE_RANGE, HEADER_CURRENT, HEADER_EMPTY, HEADER_LEGACY, HEADERS,
+    INBOX_HEADER_RANGE, INBOX_ROWS_RANGE, INBOX_TAB, LAST_AGENT_COL, LAST_COL, MESSAGE_ID_RANGE,
+    MIGRATION_INSERTS, ORDER_VERSION, STATUS_OPTIONS, UPCOMING_FORMULA, UPCOMING_HEADERS,
+    UPCOMING_TAB, WORKTREE_HEADER_RANGE, WORKTREE_HEADERS, WORKTREE_MARKER_KEY,
+    WORKTREE_ROWS_RANGE, WORKTREE_TAB, column_letter, header_state, insert_requests,
+    is_newest_first, landed, order_requests, place, pushed, same_formula, update_requests,
 )
 from .triage import NEEDS_REVIEW
 
@@ -77,9 +84,6 @@ CHECK_MR_SOURCE = "mr_source"
 #: Roles that let a person edit a Drive file.
 _EDIT_ROLES = frozenset({"writer", "owner"})
 
-_A1_FIRST_ROW = re.compile(r"![A-Z]+(\d+)")
-
-
 class SheetsUnavailable(RuntimeError):
     """A Sheets call could not be completed, or was refused for a reason that
     is not one of the panel's check words. The message never carries the
@@ -91,6 +95,11 @@ class LayoutMismatch(SheetsUnavailable):
     """Row 1 of Inbox is not the current layout, so a positional write could
     land in the wrong columns. Nothing is written; the fire re-runs set-up
     (which migrates a legacy sheet) and reads again."""
+
+
+class ReorderFailed(SheetsUnavailable):
+    """The one-time newest-first sort did not happen. The batch is atomic, so
+    no row moved and no marker was written; the next poll tries again."""
 
 
 class SheetsRefused(SheetsUnavailable):
@@ -110,6 +119,16 @@ FORMAT_APPLIED = "applied"
 FORMAT_ALREADY = "already"
 FORMAT_FAILED = "failed"
 
+#: What set-up did about the Inbox tab's row order (see :func:`_order_once`).
+#: ``applied``: sorted newest first on this pass. ``already``: the marker says
+#: it was done before. ``pending``: not done yet, and this pass was not asked
+#: to — only a poll, which holds the connection's lease, may move rows.
+ORDER_APPLIED = "applied"
+ORDER_ALREADY = "already"
+ORDER_PENDING = "pending"
+#: The answers that mean the sheet is in newest-first order.
+ORDER_SETTLED = frozenset({ORDER_APPLIED, ORDER_ALREADY})
+
 #: The Worktree tab is the agent's: it created it and may rewrite it.
 WORKTREE_OURS = "ours"
 #: The sheet already had a tab called Worktree that the agent did not create.
@@ -126,6 +145,8 @@ class Setup:
     worktree: str
     #: The Worktree tab's sheet id when it is the agent's; ``None`` when hers.
     worktree_sheet_id: int | None = None
+    #: One of the ORDER_* values.
+    ordering: str = ORDER_PENDING
 
 
 @dataclass(frozen=True)
@@ -137,6 +158,8 @@ class SheetCheck:
     formatting: str = field(default="", compare=False)
     #: ``ours`` / ``claimed`` when set-up ran; "" otherwise. Same reason.
     worktree: str = field(default="", compare=False)
+    #: One of the ORDER_* values when set-up ran; "" otherwise. Same reason.
+    ordering: str = field(default="", compare=False)
 
 
 def service():
@@ -216,7 +239,9 @@ def _run(request, *, what: str, service: str = "Sheets"):
 # Check and set up
 # --------------------------------------------------------------------------- #
 
-def check(spreadsheet_id: str, *, caller_email: str, svc=None, drive=None) -> SheetCheck:
+def check(
+    spreadsheet_id: str, *, caller_email: str, svc=None, drive=None, reorder: bool = False,
+) -> SheetCheck:
     """Is this the caller's sheet, and can the hub see and edit it?
 
     In order, and nothing is written until the third step:
@@ -230,7 +255,11 @@ def check(spreadsheet_id: str, *, caller_email: str, svc=None, drive=None) -> Sh
     status. ``ok`` means the sheet is also set up, since the same writes
     prove both. The title is returned only with ``ok``: for any other answer
     the caller has not shown the sheet is theirs, so its name is not theirs
-    to read either."""
+    to read either.
+
+    ``reorder`` lets set-up run the one-time newest-first sort. Only a poll
+    passes it: a poll holds the connection's lease, so no other write of the
+    agent's can be half-way through the rows while they move."""
     svc = svc or service()
     try:
         meta = _metadata(spreadsheet_id, svc)
@@ -244,12 +273,12 @@ def check(spreadsheet_id: str, *, caller_email: str, svc=None, drive=None) -> Sh
         return SheetCheck(CHECK_NOT_YOURS, "")
     title = str((meta.get("properties") or {}).get("title") or "")
     try:
-        done = setup(spreadsheet_id, svc=svc, meta=meta)
+        done = setup(spreadsheet_id, svc=svc, meta=meta, reorder=reorder)
     except SheetsRefused as exc:
         if exc.status == 403:
             return SheetCheck(CHECK_NOT_EDITABLE, "")
         raise
-    return SheetCheck(CHECK_OK, title, done.formatting, done.worktree)
+    return SheetCheck(CHECK_OK, title, done.formatting, done.worktree, done.ordering)
 
 
 def caller_may_edit(spreadsheet_id: str, caller_email: str, *, drive=None) -> bool:
@@ -349,7 +378,9 @@ def _worktree_marker_requests(meta: dict, sheet_id: int) -> list[dict]:
     return requests
 
 
-def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> Setup:
+def setup(
+    spreadsheet_id: str, *, svc=None, meta: dict | None = None, reorder: bool = False,
+) -> Setup:
     """Idempotent: the three tabs exist, row 1 carries the headers, row 1 is
     frozen, the Message ID column is hidden, Status has its dropdown, and
     Upcoming!A2 holds the current formula view — rewritten whenever what is
@@ -367,6 +398,11 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> Setup:
     Last, the look (:mod:`sheet_style`) — once: on a new, just-migrated or
     just-given-a-Worktree sheet, or one the marker says was never formatted at
     this version. A refused formatting pass never raises.
+
+    Very last, the row order (:func:`_order_once`) — once per sheet, and only
+    when ``reorder`` is passed. Unlike the look, a sort that fails RAISES
+    (:class:`ReorderFailed`): it is a correction to her data, not decoration,
+    and a fire that skipped it must not report itself a success.
 
     Raises :class:`SheetsRefused` with the status so :func:`check` can map
     a 403 to ``not_editable``. Only :func:`check` calls this, after the
@@ -490,9 +526,58 @@ def setup(spreadsheet_id: str, *, svc=None, meta: dict | None = None) -> Setup:
         upcoming_sheet_id=tabs[UPCOMING_TAB], worktree_sheet_id=worktree_sheet_id,
         restyle=state == HEADER_LEGACY or worktree_created,
     )
-    return Setup(
-        formatting=formatting, worktree=worktree_state, worktree_sheet_id=worktree_sheet_id
+    ordering = _order_once(
+        spreadsheet_id, svc, meta, inbox_sheet_id=inbox_sheet_id, reorder=reorder
     )
+    return Setup(
+        formatting=formatting, worktree=worktree_state, worktree_sheet_id=worktree_sheet_id,
+        ordering=ordering,
+    )
+
+
+def _order_once(
+    spreadsheet_id: str, svc, meta: dict, *, inbox_sheet_id: int, reorder: bool
+) -> str:
+    """Bring the Inbox tab into newest-first order, once per sheet.
+
+    Sheets written before new rows were inserted newest-first hold them in
+    two runs: the backfill newest-first from the top, and every message since
+    appended oldest-first underneath. One ``sortRange`` over every row below
+    the header — no columns named, so a row moves with every cell in it —
+    makes that one order, and the marker written by the same atomic batch
+    means it never runs again. After that her row order is hers.
+
+    One request, whatever the size of the sheet: Sheets sorts on its side, so
+    there is nothing to page through and nothing to resume half-way. What can
+    be interrupted is the ANSWER — the batch applied, the reply lost — so a
+    failure is checked against the sheet before it is believed: if the marker
+    is there, the sort is too. Otherwise :class:`ReorderFailed`, with the
+    sheet exactly as it was."""
+    if is_newest_first(meta):
+        return ORDER_ALREADY
+    if not reorder:
+        return ORDER_PENDING
+    try:
+        _run(
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": order_requests(meta, inbox_sheet_id)},
+            ),
+            what="row reorder",
+        )
+    except SheetsUnavailable as exc:
+        try:
+            done = is_newest_first(_metadata(spreadsheet_id, svc))
+        except SheetsUnavailable:
+            done = False
+        if not done:
+            raise ReorderFailed(
+                "The one-time reorder of the Inbox tab (newest mail first) did not complete: "
+                f"{exc}. No row was moved; it is tried again on the next poll."
+            ) from exc
+        logger.warning("a12: the row reorder's reply was lost, but the sheet shows it applied")
+    logger.info("a12: Inbox rows sorted newest first (%s)", ORDER_VERSION)
+    return ORDER_APPLIED
 
 
 def _format_once(
@@ -628,11 +713,14 @@ def id_rows(spreadsheet_id: str, *, svc=None) -> dict[str, int]:
     fire together with row 1. The first occurrence wins if she ever
     duplicated a row by hand.
 
-    Row 1 must be the current agent header: every append and update is
-    positional, and a legacy or edited header means the id column is not
+    Row 1 must be the current agent header: every write is by column
+    position, and a legacy or edited header means the id column is not
     where the layout looks. That is :class:`LayoutMismatch`, raised before
-    anything is written — never an empty map that would re-append every
-    message."""
+    anything is written — never an empty map that would write every message
+    a second time.
+
+    The row numbers are for deciding what is already on the sheet. They are
+    not addresses: :func:`write_rows` reads its own, at the moment it writes."""
     svc = svc or service()
     data = _run(
         svc.spreadsheets().values().batchGet(
@@ -672,7 +760,7 @@ def read_inbox(spreadsheet_id: str, *, svc=None) -> list[list[str]]:
     blank cells.
 
     Called only by the Worktree pass, and only when that pass has decided a
-    rebuild is warranted; the append path still reads the narrow id column."""
+    rebuild is warranted; the write path reads two narrow columns instead."""
     svc = svc or service()
     data = _run(
         svc.spreadsheets().values().batchGet(
@@ -754,43 +842,108 @@ def blank_action_ids(spreadsheet_id: str, *, svc=None) -> list[str]:
     return out
 
 
-def append(spreadsheet_id: str, rows: list[list[str]], *, svc=None) -> list[int]:
-    """One ``values.append`` for every new row of this fire. Returns the row
-    numbers the API reports, in order, or ``[]`` when it reported none."""
-    if not rows:
-        return []
+@dataclass(frozen=True)
+class Written:
+    """Where one fire's rows are after :func:`write_rows`."""
+
+    #: 1-based row of each new row, in the order the rows were given.
+    new_rows: list[int] = field(default_factory=list)
+    #: ``message id -> 1-based row`` for every update that found its row.
+    updated: dict[str, int] = field(default_factory=dict)
+    #: Ids whose row is no longer on the sheet — she deleted it while the fire
+    #: was working. Nothing was written for them.
+    missing: list[str] = field(default_factory=list)
+
+
+def _column(value_range: dict) -> list[str]:
+    return [str(row[0]).strip() if row else "" for row in value_range.get("values") or []]
+
+
+def _id_of(row: list[str]) -> str:
+    return str(row[COL_MESSAGE_ID - 1]).strip() if len(row) >= COL_MESSAGE_ID else ""
+
+
+def _inbox_sheet_id(spreadsheet_id: str, svc) -> int:
+    meta = _run(
+        svc.spreadsheets().get(
+            spreadsheetId=spreadsheet_id, fields="sheets.properties(sheetId,title)"
+        ),
+        what="tab lookup",
+    )
+    for sheet in meta.get("sheets") or []:
+        props = sheet.get("properties") or {}
+        if str(props.get("title") or "") == INBOX_TAB:
+            return int(props.get("sheetId") or 0)
+    raise SheetsUnavailable("The Inbox tab is missing from the sheet; nothing was written.")
+
+
+def write_rows(
+    spreadsheet_id: str, new_rows: list[list[str]],
+    updates: dict[str, list[str]] | None = None, *, svc=None,
+) -> Written:
+    """Everything one fire writes to Inbox, as ONE atomic ``batchUpdate``.
+
+    ``new_rows`` are the agent's cells of messages not yet on the sheet;
+    ``updates`` is ``{message id: the agent's cells}`` for rows that are.
+
+    Nothing here trusts a row number from earlier in the fire. The Date and
+    Message ID columns are read now, immediately before the write, and from
+    that read alone: every update is addressed to the row its id is on at
+    this moment, and every new row is given its place newest-first
+    (``sheet_layout.place``). New rows are inserted, so no existing cell is
+    ever written over and a row of hers only ever moves down, whole. Only
+    columns A:I are written, as text that is never evaluated.
+
+    One batch means all of it lands or none of it does. A refusal or a lost
+    connection raises with the sheet as it was, and the fire — which persists
+    nothing until this returns — runs the same mail again next time.
+
+    A new row whose id turns out to be on the sheet already is not written a
+    second time; it is reported on the row it already has."""
+    updates = dict(updates or {})
+    if not new_rows and not updates:
+        return Written()
     svc = svc or service()
-    resp = _run(
-        svc.spreadsheets().values().append(
+    inbox_sheet_id = _inbox_sheet_id(spreadsheet_id, svc)
+    data = _run(
+        svc.spreadsheets().values().batchGet(
             spreadsheetId=spreadsheet_id,
-            range=f"{INBOX_TAB}!A:{LAST_AGENT_COL}",
-            valueInputOption="RAW",
-            insertDataOption="INSERT_ROWS",
-            body={"values": rows},
+            ranges=[INBOX_HEADER_RANGE, DATE_RANGE, MESSAGE_ID_RANGE],
         ),
-        what="append",
+        what="row position read",
     )
-    match = _A1_FIRST_ROW.search(str((resp.get("updates") or {}).get("updatedRange") or ""))
-    if not match:
-        return []
-    first = int(match.group(1))
-    return [first + offset for offset in range(len(rows))]
+    ranges = data.get("valueRanges") or []
+    _require_current_header(_first_row(ranges[0] if ranges else {}))
+    dates = _column(ranges[1] if len(ranges) > 1 else {})
+    ids = _column(ranges[2] if len(ranges) > 2 else {})
+    end = max(len(dates), len(ids), 1)
+    where: dict[str, int] = {}  # message id -> 0-based row index, first occurrence
+    for index, message_id in enumerate(ids):
+        if index and message_id and message_id not in where:
+            where[message_id] = index
 
+    fresh = [position for position, row in enumerate(new_rows) if _id_of(row) not in where]
+    blocks = place(dates, [str(new_rows[p][COL_DATE - 1]) for p in fresh], end=end)
+    found = {message_id: where[message_id] for message_id in updates if message_id in where}
+    requests = update_requests(
+        inbox_sheet_id, {index: updates[message_id] for message_id, index in found.items()}
+    ) + insert_requests(inbox_sheet_id, blocks, [new_rows[p] for p in fresh])
+    if requests:
+        _run(
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id, body={"requests": requests}
+            ),
+            what="row write",
+        )
 
-def update(spreadsheet_id: str, row_values: dict[int, list[str]], *, svc=None) -> int:
-    """One ``values.batchUpdate`` for the retried rows: ``{row: the agent's
-    cells}`` written to ``A{row}:I{row}`` and nowhere else."""
-    if not row_values:
-        return 0
-    svc = svc or service()
-    data = [
-        {"range": f"{INBOX_TAB}!{AGENT_RANGE.format(row=row)}", "values": [values]}
-        for row, values in sorted(row_values.items())
-    ]
-    _run(
-        svc.spreadsheets().values().batchUpdate(
-            spreadsheetId=spreadsheet_id, body={"valueInputOption": "RAW", "data": data}
-        ),
-        what="row update",
+    rows_of_new = [0] * len(new_rows)
+    for position, row in zip(fresh, landed(blocks, len(fresh))):
+        rows_of_new[position] = row
+    for position, row in enumerate(new_rows):
+        if not rows_of_new[position]:
+            rows_of_new[position] = pushed(where[_id_of(row)], blocks) + 1
+    return Written(
+        new_rows=rows_of_new,
+        updated={message_id: pushed(index, blocks) + 1 for message_id, index in found.items()},
+        missing=[message_id for message_id in updates if message_id not in where],
     )
-    return len(data)

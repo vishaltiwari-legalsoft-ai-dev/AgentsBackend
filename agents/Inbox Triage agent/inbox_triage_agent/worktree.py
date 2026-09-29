@@ -44,6 +44,13 @@ A marker whose timestamp has not been read yet is not a message at all — it
 is dropped, so a half-ingested thread reads exactly as it did before rather
 than wrongly.
 
+**What fits on the tab.** It holds :data:`MAX_PROCESSES` rows. When there
+are more open processes than that, the :data:`RECENT_RESERVED` threads with
+the most recent mail are always on it, and the remaining rows go to the most
+urgent of the rest, alarms first (:func:`select`). Without that, an inbox with
+more old alarms than the tab has rows could never show a thread that began
+today. The order of the rows on the tab is the same either way.
+
 What never becomes a process: a thread whose every message is a newsletter,
 promotion or automated alert (:data:`NOISE_CATEGORIES`) — one alert inside a
 real conversation does not hide it, but a thread made only of them is not
@@ -103,10 +110,14 @@ STATUS_OVERDUE_REPLY = "Overdue reply"
 #: Both alarms. These sort above everything and share the red row.
 CHASE_STATUSES = frozenset({STATUS_CHASING, STATUS_OVERDUE_REPLY})
 
-#: The most rows the tab is ever given. The sort puts what needs chasing on
-#: top, so a truncation loses the quietest end of the list — and the count is
+#: The most rows the tab is ever given. The true count of open processes is
 #: recorded on the connection document either way, never guessed at.
 MAX_PROCESSES = 200
+#: Of those rows, how many are kept for the threads with the most recent mail
+#: when not everything fits. A quarter: the tab is still mostly what is most
+#: urgent, and fifty is more new conversations than either live inbox starts
+#: in a day.
+RECENT_RESERVED = 50
 
 #: ``Re:``, ``Fwd:``, ``FW:``, ``RE[2]:``, ``Antwort:``, ``Re :`` … repeated.
 _REPLY_PREFIX = re.compile(
@@ -193,6 +204,10 @@ class Process:
     due: date | None
     mails: int
     latest_link: str
+    #: When the thread's last message arrived (or was sent). ``None`` when its
+    #: Date cell could not be read. Decides nothing on the row itself — only
+    #: which processes are kept when there are too many (:func:`select`).
+    latest_at: datetime | None = None
 
     @property
     def chasing(self) -> bool:
@@ -215,6 +230,14 @@ class Process:
         bucket = 0 if self.chasing else (1 if self.due is not None else 2)
         due_key = self.due.toordinal() if self.due is not None else 0
         return (bucket, due_key, -self.waiting_days, self.title.lower(), self.thread_id)
+
+    def recency_key(self) -> tuple:
+        """Most recent mail first; a thread whose time could not be read is
+        last. The same tie-breakers as :meth:`sort_key`, for the same reason:
+        the same facts must always choose the same rows."""
+        if self.latest_at is None:
+            return (1, 0.0, self.title.lower(), self.thread_id)
+        return (0, -self.latest_at.timestamp(), self.title.lower(), self.thread_id)
 
 
 def group(messages: list[ThreadMessage]) -> dict[str, list[ThreadMessage]]:
@@ -355,13 +378,15 @@ def describe(thread_id: str, thread: list[ThreadMessage], *, today: date) -> Pro
         due=_due(thread),
         mails=len(thread),
         latest_link=_latest_link(thread),
+        latest_at=last.received_at,
     )
 
 
 @dataclass(frozen=True)
 class Worktree:
     """What one build produced. ``total`` is every open process;
-    ``processes`` is the sorted prefix that fits :data:`MAX_PROCESSES`."""
+    ``processes`` is the ones that fit :data:`MAX_PROCESSES`
+    (:func:`select`), in the tab's order."""
 
     processes: list[Process]
     total: int
@@ -371,6 +396,25 @@ class Worktree:
     #: Sent markers that made it into a process, i.e. how much of the Status
     #: column is standing on read facts rather than on the absence of them.
     sent_used: int = 0
+
+
+def select(processes: list[Process]) -> list[Process]:
+    """The processes that get the tab's rows, in the tab's order.
+
+    Everything, when everything fits. Otherwise the
+    :data:`RECENT_RESERVED` threads with the most recent mail, then the most
+    urgent of the rest until the tab is full — and the two together sorted
+    the way the tab is always sorted, so a row is where she expects it
+    whichever rule kept it."""
+    ranked = sorted(processes, key=Process.sort_key)
+    if len(ranked) <= MAX_PROCESSES:
+        return ranked
+    recent = sorted(ranked, key=Process.recency_key)[:RECENT_RESERVED]
+    kept = {process.thread_id for process in recent}
+    urgent = [process for process in ranked if process.thread_id not in kept]
+    return sorted(
+        [*recent, *urgent[: MAX_PROCESSES - len(recent)]], key=Process.sort_key
+    )
 
 
 def build(messages: list[ThreadMessage], *, today: date) -> Worktree:
@@ -383,9 +427,8 @@ def build(messages: list[ThreadMessage], *, today: date) -> Worktree:
             continue
         processes.append(describe(thread_id, thread, today=today))
         sent_used += sum(1 for m in thread if not m.on_sheet)
-    processes.sort(key=Process.sort_key)
     return Worktree(
-        processes=processes[:MAX_PROCESSES], total=len(processes),
+        processes=select(processes), total=len(processes),
         untagged=untagged, sent_used=sent_used,
     )
 

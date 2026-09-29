@@ -476,7 +476,7 @@ def test_a_real_fire_through_the_cron_leaves_no_address_subject_or_summary_in_en
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["users"][0]["new_rows"] == 2 and len(sheet.appended) == 2, "the fire really ran"
+    assert body["users"][0]["new_rows"] == 2 and len(sheet.inserted) == 2, "the fire really ran"
     carried = resp.text + " ".join(str(row) for row in trail)
     for secret in ("her@firm.com", "her@legalsoft.com", "gm@rathorelegal.in", "@",
                    "Priya", "Rathore", "Kapoor", "two paralegals", OWNER["id"]):
@@ -525,7 +525,8 @@ def test_sheet_routes_check_ownership_against_the_callers_signed_in_address(as_u
     as_user(OWNER)
     seen: list[str] = []
     monkeypatch.setattr(sheet_writer, "check",
-                        lambda sid, *, caller_email: seen.append(caller_email) or SheetCheck("not_yours", ""))
+                        lambda sid, *, caller_email, reorder=False:
+                        seen.append(caller_email) or SheetCheck("not_yours", ""))
     body = client.put("/api/inbox/sheet", json={"ref": SID}).json()
     assert body["sheet"]["check"] == "not_yours" and body["sheet"]["title"] is None
     assert client.post("/api/inbox/sheet/check").json()["sheet"]["check"] == "not_yours"

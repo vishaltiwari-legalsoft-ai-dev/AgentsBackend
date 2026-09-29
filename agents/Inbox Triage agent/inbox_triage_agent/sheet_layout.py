@@ -1,11 +1,20 @@
 """The sheet as a contract: which columns are the agent's, which are hers,
 and the one formula that keeps deadlines visible. Pure; no Sheets I/O.
 
-She reorders and edits the "Inbox" tab freely. So the agent never sorts,
-never deletes, never writes outside its own columns, and finds a row again
-by the hidden Message ID column — the hub's own records are the checkpoint,
-the sheet's id column is the reconciliation key. That is also why a
-reconnect after a disconnect updates rows instead of duplicating them.
+She reorders and edits the "Inbox" tab freely. So the agent never deletes,
+never writes outside its own columns, and finds a row again by the hidden
+Message ID column — the hub's own records are the checkpoint, the sheet's id
+column is the reconciliation key. That is also why a reconnect after a
+disconnect updates rows instead of duplicating them.
+
+**Newest first.** A new row is INSERTED, whole, directly above the first row
+that is as old as it or older (:func:`place`), so the newest mail is the
+first data row and an older message found later still lands where its date
+puts it. Inserting never overwrites a cell: every existing row, hers
+included, moves down intact. The agent sorts the tab exactly ONCE per sheet
+(:func:`order_requests`) — whole rows, every column — to bring a sheet
+written before this rule into the same order, and records that it did in a
+developer-metadata marker so it never does it again.
 
 "Upcoming" is a formula view over "Inbox": nearest deadline first, blanks
 excluded, rows she has marked Done hidden, overdue ones marked and listed
@@ -79,10 +88,10 @@ COL_STATUS = len(AGENT_COLUMNS) + USER_COLUMNS.index("Status") + 1  # J
 LAST_COL = column_letter(len(HEADERS))  # K
 LAST_AGENT_COL = column_letter(len(AGENT_COLUMNS))  # I
 
-#: A1 range of the agent's columns for one row, e.g. ``A7:I7``.
-AGENT_RANGE = f"A{{row}}:{LAST_AGENT_COL}{{row}}"
 #: The Message ID column, whole, for the id → row map.
 MESSAGE_ID_RANGE = f"{INBOX_TAB}!{column_letter(COL_MESSAGE_ID)}:{column_letter(COL_MESSAGE_ID)}"
+#: The Date column, whole — read together with the ids when rows are placed.
+DATE_RANGE = f"{INBOX_TAB}!{column_letter(COL_DATE)}:{column_letter(COL_DATE)}"
 #: Every column of Inbox, whole — the agent's cells AND hers. Read only by
 #: the Worktree pass, which needs her Status to know what is already done.
 INBOX_ROWS_RANGE = f"{INBOX_TAB}!A:{LAST_COL}"
@@ -195,6 +204,195 @@ def header_state(head: list[str]) -> str:
     if matches >= 2 and (len(cells) <= first_new or cells[first_new] != "Action"):
         return HEADER_LEGACY
     return HEADER_REPAIR
+
+
+# --------------------------------------------------------------------------- #
+# Newest first — where a new row goes, and the one-time sort
+# --------------------------------------------------------------------------- #
+
+#: Records that the Inbox tab was brought into newest-first order, once.
+#: Spreadsheet-level developer metadata, like the formatting marker: it
+#: travels with the sheet, so a sheet connected a second time is not sorted a
+#: second time.
+ORDER_MARKER_KEY = "agentos.a12.order"
+ORDER_VERSION = "newest-first/1"
+
+#: How :func:`agent_values` writes the Date cell. ISO text, so comparing two
+#: cells as text is comparing them as dates.
+_DATE_CELL = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+
+
+def is_date_cell(cell: str) -> bool:
+    return bool(_DATE_CELL.match(str(cell or "").strip()))
+
+
+def is_newest_first(meta: dict) -> bool:
+    """Does a ``spreadsheets.get`` result carry the order marker at this
+    version?"""
+    return any(
+        entry.get("metadataKey") == ORDER_MARKER_KEY
+        and str(entry.get("metadataValue") or "") == ORDER_VERSION
+        for entry in (meta or {}).get("developerMetadata") or []
+    )
+
+
+def order_requests(meta: dict, inbox_sheet_id: int) -> list[dict]:
+    """The one-time correction as ONE atomic batch: sort every row below the
+    header by Date, newest first, then write the marker.
+
+    The range names no columns, so it is the whole width of the tab: a row
+    moves with every cell in it — her Status and Notes, and any column she
+    added to the right of them. Nothing is rewritten; cells are only moved.
+    Message ID breaks a tie inside one minute (Gmail's ids grow with time and
+    are all the same length), which costs nothing when there is no tie.
+
+    The marker is the LAST request of the same batch, so it exists exactly
+    when the sort happened: a refusal leaves the sheet as it was and
+    unmarked, and the next attempt starts from the beginning — which is also
+    where it would have to start, because a sort has no half-way state."""
+    requests: list[dict] = [{
+        "sortRange": {
+            "range": {"sheetId": inbox_sheet_id, "startRowIndex": 1},
+            "sortSpecs": [
+                {"dimensionIndex": COL_DATE - 1, "sortOrder": "DESCENDING"},
+                {"dimensionIndex": COL_MESSAGE_ID - 1, "sortOrder": "DESCENDING"},
+            ],
+        }
+    }]
+    requests += [
+        {"deleteDeveloperMetadata": {"dataFilter": {
+            "developerMetadataLookup": {"metadataId": entry["metadataId"]}}}}
+        for entry in (meta or {}).get("developerMetadata") or []
+        if entry.get("metadataKey") == ORDER_MARKER_KEY and entry.get("metadataId") is not None
+    ]
+    requests.append({"createDeveloperMetadata": {"developerMetadata": {
+        "metadataKey": ORDER_MARKER_KEY,
+        "metadataValue": ORDER_VERSION,
+        "location": {"spreadsheet": True},
+        "visibility": "DOCUMENT",
+    }}})
+    return requests
+
+
+@dataclass(frozen=True)
+class Block:
+    """New rows that go in at one place. ``at`` is the 0-based row index, in
+    the sheet AS READ, that the first of them takes; ``rows`` are positions
+    in the list of new rows handed to :func:`place`, newest first."""
+
+    at: int
+    rows: tuple[int, ...]
+
+
+def place(dates: list[str], new_dates: list[str], *, end: int) -> list[Block]:
+    """Where each new row goes: directly above the first existing row that is
+    as old as it or older, and below the last row when none is.
+
+    ``dates`` is the Date column as read, header included (index 0 is row 1);
+    ``end`` is the index just past the last row that holds anything. A cell
+    that is not a date the agent wrote — blank, or a row she typed herself —
+    is neither older nor newer than anything and is simply passed over.
+
+    On a newest-first sheet that is the top for new mail, the bottom for the
+    backfill, and the right place in between for mail that arrived while the
+    inbox was disconnected. Blocks come back top to bottom."""
+    order = sorted(range(len(new_dates)), key=lambda i: new_dates[i], reverse=True)
+    blocks: list[tuple[int, list[int]]] = []
+    pointer = 1
+    for index in order:
+        wanted = new_dates[index]
+        # The new rows are taken newest first, so the place for one is never
+        # above the place for the one before it: one pass down the column.
+        while pointer < end and not (
+            pointer < len(dates) and is_date_cell(dates[pointer])
+            and str(dates[pointer]).strip() <= wanted
+        ):
+            pointer += 1
+        if blocks and blocks[-1][0] == pointer:
+            blocks[-1][1].append(index)
+        else:
+            blocks.append((pointer, [index]))
+    return [Block(at=at, rows=tuple(rows)) for at, rows in blocks]
+
+
+def landed(blocks: list[Block], count: int) -> list[int]:
+    """The 1-based sheet row each new row ends up on, in the order the new
+    rows were given — every block above one pushes it down."""
+    out = [0] * count
+    above = 0
+    for block in blocks:  # top to bottom
+        for offset, index in enumerate(block.rows):
+            out[index] = block.at + above + offset + 1
+        above += len(block.rows)
+    return out
+
+
+def pushed(row_index: int, blocks: list[Block]) -> int:
+    """Where an EXISTING row (0-based index as read) is after the blocks went
+    in: a block inserted at or above it moves it down by the block's size."""
+    return row_index + sum(len(block.rows) for block in blocks if block.at <= row_index)
+
+
+def _cells(values: list[str]) -> dict:
+    """One row for ``updateCells``. ``stringValue`` is stored as typed and
+    never evaluated — a subject line that starts with ``=`` stays text, which
+    is what ``RAW`` means on the values API. An empty cell is sent as no
+    value at all, so it is blank rather than an empty string."""
+    return {"values": [
+        {"userEnteredValue": {"stringValue": str(v)}} if str(v) != "" else {} for v in values
+    ]}
+
+
+def update_requests(inbox_sheet_id: int, row_values: dict[int, list[str]]) -> list[dict]:
+    """The agent's cells of rows that already exist, by 0-based row index as
+    read. Columns A..I and nothing to their right."""
+    return [
+        {"updateCells": {
+            "start": {"sheetId": inbox_sheet_id, "rowIndex": row_index, "columnIndex": 0},
+            "rows": [_cells(values)],
+            "fields": "userEnteredValue",
+        }}
+        for row_index, values in sorted(row_values.items())
+    ]
+
+
+def insert_requests(inbox_sheet_id: int, blocks: list[Block], rows: list[list[str]]) -> list[dict]:
+    """The blocks as structural requests, BOTTOM block first, so every index
+    is the one that was read: an insert lower down never moves a row above it.
+
+    A block that becomes the first data rows is not inserted AT row 2. The
+    tab's banding, like any range that begins on row 2, is pushed down by an
+    insert at its own first row and would start below the new rows, leaving
+    them unbanded. So the new rows are inserted just BELOW the current first
+    row — inside every such range, which therefore grows to take them — and
+    that one row is then moved, whole, to beneath them."""
+    requests: list[dict] = []
+    for block in sorted(blocks, key=lambda b: b.at, reverse=True):
+        count = len(block.rows)
+        at = max(block.at, 1)
+        if at == 1:
+            requests.append({"insertDimension": {
+                "range": {"sheetId": inbox_sheet_id, "dimension": "ROWS",
+                          "startIndex": 2, "endIndex": 2 + count},
+                "inheritFromBefore": True,
+            }})
+            requests.append({"moveDimension": {
+                "source": {"sheetId": inbox_sheet_id, "dimension": "ROWS",
+                           "startIndex": 1, "endIndex": 2},
+                "destinationIndex": 2 + count,
+            }})
+        else:
+            requests.append({"insertDimension": {
+                "range": {"sheetId": inbox_sheet_id, "dimension": "ROWS",
+                          "startIndex": at, "endIndex": at + count},
+                "inheritFromBefore": True,
+            }})
+        requests.append({"updateCells": {
+            "start": {"sheetId": inbox_sheet_id, "rowIndex": at, "columnIndex": 0},
+            "rows": [_cells(rows[index]) for index in block.rows],
+            "fields": "userEnteredValue",
+        }})
+    return requests
 
 
 MESSAGE_URL = "https://mail.google.com/mail/u/0/#inbox/{message_id}"
