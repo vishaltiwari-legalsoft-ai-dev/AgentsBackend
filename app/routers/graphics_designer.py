@@ -19,6 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from app.security import get_current_user
 from app.services import firestore_repo, imaging, storage
 from app.services.gd_brand_source import brand_logo_record
+from app.services.openrouter import ImageProviderError
 from app.services.run_tracking import (CHANGE, JOB, ActivityTrail, StagedActivity,
                                        silent)
 
@@ -297,6 +298,15 @@ def _guard(fn):
         # detail to "Internal server error" — so the one thing the user needed to
         # read lived only in the server log.
         raise HTTPException(503, exc.fallback_reason) from exc
+    except ImageProviderError as exc:
+        # The image model itself failed (after its bounded retry). A rate limit
+        # is the caller's cue to back off, so it stays a 429 with Retry-After;
+        # anything else is an honest 503 naming the model and the cause —
+        # never a flat 500, never a substitute image.
+        if exc.rate_limited:
+            headers = {"Retry-After": str(int(exc.retry_after))} if exc.retry_after else None
+            raise HTTPException(429, str(exc), headers=headers) from exc
+        raise HTTPException(503, str(exc)) from exc
 
 
 def _apply_element_styles(cfg: dict, incoming: dict, pack) -> None:

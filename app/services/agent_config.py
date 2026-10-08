@@ -5,12 +5,39 @@ from __future__ import annotations
 from app.services import runtime_config
 
 IMAGE_MODELS: list[dict[str, str | bool]] = [
+    # The GPT Image family is served by OpenRouter's Images API only, and is
+    # absent from the unfiltered /models listing the live catalog reads — so it
+    # must be curated here to be offerable (and allowed) at all.
     {
-        "id": "google/gemini-3-pro-image-preview",
+        "id": "openai/gpt-image-2.5-sunburst",
+        "name": "GPT Image 2.5 Sunburst",
+        "provider": "OpenAI",
+        "description": "Newest OpenAI image model, precision tier: exact aspect ratio, keeps the provided image in edits.",
+        "recommended": True,
+    },
+    {
+        "id": "openai/gpt-image-2.5-flare",
+        "name": "GPT Image 2.5 Flare",
+        "provider": "OpenAI",
+        "description": "GPT Image 2.5 speed tier: same price, ~35% faster, looser composition.",
+    },
+    {
+        "id": "google/gemini-3-pro-image",
         "name": "Gemini 3 Pro Image",
         "provider": "Google",
-        "description": "Best for on-brand creatives with logo and kit references.",
-        "recommended": True,
+        "description": "Closest brand-colour fidelity on gradients; on-brand creatives with kit references.",
+    },
+    {
+        "id": "google/gemini-3-pro-image-preview",
+        "name": "Gemini 3 Pro Image (preview)",
+        "provider": "Google",
+        "description": "Preview build of Gemini 3 Pro Image.",
+    },
+    {
+        "id": "openai/gpt-5.4-image-2",
+        "name": "GPT-5.4 Image 2",
+        "provider": "OpenAI",
+        "description": "GPT-5.4 with GPT Image 2 output; slow (55-115 s) and pricier per image.",
     },
     {
         "id": "google/gemini-2.5-flash-image",
@@ -120,6 +147,8 @@ MODEL_CATALOG: dict[str, list[dict[str, str | bool]]] = {
     "openrouter_image_model": IMAGE_MODELS,
     # Stage-3 polish fan-out (GD): an image-EDIT model, same catalog as above.
     "gd_polish_image_model": IMAGE_MODELS,
+    # GD Stage 1 (brand gradient): its own image model, see providers._gradient_model.
+    "gd_gradient_image_model": IMAGE_MODELS,
     "openrouter_model": TEXT_MODELS,
     "openrouter_fast_model": TEXT_MODELS,
     "openrouter_vision_model": VISION_MODELS,
@@ -148,6 +177,8 @@ AGENTS: list[dict[str, str | bool | list[str]]] = [
             # Stage-3 polish fan-out runs a separate (premium) image-edit
             # model from Stages 1-2 — see providers._polish_model.
             "gd_polish_image_model",
+            # Stage-1 brand gradient runs its own image model (colour fidelity).
+            "gd_gradient_image_model",
         ],
     },
     {

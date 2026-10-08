@@ -164,12 +164,18 @@ def test_agents_payload_lists_only_live_agents_with_their_fields(app_config):
     assert set(by_id["a1"]["fields"]) == {
         "openrouter_model", "openrouter_fast_model", "openrouter_image_model",
         "openrouter_vision_model", "gd_planner_model", "gd_polish_image_model",
+        "gd_gradient_image_model",
     }
     for agent in body["agents"]:
         assert set(agent["fields"]) <= set(runtime_config.AGENT_OVERRIDE_FIELDS)
 
     # The planner dropdown needs options too.
     assert body["catalog"].get("gd_planner_model")
+    # Every GD image field offers the GPT Image family even though OpenRouter's
+    # unfiltered /models listing omits it (Images-API-only models).
+    for field in ("openrouter_image_model", "gd_polish_image_model", "gd_gradient_image_model"):
+        ids = {o["id"] for o in body["catalog"][field]}
+        assert "openai/gpt-image-2.5-sunburst" in ids, field
 
 
 def test_update_rejects_field_the_agent_does_not_use(app_config, monkeypatch):
@@ -275,6 +281,46 @@ def test_get_polish_provider_defaults_to_the_gd_agent_id(app_config, monkeypatch
     monkeypatch.delenv("GD_POLISH_IMAGE_MODEL", raising=False)
     monkeypatch.setenv("GD_IMAGE_PROVIDER", "openrouter")
     assert providers.get_polish_provider().model == "agent/a1-polish-model"
+
+
+# --------------------------------------------------------------------------- #
+# gd_gradient_image_model: GD Stage 1 runs its own image model (2026-10-08 —
+# Gemini held the brand gradient stops, the GPT Image family drifted). It must
+# resolve agent -> global -> env like every field, and only Stage 1 may use it.
+# --------------------------------------------------------------------------- #
+
+def test_gradient_model_is_a_real_overridable_setting():
+    from app.config import settings
+
+    assert settings.gd_gradient_image_model
+    assert "gd_gradient_image_model" in runtime_config.OVERRIDE_FIELDS
+    assert "gd_gradient_image_model" in runtime_config.AGENT_OVERRIDE_FIELDS
+
+
+def test_gradient_model_resolves_agent_then_global_then_env(app_config, monkeypatch):
+    from app.config import settings
+    from graphics_designer_agent import providers
+
+    monkeypatch.setenv("GD_IMAGE_PROVIDER", "openrouter")
+    app_config["gd_gradient_image_model"] = "global/gradient-model"
+    app_config["agents"]["a1"]["gd_gradient_image_model"] = "agent/a1-gradient-model"
+    assert providers.get_provider(agent_id="a1", stage=1).model == "agent/a1-gradient-model"
+
+    app_config["agents"]["a1"].pop("gd_gradient_image_model")
+    assert providers._gradient_model("a1") == "global/gradient-model"
+
+    app_config.pop("gd_gradient_image_model")
+    assert providers._gradient_model("a1") == settings.gd_gradient_image_model
+
+
+def test_only_stage_one_uses_the_gradient_model(app_config, monkeypatch):
+    """Stage 2 (and every other caller) keeps the agent's image model."""
+    from graphics_designer_agent import providers
+
+    monkeypatch.setenv("GD_IMAGE_PROVIDER", "openrouter")
+    app_config["agents"]["a1"]["gd_gradient_image_model"] = "agent/a1-gradient-model"
+    assert providers.get_provider(agent_id="a1", stage=2).model == "google/gemini-2.5-flash-image"
+    assert providers.get_provider(agent_id="a1").model == "google/gemini-2.5-flash-image"
 
 
 def test_panel_surfaces_and_saves_the_polish_model(app_config, monkeypatch):

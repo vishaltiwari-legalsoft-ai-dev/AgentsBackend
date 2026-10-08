@@ -49,3 +49,40 @@ def test_a_pipeline_error_still_maps_to_409(monkeypatch):
 
     r = client.post(f"/api/gd/runs/{run_id}/generate", json={"stage": 1})
     assert r.status_code == 409 and r.json()["detail"] == "approve stage 1 first"
+
+
+def test_an_image_model_failure_is_a_503_naming_the_model(monkeypatch):
+    """The model call itself failed (after its bounded retry): an honest 503
+    with the model and cause, not the catch-all 500."""
+    from app.services.openrouter import ImageProviderError
+
+    run_id = client.post("/api/gd/runs", json={}).json()["id"]
+
+    def _down(run, stage, variant=None):
+        raise ImageProviderError(
+            "image model openai/gpt-image-2.5-sunburst failed (502): upstream error",
+            model="openai/gpt-image-2.5-sunburst", status=502)
+
+    monkeypatch.setattr(pipeline, "generate", _down)
+
+    r = client.post(f"/api/gd/runs/{run_id}/generate", json={"stage": 2})
+    assert r.status_code == 503, r.text
+    assert "openai/gpt-image-2.5-sunburst" in r.json()["detail"]
+
+
+def test_an_image_model_rate_limit_is_a_429_with_retry_after(monkeypatch):
+    """A burst of campaigns hits provider rate limits; the client is told to
+    back off rather than shown a server fault."""
+    from app.services.openrouter import ImageProviderError
+
+    run_id = client.post("/api/gd/runs", json={}).json()["id"]
+
+    def _limited(run, stage, variant=None):
+        raise ImageProviderError("image model x failed (429): rate limited",
+                                 model="x", status=429, retry_after=12)
+
+    monkeypatch.setattr(pipeline, "generate", _limited)
+
+    r = client.post(f"/api/gd/runs/{run_id}/generate", json={"stage": 1})
+    assert r.status_code == 429, r.text
+    assert r.headers.get("retry-after") == "12"

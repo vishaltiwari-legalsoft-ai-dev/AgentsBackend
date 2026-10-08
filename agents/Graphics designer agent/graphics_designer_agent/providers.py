@@ -267,11 +267,42 @@ def _agent_image_model(agent_id: str | None) -> str | None:
         return None
 
 
-def get_provider(name: str | None = None, *, agent_id: str | None = None) -> ImageProvider:
+# Stage 1 (the brand gradient) runs its own image model. Standalone fallback
+# only — reached when the backend app (and Settings.gd_gradient_image_model) is
+# not importable. Keep the two in sync.
+_DEFAULT_GRADIENT_MODEL = "google/gemini-3-pro-image"
+
+
+def _gradient_model(agent_id: str | None) -> str:
+    """Model for GD Stage 1: runtime config ``gd_gradient_image_model``
+    (per-agent override → global override → env ``GD_GRADIENT_IMAGE_MODEL`` →
+    Settings default), the same resolution every other model field uses.
+
+    Its own field because the live comparison of 2026-10-08 found the GPT Image
+    family drifting off the brand gradient stops (CIEDE2000 3.4-4.6) where
+    Gemini 3 Pro Image held 1.4-2.2 — so Stage 1 can stay on the faithful model
+    while Stage 2 onward moves, and either flips back by config alone."""
+    try:
+        from app.services import runtime_config
+
+        resolved = runtime_config.get_for_agent(agent_id, "gd_gradient_image_model")
+        if resolved:
+            return str(resolved)
+    except Exception:
+        pass
+    return _DEFAULT_GRADIENT_MODEL
+
+
+def get_provider(name: str | None = None, *, agent_id: str | None = None,
+                 stage: int | None = None) -> ImageProvider:
+    """The image provider for one generation. ``stage=1`` selects the Stage-1
+    gradient model (:func:`_gradient_model`); everything else uses the agent's
+    image model. The chosen model id is on ``provider.model`` so callers record
+    exactly which model produced an attempt."""
     name = (name or os.environ.get("GD_IMAGE_PROVIDER") or "").strip().lower()
     if name == "mock":
         return MockImageProvider()
-    model = _agent_image_model(agent_id)
+    model = _gradient_model(agent_id) if stage == 1 else _agent_image_model(agent_id)
     if name == "openrouter":
         return OpenRouterProvider(model=model)
     # Auto: the real model, or a loud failure. Never a silent placeholder.
@@ -282,7 +313,8 @@ def get_provider(name: str | None = None, *, agent_id: str | None = None) -> Ima
 # The Stage-3 polish pass runs a PREMIUM image-edit model by default: collision
 # fixes and text fidelity are exactly what Gemini 3 Pro Image (Nano Banana Pro)
 # is strongest at, and the polish pass is where placement quality is decided.
-# Stages 1–2 keep the cheaper default model — cost rises only where it pays.
+# A live E2E on 2026-10-08 confirmed it: GPT Image 2.5 Sunburst polishes passed
+# the QA preservation gate 1/12 times against Gemini's 3/6 on the same composites.
 # Standalone fallback only: reached when the backend app (and therefore
 # Settings.gd_polish_image_model) is not importable. Keep the two in sync.
 _DEFAULT_POLISH_MODEL = "google/gemini-3-pro-image"

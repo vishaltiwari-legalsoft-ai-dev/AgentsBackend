@@ -200,21 +200,34 @@ class Settings(BaseSettings):
     # Fast/cheap model for trivial parsing (extracting aspect ratio/brief from
     # chat, guessing the official website URL). Quality is not critical here.
     openrouter_fast_model: str = "anthropic/claude-sonnet-4.5"
-    # Image-output model. Nano Banana Pro (Gemini 3 Pro Image) is the default
-    # because it accepts the real brand logo as a reference image AND follows the
-    # detailed brand master prompt — giving on-brand, logo-accurate creatives.
-    # Flux.2 (black-forest-labs/flux.2-pro|max) is excellent for pure backgrounds
-    # but is image-only (can't composite the real logo), so it's reserved for the
-    # future layered editor.
-    openrouter_image_model: str = "google/gemini-3-pro-image-preview"
+    # Image-output model: GD Stage 2 (subject blend), the Stage-4 AI compositor
+    # and the Creative Agent rail (carousel Stage 2, brochure backgrounds, blog
+    # images). GPT Image 2.5 Sunburst (OpenAI, precision tier), chosen on a live
+    # comparison 2026-10-08: exact AR at every preset (4:5 included, rendered
+    # natively via an explicit WxH), kept the Stage-1 background on 4/4 ratios
+    # where Gemini 3 Pro Image mirrored it (4:5) or added a room (16:9), ~$0.09
+    # vs $0.14 and ~42 s vs ~27 s per 2K image. Served by OpenRouter's Images
+    # API (app.services.openrouter routes it). Known trade-off: it seats the
+    # subject higher than openai/gpt-5.4-image-2 does, so the default left text
+    # column overlapped the face on 3/4 ratios; gpt-5.4-image-2 kept clear but
+    # costs ~4x ($0.36) and takes ~2.5x as long (~100 s). Env: OPENROUTER_IMAGE_MODEL.
+    openrouter_image_model: str = "openai/gpt-image-2.5-sunburst"
+    # GD Stage 1 (brand gradient) only. Kept on Gemini 3 Pro Image: on the same
+    # comparison its gradients hit the brand stops within CIEDE2000 1.4-2.2,
+    # where GPT Image 2.5 drifted 3.4-4.6 (royal-blue end rendered ~#013CAB
+    # against #1746A2) on all four ratios. Env: GD_GRADIENT_IMAGE_MODEL.
+    gd_gradient_image_model: str = "google/gemini-3-pro-image"
     # Optional alternative/background model toggle.
     openrouter_image_model_hero: str = "black-forest-labs/flux.2-max"
     # Vision-capable model used for OCR / reading uploaded images.
     openrouter_vision_model: str = "openai/gpt-4o-mini"
     # Stage-3 polish fan-out (Graphics Designer Text Optimizer). A PREMIUM
     # image-EDIT model by default: collision fixes and text fidelity are decided
-    # here, so cost rises only where it pays. Stages 1-2 keep the cheaper
-    # ``openrouter_image_model``. Env var: GD_POLISH_IMAGE_MODEL.
+    # here. Also drives the Step-5 final tweak. Kept on Gemini 3 Pro Image after
+    # the 2026-10-08 live E2E: on the same composites the QA preservation gate
+    # passed 3/6 Gemini polishes but 1/12 GPT Image 2.5 Sunburst ones (text
+    # altered), so a GPT polish ships the deterministic fallback almost every
+    # time while still being billed. Env var: GD_POLISH_IMAGE_MODEL.
     gd_polish_image_model: str = "google/gemini-3-pro-image"
     # Auto-mode planner (Graphics Designer): plans gradient/element/text/logo
     # from the user's brief. Routed through OpenRouter like every model here.

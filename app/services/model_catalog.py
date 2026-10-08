@@ -68,6 +68,10 @@ _IMAGE_FAMILIES: tuple[tuple[str, str], ...] = (
     (r"^ideogram/", "balanced"),
 )
 
+# Fields whose dropdown offers image-output models.
+_IMAGE_FIELDS = frozenset(
+    {"openrouter_image_model", "gd_polish_image_model", "gd_gradient_image_model"})
+
 _PROVIDER_NAMES = {
     "anthropic": "Anthropic",
     "openai": "OpenAI",
@@ -156,7 +160,7 @@ def _sorted(options: list[dict]) -> list[dict]:
 
 
 def _curated_tier(field: str, model_id: str) -> str:
-    families = _IMAGE_FAMILIES if field == "openrouter_image_model" else _TEXT_FAMILIES
+    families = _IMAGE_FAMILIES if field in _IMAGE_FIELDS else _TEXT_FAMILIES
     return _classify(model_id, families) or "balanced"
 
 
@@ -223,6 +227,10 @@ def _build_catalog() -> dict[str, list[dict]]:
         # the panel can point it at a premium edit model independently.
         "gd_polish_image_model": _merge_curated(
             "gd_polish_image_model", [dict(o) for o in image]
+        ),
+        # GD Stage-1 brand gradient: same image-model universe, own field.
+        "gd_gradient_image_model": _merge_curated(
+            "gd_gradient_image_model", [dict(o) for o in image]
         ),
     }
     return {field: _sorted(options) for field, options in catalog.items()}

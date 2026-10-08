@@ -83,6 +83,14 @@ STUDIO_CREATIVE_TYPE = "social_story"
 logger = logging.getLogger("graphics_designer.pipeline")
 
 
+def _model_stamp(provider) -> dict:
+    """``{"model": id}`` for an attempt a real image model produced — the model
+    actually called (the provider never swaps models), so a run records which
+    model made each image. Empty for the mock / when unresolved."""
+    model = getattr(provider, "model", None)
+    return {"model": model} if isinstance(model, str) and model else {}
+
+
 def _optimizer_enabled() -> bool:
     """Stage-3 Text Optimizer master switch (spec 2026-07-14). Default ON;
     ``GD_TEXT_OPTIMIZER=0`` restores the deterministic-only Stage 3 exactly."""
@@ -541,6 +549,7 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
             "diffs": [],
             "warnings": [],
             "provider": provider.name if res["ai"] else "deterministic",
+            **(_model_stamp(provider) if res["ai"] else {}),
             **({"highlight_guard": highlight_guard} if highlight_guard else {}),
             **({"contrast_guard": contrast_guard} if contrast_guard else {}),
             "created_at": now_iso(),
@@ -645,7 +654,7 @@ def generate(run: dict, stage: int, variant: str | None = None,
         # no image model. Only reachable via variant "UPLOAD"; every other
         # variant keeps the byte-identical AI-generation path.
         return _generate_stage1_background(run)
-    provider = provider or get_provider(agent_id=GD_AGENT_ID)
+    provider = provider or get_provider(agent_id=GD_AGENT_ID, stage=stage)
     key = str(stage)
 
     if stage in (1, 2):
@@ -702,6 +711,7 @@ def generate(run: dict, stage: int, variant: str | None = None,
         "diffs": built["diffs"],
         "warnings": built["warnings"],
         "provider": provider.name,
+        **_model_stamp(provider),
         "created_at": now_iso(),
         **({"remix": built["remix"]} if built.get("remix") else {}),
     }
@@ -827,9 +837,11 @@ def generate_stage4(run: dict, logo_png: bytes, *, use_ai: bool | None = None,
             image_size=STAGE_IMAGE_SIZE[4],
         )
         method = "ai"
+        model_stamp = _model_stamp(provider)
     else:
         png = composite_logo(base, logo_png, layout)
         method = "deterministic"
+        model_stamp = {}
 
     rel = save_artifact(run["id"], 4, "final", attempt_no, png)
     attempt = {
@@ -838,6 +850,7 @@ def generate_stage4(run: dict, logo_png: bytes, *, use_ai: bool | None = None,
         "artifact": rel,
         "logo_artifact": logo_rel,
         "method": method,
+        **model_stamp,
         "created_at": now_iso(),
     }
     st = run["stages"]["4"]
@@ -898,6 +911,7 @@ def generate_tweak(run: dict, instruction: str,
         "prompt": result["prompt"],
         "prompt_hash": _sha(result["prompt"]),
         "provider": provider.name,
+        **_model_stamp(provider),
         "created_at": now_iso(),
     }
     st["attempts"].append(attempt)
@@ -992,7 +1006,9 @@ def establish_base(
     run = create_run(user_id, brand_id)
     run["config"]["aspect_ratio"] = aspect_ratio if aspect_ratio in ASPECT_RATIOS else DEFAULT_AR
     pack = registry.get_pack(brand_id)
-    provider = provider or get_provider(agent_id=GD_AGENT_ID)
+    # ``provider`` stays None unless a caller pins one: generate() then resolves
+    # each stage's own model (Stage 1 = the gradient model, Stage 2 = the image
+    # model), exactly as the studio does.
 
     v1 = stage1_variant or (pack.stage1_variants[0]["id"] if pack.stage1_variants else "A")
     generate(run, 1, variant=v1, provider=provider, extra_references=reference_images)
