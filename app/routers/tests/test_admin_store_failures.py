@@ -238,6 +238,9 @@ def test_list_runs_for_user_months_buckets_create_run_rows_too(monkeypatch):
     got = firestore_repo.list_runs_for_user_months("u1", ["2026-10"])
     assert [r["agent_id"] for r in got] == ["a1", "a2"]
     assert firestore_repo.count_runs_for_user_by_month("u1") == {"2026-10": 2, "2026-09": 1}
+    assert firestore_repo.runs_for_user_by_month_and_agent("u1") == {
+        "2026-10": {"a1": 1, "a2": 1}, "2026-09": {"a1": 1},
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -325,13 +328,17 @@ def test_team_usage_admin_view_counts_humans_only_newest_month_first(as_caller, 
     as_caller(_HAYLIE)
     this_month = datetime.now(timezone.utc).strftime("%Y-%m")
     asked: list[str] = []
-    counts = {"k1": {this_month: 5}, "c1": {this_month: 9, "2024-01": 3}, "y1": {}}
+    counts = {
+        "k1": {this_month: {"a2": 5}},
+        "c1": {this_month: {"a2": 6, "a10": 3}, "2024-01": {"a1": 3}},
+        "y1": {},
+    }
 
     def count(uid):
         asked.append(uid)
         return counts.get(uid, {})
 
-    monkeypatch.setattr(firestore_repo, "count_runs_for_user_by_month", count)
+    monkeypatch.setattr(firestore_repo, "runs_for_user_by_month_and_agent", count)
 
     r = client.get("/api/usage/team?months=2")
     assert r.status_code == 200, r.text
@@ -345,6 +352,8 @@ def test_team_usage_admin_view_counts_humans_only_newest_month_first(as_caller, 
     assert newest["runs"] == 14 and newest["users"] == 2
     assert [u["user_id"] for u in newest["by_user"]] == ["c1", "k1"]
     assert newest["by_user"][0]["name"] == "Chelsea E"   # no profile name → derived
+    assert newest["by_user"][0]["by_agent"] == {"a2": 6, "a10": 3}   # busiest first
+    assert newest["by_user"][1]["by_agent"] == {"a2": 5}
     assert months[1] == {"year_month": months[1]["year_month"], "runs": 0, "users": 0, "by_user": []}
     assert "cron" in body["humans"]["excluded"]
 
@@ -352,8 +361,8 @@ def test_team_usage_admin_view_counts_humans_only_newest_month_first(as_caller, 
 def test_team_usage_admin_view_answers_502_when_any_month_cannot_be_read(as_caller, directory, monkeypatch):
     as_caller(_HAYLIE)
     monkeypatch.setattr(
-        firestore_repo, "count_runs_for_user_by_month",
-        lambda uid: None if uid == "y1" else {"2026-01": 1},
+        firestore_repo, "runs_for_user_by_month_and_agent",
+        lambda uid: None if uid == "y1" else {"2026-01": {"a1": 1}},
     )
     r = client.get("/api/usage/team")
     assert r.status_code == 502, r.text

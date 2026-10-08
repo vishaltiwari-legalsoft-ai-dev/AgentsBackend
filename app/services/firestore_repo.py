@@ -1330,23 +1330,39 @@ def list_runs_for_user_months(
     return [r for r in rows if run_row_month(r) in wanted]
 
 
+def runs_for_user_by_month_and_agent(user_id: str) -> dict[str, dict[str, int]] | None:
+    """One user's rows, per ``YYYY-MM`` and per agent — one read per user.
+
+    ``{"2026-10": {"a1": 12, "a2": 3}}``. ``None`` when the read failed, never
+    an empty map that would read as "did nothing". A month absent from the
+    map is a month with no rows; a row without an agent counts as "unknown".
+    """
+    if not user_id:
+        return {}
+    rows = _user_run_rows(user_id, ("date", "agent_id"))
+    if rows is None:
+        return None
+    out: dict[str, dict[str, int]] = {}
+    for r in rows:
+        ym = run_row_month(r)
+        if not ym:
+            continue
+        agent = str(r.get("agent_id") or "unknown")
+        month = out.setdefault(ym, {})
+        month[agent] = month.get(agent, 0) + 1
+    return out
+
+
 def count_runs_for_user_by_month(user_id: str) -> dict[str, int] | None:
     """How many rows one user filed, per ``YYYY-MM`` — one read per user.
 
     ``None`` when the read failed, never a zero map that would read as "did
     nothing". A month absent from the map is a month with no rows.
     """
-    if not user_id:
-        return {}
-    rows = _user_run_rows(user_id, ("date",))
-    if rows is None:
+    by_agent = runs_for_user_by_month_and_agent(user_id)
+    if by_agent is None:
         return None
-    out: dict[str, int] = {}
-    for r in rows:
-        ym = run_row_month(r)
-        if ym:
-            out[ym] = out.get(ym, 0) + 1
-    return out
+    return {ym: sum(agents.values()) for ym, agents in by_agent.items()}
 
 
 #: How many of one caller's rows the unordered fallback will pull before it

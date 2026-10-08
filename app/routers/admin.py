@@ -576,16 +576,17 @@ def _humans_payload(users: list[dict], viewer: dict, months: int) -> dict:
     # bucketed by whichever date field the row carries — see
     # ``firestore_repo.run_row_month``.
     with ThreadPoolExecutor(max_workers=_TEAM_READ_WORKERS) as pool:
-        counts = list(pool.map(firestore_repo.count_runs_for_user_by_month, ids))
+        counts = list(pool.map(firestore_repo.runs_for_user_by_month_and_agent, ids))
     if any(c is None for c in counts):
         raise HTTPException(502, _COULD_NOT_READ.format(what="the team's monthly activity"))
 
-    per_month: dict[str, dict[str, int]] = {ym: {} for ym in year_months}
+    # month -> user -> {agent -> runs}; a user with no rows in a month is absent.
+    per_month: dict[str, dict[str, dict[str, int]]] = {ym: {} for ym in year_months}
     for uid, by_month in zip(ids, counts):
         for ym in year_months:
-            n = int((by_month or {}).get(ym, 0))
-            if n:
-                per_month[ym][uid] = n
+            agents = dict((by_month or {}).get(ym, {}))
+            if sum(agents.values()):
+                per_month[ym][uid] = agents
     by_id = {str(u["id"]): u for u in humans}
     out = []
     for ym in year_months:
@@ -594,9 +595,12 @@ def _humans_payload(users: list[dict], viewer: dict, months: int) -> dict:
                 "user_id": uid,
                 "email": by_id[uid].get("email", ""),
                 "name": by_id[uid].get("name") or _display_name_from_email(by_id[uid].get("email", "")),
-                "runs": n,
+                "runs": sum(agents.values()),
+                # Which specialists this person asked for, this month —
+                # the owner's question, answered per person.
+                "by_agent": dict(sorted(agents.items(), key=lambda kv: (-kv[1], kv[0]))),
             }
-            for uid, n in per_month[ym].items()
+            for uid, agents in per_month[ym].items()
         ]
         by_user.sort(key=lambda r: (-r["runs"], r["email"]))
         out.append({
