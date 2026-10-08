@@ -347,8 +347,10 @@ def build_carousel_frames(plan: dict[str, Any], pack: Any,
         return _all_stand_ins(
             "Carousel setup failed before any slide image could be generated, so this "
             "frame is a locally drawn brand-gradient stand-in, not an AI image.")
-    # Resolved once for every slide (each used to resolve its own): no image
-    # model at all is one honest reason, stated once, not N identical failures.
+    # Checked once up front: no image model at all is one honest reason,
+    # stated once, not N identical slide failures. Only checked - the provider
+    # is NOT pinned into establish_base, which resolves each stage's own model
+    # (Stage 1 = the gradient model, Stage 2 = the image model).
     try:
         provider = providers.get_provider(agent_id=providers.GD_AGENT_ID)
     except Exception as exc:  # noqa: BLE001 - ImageProviderUnavailable, or worse
@@ -369,7 +371,7 @@ def build_carousel_frames(plan: dict[str, Any], pack: Any,
         try:
             run = pipeline.establish_base(
                 brand_id, "1:1", reference_images=refs,
-                subject=fr.get("subject") or None, provider=provider,
+                subject=fr.get("subject") or None,
             )
             if images_only:
                 # No copy — composite just the logo onto the approved base image.

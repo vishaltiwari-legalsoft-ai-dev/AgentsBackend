@@ -21,6 +21,7 @@ always produced and generation never breaks.
 
 from __future__ import annotations
 
+import concurrent.futures
 import io
 import json
 import logging
@@ -36,6 +37,10 @@ _VALID_PLACEMENTS = ("left", "right", "top", "bottom", "center")
 # Downscale before sending to the vision model — placement only needs the gist,
 # and a ~768px image is far cheaper/faster than the native 4K base.
 _VISION_MAX_DIM = 768
+# The same budget the studio's placement brain gets. A slide whose vision call
+# outlives it takes the pixel fallback instead of holding the whole carousel
+# request until httpx's 180 s deadline (past the 300 s relay cut).
+_VISION_TIMEOUT_S = 45
 
 
 def decide_placement(image_bytes: bytes, *, headline: str = "", body: str = "",
@@ -91,7 +96,13 @@ def _vision_placement(image_bytes: bytes, headline: str, body: str,
     )
     allowed = ("left", "right") if sides_only else _VALID_PLACEMENTS
     try:
-        out = analyze_images(prompt, [(small, "image/png")], agent_id="a1")
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                                                     thread_name_prefix="gd-vision-layout")
+        try:   # not a with-block: its exit would join the worker past the budget
+            out = pool.submit(analyze_images, prompt, [(small, "image/png")],
+                              agent_id="a1").result(timeout=_VISION_TIMEOUT_S)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
         match = re.search(r"\{.*\}", out, re.S)
         if not match:
             return None

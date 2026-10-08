@@ -370,3 +370,22 @@ def test_a_file_that_cannot_be_stored_fails_the_run_instead_of_vanishing(monkeyp
     assert "503" not in str(caught.value)              # safe message for the client
     stored = cruns.get_run(run["id"])
     assert stored["state"] != "DONE" and stored["progress"]["state"] == "failed"
+
+
+def test_carousel_leaves_each_stage_its_own_image_model(monkeypatch):
+    """The up-front availability check must not pin one provider into the
+    slide bases: Stage 1 runs the gradient model, Stage 2 the image model."""
+    from graphics_designer_agent import pipeline as gd_pipeline
+
+    stages: list = []
+
+    def per_stage(name=None, *, agent_id=None, stage=None):
+        stages.append(stage)
+        return _ModelProvider()
+
+    monkeypatch.setattr(gd_pipeline, "get_provider", per_stage)
+    monkeypatch.setattr(db.providers, "get_provider", lambda *a, **k: _ModelProvider())
+    plan = planner.plan("carousel", "hiring", brand_name=PACK.name, count=3, use_llm=False)
+    db.build("carousel", plan, PACK)
+    slides = len(plan["frames"])
+    assert stages.count(1) == slides and stages.count(2) == slides

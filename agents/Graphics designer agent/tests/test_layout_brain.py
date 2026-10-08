@@ -60,3 +60,28 @@ def test_decide_placement_always_returns_a_valid_zone():
 def test_unreadable_bytes_degrade_to_a_safe_default():
     out = layout_brain._pixel_placement(b"not an image")
     assert out["placement"] == "left" and out["color"] == "dark"
+
+
+def test_a_vision_call_that_never_answers_falls_back_at_the_budget(monkeypatch):
+    """A slide whose layout vision call hangs takes the pixel placement at the
+    budget, instead of holding the carousel request until httpx gives up."""
+    import threading
+    import time
+
+    from app.services import openrouter
+
+    release = threading.Event()
+
+    def never_answers(*_a, **_k):
+        release.wait(10)
+        return "{}"
+
+    monkeypatch.setattr(openrouter, "analyze_images", never_answers)
+    monkeypatch.setattr(layout_brain, "_VISION_TIMEOUT_S", 0.2)
+    try:
+        t0 = time.monotonic()
+        out = layout_brain.decide_placement(_busy_left(), headline="Hi", sides_only=True)
+        assert time.monotonic() - t0 < 2.0
+        assert out["placement"] in ("left", "right") and out.get("source") != "vision"
+    finally:
+        release.set()
