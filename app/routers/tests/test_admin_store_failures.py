@@ -146,8 +146,17 @@ def test_org_chart_reports_none_for_someone_who_has_not_signed_in():
 
 
 def test_org_chart_identifies_a_manager_and_nobody_else():
-    assert org_chart.manager_for_user(_u("k", "k@x.com", "Kier Dela Rosa")).person.name == \
-        "Kier Anthony M. Dela Rosa"
+    # A manager with an e-mail on the chart is matched on that e-mail only: the
+    # right address is a manager whatever the display name says, and a display
+    # name alone (which anyone can set on their Google profile) is not.
+    assert org_chart.manager_for_user(
+        _u("k", "kier.delarosa@legalsoft.com", "K.")).person.name == "Kier Anthony M. Dela Rosa"
+    assert org_chart.manager_for_user(_u("k2", "k@x.com", "Kier Dela Rosa")) is None
+    # Raj has no e-mail on the chart yet, so he is still found by name.
+    assert org_chart.manager_for_user(_u("r", "r@x.com", "Raj Dobariya")).person.name == "Raj Dobariya"
+    # A manager named with no reportees is still a manager, with an empty team.
+    assert org_chart.manager_for_user(
+        _u("a", "anushka.p@legalsoft.com", "Anushka")).reportees == ()
     assert org_chart.manager_for_user(_u("h", "h@x.com", "Haylie Anne Logan")) is None
     assert org_chart.manager_for_user(_u("b", "brix.ayo@x.com", "Brix Ayo")) is None
 
@@ -172,12 +181,12 @@ def test_count_runs_for_user_month_reports_none_on_failure(monkeypatch):
 # GET /api/usage/team — the HTTP layer
 # --------------------------------------------------------------------------- #
 
-_KIER = {"id": "k1", "email": "kier@legalsoft.com", "is_admin": False, "timezone": "UTC"}
+_KIER = {"id": "k1", "email": "kier.delarosa@legalsoft.com", "is_admin": False, "timezone": "UTC"}
 _HAYLIE = {"id": "h1", "email": "haylie@legalsoft.com", "is_admin": True, "timezone": "UTC"}
 _MEMBER = {"id": "b1", "email": "brix.ayo@legalsoft.com", "is_admin": False, "timezone": "UTC"}
 
 _DIRECTORY = [
-    _u("k1", "kier@legalsoft.com", "Kier Dela Rosa"),
+    _u("k1", "kier.delarosa@legalsoft.com", "Kier Dela Rosa"),
     _u("c1", "chelsea.e@practice360.ai") | {"last_login": "2026-10-07T01:00:00+00:00"},
     _u("y1", "yans.suarez@legalsoft.com", "Yans Suarez"),
     _u("h1", "haylie@legalsoft.com", "Haylie Anne Logan"),

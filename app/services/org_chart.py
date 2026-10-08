@@ -1,10 +1,10 @@
 """The team chart: who reports to whom, and how a chart name finds a sign-in.
 
-Seed data from the manager's spreadsheet — names and titles only. Nobody's
-e-mail was known when this was written, so every ``email`` is ``None`` and an
-admin fills them in as people sign in. Until then a chart person is matched to
-a ``users`` document by name, with the rules below; once an ``email`` is set
-the name rules are not consulted for that person at all.
+Seed data from the manager's spreadsheet. The managers' e-mails were given by
+the owner on 2026-10-08 and are matched on e-mail only; every reportee still
+has ``email=None`` and is matched to a ``users`` document by name, with the
+rules below, until an admin fills the address in. Once an ``email`` is set the
+name rules are not consulted for that person at all.
 
 Everything here is plain data and pure functions. No Firestore, no clock —
 ``GET /api/usage/team`` (``app/routers/admin.py``) does the reads and hands
@@ -58,7 +58,8 @@ def _p(name: str, title: str, email: Optional[str] = None) -> Person:
 #: identified by ``is_admin`` on the caller, never by this table.
 MANAGERS: tuple[Manager, ...] = (
     Manager(
-        _p("Angelica Mhay Canlas-David", "Executive Assistant (Deliverable Management)"),
+        _p("Angelica Mhay Canlas-David", "Executive Assistant (Deliverable Management)",
+           "angelica.david@legalsoft.com"),
         (
             _p("Francesca Canquin", "Client General Manager"),
             _p("Julian Rivera Gomez", "Client General Manager"),
@@ -69,7 +70,7 @@ MANAGERS: tuple[Manager, ...] = (
         ),
     ),
     Manager(
-        _p("Kier Anthony M. Dela Rosa", "SEO Manager"),
+        _p("Kier Anthony M. Dela Rosa", "SEO Manager", "kier.delarosa@legalsoft.com"),
         (
             _p("Yans Suarez", "SEO Specialist"),
             _p("Marian Portillo", "SEO Specialist"),
@@ -80,7 +81,7 @@ MANAGERS: tuple[Manager, ...] = (
         ),
     ),
     Manager(
-        _p("Daniel Sernin Noche Amorsolo", "Graphic Designer"),
+        _p("Daniel Sernin Noche Amorsolo", "Graphic Designer", "daniel.amorsolo@legalsoft.com"),
         (_p("Brix Ayo", "Graphic Designer"),),
     ),
     Manager(
@@ -93,6 +94,10 @@ MANAGERS: tuple[Manager, ...] = (
             _p("Mari Ann Belle S. Del Socorro (Mabs)", "UI/UX Designer"),
         ),
     ),
+    # Named by the owner on 2026-10-08 with an e-mail but no reportees yet;
+    # the Home panel says "nobody reports to you on the chart yet" until the
+    # chart lists them.
+    Manager(_p("Anushka Prasad", "Manager", "anushka.p@legalsoft.com"), ()),
 )
 
 
