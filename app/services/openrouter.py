@@ -13,8 +13,10 @@ from __future__ import annotations
 import base64
 import logging
 import math
+import os
 import random
 import re
+import threading
 import time
 from io import BytesIO
 
@@ -209,10 +211,35 @@ _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504, 520, 522, 524,
 # bounded so Stage-3's fan-out (3 parallel polish calls x QA retry) stays well
 # inside Cloud Run's 900 s request timeout.
 IMAGE_MAX_ATTEMPTS = 2
-_RETRY_AFTER_CAP_S = 30.0
-# Per-attempt HTTP timeout. Measured worst case 2026-10-08: GPT-5.4 Image 2
-# 115 s, GPT Image 2.5 Sunburst 50 s, Gemini 3 Pro Image 28 s.
-IMAGE_TIMEOUT = httpx.Timeout(150.0, connect=10.0)
+_RETRY_AFTER_CAP_S = 15.0
+_JITTER_MAX_S = 1.5
+# Per-attempt HTTP timeout, sized so BOTH attempts plus the back-off fit inside
+# ~200 s: the Vercel relay cuts every request at 300 s (maxDuration), so one
+# image call must never outlive it. 2 x 90 + 15 + 1.5 = 196.5 s. Measured
+# worst cases 2026-10-08: GPT Image 2.5 Sunburst 62 s, Gemini 3 Pro Image 47 s
+# (GPT-5.4 Image 2 reached 115 s — it would need its own budget if selected).
+IMAGE_TIMEOUT = httpx.Timeout(90.0, connect=10.0)
+IMAGE_CALL_BUDGET_S = (IMAGE_MAX_ATTEMPTS * IMAGE_TIMEOUT.read
+                       + _RETRY_AFTER_CAP_S + _JITTER_MAX_S)
+
+
+# Per-instance cap on image calls in flight. An instance serves 40 threads; the
+# Text Optimizer fans out 3 parallel calls, a carousel 5, a brochure 4, so a
+# 7-70 campaign burst could otherwise park every thread on an outbound image
+# call and stall every agent on the instance. Waiting for a slot is bounded so
+# slot wait + IMAGE_CALL_BUDGET_S still fits the 300 s relay cut; a call that
+# cannot get a slot in time fails as an honest 503, never hangs.
+def _concurrency_from_env(default: int = 12) -> int:
+    """``IMAGE_CALL_CONCURRENCY`` (>= 1); unset or junk -> ``default``."""
+    try:
+        return max(1, int(os.environ.get("IMAGE_CALL_CONCURRENCY") or default))
+    except ValueError:
+        return default
+
+
+IMAGE_CALL_CONCURRENCY = _concurrency_from_env()
+IMAGE_SLOT_WAIT_S = 60.0
+_IMAGE_SLOTS = threading.BoundedSemaphore(IMAGE_CALL_CONCURRENCY)
 
 
 def _sleep(seconds: float) -> None:  # seam for tests
@@ -242,6 +269,20 @@ def _upstream_reason(response: httpx.Response) -> str:
 
 
 def _post_image(url: str, body: dict, headers: dict, model: str) -> dict:
+    """One image call under the per-instance concurrency cap (one slot held
+    for both attempts). Raises a 503 :class:`ImageProviderError` when no slot
+    frees up within ``IMAGE_SLOT_WAIT_S``."""
+    if not _IMAGE_SLOTS.acquire(timeout=IMAGE_SLOT_WAIT_S):
+        raise ImageProviderError(
+            f"image generation is busy on this server ({IMAGE_CALL_CONCURRENCY} image "
+            f"calls already running) — retry shortly", model=model, status=503)
+    try:
+        return _post_image_attempts(url, body, headers, model)
+    finally:
+        _IMAGE_SLOTS.release()
+
+
+def _post_image_attempts(url: str, body: dict, headers: dict, model: str) -> dict:
     """POST with a bounded, jittered retry. Returns the parsed JSON body or
     raises :class:`ImageProviderError` naming the model and the real cause."""
     last: ImageProviderError | None = None
@@ -272,7 +313,7 @@ def _post_image(url: str, body: dict, headers: dict, model: str) -> dict:
                 raise last
         if attempt < IMAGE_MAX_ATTEMPTS:
             wait = last.retry_after if last.retry_after is not None else 2.0 * attempt
-            wait = min(_RETRY_AFTER_CAP_S, wait) + random.uniform(0, 1.5)
+            wait = min(_RETRY_AFTER_CAP_S, wait) + random.uniform(0, _JITTER_MAX_S)
             logger.warning("image call retry %d/%d for %s in %.1fs: %s",
                            attempt, IMAGE_MAX_ATTEMPTS - 1, model, wait, last)
             _sleep(wait)

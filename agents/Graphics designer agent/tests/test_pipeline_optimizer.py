@@ -114,6 +114,9 @@ def test_dark_base_records_contrast_guard_and_flips_ink(monkeypatch):
     _seed(run)
     from graphics_designer_agent.runs import save_artifact
 
+    # A dark user-photo background end to end (Stage 1 and the Stage-2 base),
+    # so the subject guard sees an unchanged background and leaves layout alone.
+    save_artifact(run["id"], 1, "A", 1, _dark_png())
     save_artifact(run["id"], 2, "A", 1, _dark_png())  # overwrite approved base: dark field
     attempt = pipeline._generate_stage3(run, provider=_FakeProvider())
     guard = attempt.get("contrast_guard") or []

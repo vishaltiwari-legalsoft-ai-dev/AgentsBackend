@@ -308,3 +308,61 @@ def test_attempts_record_the_model_that_made_them(monkeypatch):
     assert a1["model"] == "gemini/gradient"
     assert a2["model"] == "openai/gpt-image-2.5-sunburst"
     assert seen == [1, 2]
+
+
+# --- 4. bounded in time and in concurrency (2026-10-09) ----------------------
+
+def test_one_image_call_fits_inside_the_relay_cut():
+    """The Vercel relay cuts a request at 300 s; both attempts plus back-off,
+    plus the longest wait for a concurrency slot, must fit with room to spare."""
+    assert openrouter.IMAGE_CALL_BUDGET_S <= 200
+    assert openrouter.IMAGE_SLOT_WAIT_S + openrouter.IMAGE_CALL_BUDGET_S < 300
+
+
+def test_busy_instance_fails_fast_as_a_503_instead_of_hanging(wire, monkeypatch):
+    """Every slot taken: the call gives up after the bounded wait with an
+    honest, retryable 503 — it never queues forever and never posts."""
+    import threading
+
+    calls, _queue = wire
+    monkeypatch.setattr(openrouter, "_IMAGE_SLOTS", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(openrouter, "IMAGE_SLOT_WAIT_S", 0.05)
+    openrouter._IMAGE_SLOTS.acquire()  # another call holds the only slot
+    try:
+        with pytest.raises(openrouter.ImageProviderError) as exc:
+            openrouter.generate_image("x", model="openai/gpt-image-2.5-sunburst",
+                                      aspect_ratio="1:1", image_size="1K")
+    finally:
+        openrouter._IMAGE_SLOTS.release()
+    assert exc.value.status == 503 and not exc.value.rate_limited
+    assert "busy" in str(exc.value) and "retry" in str(exc.value)
+    assert not [c for c in calls if "url" in c]
+
+
+def test_slot_is_released_after_success_and_after_failure(wire, monkeypatch):
+    import threading
+
+    _calls, queue = wire
+    monkeypatch.setattr(openrouter, "_IMAGE_SLOTS", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(openrouter, "IMAGE_SLOT_WAIT_S", 0.05)
+    queue.append(_images_ok(1088, 1088))
+    openrouter.generate_image("x", model="openai/gpt-image-2.5-sunburst",
+                              aspect_ratio="1:1", image_size="1K")
+    queue.append(_Resp(400, {"error": {"message": "bad"}}))
+    with pytest.raises(openrouter.ImageProviderError):
+        openrouter.generate_image("x", model="openai/gpt-image-2.5-sunburst",
+                                  aspect_ratio="1:1", image_size="1K")
+    # Both calls gave their slot back: a third can still take it.
+    assert openrouter._IMAGE_SLOTS.acquire(timeout=0.05)
+    openrouter._IMAGE_SLOTS.release()
+
+
+def test_concurrency_cap_reads_its_env_knob(monkeypatch):
+    monkeypatch.setenv("IMAGE_CALL_CONCURRENCY", "3")
+    assert openrouter._concurrency_from_env() == 3
+    monkeypatch.setenv("IMAGE_CALL_CONCURRENCY", "0")
+    assert openrouter._concurrency_from_env() == 1        # never zero slots
+    monkeypatch.setenv("IMAGE_CALL_CONCURRENCY", "lots")
+    assert openrouter._concurrency_from_env() == 12       # junk -> the default
+    monkeypatch.delenv("IMAGE_CALL_CONCURRENCY")
+    assert openrouter._concurrency_from_env() == 12

@@ -319,6 +319,45 @@ def _prompt_references(run: dict) -> tuple[list[tuple[bytes, str]] | None, list[
     return (_shrink_reference(out) if out else None), warnings
 
 
+# Subject placement "auto" used to add nothing, so the default left text column
+# and the curated "lower portion" framing collided whenever the image model
+# seated the person mid-frame (the 2026-10-08 E2E put the headline across her
+# face on 3 of 4 ratios). Auto now reserves the copy's side in the Stage-2
+# prompt — appended, the subject's own wording kept — while an explicit 9-cell
+# pick still goes through ``place_subject`` unchanged.
+_TEXT_SIDE_CLAUSES = {
+    "left": ("Keep the LEFT side of the frame (roughly the left 45%) completely free of "
+             "the subject and of any props - the headline is set there. Seat the subject "
+             "on the right side."),
+    "right": ("Keep the RIGHT side of the frame (roughly the right 45%) completely free of "
+              "the subject and of any props - the headline is set there. Seat the subject "
+              "on the left side."),
+    "top": ("Keep the TOP 40% of the frame completely free of the subject and of any "
+            "props - the headline is set there. Seat the subject low in the frame."),
+    "bottom": ("Keep the BOTTOM 35% of the frame completely free of the subject and of "
+               "any props - the copy is set there. Seat the subject high in the frame."),
+}
+
+
+def _text_side(cfg: dict) -> str:
+    """Where the headline will sit: its pinned x when the user placed it, else
+    its placement token (default left)."""
+    pinned = (cfg.get("layout") or {}).get("headline")
+    if isinstance(pinned, dict) and "x" in pinned:
+        return "left" if float(pinned["x"]) < 0.5 else "right"
+    return ((cfg.get("element_styles") or {}).get("headline") or {}).get(
+        "placement", DEFAULT_TEXT_PLACEMENT)
+
+
+def _placed_subject(subject: str, cfg: dict) -> str:
+    """The Stage-2 subject text with its placement instruction."""
+    chosen = (cfg.get("element_placement") or "auto").strip().lower()
+    if chosen != "auto":
+        return place_subject(subject, chosen)
+    clause = _TEXT_SIDE_CLAUSES.get(_text_side(cfg))
+    return f"{subject.rstrip()} {clause}" if clause else subject
+
+
 def build_prompt(run: dict, stage: int, variant: str, *, remix: bool = False) -> dict:
     """Return the exact final prompt + audit diff for a stage (no generation)."""
     cfg = run["config"]
@@ -364,7 +403,7 @@ def build_prompt(run: dict, stage: int, variant: str, *, remix: bool = False) ->
                 subject, remix_meta = rr.text, rr.meta
         # Prompt-steered placement: when the user picks one of the 9 cells we
         # append an explicit override clause; "auto"/absent is a strict no-op.
-        subject = place_subject(subject, cfg.get("element_placement"))
+        subject = _placed_subject(subject, cfg)
         sub = substitute_stage2(
             pack.load_prompt(pack.stage2_blend_prompt), variant, ar, subject=subject
         )
@@ -446,6 +485,62 @@ def _hires_canvas(base_png: bytes, canvas_w: int, canvas_h: int) -> tuple[int, i
     return round(canvas_w * scale), round(canvas_h * scale), scale
 
 
+# The logo is chosen at Stage 4, after the copy is set, so Stage 3 reserves the
+# box it will most likely take: the run's logo position/size/margin with a
+# typical wide wordmark (h = 0.45 w) at the wide-logo default width (25%) when
+# no size is set. Stage 4 re-checks the real logo box against the real ink.
+_RESERVE_LOGO_W, _RESERVE_LOGO_H = 1000, 450
+
+
+def _logo_reserve(run: dict, canvas_w: int, canvas_h: int) -> tuple[float, float, float, float]:
+    from .stage4_logo.compositor import DEFAULT_LOGO_POSITION, WIDTH_RATIO_WIDE
+
+    lay = run["config"].get("logo_layout") or {}
+    box = logo_placement(
+        canvas_w, canvas_h, _RESERVE_LOGO_W, _RESERVE_LOGO_H,
+        position=lay.get("position") or DEFAULT_LOGO_POSITION,
+        size_pct=lay.get("size_pct") or WIDTH_RATIO_WIDE * 100,
+        margin_pct=lay.get("margin_pct"),
+        offset_x=int(lay.get("offset_x", 0) or 0), offset_y=int(lay.get("offset_y", 0) or 0))
+    return (box["x"] / canvas_w, box["y"] / canvas_h,
+            (box["x"] + box["w"]) / canvas_w, (box["y"] + box["h"]) / canvas_h)
+
+
+def _enforce_subject_clearance(run: dict, layers: list[dict], base: bytes,
+                               canvas_w: int, canvas_h: int, pack) -> dict | None:
+    """Run the Stage-3 subject guard on ``layers`` (mutated in place when the
+    copy has to move) and persist any move into the run config, so the editor
+    shows where the text really is and the config hash matches the render.
+    Returns the ``placement_guard`` record, or None when nothing moved."""
+    from .stage3_text import subject_guard
+
+    try:
+        _layers, record = subject_guard.enforce(
+            layers, _approved_png(run, 1), base, canvas_w, canvas_h, pack,
+            reserve=[_logo_reserve(run, canvas_w, canvas_h)])
+    except subject_guard.SubjectGuardError as exc:
+        raise PipelineError(str(exc)) from exc
+    if not record:
+        return None
+    cfg = run["config"]
+    lay = cfg.setdefault("layout", {})
+    styles = cfg.setdefault("element_styles", {})
+    # Layer ids number the NON-EMPTY sub-headings; map back to config indices.
+    sub_idx = [i for i, s in enumerate(cfg.get("subheadings") or [])
+               if (s.get("text") or "").strip()]
+    by_id = {l["id"]: l for l in layers}
+    for lid in record["moved"]:
+        layer = by_id[lid]
+        lay[lid] = {"x": layer["x"], "y": layer["y"], "w": layer["w"], "anchor": "mc"}
+        size = {"size_pct": layer["size_pct"], "offset_x": 0, "offset_y": 0}
+        if lid in ("headline", "cta"):
+            styles[lid] = {**(styles.get(lid) or {}), **size}
+        elif lid.startswith("subheading-") and int(lid.rsplit("-", 1)[1]) < len(sub_idx):
+            i = sub_idx[int(lid.rsplit("-", 1)[1])]
+            cfg["subheadings"][i] = {**cfg["subheadings"][i], **size}
+    return record
+
+
 def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
     """Stage 3 = the Text Optimizer agent (spec 2026-07-14).
 
@@ -487,6 +582,11 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
     view, chosen_fonts = text_optimizer.resolved_fonts_view(run, pack, judgment)
 
     layers = gd_layout.resolve_layers(view)
+    canvas_w, canvas_h = _stage_dims(run, 3)
+    # Subject guard (both paths): copy must never sit on the Stage-2 subject.
+    # A colliding arrangement is re-flowed into clean space and the move is
+    # persisted + recorded; when no clean space exists this is an honest error.
+    placement_guard = _enforce_subject_clearance(run, layers, base, canvas_w, canvas_h, pack)
     # Legibility guard (optimizer path only, so flag-off stays byte-identical):
     # a brand-gradient highlight whose light stop vanishes on a light background
     # is rendered with the gradient's dark stop instead — recorded honestly.
@@ -498,7 +598,6 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
     contrast_guard = (
         text_optimizer.ensure_text_contrast(layers, base) if use_optimizer else []
     )
-    canvas_w, canvas_h = _stage_dims(run, 3)
     w, h, px_scale = _hires_canvas(base, canvas_w, canvas_h)
     png = render.render_layers(
         base, layers, w, h, px_scale=px_scale, pack=pack,
@@ -520,6 +619,7 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
             "diffs": [],
             "warnings": [],
             "provider": "deterministic",
+            **({"placement_guard": placement_guard} if placement_guard else {}),
             "created_at": now_iso(),
             **({"fonts": chosen_fonts} if chosen_fonts else {}),
         }
@@ -552,6 +652,7 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
             **(_model_stamp(provider) if res["ai"] else {}),
             **({"highlight_guard": highlight_guard} if highlight_guard else {}),
             **({"contrast_guard": contrast_guard} if contrast_guard else {}),
+            **({"placement_guard": placement_guard} if placement_guard else {}),
             "created_at": now_iso(),
             "style": res["style"],
             "style_label": res["label"],
@@ -810,6 +911,46 @@ def _generate_stage1_background(run: dict) -> dict:
     return attempt
 
 
+def _clear_logo_layout(run: dict, base: bytes, logo_png: bytes,
+                       layout: dict) -> tuple[dict, dict | None]:
+    """Keep the logo off the Stage-3 copy and the subject: the requested
+    position when clear, else the first clear corner (persisted to the run's
+    ``logo_layout`` and recorded). No clear position is an honest error."""
+    from PIL import Image
+
+    from .stage3_text import subject_guard
+    from .stage4_logo.compositor import DEFAULT_LOGO_POSITION, logo_placement
+
+    pack = registry.get_pack(run.get("brand_id"))
+    canvas_w, canvas_h = _stage_dims(run, 3)
+    view, _fonts = text_optimizer.resolved_fonts_view(run, pack)
+    ink = subject_guard.text_ink_mask(gd_layout.resolve_layers(view), canvas_w, canvas_h, pack)
+    s1, s2 = _approved_png(run, 1), _approved_png(run, 2)
+    subject = subject_guard.subject_mask(s1, s2) if s1 is not None and s2 is not None else None
+    base_w, base_h = Image.open(BytesIO(base)).size
+    logo_w, logo_h = Image.open(BytesIO(logo_png)).size
+
+    def place(position: str) -> dict:
+        return logo_placement(
+            base_w, base_h, logo_w, logo_h, position=position,
+            size_pct=layout.get("size_pct"), margin_pct=layout.get("margin_pct"),
+            offset_x=int(layout.get("offset_x", 0) or 0),
+            offset_y=int(layout.get("offset_y", 0) or 0))
+
+    requested = layout.get("position") or DEFAULT_LOGO_POSITION
+    try:
+        position, record = subject_guard.logo_clear_position(
+            requested=requested, place=place, base_w=base_w, base_h=base_h,
+            ink=ink, subject=subject)
+    except subject_guard.SubjectGuardError as exc:
+        raise PipelineError(str(exc)) from exc
+    if record is None:
+        return layout, None
+    layout = {**layout, "position": position}
+    run["config"]["logo_layout"] = {**(run["config"].get("logo_layout") or {}), "position": position}
+    return layout, record
+
+
 def generate_stage4(run: dict, logo_png: bytes, *, use_ai: bool | None = None,
                     provider: ImageProvider | None = None) -> dict:
     """Composite the logo onto the approved Stage-3 image."""
@@ -839,9 +980,10 @@ def generate_stage4(run: dict, logo_png: bytes, *, use_ai: bool | None = None,
         method = "ai"
         model_stamp = _model_stamp(provider)
     else:
+        layout, logo_guard = _clear_logo_layout(run, base, logo_png, layout)
         png = composite_logo(base, logo_png, layout)
         method = "deterministic"
-        model_stamp = {}
+        model_stamp = {"logo_guard": logo_guard} if logo_guard else {}
 
     rel = save_artifact(run["id"], 4, "final", attempt_no, png)
     attempt = {

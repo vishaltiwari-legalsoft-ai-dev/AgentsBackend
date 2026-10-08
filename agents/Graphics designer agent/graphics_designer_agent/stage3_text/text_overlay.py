@@ -582,3 +582,26 @@ def theme_for_pack(pack=None) -> _Theme:
 # Public alias so render_contract can rasterize shape layers without reaching
 # into a private. Same code path the Pillow engine uses — parity by construction.
 draw_shape_layer = _draw_shape
+
+
+def layer_ink_bbox(layer: dict, base_w: int, base_h: int, *, pack=None,
+                   px_scale: float = 1.0) -> tuple[int, int, int, int] | None:
+    """Pixel bbox ``(x0, y0, x1, y1)`` of the ink ONE pinned text/CTA layer would
+    lay down on a ``base_w`` x ``base_h`` canvas — drawn by the same code the
+    renderer uses, onto a transparent canvas, so measurement and render can
+    never disagree. ``None`` when nothing is drawn. Read-only: no render path
+    changes (used by ``subject_guard`` to keep copy off the Stage-2 subject)."""
+    theme = _theme_from_pack(pack) if pack is not None else _default_theme()
+    canvas = Image.new("RGBA", (base_w, base_h), (0, 0, 0, 0))
+    if layer.get("type") == "cta":
+        _draw_cta(canvas, {"text": layer["text"], "font": layer["font"],
+                           "size_pct": layer["size_pct"], "color": layer.get("color", "cta"),
+                           "placement": layer.get("placement", "bottom"),
+                           "offset": layer.get("offset", (0, 0))},
+                  base_w, base_h, theme, px_scale,
+                  coords={"x": layer["x"], "y": layer["y"], "anchor": layer["anchor"]})
+    else:
+        _draw_text_abs(canvas, {**layer, "offset": layer.get("offset", (0, 0))},
+                       base_w, base_h, theme, px_scale)
+    # Ignore the faint tail of the CTA drop shadow; count real ink.
+    return canvas.getchannel("A").point(lambda a: 255 if a > 40 else 0).getbbox()

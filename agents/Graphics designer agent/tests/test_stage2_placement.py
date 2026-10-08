@@ -2,9 +2,11 @@
 
 The Stage-2 subject is baked into the AI image (not a movable layer), so its
 position is steered by an explicit override clause appended to the subject
-prompt. ``auto`` (the default) is a STRICT no-op so the existing engine is
-untouched unless the user opts in.
+prompt. ``place_subject`` itself treats ``auto`` as a no-op; the pipeline's
+auto path instead reserves the headline's side (see pipeline._placed_subject).
 """
+
+import pytest
 
 from graphics_designer_agent import pipeline
 from graphics_designer_agent.runs import create_run
@@ -67,14 +69,41 @@ def test_never_raises_for_any_variant_or_cell():
 
 
 # ── pipeline wiring (the "don't break the engine" guarantee) ───────────────────
-def test_pipeline_auto_is_a_no_op():
+def test_pipeline_auto_reserves_the_text_side():
+    """Auto used to be a strict no-op, and the default left text column landed on
+    the subject's face (2026-10-08 E2E, 3 of 4 ratios). Auto now keeps the
+    headline's side clear in the Stage-2 prompt; the subject wording is kept."""
     run = create_run("place-auto")
     base = pipeline.build_prompt(run, 2, "A")["text"]
     run["config"]["element_placement"] = "auto"
     with_auto = pipeline.build_prompt(run, 2, "A")["text"]
     assert with_auto == base  # absent and "auto" produce identical prompts
-    assert "position the subject" not in with_auto.lower()
+    assert "keep the left side of the frame" in with_auto.lower()
+    assert "seat the subject on the right side" in with_auto.lower()
     assert STAGE2_VARIANTS[0]["subject"] in base  # curated subject untouched
+
+
+@pytest.mark.parametrize("side,phrase", [
+    ("right", "keep the right side of the frame"),
+    ("top", "keep the top 40% of the frame"),
+    ("bottom", "keep the bottom 35% of the frame"),
+])
+def test_pipeline_auto_follows_the_headline_placement(side, phrase):
+    run = create_run(f"place-auto-{side}")
+    run["config"].setdefault("element_styles", {}).setdefault("headline", {})["placement"] = side
+    assert phrase in pipeline.build_prompt(run, 2, "A")["text"].lower()
+
+
+def test_pipeline_auto_follows_a_pinned_headline():
+    run = create_run("place-auto-pinned")
+    run["config"]["layout"] = {"headline": {"x": 0.8, "y": 0.2, "w": 0.3, "anchor": "mc"}}
+    assert "keep the right side of the frame" in pipeline.build_prompt(run, 2, "A")["text"].lower()
+
+
+def test_pipeline_centred_headline_adds_no_side_clause():
+    run = create_run("place-auto-center")
+    run["config"].setdefault("element_styles", {}).setdefault("headline", {})["placement"] = "center"
+    assert "completely free of the subject" not in pipeline.build_prompt(run, 2, "A")["text"].lower()
 
 
 def test_pipeline_cell_injects_override_clause():
