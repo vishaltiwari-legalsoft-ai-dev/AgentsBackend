@@ -1385,7 +1385,10 @@ def test_the_pdf_is_exactly_what_the_renderer_returned(board_on, renderer_on, mo
     assert len(calls) == 1
     assert calls[0]["url"] == "http://renderer.invalid/pdf"
     assert calls[0]["json"] == {"v": 1, "html": html}
-    assert calls[0]["headers"] == {"X-Renderer-Token": "test-token-not-a-real-secret"}
+    # The renderer is private behind Google's front end: the call also carries
+    # this service's Google ID token (stubbed in conftest — no network).
+    assert calls[0]["headers"] == {"X-Renderer-Token": "test-token-not-a-real-secret",
+                                   "Authorization": "Bearer test-id-token-not-a-real-jwt"}
     assert calls[0]["timeout"] is not None, "an external call with no timeout"
 
 
@@ -2342,8 +2345,9 @@ def test_the_runs_list_costs_two_scoped_queries_when_the_workspace_is_shared(
     assert len(calls) == 2, calls
     (own_id, own_kinds), (ws_id, ws_kinds) = calls
     assert own_id == MEMBER["id"] and "daily_summary" in own_kinds
-    assert ws_id == WORKSPACE and set(ws_kinds) == set(reports.BOARD_KINDS), (
-        "the workspace query must ask for the board kinds only — every other kind "
+    # WORKSPACE_KINDS = the board kinds + the vendor report (2026-10-08).
+    assert ws_id == WORKSPACE and set(ws_kinds) == set(reports.WORKSPACE_KINDS), (
+        "the workspace query must ask for the workspace kinds only — every other kind "
         "under that key is somebody else's private report")
 
     # The caller who IS the workspace key needs no second query.

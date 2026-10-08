@@ -337,6 +337,7 @@ def test_the_gets_that_hand_the_user_a_file_are_recorded():
         "/api/mr/runs/{run_id}/pdf",
         "/api/mr/lead-analysis/pdf",
         "/api/mr/snapshots/vendor/{slug}/pdf",
+        "/api/mr/vendor-report/{run_id}/pdf",
     ):
         assert path in declared, sorted(declared)
 
@@ -358,6 +359,9 @@ def test_the_reads_that_render_a_panel_stay_out_of_the_trail():
         "/api/mr/lead-analysis/pdf",
         "/api/mr/runs/{run_id}/pdf",
         "/api/mr/snapshots/vendor/{slug}/pdf",
+        # 2026-10-08: the vendor report's PDF export — same class as the board
+        # PDF above; its HTML preview and periods read stay silent.
+        "/api/mr/vendor-report/{run_id}/pdf",
     ], recorded_reads
 
 

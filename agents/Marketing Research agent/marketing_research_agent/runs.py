@@ -324,3 +324,147 @@ def list_runs(user_id, kind: str | tuple[str, ...] | None = None) -> list[dict]:
         out.append(run)
     out.sort(key=lambda r: r.get("generated_at") or "", reverse=True)
     return out
+
+
+# --- report templates (workspace-wide, append-only, versioned) ----------------
+#
+# Owner decisions (2026-10-08): a template applies to the WHOLE workspace; any
+# member may upload or replace it; every version is kept for history and
+# one-click revert; the built-in default is always available.
+#
+# Stored as ordinary ``mr_runs`` docs — this module is the shared MR store, so
+# templates inherit its tenancy (``user_id`` = the workspace key the router
+# resolves with ``workspace.workspace_id``, so they follow ``MR_WORKSPACE_SHARED``)
+# and its lifecycle (``_enforce_retention``: the newest :func:`retention_cap`
+# versions per workspace per report, 25 by default). Append-only: a revert, and
+# "back to built-in", each WRITE a new version, so the active template is always
+# simply the newest one and retention can never evict it.
+#
+# One ``kind`` per report (``report_template:<report>``) so each report's history
+# is retained on its own — under a shared kind, 25 uploads of one report's
+# template would evict another report's ACTIVE template.
+#
+# Not in :data:`STATE_KINDS`, and not in ``reports.KINDS``, so ``GET /mr/runs``
+# never lists a template as a saved report.
+
+TEMPLATE_REPORTS = frozenset({"vendor_performance"})
+TEMPLATE_SOURCE_KINDS = frozenset({"pdf", "image", "html", "builder"})
+BUILTIN_TEMPLATE_ID = "builtin"
+
+#: Firestore's document limit is 1 MiB; leave headroom for the envelope.
+_TEMPLATE_MAX_BYTES = 900_000
+
+
+def template_kind(report: str = "vendor_performance") -> str:
+    if report not in TEMPLATE_REPORTS:
+        raise ValueError(f"unknown report for templates: {report!r}")
+    return f"report_template:{report}"
+
+
+def _require_workspace(workspace) -> None:
+    if workspace is None or not str(workspace).strip():
+        raise ValueError("a template belongs to a workspace — a blank key would "
+                         "write or read outside every tenant")
+
+
+def builtin_template(report: str = "vendor_performance") -> dict:
+    """The built-in default. Synthesised, never stored, always available."""
+    return {"id": BUILTIN_TEMPLATE_ID, "kind": template_kind(report), "report": report,
+            "builtin": True, "source_kind": None, "spec": None, "html": None,
+            "original_gcs_path": None, "sha256": None, "created_at": None,
+            "uploaded_by": None, "reverted_from": None}
+
+
+def save_template_version(workspace, *, uploaded_by: str, source_kind: str | None = None,
+                          spec: dict | None = None, html: str | None = None,
+                          original_gcs_path: str | None = None, sha256: str | None = None,
+                          builtin: bool = False, reverted_from: str | None = None,
+                          report: str = "vendor_performance") -> dict:
+    """Append a new version; it becomes the active template. Returns the record.
+
+    ``html`` must ALREADY be sanitized by the caller — this layer stores it, it
+    does not clean it — and is accepted only for ``source_kind == "html"``.
+    ``builtin=True`` records "use the built-in default" (no spec/html/source).
+
+    Raises ``ValueError`` for a blank workspace/uploader, an unknown
+    report/source kind, or a payload over Firestore's document limit, and
+    :class:`RunStoreError` when the version did not reach the durable store (its
+    local copy is removed, so no instance serves a version others cannot see).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    _require_workspace(workspace)
+    kind = template_kind(report)
+    if not uploaded_by or not str(uploaded_by).strip():
+        raise ValueError("uploaded_by is required — template history names who changed it")
+    if builtin:
+        source_kind, spec, html, original_gcs_path, sha256 = None, None, None, None, None
+    else:
+        if source_kind not in TEMPLATE_SOURCE_KINDS:
+            raise ValueError(f"source_kind must be one of {sorted(TEMPLATE_SOURCE_KINDS)}")
+        if html is not None and source_kind != "html":
+            raise ValueError("html is stored only for source_kind 'html'")
+        if spec is None and html is None:
+            raise ValueError("a template version needs a spec or html")
+    # "Active" is "newest", so a new version must sort strictly after the
+    # current one even when the clock ties (coarse on some hosts) or skews.
+    now_dt = datetime.now(timezone.utc)
+    newest = list_template_versions(workspace, report=report, limit=1)
+    if newest:
+        try:
+            floor = datetime.fromisoformat(newest[0]["generated_at"]) + timedelta(microseconds=1)
+            now_dt = max(now_dt, floor)
+        except (KeyError, TypeError, ValueError):
+            pass
+    now = now_dt.isoformat()
+    record = {
+        "id": new_run_id(), "kind": kind, "user_id": workspace, "report": report,
+        "generated_at": now, "created_at": now, "uploaded_by": str(uploaded_by).strip(),
+        "source_kind": source_kind, "spec": spec, "html": html,
+        "original_gcs_path": original_gcs_path, "sha256": sha256,
+        "builtin": bool(builtin), "reverted_from": reverted_from,
+    }
+    if len(json.dumps(record, default=str).encode("utf-8")) > _TEMPLATE_MAX_BYTES:
+        raise ValueError("template version is larger than the store's document limit")
+    if not save_run(record):
+        delete_run(record["id"])
+        raise RunStoreError("the template version could not be saved durably")
+    return record
+
+
+def list_template_versions(workspace, *, report: str = "vendor_performance",
+                           limit: int | None = None) -> list[dict]:
+    """This workspace's versions of one report's template, newest first — at most
+    :func:`retention_cap` exist, ``limit`` trims further. One equality query on
+    ``(user_id, kind)``: no composite index."""
+    _require_workspace(workspace)
+    rows = list_runs(workspace, kind=template_kind(report))
+    return rows if limit is None else rows[: max(limit, 0)]
+
+
+def active_template(workspace, *, report: str = "vendor_performance") -> dict:
+    """The newest version, or :func:`builtin_template` when none was ever saved.
+    A version saved with ``builtin=True`` is returned as-is (``builtin`` is
+    True, ``spec``/``html`` None): the consumer renders the default for either."""
+    rows = list_template_versions(workspace, report=report, limit=1)
+    return rows[0] if rows else builtin_template(report)
+
+
+def revert_template(workspace, version_id: str, *, uploaded_by: str,
+                    report: str = "vendor_performance") -> dict:
+    """One-click revert: append a NEW version copying ``version_id``
+    (``"builtin"`` = back to the built-in default). The version is looked up
+    inside THIS workspace's list only, so another workspace's id is not found —
+    it raises ``LookupError`` exactly like a missing one."""
+    if version_id == BUILTIN_TEMPLATE_ID:
+        return save_template_version(workspace, uploaded_by=uploaded_by, builtin=True,
+                                     reverted_from=BUILTIN_TEMPLATE_ID, report=report)
+    old = next((r for r in list_template_versions(workspace, report=report)
+                if r.get("id") == version_id), None)
+    if old is None:
+        raise LookupError(f"no template version {version_id!r} in this workspace")
+    return save_template_version(
+        workspace, uploaded_by=uploaded_by, source_kind=old.get("source_kind"),
+        spec=old.get("spec"), html=old.get("html"),
+        original_gcs_path=old.get("original_gcs_path"), sha256=old.get("sha256"),
+        builtin=bool(old.get("builtin")), reverted_from=version_id, report=report)

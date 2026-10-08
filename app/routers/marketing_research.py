@@ -13,18 +13,22 @@ import io
 import logging
 import math
 import os
+import re
 import tempfile
 import threading
-import time
 from datetime import date, datetime, timezone
 
-import httpx
+# Not called here any more: the renderer client lives in app.services.pdf_renderer.
+# Kept because the router suites stub ``mr_router.httpx.post`` (the module object
+# both share), so this name is part of how those tests reach the transport.
+import httpx  # noqa: F401
 from fastapi import (
     APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile,
 )
 from fastapi.responses import StreamingResponse
 
 from app.security import get_current_user
+from app.services import pdf_renderer
 from app.services.run_tracking import (
     CHANGE, CRON, JOB, Activity, ActivityTrail, silent,
 )
@@ -1765,6 +1769,8 @@ def make_report(kind: str, body: dict | None = None, user=Depends(get_current_us
         # route's one-``period`` body. Say where they do rather than 500 on a
         # builder that refuses them.
         raise HTTPException(422, f"'{kind}' is built at POST /api/mr/board-report.")
+    if kind in reports.VENDOR_KINDS:
+        raise HTTPException(422, f"'{kind}' is built at POST /api/mr/vendor-report.")
     period = str((body or {}).get("period") or "").strip() or None
     if period and kind not in ("monthly_summary", "quarterly_summary"):
         raise HTTPException(422, f"'{kind}' reports don't take a period.")
@@ -1876,6 +1882,8 @@ def _listed_period(structured: dict) -> str | None:
     single = (structured.get("period") or {}).get("label")
     if single:
         return str(single)
+    if structured.get("year_month"):  # the vendor report: one month, as of a sweep
+        return str(structured.get("month_label") or structured["year_month"])
     labels = [str(p.get("label") or p.get("key") or "").strip()
               for p in (structured.get("periods") or [])
               if isinstance(p, dict)]
@@ -1906,7 +1914,7 @@ def _may_read_run(run: dict, user: dict) -> bool:
     owner = run.get("user_id")
     if owner == user["id"]:
         return True
-    return run.get("kind") in reports.BOARD_KINDS and owner == _ws(user)
+    return run.get("kind") in reports.WORKSPACE_KINDS and owner == _ws(user)
 
 
 @router.get("/mr/runs")
@@ -1921,7 +1929,7 @@ def list_report_runs(user=Depends(get_current_user)):
         rows = runs.list_runs(user["id"], kind=kinds)
     else:
         rows = (runs.list_runs(user["id"], kind=kinds)
-                + runs.list_runs(ws, kind=tuple(reports.BOARD_KINDS)))
+                + runs.list_runs(ws, kind=tuple(reports.WORKSPACE_KINDS)))
         rows.sort(key=lambda r: r.get("generated_at") or "", reverse=True)
     return [
         {"id": r["id"], "kind": r.get("kind"), "generated_at": r.get("generated_at"),
@@ -1972,6 +1980,10 @@ def report_run_pdf(run_id: str, user=Depends(get_current_user),
         raise HTTPException(
             404, "a board report's PDF is at "
                  f"GET /api/mr/board-report/{run_id}/pdf, not here.")
+    if run.get("kind") in reports.VENDOR_KINDS:
+        raise HTTPException(
+            404, "a vendor report's PDF is at "
+                 f"GET /api/mr/vendor-report/{run_id}/pdf, not here.")
     stamp = str(run.get("generated_at", ""))[:10] or date.today().isoformat()
     act.note(f"Downloaded the {run['kind']} report as PDF ({stamp})", run_id=run_id)
     return _pdf_response(mr_pdf.report_pdf(run), f"mr-{run['kind']}-{stamp}.pdf")
@@ -2223,148 +2235,32 @@ def board_report_html(run_id: str, user=Depends(get_current_user)):
 
 
 # --- the PDF renderer, which is another service ------------------------------
-# Every call below is treated as hostile: an explicit timeout, a retry policy
-# that only retries what a retry can fix, and one defined answer per failure.
-# There is no fallback path and there must never be one. ``pdf_export.py``
-# renders a DIFFERENT report in a different visual identity, and an HTML file
-# under a ``.pdf`` name is not a PDF - a missing renderer is a loud failure, not
-# a substitution.
+# Every call goes through ``app.services.pdf_renderer.render_pdf`` - the ONE
+# client the board PDF, the vendor PDF and the template preview share: explicit
+# timeouts, retry only what a retry can fix, a Google ID token for the private
+# renderer plus its shared secret, and one honest answer per failure. There is
+# no fallback path and there must never be one. ``pdf_export.py`` renders a
+# DIFFERENT report in a different visual identity, and an HTML file under a
+# ``.pdf`` name is not a PDF - a missing renderer is a loud failure, not a
+# substitution.
 
-#: The request contract ``renderer/src/app.js`` checks (its ``v`` field).
-_RENDERER_CONTRACT_VERSION = 1
+#: Seconds between retry attempts. Read at call time so a test can zero it.
+_RENDERER_BACKOFF_SECONDS = pdf_renderer.BACKOFF_SECONDS
 
-#: Attempts for one document. The render is a pure function of the HTML and the
-#: renderer holds no state, so a retry is safe. It is also expensive - a
-#: Chromium page load - so only the failures a retry can actually fix are
-#: retried: a refused or dropped connection, and the 502/504 a Cloud Run
-#: instance answers while it is still coming up at ``min-instances=0``.
-#:
-#: NOT retried: a read timeout (the same render times out again and doubles the
-#: caller's wait), any 4xx, and 503 - the renderer uses 503 to mean "fail closed,
-#: my RENDERER_TOKEN is unset", and hammering a deliberate refusal is noise.
-_RENDERER_ATTEMPTS = 2
-_RENDERER_BACKOFF_SECONDS = 1.0
-_RENDERER_RETRY_STATUS = frozenset({502, 504})
+_BOARD_HTML_HINT = (" The board report is available as HTML at "
+                    "GET /api/mr/board-report/{run_id}/html.")
 
 
-def _renderer_read_timeout() -> float:
-    """Seconds to wait for the render itself.
-
-    Generous on purpose. The renderer's own budget is ``PDF_TIMEOUT_MS`` per
-    phase (60s laying the page out, 60s writing the PDF) on top of a cold start
-    that launches Chromium, so a short read timeout turns a slow-but-working
-    render into a 504 nobody can act on.
-    """
+def _render_pdf_via_service(html: str, *, run_id: str,
+                            html_hint: str = _BOARD_HTML_HINT) -> tuple[bytes, str]:
+    """The HTML rendered to PDF bytes by the renderer service, as
+    ``(pdf_bytes, blocked_subresource_count)``. Raises ``HTTPException`` - never
+    returns a substitute - on every failure path."""
     try:
-        return max(1.0, float(os.environ.get("RENDERER_TIMEOUT_SECONDS", "150")))
-    except ValueError:
-        return 150.0
-
-
-def _renderer_config() -> tuple[str, str]:
-    """``(url, token)`` for the PDF renderer, or a 503 naming what is unset.
-
-    By env var NAME, never by value - here, in the error the caller reads, and
-    in every log line below.
-    """
-    url = os.environ.get("RENDERER_URL", "").strip().rstrip("/")
-    token = os.environ.get("RENDERER_TOKEN", "").strip()
-    missing = [name for name, value in (("RENDERER_URL", url), ("RENDERER_TOKEN", token))
-               if not value]
-    if missing:
-        raise HTTPException(
-            503,
-            "PDF rendering is not configured on this service: "
-            + " and ".join(missing)
-            + (" is unset." if len(missing) == 1 else " are unset.")
-            + " The board report is available as HTML at "
-              "GET /api/mr/board-report/{run_id}/html.")
-    return url, token
-
-
-def _render_pdf_via_service(html: str, *, run_id: str) -> tuple[bytes, str]:
-    """The HTML rendered to PDF bytes by the renderer service.
-
-    Returns ``(pdf_bytes, blocked_subresource_count)``. Raises ``HTTPException``
-    - never returns a substitute - on every failure path.
-    """
-    url, token = _renderer_config()
-    endpoint = f"{url}/pdf"
-    payload = {"v": _RENDERER_CONTRACT_VERSION, "html": html}
-    # The shared secret goes in this header and nowhere else: not a query
-    # string, not a log line, not an error body.
-    headers = {"X-Renderer-Token": token}
-    timeout = httpx.Timeout(_renderer_read_timeout(), connect=10.0)
-
-    for attempt in range(1, _RENDERER_ATTEMPTS + 1):
-        unreachable: str | None = None
-        try:
-            resp = httpx.post(endpoint, json=payload, headers=headers, timeout=timeout)
-        except (httpx.ConnectError, httpx.ConnectTimeout,
-                httpx.RemoteProtocolError) as exc:
-            unreachable = type(exc).__name__
-            logger.warning("mr board pdf %s: attempt %d/%d could not reach the "
-                           "renderer (RENDERER_URL) - %s",
-                           run_id, attempt, _RENDERER_ATTEMPTS, exc)
-            if attempt >= _RENDERER_ATTEMPTS:
-                raise HTTPException(
-                    502, f"could not reach the PDF renderer ({unreachable}) after "
-                         f"{_RENDERER_ATTEMPTS} attempts - RENDERER_URL points at a "
-                         "service this deployment cannot connect to.")
-        except httpx.TimeoutException as exc:
-            logger.error("mr board pdf %s: the renderer did not answer in %.0fs - %s",
-                         run_id, _renderer_read_timeout(), exc)
-            raise HTTPException(
-                504, "the PDF renderer did not answer within "
-                     f"{_renderer_read_timeout():.0f}s (RENDERER_TIMEOUT_SECONDS). "
-                     "The report was not rendered.")
-        except httpx.HTTPError as exc:
-            logger.error("mr board pdf %s: renderer transport failure - %s", run_id, exc)
-            raise HTTPException(
-                502, f"the PDF renderer call failed ({type(exc).__name__}).")
-
-        if unreachable is not None:
-            time.sleep(_RENDERER_BACKOFF_SECONDS * attempt)
-            continue
-
-        if resp.status_code == 200:
-            body = resp.content
-            if not body.startswith(b"%PDF"):
-                # 200 carrying something that is not a PDF is exactly the shape
-                # of a fake success - a proxy's error page streamed under
-                # application/pdf. Refuse it rather than hand it over.
-                logger.error("mr board pdf %s: renderer answered 200 with %d bytes that "
-                             "are not a PDF", run_id, len(body))
-                raise HTTPException(
-                    502, "the PDF renderer answered 200 with something that is not a "
-                         "PDF; nothing was rendered.")
-            return body, resp.headers.get("x-blocked-subresources", "0")
-
-        if resp.status_code == 401:
-            logger.error("mr board pdf %s: the renderer rejected this service's "
-                         "RENDERER_TOKEN", run_id)
-            raise HTTPException(
-                502, "the PDF renderer rejected this service's credentials - the "
-                     "RENDERER_TOKEN here does not match the renderer's.")
-        if resp.status_code == 503:
-            logger.error("mr board pdf %s: the renderer answered 503 (its own "
-                         "RENDERER_TOKEN is unset, or it is unavailable)", run_id)
-            raise HTTPException(
-                503, "the PDF renderer is unavailable: it answered 503, which is what "
-                     "it returns when its own RENDERER_TOKEN is unset.")
-        if resp.status_code in _RENDERER_RETRY_STATUS and attempt < _RENDERER_ATTEMPTS:
-            logger.warning("mr board pdf %s: renderer answered %d on attempt %d/%d",
-                           run_id, resp.status_code, attempt, _RENDERER_ATTEMPTS)
-            time.sleep(_RENDERER_BACKOFF_SECONDS * attempt)
-            continue
-
-        logger.error("mr board pdf %s: renderer answered %d", run_id, resp.status_code)
-        raise HTTPException(
-            502, f"the PDF renderer answered {resp.status_code}; the report was not "
-                 "rendered.")
-
-    # Unreachable: the loop either returns or raises on its last attempt.
-    raise HTTPException(502, "the PDF renderer could not be reached.")
+        return pdf_renderer.render_pdf(html, label=run_id, html_hint=html_hint,
+                                       backoff_seconds=_RENDERER_BACKOFF_SECONDS)
+    except pdf_renderer.RendererError as exc:
+        raise HTTPException(exc.status, exc.detail)
 
 
 @router.get("/mr/board-report/{run_id}/pdf")
@@ -2395,6 +2291,174 @@ def board_report_pdf(run_id: str, user=Depends(get_current_user),
     stamp = _board_stamp(run)
     act.note(f"Downloaded the {run['kind']} as PDF ({stamp})", run_id=run_id)
     response = _pdf_response(pdf, f"mr-board-report-{stamp}.pdf")
+    response.headers["X-Blocked-Subresources"] = blocked
+    return response
+
+
+# --------------------------------------------------------------------------- #
+# The vendor performance report - build (JSON), document (HTML), PDF
+# --------------------------------------------------------------------------- #
+# Mirrors the board report exactly: one POST that builds (or serves the stored
+# run, idempotent on its inputs), and two document routes that READ the stored
+# run rather than re-deriving it, all behind ``MR_VENDOR_REPORT`` (default off),
+# checked INSIDE the handler after ``Depends(get_current_user)`` so an anonymous
+# caller gets 401 whether the feature is on or off. The periods route is the
+# one exception to the 404: it answers ``enabled: false`` so the console can
+# hide the band without discovering the switch through a failed click.
+#
+# Workspace-wide like the snapshot routes it reads from: ``mr_snapshots`` carries
+# no tenant key, and the run is stamped with ``_ws(user)``.
+
+_YEAR_MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+_VENDOR_HTML_HINT = (" Ask an admin to set up PDF export; until then, the full report "
+                     "opens as a web page (GET /api/mr/vendor-report/{run_id}/html).")
+
+
+def _pdf_unavailable_reason() -> str | None:
+    """What the console shows beside a disabled PDF button — actionable, and
+    naming the setting rather than its value."""
+    missing = pdf_renderer.missing_config()
+    if not missing:
+        return None
+    return ("PDF export isn't set up on this server yet (" + " and ".join(missing)
+            + (" is" if len(missing) == 1 else " are") + " unset). Ask an admin to set it "
+            "up — meanwhile, the full report opens as a web page.")
+
+
+@router.get("/mr/vendor-report/periods")
+def vendor_report_periods(user=Depends(get_current_user)):
+    """The month picker: months with a vendor sweep, newest first, plus whether
+    the feature is on and whether PDF export is configured. Off, it reads
+    nothing and lists nothing."""
+    from marketing_research_agent import vendor_report as vr
+
+    enabled = reports.vendor_report_enabled()
+    return {
+        "enabled": enabled,
+        "pdf_available": not pdf_renderer.missing_config(),
+        "pdf_unavailable_reason": _pdf_unavailable_reason(),
+        "months": vr.periods() if enabled else [],
+    }
+
+
+def _year_month_field(body: dict | None) -> str | None:
+    value = (body or {}).get("year_month")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, str) and _YEAR_MONTH_RE.match(value.strip()):
+        return value.strip()
+    raise HTTPException(
+        422, f"'{reports._echo_period(value)}' is not a month - year_month is 'YYYY-MM'.")
+
+
+@router.post("/mr/vendor-report")
+def vendor_report_build(body: dict | None = None, user=Depends(get_current_user),
+                        act: Activity = trail.records("report:vendor",
+                                                      "Built a vendor performance report")):
+    """Build the vendor performance report for one month - the newest sweep in
+    it - or return the run already stored for exactly these inputs
+    (``reused``).
+
+    Body (all optional): ``{"year_month": "YYYY-MM", "template": "builtin"}``.
+    No ``year_month`` = the newest month with a sweep. ``template: "builtin"`` is
+    the explicit override and the ONLY way a build uses the built-in template
+    when the workspace has a different one active; there is no silent swap.
+    """
+    from marketing_research_agent import vendor_report as vr
+
+    if not reports.vendor_report_enabled():
+        raise HTTPException(404, "Not Found")
+    year_month = _year_month_field(body)
+    try:
+        run = vr.build(workspace_id=_ws(user), year_month=year_month,
+                       template=(body or {}).get("template"))
+    except (vr.EmptyMonth, vr.TemplateRefused) as exc:
+        raise HTTPException(422, str(exc))
+    s = run.get("structured") or {}
+    act.note(f"Built the vendor report for {s.get('month_label')} from the "
+             f"{run.get('sweep_date')} sweep ({(s.get('sweep') or {}).get('vendor_count')} "
+             "vendors)" + (" - served from the store" if run.get("reused") else ""),
+             action="report:vendor_report", run_id=str(run.get("id") or "") or None)
+    rid = run.get("id")
+    return {**run, "links": {"html": f"/api/mr/vendor-report/{rid}/html",
+                             "pdf": f"/api/mr/vendor-report/{rid}/pdf"}}
+
+
+def _vendor_run(run_id: str, user: dict) -> dict:
+    """A vendor run this caller may read, or 404 (never 403 - that would
+    confirm the id exists)."""
+    run = runs.get_run(run_id)
+    if (not run or run.get("kind") not in reports.VENDOR_KINDS
+            or not _may_read_run(run, user)):
+        raise HTTPException(404, "vendor report not found")
+    return run
+
+
+def _vendor_document(run: dict) -> str:
+    """The stored run as one self-contained HTML document, or a 422 saying why
+    not. Imported lazily for the same reason as ``_board_document``: the
+    renderer carries the embedded font faces."""
+    from marketing_research_agent import vendor_report_render as vrr
+
+    try:
+        layout = vrr.layout_for_template(run.get("template"))
+        return vrr.render(run.get("structured") or {}, layout)
+    except ValueError as exc:
+        raise HTTPException(422, f"{exc} - rebuild it at POST /api/mr/vendor-report")
+    except (KeyError, TypeError, IndexError):
+        logger.exception("mr vendor report %s: stored run could not be rendered",
+                         run.get("id"))
+        raise HTTPException(
+            422, "this vendor run cannot be rendered by this service - rebuild it at "
+                 "POST /api/mr/vendor-report")
+
+
+def _vendor_stamp(run: dict) -> str:
+    return (str(run.get("sweep_date") or run.get("generated_at") or "")[:10]
+            or date.today().isoformat())
+
+
+@router.get("/mr/vendor-report/{run_id}/html")
+@silent("an inline preview the console re-renders on every view of the report - "
+        "the PDF beside it is the recorded unit, and a row per view would grow "
+        "the trail faster than the reports it describes")
+def vendor_report_html(run_id: str, user=Depends(get_current_user)):
+    """One stored vendor run as a complete, self-contained HTML document."""
+    if not reports.vendor_report_enabled():
+        raise HTTPException(404, "Not Found")
+    run = _vendor_run(run_id, user)
+    html = _vendor_document(run)
+    return Response(
+        content=html,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "Content-Disposition":
+                f'inline; filename="mr-vendor-report-{_vendor_stamp(run)}.html"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get("/mr/vendor-report/{run_id}/pdf")
+def vendor_report_pdf(run_id: str, user=Depends(get_current_user),
+                      act: Activity = trail.records("export:vendor_report_pdf",
+                                                    "Downloaded a vendor report PDF")):
+    """One stored vendor run as a PDF, via the shared renderer client. No local
+    fallback: unconfigured is a 503 naming the variable, a failing renderer a
+    502/504 saying so."""
+    if not reports.vendor_report_enabled():
+        raise HTTPException(404, "Not Found")
+    run = _vendor_run(run_id, user)
+    html = _vendor_document(run)
+    pdf, blocked = _render_pdf_via_service(
+        html, run_id=run_id, html_hint=_VENDOR_HTML_HINT.replace("{run_id}", run_id))
+    if blocked not in ("", "0"):
+        logger.error("mr vendor pdf %s: the renderer blocked %s subresource(s) - the "
+                     "vendor document is no longer self-contained", run_id, blocked)
+    stamp = _vendor_stamp(run)
+    act.note(f"Downloaded the vendor report as PDF ({stamp})", run_id=run_id)
+    response = _pdf_response(pdf, f"mr-vendor-report-{stamp}.pdf")
     response.headers["X-Blocked-Subresources"] = blocked
     return response
 

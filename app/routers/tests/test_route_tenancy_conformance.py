@@ -476,6 +476,14 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("POST", "/api/mr/board-report"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("GET", "/api/mr/board-report/{run_id}/html"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("GET", "/api/mr/board-report/{run_id}/pdf"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    # 2026-10-08: the vendor performance report. Reads the vendor sweep from
+    # ``mr_snapshots`` (no tenant key - same exposure as the snapshot routes
+    # below) and stamps its run with the WORKSPACE key, read back through
+    # ``_may_read_run`` like a board run. Kill switch ``MR_VENDOR_REPORT``.
+    ("GET", "/api/mr/vendor-report/periods"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/mr/vendor-report"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/vendor-report/{run_id}/html"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/mr/vendor-report/{run_id}/pdf"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("GET", "/api/mr/datasets"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("DELETE", "/api/mr/datasets/{dataset_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("POST", "/api/mr/ingest"): (WORKSPACE_SHARED, INTERNAL_ONLY),
@@ -621,7 +629,12 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
 #: is the org chart and ``is_admin`` inside the handler, not a tenancy filter,
 #: so it is counted here where a cross-user read belongs. See its ledger entry.
 # 77 -> 76 on 2026-10-08: GET /api/issues moved to ADMIN_ONLY (see its entry).
-WORKSPACE_SHARED_BASELINE = 76
+#: 76 → 80 on 2026-10-08: the vendor performance report — periods, build, and
+#: its HTML and PDF documents. A real widening of the counted surface, though not
+#: of the reach: the figures are the vendor sweep every member can already read
+#: through ``GET /mr/snapshots*`` (counted above), and the run is stamped with the
+#: workspace key exactly like a board run. INTERNAL_ONLY, dark by default.
+WORKSPACE_SHARED_BASELINE = 80
 
 #: The GEO editor surface, BY NAME. Not a count — a count would let a future
 #: route join the role while another left it and say nothing, and the thing

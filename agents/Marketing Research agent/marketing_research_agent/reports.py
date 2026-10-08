@@ -34,6 +34,9 @@ KINDS = [
     # on read back - and the only two that are not narrated. See BOARD_KINDS.
     "board_report",
     "board_report_comparison",
+    # The vendor performance report (vendor_report.py): built at
+    # POST /mr/vendor-report, not narrated. See VENDOR_KINDS.
+    "vendor_report",
 ]
 
 # Campaign-performance kinds share the aggregation pipeline and the
@@ -645,6 +648,8 @@ def build(kind: str, dataset: dict, user_id: str, period: str | None = None) -> 
         raise ValueError(
             f"'{kind}' is not built here - use build_board_report(), which takes "
             "two periods and keys the result on board_report.cache_key()")
+    if kind in VENDOR_KINDS:
+        raise ValueError(f"'{kind}' is not built here - use vendor_report.build()")
     targets = goals.get_targets(user_id)
     if period is not None and kind not in ("monthly_summary", "quarterly_summary"):
         raise PeriodError(f"'{kind}' reports don't take a period.")
@@ -804,9 +809,23 @@ def available_periods(dataset: dict) -> dict:
 #: second, unreconcilable account of the same numbers.
 BOARD_KINDS = ("board_report", "board_report_comparison")
 
+#: The vendor performance report: arithmetic over one vendor sweep, built by
+#: ``vendor_report.build`` and never narrated, for the same reason as above.
+VENDOR_KINDS = ("vendor_report",)
+
+#: Kinds stamped with the WORKSPACE key and readable by every member of it.
+WORKSPACE_KINDS = BOARD_KINDS + VENDOR_KINDS
+
 #: The kinds :func:`build` does narrate. A test sweeping "every report kind"
 #: wants this, not :data:`KINDS`.
-NARRATED_KINDS = tuple(k for k in KINDS if k not in BOARD_KINDS)
+NARRATED_KINDS = tuple(k for k in KINDS if k not in WORKSPACE_KINDS)
+
+
+def vendor_report_enabled() -> bool:
+    """Kill switch for the vendor report, **default off** — the same contract
+    as :func:`board_report_enabled` (env read per call; off → the routes answer
+    404 after auth)."""
+    return os.environ.get("MR_VENDOR_REPORT", "0").strip().lower() in ("1", "true", "on")
 
 #: Stated on every board report, because a reader who knows the template will
 #: look for its channel table and needs to know why it is not there.

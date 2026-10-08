@@ -11,7 +11,8 @@ import json
 import logging
 import os
 import re
-from datetime import date, datetime, timezone
+import uuid
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from . import config
@@ -390,11 +391,12 @@ def get_snapshot(slug: str, date_iso: str) -> dict | None:
 
 
 def list_snapshots(slug: str | None = None, month: str | None = None,
-                   meta_only: bool = False, *,
-                   _store: dict[str, dict] | None = None) -> list[dict]:
-    """Vendor snapshots, date-sorted. ``_store`` lets one caller reuse a single
-    fetch across two listings (see :func:`portfolio`)."""
-    by_id = _merged(slug, month) if _store is None else _store
+                   meta_only: bool = False) -> list[dict]:
+    """Vendor snapshots, date-sorted.
+
+    Every doc ever stored under the filters, same-day stale captures included;
+    for "the vendors as of a date" use :func:`vendor_sweep`."""
+    by_id = _merged(slug, month)
     out = []
     for snap in by_id.values():
         # Rollup-tab snapshots duplicate the vendor tabs — never list them.
@@ -411,48 +413,317 @@ def list_snapshots(slug: str | None = None, month: str | None = None,
     return out
 
 
-def latest_rollup_snapshot(date_iso: str | None = None, *,
-                           _store: dict[str, dict] | None = None) -> dict | None:
-    """Latest snapshot of the consolidated Overall tab — the sheet's own
-    official team totals. Kept out of every vendor listing (it duplicates the
-    vendors), but the portfolio bar reads it as the source of truth.
-
-    ``_store`` lets :func:`portfolio` reuse the fetch it already paid for — this
-    function used to scan the whole collection a SECOND time in the same
-    request."""
-    by_id = _merged() if _store is None else _store
-    best = None
-    for snap in by_id.values():
-        if "overall" not in (snap.get("vendor_slug") or ""):
-            continue
-        if date_iso and (snap.get("date") or "") > date_iso:
-            continue
-        if best is None or (snap.get("date") or "") > (best.get("date") or ""):
-            best = snap
-    return best
-
-
 def capture_workbook(grids, *, year: int, today: date) -> list[dict]:
     """Capture every tracker-format tab; skip the rest; never abort the run.
 
     Workbook layout rule (user, 2026-07-27): vendors are the tabs BEFORE the
     Overall Report. The roll-up itself is captured last — the portfolio bar
-    reads it as the official totals — and nothing after it is touched."""
+    reads it as the official totals — and nothing after it is touched.
+
+    Hidden tabs are skipped, the same rule the dataset path applies
+    (``sheets_source.fetch_all_trackers``): a hidden tab is an archive or a
+    Looker dump, never a live vendor, and the two paths must agree on what a
+    vendor is or the snapshot totals drift from the dataset's.
+
+    Every doc this run writes is stamped with one ``sweep_id`` (and ``hidden``,
+    always ``False`` given the skip — present so a reader can tell a stamped doc
+    from a legacy one). The refresh cron captures every 15 minutes and each run
+    overwrites ``{slug}_{date}``, so a tab renamed or deleted mid-day leaves its
+    earlier capture behind under the old slug; :func:`_split_sweep` uses the
+    ``sweep_id`` to keep only the day's final run."""
     results = []
+    sweep_id = uuid.uuid4().hex[:12]
     for g in grids:
         try:
-            snap = capture_tab(g.rows, title=g.title, gid=g.gid, year=year, today=today)
-            if snap is None:
-                results.append({"tab": g.title, "skipped": True})
+            if getattr(g, "hidden", False):
+                results.append({"tab": g.title, "skipped": True, "reason": "hidden"})
             else:
-                save_snapshot(snap)
-                results.append({"tab": g.title, "slug": snap["vendor_slug"], "captured": True})
+                snap = capture_tab(g.rows, title=g.title, gid=g.gid, year=year, today=today)
+                if snap is None:
+                    results.append({"tab": g.title, "skipped": True})
+                else:
+                    snap["hidden"] = False
+                    snap["sweep_id"] = sweep_id
+                    save_snapshot(snap)
+                    results.append({"tab": g.title, "slug": snap["vendor_slug"], "captured": True})
+            # Checked even for a hidden roll-up: stopping here is the safe side,
+            # because everything after the Overall tab is ops sheets.
             if "overall" in slugify(g.title):
                 break
         except Exception as exc:  # one bad tab must not kill the daily run
             logger.exception("snapshot capture failed for tab %s", g.title)
             results.append({"tab": g.title, "error": str(exc)})
     return results
+
+
+# --- one day's sweep (bounded reads) ------------------------------------------
+#
+# A "sweep" is the set of tabs the day's FINAL capture run wrote. Readers that
+# want "the vendors as of date D" must read exactly that set, and nothing else:
+#
+# * Reading the whole collection to find it (what ``portfolio()`` used to do)
+#   costs every doc ever captured (~1,650 docs / ~46 MB in 2026-10, +15-20/day).
+#   A sweep is one ``date ==`` query (14-28 docs) plus, to find the date, one
+#   ``order_by(date) limit 1`` read. Both run on ``date``'s automatic
+#   single-field index: NO composite index is needed.
+# * The docs of one date are NOT all one sweep. The refresh cron captures every
+#   15 minutes and each run overwrites ``{slug}_{date}``, so a tab renamed,
+#   deleted or moved past the Overall tab during the day keeps its earlier
+#   capture under its old slug. On 2026-09-02 eight such docs ("Copy of Flytech
+#   Meta LS", "AB Twitter LS (New)", "DanteAgency LI Googlex", …) sat beside the
+#   final run's 20 and lifted the vendor sum from $95,600 / $2,737 / 18 leads
+#   (the team's published figures) to $117,200 / $2,906 / 20. Same pattern on
+#   09-08, 09-16, 09-22, 09-29 and 10-01.
+#
+# Exclusion rule, in order:
+#   1. ``hidden`` is True                      -> reason "hidden"
+#   2. not written by the day's final run      -> reason "stale_capture"
+#      * stamped docs: a different ``sweep_id`` than the newest doc's;
+#      * legacy docs (no ``sweep_id``): outside the chain of captures, walking
+#        back from the newest, whose consecutive ``captured_at`` gaps are all
+#        <= :data:`_RUN_GAP_SECONDS`. Measured over 2026-08-20..10-08: one run
+#        spans <= 2.5 s with gaps <= 0.3 s; separate runs are >= 15 min apart.
+# Works for every historical day with no backfill and no Sheets call.
+
+#: Largest gap between two consecutive tab writes that still counts as one
+#: capture run (legacy docs only). Observed max 0.3 s; runs are 900 s apart.
+_RUN_GAP_SECONDS = 120.0
+
+#: Fields read when only a sweep's MEMBERSHIP is needed (not its numbers).
+_SWEEP_META_FIELDS = ("vendor", "vendor_slug", "gid", "date", "month",
+                      "captured_at", "hidden", "sweep_id")
+
+_YM_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+_DATE_IN_STEM = re.compile(r"_(\d{4}-\d{2}-\d{2})$")
+
+
+def _is_rollup_slug(slug: str | None) -> bool:
+    return "overall" in (slug or "")
+
+
+def _cloud_newest_date(lo: str | None, hi: str | None, *, oldest: bool = False) -> str | None:
+    """Newest (or, with ``oldest``, oldest) ``date`` in ``[lo, hi]`` — ONE
+    document read, ``date`` field only.
+
+    A range and an ``order_by`` on the SAME field are served by its automatic
+    single-field index. Raises :class:`SnapshotStoreError` on a failed read."""
+    try:
+        from google.cloud import firestore as _fs
+
+        from app.services import firestore_repo
+        query = firestore_repo._db().collection(_COLLECTION)
+        if lo:
+            query = query.where(filter=_fs.FieldFilter("date", ">=", lo))
+        if hi:
+            query = query.where(filter=_fs.FieldFilter("date", "<=", hi))
+        direction = _fs.Query.ASCENDING if oldest else _fs.Query.DESCENDING
+        query = query.order_by("date", direction=direction).limit(1).select(["date"])
+        for doc in query.stream():
+            return (doc.to_dict() or {}).get("date")
+        return None
+    except Exception as exc:
+        logger.warning("snapshot newest-date read failed", exc_info=True)
+        raise SnapshotStoreError("the snapshot store could not be read") from exc
+
+
+def _cloud_on_date(date_iso: str, fields: tuple[str, ...] | None = None) -> list[dict]:
+    """Every doc captured on ``date_iso`` (``date ==``: 14-28 docs). ``fields``
+    projects the read down to membership metadata. Raises on a failed read."""
+    try:
+        from google.cloud import firestore as _fs
+
+        from app.services import firestore_repo
+        query = (firestore_repo._db().collection(_COLLECTION)
+                 .where(filter=_fs.FieldFilter("date", "==", date_iso)))
+        if fields:
+            query = query.select(list(fields))
+        return [d.to_dict() for d in query.stream()]
+    except Exception as exc:
+        logger.warning("snapshot date read failed for %s", date_iso, exc_info=True)
+        raise SnapshotStoreError("the snapshot store could not be read") from exc
+
+
+def _disk_dates() -> set[str]:
+    out = set()
+    for p in _root().glob("*.json"):
+        m = _DATE_IN_STEM.search(p.stem)
+        if m:
+            out.add(m.group(1))
+    return out
+
+
+def _newest_date(lo: str | None = None, hi: str | None = None) -> str | None:
+    """Newest captured date within ``[lo, hi]`` across the durable store and
+    this instance's local copies."""
+    found = [d for d in _disk_dates() if (lo is None or d >= lo) and (hi is None or d <= hi)]
+    if _use_cloud():
+        d = _cloud_newest_date(lo, hi)
+        if d:
+            found.append(d)
+    return max(found) if found else None
+
+
+def _oldest_date() -> str | None:
+    found = list(_disk_dates())
+    if _use_cloud():
+        d = _cloud_newest_date(None, None, oldest=True)
+        if d:
+            found.append(d)
+    return min(found) if found else None
+
+
+def _docs_on(date_iso: str, fields: tuple[str, ...] | None = None) -> list[dict]:
+    """The docs of one date, durable merged with local (local same-id wins)."""
+    by_id: dict[str, dict] = {}
+    if _use_cloud():
+        for snap in _cloud_on_date(date_iso, fields):
+            if isinstance(snap, dict) and snap.get("vendor_slug"):
+                by_id[_doc_id(snap["vendor_slug"], date_iso)] = snap
+    for p in _root().glob(f"*_{date_iso}.json"):
+        try:
+            snap = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(snap, dict) and snap.get("date") == date_iso:
+            by_id[p.stem] = snap
+    return list(by_id.values())
+
+
+def _ts(snap: dict) -> datetime | None:
+    try:
+        return datetime.fromisoformat(snap["captured_at"])
+    except Exception:
+        return None
+
+
+def _split_sweep(docs: list[dict]) -> tuple[list[dict], dict | None, list[dict]]:
+    """``(vendor docs, roll-up doc or None, excluded)`` for one date's docs.
+    See the rule at the top of this section."""
+    excluded: list[dict] = []
+
+    def drop(snap: dict, reason: str) -> None:
+        excluded.append({"tab": snap.get("vendor") or snap.get("vendor_slug"),
+                         "slug": snap.get("vendor_slug"), "reason": reason})
+
+    live = []
+    for s in docs:
+        if s.get("hidden") is True:
+            drop(s, "hidden")
+        else:
+            live.append(s)
+
+    timed = sorted((s for s in live if _ts(s) is not None), key=_ts, reverse=True)
+    if timed:
+        anchor = timed[0]
+        if anchor.get("sweep_id"):
+            in_run = {id(s) for s in live if s.get("sweep_id") == anchor["sweep_id"]}
+        else:
+            in_run = {id(anchor)}
+            for newer, older in zip(timed, timed[1:]):
+                if older.get("sweep_id") or (
+                        (_ts(newer) - _ts(older)).total_seconds() > _RUN_GAP_SECONDS):
+                    break
+                in_run.add(id(older))
+        # A doc with no captured_at cannot be placed in time; it predates every
+        # run that stamps one, so it is kept only on a day with no timed docs.
+        kept = []
+        for s in live:
+            if id(s) in in_run:
+                kept.append(s)
+            else:
+                drop(s, "stale_capture")
+        live = kept
+
+    rollups = [s for s in live if _is_rollup_slug(s.get("vendor_slug"))]
+    vendors = sorted((s for s in live if not _is_rollup_slug(s.get("vendor_slug"))),
+                     key=lambda s: s.get("vendor_slug") or "")
+    rollup = max(rollups, key=lambda s: s.get("captured_at") or "") if rollups else None
+    excluded.sort(key=lambda e: (e["reason"], e["slug"] or ""))
+    return vendors, rollup, excluded
+
+
+def _sweep(date_iso: str, fields: tuple[str, ...] | None = None) -> dict:
+    vendors, rollup, excluded = _split_sweep(_docs_on(date_iso, fields))
+    return {"date": date_iso, "docs": vendors, "excluded": excluded, "rollup": rollup}
+
+
+def _month_bounds(year_month: str) -> tuple[str, str]:
+    if not isinstance(year_month, str) or not _YM_RE.match(year_month):
+        raise ValueError(f"year_month must be 'YYYY-MM', got {year_month!r}")
+    return f"{year_month}-01", f"{year_month}-31"   # string bound; no day 32
+
+
+def vendor_sweep(year_month: str | None = None) -> dict | None:
+    """Newest sweep date within ``year_month`` ('YYYY-MM'; None = newest overall).
+
+    Returns ``{'date': 'YYYY-MM-DD', 'docs': [<snapshot doc dicts, same shape as
+    stored, roll-up EXCLUDED, sorted by vendor_slug>], 'excluded': [{'tab':
+    <title>, 'slug': <slug>, 'reason': 'hidden' | 'stale_capture'}], 'rollup':
+    <the Overall tab's doc from the same run, or None>}``, or ``None`` when no
+    sweep exists in range — including when the newest day's docs are ALL
+    excluded or roll-up only (a month of nothing but copy tabs is no month).
+
+    Cost: 1 read to find the date + one ``date ==`` query (14-28 docs). No
+    composite index. Raises :class:`SnapshotStoreError` when the store cannot be
+    read, and ``ValueError`` for a malformed ``year_month``."""
+    lo, hi = _month_bounds(year_month) if year_month is not None else (None, None)
+    d = _newest_date(lo, hi)
+    if not d:
+        return None
+    sweep = _sweep(d)
+    return sweep if sweep["docs"] else None
+
+
+#: How far past ``limit`` :func:`sweep_months` walks back through months with
+#: no sweep before giving up — the bound on a store with gaps.
+_MONTH_WALK_SLACK = 12
+
+
+def _prev_ym(ym: str) -> str:
+    y, m = int(ym[:4]), int(ym[5:7])
+    y, m = (y - 1, 12) if m == 1 else (y, m - 1)
+    return f"{y:04d}-{m:02d}"
+
+
+def _month_has_sweep(ym: str) -> bool:
+    """:func:`vendor_sweep` would return something for ``ym`` — checked on a
+    MEMBERSHIP projection (no numbers shipped): 1 + 14-28 small reads."""
+    d = _newest_date(*_month_bounds(ym))
+    return bool(d) and bool(_sweep(d, _SWEEP_META_FIELDS)["docs"])
+
+
+def sweep_months(limit: int = 12) -> list[str]:
+    """YYYY-MM months that have at least one vendor sweep, newest first.
+
+    Exactly the months for which :func:`vendor_sweep` returns a sweep (same
+    exclusion rule). Never scans the collection: 2 reads for the store's
+    newest/oldest dates, then per month walked 1 date probe + one projected
+    ``date ==`` membership read (14-28 docs). The per-month checks run
+    concurrently. A full year is ~2 + 12 x ~22 = ~270 small projected reads,
+    against ~1,650 full docs for the old whole-collection read. Walks at most
+    ``limit + 12`` months back, and never past the oldest captured date.
+    Raises :class:`SnapshotStoreError` when the store cannot be read."""
+    if limit < 1:
+        return []
+    newest, oldest = _newest_date(), _oldest_date()
+    if newest is None or oldest is None:
+        return []
+    months, ym = [], newest[:7]
+    while ym >= oldest[:7] and len(months) < limit + _MONTH_WALK_SLACK:
+        months.append(ym)
+        ym = _prev_ym(ym)
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(8, len(months))) as pool:
+        has = list(pool.map(_month_has_sweep, months))   # re-raises a store error
+    return [m for m, ok in zip(months, has) if ok][:limit]
+
+
+def previous_month_sweep(year_month: str) -> dict | None:
+    """Same shape as :func:`vendor_sweep`: the newest sweep of the month BEFORE
+    ``year_month`` (its month-end MTD state), or ``None``."""
+    _month_bounds(year_month)
+    return vendor_sweep(_prev_ym(year_month))
 
 
 # --- delta engine (computed on read) -----------------------------------------
@@ -601,38 +872,32 @@ def portfolio(date_iso: str | None = None) -> dict | None:
 
     Paid vendors only (the Overall roll-up snapshot is excluded), each vendor's
     latest snapshot, summed on the Performance basis — the way the team reads
-    the sheet's "official" figures."""
+    the sheet's "official" figures.
+
+    The bar is stamped "<month> MTD · as of <date>", so only the tabs the
+    newest sweep captured may be in it — one :func:`_sweep` (a renamed or
+    offboarded tab's last snapshot never leaks into a later bar, and a same-day
+    stale capture never doubles a vendor). It used to read the WHOLE collection
+    per call to find that sweep. Now: 1 read for the date + one ``date ==``
+    query, plus a projected membership read of the sweep before it so a vendor
+    that dropped out is still NAMED in ``vendors_excluded``, never silently
+    discarded."""
     import calendar as _cal
 
-    store = _merged()  # ONE fetch, reused by the roll-up lookup below
-    per_slug: dict[str, dict] = {}
-    for s in list_snapshots(_store=store):
-        if "overall" in s["vendor_slug"]:
-            continue
-        if date_iso and s["date"] > date_iso:
-            continue
-        per_slug[s["vendor_slug"]] = s  # list is date-sorted per vendor; last wins
-    if not per_slug:
+    newest_date = _newest_date(hi=date_iso)
+    if newest_date is None:
         return None
-
-    # The bar is stamped "<month> MTD · as of <date>", so only the tabs that
-    # were actually captured on that date may be in it. This used to take every
-    # slug's latest snapshot whenever it was taken, which broke twice over:
-    #
-    # 1. Renaming a tab ("DrivGen LS Email" -> "… (Offboarded)") mints a second
-    #    slug. The old one stops being captured but its final snapshot never
-    #    expires, so the vendor was summed twice — for ever.
-    # 2. A vendor last captured in July kept contributing July figures to a bar
-    #    headed August.
-    #
-    # Capture is one daily sweep over the live tabs, so "absent from the newest
-    # sweep" means offboarded, renamed, or failed — and none of those belong in
-    # today's total. Dropped slugs are counted, never silently discarded.
-    newest = max(s["date"] for s in per_slug.values())
-    latest = {slug: s for slug, s in per_slug.items() if s["date"] == newest}
-    excluded = sorted(set(per_slug) - set(latest))
+    sweep = _sweep(newest_date)
+    latest = {s["vendor_slug"]: s for s in sweep["docs"]}
     if not latest:
         return None
+    newest = newest_date
+    gone = {e["slug"] for e in sweep["excluded"] if e.get("slug")}
+    prior_date = _newest_date(
+        hi=(date.fromisoformat(newest) - timedelta(days=1)).isoformat())
+    if prior_date:
+        gone |= {s["vendor_slug"] for s in _sweep(prior_date, _SWEEP_META_FIELDS)["docs"]}
+    excluded = sorted(gone - set(latest))
 
     def raw(node: dict, *path, pair: bool = False) -> float | None:
         """The cell as the sheet reports it — ``None`` when the ROW IS ABSENT,
@@ -670,8 +935,11 @@ def portfolio(date_iso: str | None = None) -> dict | None:
     # above always undercounts. When its snapshot exists for this month, ITS
     # figures are the summary bar; the vendor sum stays as the audit trail.
     source, computed_spend, computed_budget = "vendor_sum", round(spend, 2), round(budget, 2)
-    rollup = latest_rollup_snapshot(date_iso, _store=store)
-    if rollup and (rollup.get("date") or "")[:7] == newest[:7]:
+    # The roll-up is the last tab of the same capture run, so it is read from
+    # the same sweep. A run whose roll-up failed falls back to the vendor sum
+    # and says so via `source`, rather than borrowing an earlier day's roll-up.
+    rollup = sweep["rollup"]
+    if rollup:
         t = (rollup.get("canonical") or {}).get("team_overall", {})
         o_spend = raw(t, "spend", pair=True)
         if o_spend is not None:  # an empty parse must never blank the whole bar

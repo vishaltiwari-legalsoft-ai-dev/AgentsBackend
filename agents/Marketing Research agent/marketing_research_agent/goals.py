@@ -63,6 +63,27 @@ _DEFAULT_THRESHOLDS: dict[str, float] = {
     "zero_completed_min_demos": 3.0,
     "ql_ratio_great": 75.0,
     "booking_rate_broken": 15.0,
+    # Vendor performance report (2026-10-08). The CPL ceiling is the owner's
+    # stated benchmark ("CPL never >$220"); the rest are the report's own rule
+    # thresholds, editable like every figure above. See VENDOR_REPORT_TARGETS.
+    "cost_per_lead_ceiling": 220.0,
+    # ≥ this % of paid spend in ONE channel → that channel's benchmarks apply;
+    # otherwise the Total set does (owner decision).
+    "vendor_channel_mix_pct": 80.0,
+    # Status pills. Strong Start: this many completed demos at/above the
+    # channel's show-rate target, OR this many qualified leads.
+    "vendor_strong_start_min_completed": 2.0,
+    "vendor_strong_start_min_qualified_leads": 4.0,
+    # Check In: a DNC bad lead logged against $0 recorded spend; or a bad-lead
+    # rate at/above bad_lead_rate_red once a vendor has this many leads.
+    "vendor_check_in_min_dnc_zero_spend": 1.0,
+    "vendor_check_in_min_leads": 10.0,
+    # A Too Early vendor with this many qualified demos booked gets its own
+    # action row instead of folding into "All other vendors".
+    "vendor_watch_min_qual_booked": 3.0,
+    # Below either count the report says to read its ratios as a small sample.
+    "vendor_small_sample_min_leads": 50.0,
+    "vendor_small_sample_min_demos": 30.0,
 }
 
 
@@ -456,6 +477,103 @@ def goal_dict(channel: str, targets: dict) -> dict | None:
         "cpd_completed_high": g.cpd_completed_high,
         "completed_demo_pct": g.completed_demo_pct,
     }
+
+
+# --- vendor performance report benchmarks ------------------------------------
+#
+# The six benchmarks the vendor report's "Biggest movers" chart measures the
+# portfolio against. Every VALUE comes from the editable store above — a
+# threshold or a channel goal — so the team edits a benchmark where it already
+# edits the rest; nothing here holds a second copy of a number. What lives here
+# is only the RULE that turns the stored figures into one target (the stated
+# value, the top of a range, a range's midpoint) and the basis label the report
+# prints beside it, built from the same numbers so the label cannot drift from
+# the target.
+
+#: How one benchmark is derived. ``source`` is ``"threshold"`` (``fields`` names
+#: thresholds) or ``"channel"`` (``fields`` names :class:`ChannelGoal` fields,
+#: read from whichever channel set the report applies). ``rule`` is ``"value"``
+#: (one field), ``"top"`` (the high end of a low/high pair), ``"midpoint"`` (of a
+#: low/high pair) or ``"share"`` (a 0-1 fraction shown as a percentage).
+@dataclass(frozen=True)
+class VendorTarget:
+    key: str
+    label: str
+    polarity: str          # "down" = lower is better, "up" = higher is better
+    format: str            # "money" | "pct"
+    source: str
+    fields: tuple[str, ...]
+    rule: str
+    noun: str              # "ceiling" / "target" — the word the basis line uses
+
+
+VENDOR_REPORT_TARGETS: tuple[VendorTarget, ...] = (
+    VendorTarget("cost_per_lead", "Cost / Lead", "down", "money",
+                 "threshold", ("cost_per_lead_ceiling",), "value", "ceiling"),
+    VendorTarget("cost_per_qualified_lead", "Cost / Qual. Lead", "down", "money",
+                 "threshold", ("cost_per_qualified_lead_target_low",
+                               "cost_per_qualified_lead_target_high"), "top", "ceiling"),
+    VendorTarget("cost_per_qual_demo_booked", "Cost / Qual. Demo Booked", "down", "money",
+                 "channel", ("cpd_booked_low", "cpd_booked_high"), "midpoint", "target"),
+    VendorTarget("ql_ratio_pct", "Qualified Lead Ratio", "up", "pct",
+                 "threshold", ("ql_ratio_great",), "value", "target"),
+    VendorTarget("show_rate_pct", "Show-up Rate", "up", "pct",
+                 "channel", ("completed_demo_pct",), "share", "target"),
+    VendorTarget("cost_per_demo_completed", "Cost / Demo Completed", "down", "money",
+                 "channel", ("cpd_completed_low", "cpd_completed_high"), "midpoint", "target"),
+)
+
+#: How the report names a channel set in prose. Keys are ``CHANNEL_GOALS`` keys.
+_SET_NAMES = {"META": "Meta", "Google": "Google", "Email": "Email",
+              "Websites": "Websites", "Total": "Total"}
+
+
+def _money_label(v: float) -> str:
+    return f"${v:,.0f}"
+
+
+def vendor_report_targets(targets: dict, channel_set: str) -> list[dict]:
+    """The six benchmarks for one resolved targets dict and one channel set.
+
+    ``channel_set`` is a ``CHANNEL_GOALS`` key (``"META"``, ``"Google"``,
+    ``"Email"``, ``"Total"``). A benchmark whose stored figures are missing comes
+    back with ``target: None`` and ``basis: "no target set"`` — the report then
+    leaves it out of the movers chart rather than inventing one.
+    """
+    thr = thresholds(targets)
+    goal = channel_goal(channel_set, targets)
+    set_name = _SET_NAMES.get(goal.channel if goal else channel_set, channel_set)
+    out: list[dict] = []
+    for t in VENDOR_REPORT_TARGETS:
+        if t.source == "threshold":
+            vals = [thr.get(f) for f in t.fields]
+        else:
+            vals = [getattr(goal, f, None) if goal else None for f in t.fields]
+        target: float | None = None
+        basis = "no target set"
+        if all(isinstance(v, (int, float)) for v in vals) and vals:
+            if t.rule == "value":
+                target = float(vals[0])
+                shown = (_money_label(target) if t.format == "money" else f"{target:g}%")
+                basis = f"{t.label} {t.noun} {shown}"
+            elif t.rule == "top":
+                lo, hi = float(vals[0]), float(vals[1])
+                target = hi
+                basis = (f"{t.label} {t.noun} {_money_label(hi)} (top of the "
+                         f"{_money_label(lo)}–{_money_label(hi)} target range)")
+            elif t.rule == "midpoint":
+                lo, hi = float(vals[0]), float(vals[1])
+                target = round((lo + hi) / 2, 2)
+                owner = f"{set_name}'s" if set_name != "Total" else "the Total"
+                basis = (f"{t.label} {_money_label(target)} (midpoint of {owner} "
+                         f"{_money_label(lo)}–{_money_label(hi)} range)")
+            elif t.rule == "share":
+                target = round(float(vals[0]) * 100, 2)
+                basis = f"{t.label} {t.noun} {target:g}% ({set_name})"
+        out.append({"key": t.key, "label": t.label, "polarity": t.polarity,
+                    "format": t.format, "target": target, "basis": basis,
+                    "source": t.source, "fields": list(t.fields), "rule": t.rule})
+    return out
 
 
 def evaluate(metric: CampaignMetric, *, targets: dict,

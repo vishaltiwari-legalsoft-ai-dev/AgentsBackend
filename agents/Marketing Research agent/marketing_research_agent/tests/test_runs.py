@@ -528,3 +528,143 @@ def test_the_environment_is_read_on_every_call(monkeypatch):
     assert workspace.workspace_id("u1") == "u1"
     monkeypatch.delenv("MR_WORKSPACE_SHARED")             # rollback by unsetting
     assert workspace.workspace_id("u1") == "u1"
+
+
+# --- report templates: workspace-wide, append-only, versioned ------------------
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture
+def tpl_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    monkeypatch.delenv("MR_RUN_RETENTION_PER_KIND", raising=False)
+    return tmp_path
+
+
+def _upload(ws, n, who="a@x.com"):
+    return runs.save_template_version(ws, uploaded_by=who, source_kind="builder",
+                                      spec={"layout": f"v{n}"})
+
+
+def test_no_template_ever_saved_means_the_builtin(tpl_store):
+    active = runs.active_template("ws-a")
+    assert active["builtin"] is True and active["id"] == runs.BUILTIN_TEMPLATE_ID
+    assert runs.list_template_versions("ws-a") == []
+
+
+def test_the_newest_version_is_active_and_history_is_newest_first(tpl_store):
+    v1, v2, v3 = (_upload("ws-a", i) for i in (1, 2, 3))
+    assert runs.active_template("ws-a")["id"] == v3["id"]
+    assert [r["id"] for r in runs.list_template_versions("ws-a")] == [v3["id"], v2["id"], v1["id"]]
+    assert [r["id"] for r in runs.list_template_versions("ws-a", limit=2)] == [v3["id"], v2["id"]]
+    assert v3["uploaded_by"] == "a@x.com" and v3["user_id"] == "ws-a"
+    assert v3["kind"] == "report_template:vendor_performance"
+
+
+def test_workspace_b_can_never_read_or_revert_workspace_as_templates(tpl_store):
+    va = _upload("ws-a", 1)
+    assert runs.list_template_versions("ws-b") == []
+    assert runs.active_template("ws-b")["builtin"] is True
+    with pytest.raises(LookupError):
+        runs.revert_template("ws-b", va["id"], uploaded_by="b@x.com")
+    assert runs.list_template_versions("ws-b") == []          # nothing copied across
+    assert runs.active_template("ws-a")["id"] == va["id"]     # A untouched
+
+
+def test_revert_appends_a_copy_and_never_rewrites_history(tpl_store):
+    v1, v2 = _upload("ws-a", 1), _upload("ws-a", 2)
+    r = runs.revert_template("ws-a", v1["id"], uploaded_by="b@x.com")
+    assert r["id"] not in (v1["id"], v2["id"]) and r["reverted_from"] == v1["id"]
+    assert r["spec"] == {"layout": "v1"} and r["uploaded_by"] == "b@x.com"
+    assert runs.active_template("ws-a")["id"] == r["id"]
+    assert len(runs.list_template_versions("ws-a")) == 3
+
+
+def test_revert_to_builtin_is_a_version_too(tpl_store):
+    _upload("ws-a", 1)
+    r = runs.revert_template("ws-a", runs.BUILTIN_TEMPLATE_ID, uploaded_by="a@x.com")
+    active = runs.active_template("ws-a")
+    assert active["id"] == r["id"] and active["builtin"] is True and active["spec"] is None
+    assert len(runs.list_template_versions("ws-a")) == 2
+
+
+def test_retention_trims_the_oldest_versions_never_the_active(tpl_store, monkeypatch):
+    monkeypatch.setenv("MR_RUN_RETENTION_PER_KIND", "3")
+    ids = [_upload("ws-a", i)["id"] for i in range(5)]
+    kept = [r["id"] for r in runs.list_template_versions("ws-a")]
+    assert kept == ids[:1:-1]                    # the newest three, newest first
+    assert runs.active_template("ws-a")["id"] == ids[-1]
+
+
+def test_the_default_template_retention_is_25(tpl_store):
+    for i in range(27):
+        _upload("ws-a", i)
+    assert len(runs.list_template_versions("ws-a")) == 25
+
+
+def test_another_workspaces_uploads_never_evict_mine(tpl_store, monkeypatch):
+    monkeypatch.setenv("MR_RUN_RETENTION_PER_KIND", "2")
+    mine = _upload("ws-a", 1)
+    for i in range(4):
+        _upload("ws-b", i)
+    assert [r["id"] for r in runs.list_template_versions("ws-a")] == [mine["id"]]
+
+
+def test_templates_are_validated_before_they_are_stored(tpl_store):
+    with pytest.raises(ValueError):
+        runs.save_template_version("", uploaded_by="a@x.com", source_kind="builder", spec={})
+    with pytest.raises(ValueError):
+        runs.save_template_version("ws-a", uploaded_by=" ", source_kind="builder", spec={})
+    with pytest.raises(ValueError):
+        runs.save_template_version("ws-a", uploaded_by="a@x.com", source_kind="docx", spec={})
+    with pytest.raises(ValueError):   # html only in html mode
+        runs.save_template_version("ws-a", uploaded_by="a@x.com", source_kind="pdf",
+                                   spec={}, html="<p>x</p>")
+    with pytest.raises(ValueError):
+        runs.save_template_version("ws-a", uploaded_by="a@x.com", source_kind="html",
+                                   html="x" * 1_000_000)
+    with pytest.raises(ValueError):
+        runs.list_template_versions(None)
+    with pytest.raises(ValueError):
+        runs.template_kind("board")
+    assert runs.list_template_versions("ws-a") == []
+
+
+def test_a_version_that_misses_the_durable_store_is_a_loud_failure(tpl_store, monkeypatch):
+    """No fake success: a template only one instance's disk holds would be
+    'active' there and invisible everywhere else."""
+    class _Doc:
+        def set(self, _payload):
+            raise RuntimeError("503")
+
+        def delete(self):
+            pass
+
+    class _Coll:
+        def document(self, _id):
+            return _Doc()
+
+    monkeypatch.setattr(runs, "_use_cloud", lambda: True)
+    monkeypatch.setattr(runs, "_collection", lambda: _Coll())
+    monkeypatch.setattr(runs, "_cloud_list", lambda *a, **kw: [])
+    with pytest.raises(runs.RunStoreError):
+        _upload("ws-a", 1)
+    assert list(tpl_store.glob("*.json")) == []                # local copy removed
+
+
+def test_the_template_read_is_one_scoped_equality_query(tpl_store, monkeypatch):
+    seen = []
+    monkeypatch.setattr(runs, "_use_cloud", lambda: True)
+    monkeypatch.setattr(runs, "_cloud_list",
+                        lambda user_id=None, kind=None: seen.append((user_id, kind)) or [])
+    runs.list_template_versions("ws-a")
+    assert seen == [("ws-a", "report_template:vendor_performance")]
+
+
+def test_templates_never_appear_as_saved_reports():
+    from marketing_research_agent import reports
+
+    kind = runs.template_kind()
+    assert kind not in reports.KINDS and kind not in runs.STATE_KINDS

@@ -1194,7 +1194,8 @@ def test_board_kinds_are_report_kinds_but_are_not_narrated():
     for kind in reports.BOARD_KINDS:
         assert kind in reports.KINDS, f"{kind} must list and read back like any run"
         assert kind not in reports.NARRATED_KINDS
-    assert set(reports.KINDS) == set(reports.NARRATED_KINDS) | set(reports.BOARD_KINDS)
+    assert set(reports.KINDS) == (set(reports.NARRATED_KINDS) | set(reports.BOARD_KINDS)
+                                  | set(reports.VENDOR_KINDS))
 
 
 def test_build_refuses_a_board_kind_and_names_the_builder_that_takes_it(

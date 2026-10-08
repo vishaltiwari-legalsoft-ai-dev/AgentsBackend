@@ -103,6 +103,58 @@ def test_capture_workbook_filters_and_reports(monkeypatch, tmp_path):
     assert snapshots.get_snapshot("all-contacts", "2026-02-07") is None
 
 
+def _tracker(title):
+    return [[title, "Feb (Performance)", "Feb (Investment)"],
+            ["Spend", "$10.00", "$20.00"], ["Leads", "1", ""]]
+
+
+def test_capture_skips_hidden_tabs_like_the_dataset_path(monkeypatch, tmp_path):
+    """sheets_source.fetch_all_trackers skips hidden tabs; capture did not,
+    so the two paths disagreed on what a vendor is."""
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_SNAPSHOTS_DIR", str(tmp_path))
+    grids = [
+        TabGrid(title="Copy of Meta 360 RA", gid=7, hidden=True,
+                rows=_tracker("Copy of Meta 360 RA"), n_rows=3, n_cols=3),
+        TabGrid(title="Meta 360 RA", gid=1, hidden=False,
+                rows=_tracker("Meta 360 RA"), n_rows=3, n_cols=3),
+    ]
+    results = snapshots.capture_workbook(grids, year=2026, today=date(2026, 2, 7))
+    assert results[0] == {"tab": "Copy of Meta 360 RA", "skipped": True, "reason": "hidden"}
+    assert snapshots.get_snapshot("copy-of-meta-360-ra", "2026-02-07") is None
+    snap = snapshots.get_snapshot("meta-360-ra", "2026-02-07")
+    assert snap["hidden"] is False and snap["gid"] == 1
+
+
+def test_one_capture_run_stamps_one_sweep_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_SNAPSHOTS_DIR", str(tmp_path))
+    grids = [TabGrid(title=t, gid=i, hidden=False, rows=_tracker(t), n_rows=3, n_cols=3)
+             for i, t in enumerate(["Meta 360 RA", "Hawksem LS Google"])]
+    snapshots.capture_workbook(grids, year=2026, today=date(2026, 2, 7))
+    first = {s["sweep_id"] for s in snapshots.list_snapshots(month="2026-02")}
+    assert len(first) == 1 and None not in first
+    snapshots.capture_workbook(grids[:1], year=2026, today=date(2026, 2, 7))
+    ids = {s["vendor_slug"]: s["sweep_id"] for s in snapshots.list_snapshots(month="2026-02")}
+    assert ids["meta-360-ra"] not in first        # a second run is a new sweep
+    sw = snapshots.vendor_sweep("2026-02")
+    assert [s["vendor_slug"] for s in sw["docs"]] == ["meta-360-ra"]
+    assert sw["excluded"][0]["slug"] == "hawksem-ls-google"   # not in the final run
+
+
+def test_a_hidden_rollup_still_ends_the_capture(monkeypatch, tmp_path):
+    """Everything after the Overall tab is ops sheets — hiding the roll-up
+    must not let the capture walk on into them."""
+    monkeypatch.setenv("MR_OFFLINE", "1")
+    monkeypatch.setenv("MR_SNAPSHOTS_DIR", str(tmp_path))
+    grids = [TabGrid(title="Marketing 2026 Overall Report", gid=1, hidden=True,
+                     rows=_tracker("Overall"), n_rows=3, n_cols=3),
+             TabGrid(title="Raw Information", gid=2, hidden=False,
+                     rows=_tracker("Raw Information"), n_rows=3, n_cols=3)]
+    results = snapshots.capture_workbook(grids, year=2026, today=date(2026, 2, 7))
+    assert [r["tab"] for r in results] == ["Marketing 2026 Overall Report"]
+
+
 # --- an unreadable store must never look like an empty one -------------------
 
 def _dead_db(*_a, **_kw):
@@ -120,8 +172,6 @@ def test_list_snapshots_raises_when_the_cloud_read_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(snapshots, "_cloud_list", lambda *a, **kw: None)
     with pytest.raises(snapshots.SnapshotStoreError):
         snapshots.list_snapshots(slug="meta-360-ra")
-    with pytest.raises(snapshots.SnapshotStoreError):
-        snapshots.latest_rollup_snapshot()
 
 
 def test_cloud_list_reports_none_not_empty_on_failure(monkeypatch):

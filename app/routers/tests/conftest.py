@@ -125,3 +125,33 @@ def unauthenticated() -> Callable[[], None]:
         fastapi_app.dependency_overrides.pop(get_current_user, None)
 
     return _drop
+
+
+#: What the stand-in identity provider below hands out. Not a JWT and not a
+#: secret: a fixed marker a test can assert reached the Authorization header.
+FAKE_ID_TOKEN = "test-id-token-not-a-real-jwt"
+
+
+@pytest.fixture(autouse=True)
+def _no_live_identity_token(monkeypatch):
+    """No router test may mint a real Google ID token.
+
+    ``app.services.pdf_renderer`` asks google-auth for an ID token before every
+    renderer call. Unstubbed, that is a network call — to the metadata server,
+    or to Google's token endpoint with whatever service-account key the
+    developer's ``.env`` points at. Replaced here for EVERY test in the
+    directory, so "this suite never reaches Google" is structural, the same way
+    ``_no_live_renderer`` makes the renderer unreachable. A test that exercises
+    the identity path (audience, fetch failure) installs its own stand-in over
+    this one. Records each audience asked for in ``calls``.
+    """
+    from app.services import pdf_renderer
+
+    calls: list[str] = []
+
+    def _fake(audience: str) -> str:
+        calls.append(audience)
+        return FAKE_ID_TOKEN
+
+    monkeypatch.setattr(pdf_renderer, "_fetch_id_token", _fake)
+    return calls
