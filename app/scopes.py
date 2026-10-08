@@ -99,7 +99,9 @@ GEO_SCOPE_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # clean removal is a console change (drop the count for a scoped user),
         # not a backend one.
         ("GET", "/api/library"),
-        ("GET", "/api/issues"),
+        # ``GET /api/issues`` left this set on 2026-10-08: the route is admin
+        # only now, and the console no longer asks for the count unless the
+        # viewer is an admin.
         ("GET", "/api/news"),
         # The caller's OWN runs. ``firestore_repo.list_runs_for_user`` filters
         # on ``user_id`` before it orders, so this is the one route here that is

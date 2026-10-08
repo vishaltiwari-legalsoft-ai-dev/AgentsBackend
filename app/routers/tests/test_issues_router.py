@@ -27,7 +27,9 @@ from seo_geo_agent import insights, state as seo_state
 BRAND = {"id": "legalsoft", "name": "Legal Soft", "domain": "legalsoft.com",
          "seeds": ["legal virtual assistant"], "enabled": True}
 OFF_BRAND = {"id": "dormant", "name": "Dormant", "domain": "dormant.com", "enabled": False}
-USER = {"id": "u1", "email": "t@legalsoft.com", "is_admin": False, "is_creator": False}
+# An admin: since 2026-10-08 the panel is theirs alone (``require_admin``).
+USER = {"id": "u1", "email": "t@legalsoft.com", "is_admin": True, "is_creator": False}
+MEMBER = {"id": "u2", "email": "m@legalsoft.com", "is_admin": False, "is_creator": False}
 
 GSC_403 = (
     "Search Console rejected sc-domain:legalsoft.com: <HttpError 403 when requesting "
@@ -74,6 +76,13 @@ def _codes(body: dict, brand_id: str = "legalsoft") -> set[str]:
 def test_requires_a_signed_in_caller():
     app_under_test.dependency_overrides.clear()
     assert client.get("/api/issues").status_code == 401
+
+
+def test_a_member_is_refused_the_issues_panel():
+    """Sub-managers and reportees use the specialists; the workspace-wide
+    issue list is the admin's. A member gets 403, not a thinner list."""
+    app_under_test.dependency_overrides[get_current_user] = lambda: dict(MEMBER)
+    assert client.get("/api/issues").status_code == 403
 
 
 def test_composes_seo_and_geo_signals_for_enabled_brands_only(runlog):

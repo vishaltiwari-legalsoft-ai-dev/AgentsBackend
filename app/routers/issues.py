@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 from fastapi import APIRouter, Depends
 
-from app.security import get_current_user
+from app.security import require_admin
 from app.services import issues as issues_svc
 from final_geo_agent import geo_engines, geo_poll, geo_strategy
 from seo_geo_agent import insights
@@ -79,7 +79,7 @@ def _brand_issues(brand: dict, engine_status: dict | None) -> list[dict]:
 
 
 @router.get("/issues")
-def list_issues(user: dict = Depends(get_current_user)) -> dict:
+def list_issues(user: dict = Depends(require_admin)) -> dict:
     """Every open issue across every enabled brand, most severe first."""
     found: list[dict] = []
     workspace = issues_svc.WORKSPACE_BRAND

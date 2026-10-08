@@ -461,7 +461,8 @@ def test_the_brand_blind_optimizer_routes_are_gone(method, path):
 # ------------------------------------------------------------------ issues
 
 
-def test_issues_is_mounted_and_reads_the_shared_registry():
+def test_issues_is_mounted_and_reads_the_shared_registry(as_caller):
+    as_caller({**OWNER, "is_admin": True})  # admin-only since 2026-10-08
     body = client.get("/api/issues").json()
     assert set(body["counts"]) == {"high", "medium", "low"}
     assert body["generated_at"]

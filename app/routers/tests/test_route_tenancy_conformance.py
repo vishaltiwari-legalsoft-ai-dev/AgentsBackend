@@ -138,7 +138,7 @@ _AUTHENTICATED = {
 #: four outside contractors among the eight. Read it as a decision that this
 #: route may be served to somebody who does not work here.
 #:
-#: Small on purpose — 33 of 176 — and every entry is either public, part of the
+#: Small on purpose — 32 of 176 — and every entry is either public, part of the
 #: console shell that has to render before GEO is openable, or GEO itself. The
 #: two that are none of those (``GET /api/library``, ``GET /api/seo-geo/overview``)
 #: say so where they are listed in ``app/scopes.py``.
@@ -399,7 +399,12 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     # Issues: a read-only composition of the shared brand registry with each
     # brand's SEO run, GEO config, run log and plan — the same rows
     # ``/seo-geo/overview`` serves, for the same reason.
-    ("GET", "/api/issues"): (WORKSPACE_SHARED, EXTERNAL_OK),
+    # Admin only since 2026-10-08: the owner decided the Issues panel is part
+    # of the admin's view of the whole workspace, not something a member or a
+    # sub-manager sees — they use the specialists and, on Home, watch their
+    # own team's usage (``GET /api/usage/team``). The route still reads the
+    # same shared brand/GEO signals; only the door moved.
+    ("GET", "/api/issues"): (ADMIN_ONLY, INTERNAL_ONLY),
     # MR workbook substrate — ``/ask``, ``/workbook``, ``/workbook/scan`` and
     # the sources registry behind them. All four were TENANT_SCOPED until
     # 2026-09-05 and none of them ever was: they read ONE deployment-wide
@@ -604,7 +609,8 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
 #: reportees' ``runs`` rows and an admin every person's monthly count; the gate
 #: is the org chart and ``is_admin`` inside the handler, not a tenancy filter,
 #: so it is counted here where a cross-user read belongs. See its ledger entry.
-WORKSPACE_SHARED_BASELINE = 77
+# 77 -> 76 on 2026-10-08: GET /api/issues moved to ADMIN_ONLY (see its entry).
+WORKSPACE_SHARED_BASELINE = 76
 
 #: The GEO editor surface, BY NAME. Not a count — a count would let a future
 #: route join the role while another left it and say nothing, and the thing
