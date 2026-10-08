@@ -1,6 +1,8 @@
 import logging
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -13,6 +15,7 @@ from app.services import (
     agent_config,
     firestore_repo,
     model_catalog,
+    org_chart,
     runtime_config,
     storage,
 )
@@ -429,6 +432,225 @@ def get_usage(
             raise HTTPException(403, "The all-users view is available to the creator only.")
         return _usage_payload(None, days)
     return _usage_payload(str(user["id"]), days)
+
+
+# --------------------------------------------------------------------------- #
+# Team usage (Home): a chart manager's reportees today / this week / this month,
+# and — for admins — how much of each month's agent work was done by people.
+# --------------------------------------------------------------------------- #
+
+#: Worker threads for the per-user Firestore reads. Each read is one short
+#: query; the pool exists so an admin's N users × M months of counts, or a
+#: manager's six reportees, do not serialise into a multi-second page load.
+_TEAM_READ_WORKERS = 8
+
+_COULD_NOT_READ = (
+    "Could not read {what} from the database. "
+    "The figures would be wrong, so nothing is shown rather than a wrong figure."
+)
+
+
+def _viewer_tz(user: dict) -> ZoneInfo:
+    """The caller's zone from the token, UTC when it is missing or unknown."""
+    try:
+        return ZoneInfo(str(user.get("timezone") or "UTC"))
+    except Exception:  # noqa: BLE001 — an unknown zone name is not worth a 500
+        return ZoneInfo("UTC")
+
+
+def _utc_year_month(local_midnight: datetime) -> str:
+    return local_midnight.astimezone(timezone.utc).strftime("%Y-%m")
+
+
+def _month_back(year_month: str, n: int) -> str:
+    y, m = int(year_month[:4]), int(year_month[5:7])
+    idx = y * 12 + (m - 1) - n
+    return f"{idx // 12:04d}-{idx % 12 + 1:02d}"
+
+
+def _is_human(user_id: str, email: str) -> bool:
+    """A row or account that is a person, not the scheduler. Mirrors
+    ``run_tracking.CRON_USER`` (``id="cron"``, ``email="cron@scheduler"``)."""
+    return user_id not in ("", "cron") and not email.lower().endswith("@scheduler")
+
+
+def _aggregate_reportee(
+    rows: list[dict], *, tz: ZoneInfo, today: date, week_from: date, month: str
+) -> dict:
+    """Bucket one reportee's projected rows into today / week / month, by the
+    viewer's clock. ``created_at`` (UTC ISO) is converted; a row without a
+    parseable one falls back to the UTC ``day`` it was stamped with."""
+    counts = {"today": 0, "week": 0, "month": 0}
+    by_agent: Counter[str] = Counter()
+    last_run_at: str | None = None
+    for row in rows:
+        created = str(row.get("created_at") or "")
+        local_day: date | None
+        try:
+            local_day = datetime.fromisoformat(created).astimezone(tz).date()
+        except ValueError:
+            try:
+                local_day = date.fromisoformat(str(row.get("day") or ""))
+            except ValueError:
+                local_day = None
+        if local_day is None:
+            continue
+        if local_day.strftime("%Y-%m") == month:
+            counts["month"] += 1
+            by_agent[str(row.get("agent_id") or "unknown")] += 1
+        if week_from <= local_day <= today:
+            counts["week"] += 1
+        if local_day == today:
+            counts["today"] += 1
+        if created and (last_run_at is None or created > last_run_at):
+            last_run_at = created
+    return {**counts, "by_agent": dict(by_agent), "last_run_at": last_run_at}
+
+
+def _team_payload(manager: org_chart.Manager, users: list[dict], viewer: dict) -> dict:
+    tz = _viewer_tz(viewer)
+    now_local = datetime.now(timezone.utc).astimezone(tz)
+    today = now_local.date()
+    week_from = today - timedelta(days=6)
+    month = today.strftime("%Y-%m")
+    # The rows' ``year_month`` is stamped in UTC at write time, so the months
+    # to read are the UTC months the viewer's window touches: the start of
+    # their calendar month, the start of their 7-day window, and now.
+    month_start = datetime(today.year, today.month, 1, tzinfo=tz)
+    week_start = datetime(week_from.year, week_from.month, week_from.day, tzinfo=tz)
+    year_months = list(dict.fromkeys(
+        [_utc_year_month(month_start), _utc_year_month(week_start),
+         now_local.astimezone(timezone.utc).strftime("%Y-%m")]
+    ))
+
+    reportees = org_chart.resolve_reportees(users, manager)
+
+    def read(entry: dict) -> list[dict] | None:
+        if not entry["user_id"]:
+            return []
+        return firestore_repo.list_runs_for_user_months(entry["user_id"], year_months)
+
+    with ThreadPoolExecutor(max_workers=_TEAM_READ_WORKERS) as pool:
+        results = list(pool.map(read, reportees))
+
+    out = []
+    totals = {"today": 0, "week": 0, "month": 0}
+    for entry, rows in zip(reportees, results):
+        profile = entry.pop("user") or {}
+        row = {**entry, "last_login": profile.get("last_login") or None}
+        if rows is None:
+            # The read failed. No numbers at all — a zero here would read as
+            # "did nothing", which is the one thing we do not know.
+            out.append({**row, "read_ok": False, "today": None, "week": None,
+                        "month": None, "by_agent": {}, "last_run_at": None})
+            continue
+        agg = _aggregate_reportee(rows, tz=tz, today=today, week_from=week_from, month=month)
+        for k in totals:
+            totals[k] += agg[k]
+        out.append({**row, **agg, "read_ok": True})
+
+    return {
+        "manager": {"name": manager.person.name, "title": manager.person.title},
+        "today": today.isoformat(),
+        "week_from": week_from.isoformat(),
+        "month": month,
+        "reportees": out,
+        "totals": totals,
+    }
+
+
+def _humans_payload(users: list[dict], viewer: dict, months: int) -> dict:
+    """Per month, agent work done by signed-in people — the scheduler's rows
+    (``run_tracking.CRON_USER``) are never counted. Months are the ``runs``
+    rows' own ``year_month`` (stamped in UTC), newest first."""
+    tz = _viewer_tz(viewer)
+    current = datetime.now(timezone.utc).astimezone(tz).strftime("%Y-%m")
+    year_months = [_month_back(current, i) for i in range(months)]
+    humans = [
+        u for u in users
+        if _is_human(str(u.get("id") or ""), str(u.get("email") or ""))
+    ]
+    jobs = [(str(u["id"]), ym) for u in humans for ym in year_months]
+
+    with ThreadPoolExecutor(max_workers=_TEAM_READ_WORKERS) as pool:
+        counts = list(pool.map(
+            lambda job: firestore_repo.count_runs_for_user_month(job[0], job[1]), jobs
+        ))
+    if any(c is None for c in counts):
+        raise HTTPException(502, _COULD_NOT_READ.format(what="the team's monthly activity"))
+
+    per_month: dict[str, dict[str, int]] = {ym: {} for ym in year_months}
+    for (uid, ym), n in zip(jobs, counts):
+        if n:
+            per_month[ym][uid] = int(n)
+    by_id = {str(u["id"]): u for u in humans}
+    out = []
+    for ym in year_months:
+        by_user = [
+            {
+                "user_id": uid,
+                "email": by_id[uid].get("email", ""),
+                "name": by_id[uid].get("name") or _display_name_from_email(by_id[uid].get("email", "")),
+                "runs": n,
+            }
+            for uid, n in per_month[ym].items()
+        ]
+        by_user.sort(key=lambda r: (-r["runs"], r["email"]))
+        out.append({
+            "year_month": ym,
+            "runs": sum(r["runs"] for r in by_user),
+            "users": len(by_user),
+            "by_user": by_user,
+        })
+    return {"months": out, "excluded": "Scheduled runs (the cron user) are not counted."}
+
+
+@router.get("/usage/team")
+def get_team_usage(months: int = 3, user: dict = Depends(get_current_user)) -> dict:
+    """Home panel: a chart manager's reportees, and for admins the humans-only
+    monthly totals. Anyone signed in may call it; a caller who is neither gets
+    ``team: null, humans: null`` and the frontend shows nothing.
+
+    The reportee read is a deliberate cross-user read: it is gated by the org
+    chart in ``app.services.org_chart`` (the caller must resolve to exactly one
+    chart manager), not by a tenancy filter. See the ROUTE_LEDGER entry.
+    """
+    months = max(1, min(int(months), 12))
+    is_admin = bool(user.get("is_admin"))
+    email = str(user.get("email") or "")
+    try:
+        profile = firestore_repo.get_user_by_email(email)
+    except Exception:  # noqa: BLE001 — the read failed; say so, do not guess
+        logger.warning("team usage: could not read the caller's profile", exc_info=True)
+        raise HTTPException(502, _COULD_NOT_READ.format(what="your profile"))
+    manager = org_chart.manager_for_user(
+        profile or {"id": user.get("id"), "email": email, "name": ""}
+    )
+
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "viewer": {
+            "manager": manager is not None,
+            "admin": is_admin,
+            "matched_as": manager.person.name if manager else None,
+        },
+        "team": None,
+        "humans": None,
+    }
+    if manager is None and not is_admin:
+        return payload
+
+    try:
+        users = firestore_repo.list_users()
+    except Exception:  # noqa: BLE001
+        logger.warning("team usage: could not read the user directory", exc_info=True)
+        raise HTTPException(502, _COULD_NOT_READ.format(what="the user directory"))
+
+    if manager is not None:
+        payload["team"] = _team_payload(manager, users, user)
+    if is_admin:
+        payload["humans"] = _humans_payload(users, user, months)
+    return payload
 
 
 @router.get("/admin/users")

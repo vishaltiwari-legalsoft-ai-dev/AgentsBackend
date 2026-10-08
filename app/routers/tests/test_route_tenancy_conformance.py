@@ -329,6 +329,19 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("GET", "/api/runs"): (TENANT_SCOPED, EXTERNAL_OK),
     ("GET", "/api/usage"): (TENANT_SCOPED, INTERNAL_ONLY),
     # --- shared across the whole workspace, with no boundary object -------- #
+    # ``GET /api/usage/team`` (2026-10-08) is a DELIBERATE cross-user read and
+    # is filed here rather than next to ``/api/usage`` because TENANT_SCOPED
+    # would be a lie: a chart manager is shown their reportees' ``runs`` rows,
+    # and an admin every person's monthly count. Neither is gated by a tenancy
+    # filter. The gate is the org chart (``app.services.org_chart`` — the
+    # caller's ``users`` document must resolve to exactly one chart manager,
+    # by e-mail once an admin fills it in, by name until then) plus
+    # ``is_admin`` for the humans block; a caller who is neither gets
+    # ``team: null, humans: null``. It is not ADMIN_ONLY because every
+    # signed-in user may call it (the dependency is ``get_current_user``),
+    # and the ratchet below counts it on purpose — the name-based gate is the
+    # weakest in the service until the chart carries e-mails.
+    ("GET", "/api/usage/team"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     # Blog Writer, moved out of SHARED_CATALOG on 2026-09-12. That label means
     # "static or near-static reference data … carries no per-user rows at all",
     # and these two are neither static nor reads: ``POST …/voice`` OVERWRITES
@@ -586,7 +599,12 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
 #: uploads, reference delete) serve one company-wide brand set to every member
 #: by the owner's decision; the picker ``GET /api/gd/brands`` moved here from
 #: SHARED_CATALOG because it now lists rows members write. Archive is ADMIN_ONLY.
-WORKSPACE_SHARED_BASELINE = 76
+#:
+#: 76 → 77 on 2026-10-08: ``GET /api/usage/team``. A chart manager reads their
+#: reportees' ``runs`` rows and an admin every person's monthly count; the gate
+#: is the org chart and ``is_admin`` inside the handler, not a tenancy filter,
+#: so it is counted here where a cross-user read belongs. See its ledger entry.
+WORKSPACE_SHARED_BASELINE = 77
 
 #: The GEO editor surface, BY NAME. Not a count — a count would let a future
 #: route join the role while another left it and say nothing, and the thing

@@ -1229,6 +1229,70 @@ def count_runs_for_user(user_id: str) -> int | None:
         return None
 
 
+#: Ceiling on any single ``runs`` read made for the team-usage panel. Firestore
+#: retries transient faults on its own; what it will not do unasked is stop
+#: waiting, and the Home panel must not hang on a reportee's row.
+_RUNS_READ_TIMEOUT_S = 20.0
+
+#: Fields the team-usage panel needs per row. Projected so a reportee's month
+#: of rows (one per unit of work) travels as a few bytes each, not the full
+#: task text and summary.
+TEAM_RUN_FIELDS: tuple[str, ...] = ("agent_id", "day", "created_at")
+
+
+def list_runs_for_user_months(
+    user_id: str, year_months: list[str], fields: tuple[str, ...] = TEAM_RUN_FIELDS
+) -> list[dict[str, Any]] | None:
+    """One user's rows for the given ``YYYY-MM`` months, projected to ``fields``.
+
+    Two equality filters (``user_id``, ``year_month``), so no composite index is
+    needed — and no ``order_by``, because the ``(user_id, created_at DESC)``
+    index is not built in production. ``None`` means the read failed; ``[]``
+    means the user filed nothing in those months. Same contract as
+    :func:`count_runs_for_user`.
+    """
+    if not user_id:
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        col = _db().collection("runs")
+        for ym in dict.fromkeys(year_months):
+            query = (
+                col.where(filter=firestore.FieldFilter("user_id", "==", user_id))
+                .where(filter=firestore.FieldFilter("year_month", "==", ym))
+                .select(list(fields))
+            )
+            for doc in query.stream(timeout=_RUNS_READ_TIMEOUT_S):
+                rows.append(doc.to_dict() or {})
+    except Exception:
+        logger.warning("could not read a user's runs for %s", year_months, exc_info=True)
+        return None
+    return rows
+
+
+def count_runs_for_user_month(user_id: str, year_month: str) -> int | None:
+    """How many rows one user filed in one ``YYYY-MM`` — a server-side count.
+
+    ``None`` when the count could not be read, never a zero that would read
+    as "did nothing". Same two-equality shape as the list above.
+    """
+    if not user_id:
+        return 0
+    try:
+        result = (
+            _db()
+            .collection("runs")
+            .where(filter=firestore.FieldFilter("user_id", "==", user_id))
+            .where(filter=firestore.FieldFilter("year_month", "==", year_month))
+            .count()
+            .get(timeout=_RUNS_READ_TIMEOUT_S)
+        )
+        return int(result[0][0].value) if result and result[0] else 0
+    except Exception:
+        logger.warning("could not count a user's runs for %s", year_month, exc_info=True)
+        return None
+
+
 #: How many of one caller's rows the unordered fallback will pull before it
 #: gives up on being complete. Well above today's whole-collection size, and low
 #: enough that a runaway agent cannot turn one page load into a full scan.
