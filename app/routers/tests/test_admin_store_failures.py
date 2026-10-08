@@ -177,10 +177,31 @@ def test_list_runs_for_user_months_reports_none_on_failure(monkeypatch):
     assert firestore_repo.list_runs_for_user_months("", ["2026-10"]) == []
 
 
-def test_count_runs_for_user_month_reports_none_on_failure(monkeypatch):
+def test_count_runs_for_user_by_month_reports_none_on_failure(monkeypatch):
     monkeypatch.setattr(firestore_repo, "_db", _dead)
-    assert firestore_repo.count_runs_for_user_month("u1", "2026-10") is None
-    assert firestore_repo.count_runs_for_user_month("", "2026-10") == 0
+    assert firestore_repo.count_runs_for_user_by_month("u1") is None
+    assert firestore_repo.count_runs_for_user_by_month("") == {}
+
+
+def test_run_row_month_reads_whichever_date_field_a_row_carries():
+    # record_activity rows carry year_month; create_run rows (GD / Blog /
+    # Creative — most human work) historically carried only date + created_at.
+    assert firestore_repo.run_row_month({"year_month": "2026-09", "date": "2026-10-01"}) == "2026-09"
+    assert firestore_repo.run_row_month({"date": "2026-10-07", "created_at": "2026-10-07T10:00:00+00:00"}) == "2026-10"
+    assert firestore_repo.run_row_month({"created_at": "2026-08-30T23:59:00+00:00"}) == "2026-08"
+    assert firestore_repo.run_row_month({}) == ""
+
+
+def test_list_runs_for_user_months_buckets_create_run_rows_too(monkeypatch):
+    rows = [
+        {"agent_id": "a1", "date": "2026-10-03", "created_at": "2026-10-03T09:00:00+00:00"},   # create_run shape
+        {"agent_id": "a2", "year_month": "2026-10", "day": "2026-10-04", "created_at": "2026-10-04T09:00:00+00:00"},
+        {"agent_id": "a1", "date": "2026-09-30", "created_at": "2026-09-30T09:00:00+00:00"},
+    ]
+    monkeypatch.setattr(firestore_repo, "_user_run_rows", lambda uid, fields: list(rows))
+    got = firestore_repo.list_runs_for_user_months("u1", ["2026-10"])
+    assert [r["agent_id"] for r in got] == ["a1", "a2"]
+    assert firestore_repo.count_runs_for_user_by_month("u1") == {"2026-10": 2, "2026-09": 1}
 
 
 # --------------------------------------------------------------------------- #
@@ -267,21 +288,21 @@ def test_team_usage_manager_view(as_caller, directory, monkeypatch):
 def test_team_usage_admin_view_counts_humans_only_newest_month_first(as_caller, directory, monkeypatch):
     as_caller(_HAYLIE)
     this_month = datetime.now(timezone.utc).strftime("%Y-%m")
-    asked: list[tuple[str, str]] = []
-    counts = {("k1", this_month): 5, ("c1", this_month): 9, ("y1", this_month): 0}
+    asked: list[str] = []
+    counts = {"k1": {this_month: 5}, "c1": {this_month: 9, "2024-01": 3}, "y1": {}}
 
-    def count(uid, ym):
-        asked.append((uid, ym))
-        return counts.get((uid, ym), 0)
+    def count(uid):
+        asked.append(uid)
+        return counts.get(uid, {})
 
-    monkeypatch.setattr(firestore_repo, "count_runs_for_user_month", count)
+    monkeypatch.setattr(firestore_repo, "count_runs_for_user_by_month", count)
 
     r = client.get("/api/usage/team?months=2")
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["viewer"]["admin"] is True and body["viewer"]["manager"] is False
     assert body["team"] is None
-    assert all(uid != "cron" for uid, _ in asked), "the scheduler must never be counted"
+    assert "cron" not in asked, "the scheduler must never be counted"
     months = body["humans"]["months"]
     assert [m["year_month"] for m in months] == [this_month, admin_router._month_back(this_month, 1)]
     newest = months[0]
@@ -295,8 +316,8 @@ def test_team_usage_admin_view_counts_humans_only_newest_month_first(as_caller, 
 def test_team_usage_admin_view_answers_502_when_any_month_cannot_be_read(as_caller, directory, monkeypatch):
     as_caller(_HAYLIE)
     monkeypatch.setattr(
-        firestore_repo, "count_runs_for_user_month",
-        lambda uid, ym: None if uid == "y1" else 1,
+        firestore_repo, "count_runs_for_user_by_month",
+        lambda uid: None if uid == "y1" else {"2026-01": 1},
     )
     r = client.get("/api/usage/team")
     assert r.status_code == 502, r.text

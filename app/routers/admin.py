@@ -562,7 +562,7 @@ def _team_payload(manager: org_chart.Manager, users: list[dict], viewer: dict) -
 def _humans_payload(users: list[dict], viewer: dict, months: int) -> dict:
     """Per month, agent work done by signed-in people — the scheduler's rows
     (``run_tracking.CRON_USER``) are never counted. Months are the ``runs``
-    rows' own ``year_month`` (stamped in UTC), newest first."""
+    rows' own calendar month (stamped in UTC at write time), newest first."""
     tz = _viewer_tz(viewer)
     current = datetime.now(timezone.utc).astimezone(tz).strftime("%Y-%m")
     year_months = [_month_back(current, i) for i in range(months)]
@@ -570,19 +570,22 @@ def _humans_payload(users: list[dict], viewer: dict, months: int) -> dict:
         u for u in users
         if _is_human(str(u.get("id") or ""), str(u.get("email") or ""))
     ]
-    jobs = [(str(u["id"]), ym) for u in humans for ym in year_months]
+    ids = [str(u["id"]) for u in humans]
 
+    # One projected read per person (every row they filed, a few bytes each),
+    # bucketed by whichever date field the row carries — see
+    # ``firestore_repo.run_row_month``.
     with ThreadPoolExecutor(max_workers=_TEAM_READ_WORKERS) as pool:
-        counts = list(pool.map(
-            lambda job: firestore_repo.count_runs_for_user_month(job[0], job[1]), jobs
-        ))
+        counts = list(pool.map(firestore_repo.count_runs_for_user_by_month, ids))
     if any(c is None for c in counts):
         raise HTTPException(502, _COULD_NOT_READ.format(what="the team's monthly activity"))
 
     per_month: dict[str, dict[str, int]] = {ym: {} for ym in year_months}
-    for (uid, ym), n in zip(jobs, counts):
-        if n:
-            per_month[ym][uid] = int(n)
+    for uid, by_month in zip(ids, counts):
+        for ym in year_months:
+            n = int((by_month or {}).get(ym, 0))
+            if n:
+                per_month[ym][uid] = n
     by_id = {str(u["id"]): u for u in humans}
     out = []
     for ym in year_months:

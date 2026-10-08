@@ -1042,6 +1042,10 @@ def start_run(
     base = {
         "run_id": run_id,
         "date": now[:10],
+        # The same calendar keys ``run_tracking.record_activity`` stamps, so
+        # both kinds of row can be bucketed alike (team usage reads either).
+        "day": now[:10],
+        "year_month": now[:7],
         "timezone": timezone,
         "created_at": now,
         "session_id": session_id,
@@ -1237,7 +1241,56 @@ _RUNS_READ_TIMEOUT_S = 20.0
 #: Fields the team-usage panel needs per row. Projected so a reportee's month
 #: of rows (one per unit of work) travels as a few bytes each, not the full
 #: task text and summary.
-TEAM_RUN_FIELDS: tuple[str, ...] = ("agent_id", "day", "created_at")
+TEAM_RUN_FIELDS: tuple[str, ...] = ("agent_id", "day", "date", "year_month", "created_at")
+
+#: Ceiling on one user's projected rows in a team-usage read. Far above any
+#: real account today; hitting it means the figure would be a floor, not a
+#: count, so the read reports failure rather than a number that is quietly
+#: short.
+_TEAM_ROWS_CAP = 10000
+
+
+def run_row_month(row: dict[str, Any]) -> str:
+    """The ``YYYY-MM`` a ``runs`` row belongs to.
+
+    Two writers fill the collection: ``run_tracking.record_activity`` stamps
+    ``year_month``/``day``; ``create_run`` (the staged GD / Blog / Creative
+    runs — most of what people actually do) historically stamped only ``date``
+    and ``created_at``. Reading the month off whichever field a row carries is
+    what makes both kinds count; filtering on ``year_month`` alone counted
+    nearly nothing (2026-10-08).
+    """
+    ym = str(row.get("year_month") or "")
+    if len(ym) == 7:
+        return ym
+    return str(row.get("date") or row.get("day") or row.get("created_at") or "")[:7]
+
+
+def _user_run_rows(user_id: str, fields: tuple[str, ...]) -> list[dict[str, Any]] | None:
+    """Every row one user filed, projected to ``fields`` — one equality filter,
+    no ``order_by`` (the ``(user_id, created_at DESC)`` index is not built in
+    production) and no second filter (rows disagree on which date field they
+    carry, see :func:`run_row_month`). ``None`` on a failed read or when the
+    cap is hit; ``[]`` when the user filed nothing."""
+    if not user_id:
+        return []
+    want = list(dict.fromkeys([*fields, "date", "year_month", "created_at"]))
+    try:
+        query = (
+            _db().collection("runs")
+            .where(filter=firestore.FieldFilter("user_id", "==", user_id))
+            .select(want)
+            .limit(_TEAM_ROWS_CAP)
+        )
+        rows = [doc.to_dict() or {} for doc in query.stream(timeout=_RUNS_READ_TIMEOUT_S)]
+    except Exception:
+        logger.warning("could not read a user's runs", exc_info=True)
+        return None
+    if len(rows) >= _TEAM_ROWS_CAP:
+        logger.warning("runs: a user has %s+ rows; the team-usage read is capped "
+                       "and reports failure rather than a short count", _TEAM_ROWS_CAP)
+        return None
+    return rows
 
 
 def list_runs_for_user_months(
@@ -1245,52 +1298,33 @@ def list_runs_for_user_months(
 ) -> list[dict[str, Any]] | None:
     """One user's rows for the given ``YYYY-MM`` months, projected to ``fields``.
 
-    Two equality filters (``user_id``, ``year_month``), so no composite index is
-    needed — and no ``order_by``, because the ``(user_id, created_at DESC)``
-    index is not built in production. ``None`` means the read failed; ``[]``
-    means the user filed nothing in those months. Same contract as
-    :func:`count_runs_for_user`.
+    ``None`` means the read failed; ``[]`` means the user filed nothing in
+    those months. Same contract as :func:`count_runs_for_user`.
+    """
+    rows = _user_run_rows(user_id, fields)
+    if rows is None:
+        return None
+    wanted = set(year_months)
+    return [r for r in rows if run_row_month(r) in wanted]
+
+
+def count_runs_for_user_by_month(user_id: str) -> dict[str, int] | None:
+    """How many rows one user filed, per ``YYYY-MM`` — one read per user.
+
+    ``None`` when the read failed, never a zero map that would read as "did
+    nothing". A month absent from the map is a month with no rows.
     """
     if not user_id:
-        return []
-    rows: list[dict[str, Any]] = []
-    try:
-        col = _db().collection("runs")
-        for ym in dict.fromkeys(year_months):
-            query = (
-                col.where(filter=firestore.FieldFilter("user_id", "==", user_id))
-                .where(filter=firestore.FieldFilter("year_month", "==", ym))
-                .select(list(fields))
-            )
-            for doc in query.stream(timeout=_RUNS_READ_TIMEOUT_S):
-                rows.append(doc.to_dict() or {})
-    except Exception:
-        logger.warning("could not read a user's runs for %s", year_months, exc_info=True)
+        return {}
+    rows = _user_run_rows(user_id, ("date",))
+    if rows is None:
         return None
-    return rows
-
-
-def count_runs_for_user_month(user_id: str, year_month: str) -> int | None:
-    """How many rows one user filed in one ``YYYY-MM`` — a server-side count.
-
-    ``None`` when the count could not be read, never a zero that would read
-    as "did nothing". Same two-equality shape as the list above.
-    """
-    if not user_id:
-        return 0
-    try:
-        result = (
-            _db()
-            .collection("runs")
-            .where(filter=firestore.FieldFilter("user_id", "==", user_id))
-            .where(filter=firestore.FieldFilter("year_month", "==", year_month))
-            .count()
-            .get(timeout=_RUNS_READ_TIMEOUT_S)
-        )
-        return int(result[0][0].value) if result and result[0] else 0
-    except Exception:
-        logger.warning("could not count a user's runs for %s", year_month, exc_info=True)
-        return None
+    out: dict[str, int] = {}
+    for r in rows:
+        ym = run_row_month(r)
+        if ym:
+            out[ym] = out.get(ym, 0) + 1
+    return out
 
 
 #: How many of one caller's rows the unordered fallback will pull before it
