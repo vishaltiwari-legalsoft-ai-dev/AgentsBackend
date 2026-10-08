@@ -183,6 +183,42 @@ def test_count_runs_for_user_by_month_reports_none_on_failure(monkeypatch):
     assert firestore_repo.count_runs_for_user_by_month("") == {}
 
 
+def test_user_run_rows_retries_one_cold_deadline_then_reads(monkeypatch):
+    from google.api_core import exceptions as gexc
+    calls = {"n": 0}
+
+    class _Query:
+        def where(self, **kw): return self
+        def select(self, *a): return self
+        def limit(self, *a): return self
+        def stream(self, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise gexc.DeadlineExceeded("504 Stream removed")
+            return iter([_Doc({"date": "2026-10-07"})])
+
+    class _Doc:
+        def __init__(self, d): self._d = d
+        def to_dict(self): return self._d
+
+    class _Db:
+        def collection(self, name): return _Query()
+
+    monkeypatch.setattr(firestore_repo, "_db", lambda: _Db())
+    assert firestore_repo.count_runs_for_user_by_month("u1") == {"2026-10": 1}
+    assert calls["n"] == 2
+    # Two deadlines in a row are a failed read, never an empty one.
+    class _AlwaysLate(_Query):
+        def stream(self, timeout=None):
+            raise gexc.DeadlineExceeded("504 Stream removed")
+
+    class _DbLate:
+        def collection(self, name): return _AlwaysLate()
+
+    monkeypatch.setattr(firestore_repo, "_db", lambda: _DbLate())
+    assert firestore_repo.count_runs_for_user_by_month("u1") is None
+
+
 def test_run_row_month_reads_whichever_date_field_a_row_carries():
     # record_activity rows carry year_month; create_run rows (GD / Blog /
     # Creative — most human work) historically carried only date + created_at.

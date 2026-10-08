@@ -1266,6 +1266,16 @@ def run_row_month(row: dict[str, Any]) -> str:
     return str(row.get("date") or row.get("day") or row.get("created_at") or "")[:7]
 
 
+def _is_transient_read_failure(exc: BaseException) -> bool:
+    """A deadline or availability fault from the Firestore transport — the kind
+    that clears on its own — as opposed to a bad query, which does not."""
+    try:
+        from google.api_core import exceptions as gexc
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(exc, (gexc.DeadlineExceeded, gexc.ServiceUnavailable, gexc.Aborted))
+
+
 def _user_run_rows(user_id: str, fields: tuple[str, ...]) -> list[dict[str, Any]] | None:
     """Every row one user filed, projected to ``fields`` — one equality filter,
     no ``order_by`` (the ``(user_id, created_at DESC)`` index is not built in
@@ -1275,16 +1285,28 @@ def _user_run_rows(user_id: str, fields: tuple[str, ...]) -> list[dict[str, Any]
     if not user_id:
         return []
     want = list(dict.fromkeys([*fields, "date", "year_month", "created_at"]))
-    try:
-        query = (
-            _db().collection("runs")
-            .where(filter=firestore.FieldFilter("user_id", "==", user_id))
-            .select(want)
-            .limit(_TEAM_ROWS_CAP)
-        )
-        rows = [doc.to_dict() or {} for doc in query.stream(timeout=_RUNS_READ_TIMEOUT_S)]
-    except Exception:
-        logger.warning("could not read a user's runs", exc_info=True)
+    rows: list[dict[str, Any]] | None = None
+    # The first streams on a cold Cloud Run instance have timed out at the gRPC
+    # layer (DeadlineExceeded, 2026-10-08, eight at once on a fresh revision)
+    # and then answered in under a second. One retry covers that; a second
+    # failure is reported as a failed read, never as an empty one.
+    for attempt in (1, 2):
+        try:
+            query = (
+                _db().collection("runs")
+                .where(filter=firestore.FieldFilter("user_id", "==", user_id))
+                .select(want)
+                .limit(_TEAM_ROWS_CAP)
+            )
+            rows = [doc.to_dict() or {} for doc in query.stream(timeout=_RUNS_READ_TIMEOUT_S)]
+            break
+        except Exception as exc:  # noqa: BLE001 — classified below
+            if attempt == 1 and _is_transient_read_failure(exc):
+                logger.warning("runs: a user's read timed out on a cold channel; retrying once")
+                continue
+            logger.warning("could not read a user's runs", exc_info=True)
+            return None
+    if rows is None:
         return None
     if len(rows) >= _TEAM_ROWS_CAP:
         logger.warning("runs: a user has %s+ rows; the team-usage read is capped "
