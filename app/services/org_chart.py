@@ -56,49 +56,55 @@ def _p(name: str, title: str, email: Optional[str] = None) -> Person:
 
 #: The chart. Haylie Anne Logan (CMO) is deliberately absent: admins are
 #: identified by ``is_admin`` on the caller, never by this table.
-MANAGERS: tuple[Manager, ...] = (
-    Manager(
-        _p("Angelica Mhay Canlas-David", "Executive Assistant (Deliverable Management)",
-           "angelica.david@legalsoft.com"),
-        (
-            _p("Francesca Canquin", "Client General Manager"),
-            _p("Julian Rivera Gomez", "Client General Manager"),
-            _p("Cleff Remegio", "Product Manager"),
-            _p("Dexter Jumig", "Marketing Analyst"),
-            _p("Nikki Riva Saludar", "Marketing Coordinator"),
-            _p("Jennifer Melissa Orozco", "Marketing Coordinator"),
-        ),
+_ANGELICA = Manager(
+    _p("Angelica Mhay Canlas-David", "Executive Assistant (Deliverable Management)",
+       "angelica.david@legalsoft.com"),
+    (
+        _p("Francesca Canquin", "Client General Manager"),
+        _p("Julian Rivera Gomez", "Client General Manager"),
+        _p("Cleff Remegio", "Product Manager"),
+        _p("Dexter Jumig", "Marketing Analyst"),
+        _p("Nikki Riva Saludar", "Marketing Coordinator"),
+        _p("Jennifer Melissa Orozco", "Marketing Coordinator"),
     ),
-    Manager(
-        _p("Kier Anthony M. Dela Rosa", "SEO Manager", "kier.delarosa@legalsoft.com"),
-        (
-            _p("Yans Suarez", "SEO Specialist"),
-            _p("Marian Portillo", "SEO Specialist"),
-            _p("Michael John Tayco", "SEO Specialist"),
-            _p("Mahmoud Elsheikh", "SEO Specialist"),
-            _p("Lynie Tinguban", "SEO Specialist"),
-            _p("Chelsea Estrella", "SEO Specialist"),
-        ),
-    ),
-    Manager(
-        _p("Daniel Sernin Noche Amorsolo", "Graphic Designer", "daniel.amorsolo@legalsoft.com"),
-        (_p("Brix Ayo", "Graphic Designer"),),
-    ),
-    Manager(
-        _p("Raj Dobariya", "Internal Web Developer"),
-        (
-            _p("Robert Bob Mondigo", "Internal Web Developer"),
-            _p("Sakir Showrov", "Internal Web Developer"),
-            _p("Julius Cristobal", "UI/UX Designer"),
-            _p("Kamran Shah", "UI/UX Designer"),
-            _p("Mari Ann Belle S. Del Socorro (Mabs)", "UI/UX Designer"),
-        ),
-    ),
-    # Named by the owner on 2026-10-08 with an e-mail but no reportees yet;
-    # the Home panel says "nobody reports to you on the chart yet" until the
-    # chart lists them.
-    Manager(_p("Anushka Prasad", "Manager", "anushka.p@legalsoft.com"), ()),
 )
+_KIER = Manager(
+    _p("Kier Anthony M. Dela Rosa", "SEO Manager", "kier.delarosa@legalsoft.com"),
+    (
+        _p("Yans Suarez", "SEO Specialist"),
+        _p("Marian Portillo", "SEO Specialist"),
+        _p("Michael John Tayco", "SEO Specialist"),
+        _p("Mahmoud Elsheikh", "SEO Specialist"),
+        _p("Lynie Tinguban", "SEO Specialist"),
+        _p("Chelsea Estrella", "SEO Specialist"),
+    ),
+)
+_DANIEL = Manager(
+    _p("Daniel Sernin Noche Amorsolo", "Graphic Designer", "daniel.amorsolo@legalsoft.com"),
+    (_p("Brix Ayo", "Graphic Designer"),),
+)
+# The web team. Raj Dobariya led it on the sheet; on 2026-10-08 the owner set
+# him aside as a manager, so the team reports to Anushka with him in it.
+_WEB_TEAM: tuple[Person, ...] = (
+    _p("Raj Dobariya", "Internal Web Developer"),
+    _p("Robert Bob Mondigo", "Internal Web Developer"),
+    _p("Sakir Showrov", "Internal Web Developer"),
+    _p("Julius Cristobal", "UI/UX Designer"),
+    _p("Kamran Shah", "UI/UX Designer"),
+    _p("Mari Ann Belle S. Del Socorro (Mabs)", "UI/UX Designer"),
+)
+# Everyone on the chart reports to Anushka (owner, 2026-10-08): the three
+# team managers, their reportees, and the web team.
+_ANUSHKA = Manager(
+    _p("Anushka Prasad", "Manager", "anushka.p@legalsoft.com"),
+    tuple(
+        [m.person for m in (_ANGELICA, _KIER, _DANIEL)]
+        + [r for m in (_ANGELICA, _KIER, _DANIEL) for r in m.reportees]
+        + list(_WEB_TEAM)
+    ),
+)
+
+MANAGERS: tuple[Manager, ...] = (_ANGELICA, _KIER, _DANIEL, _ANUSHKA)
 
 
 # --------------------------------------------------------------------------- #

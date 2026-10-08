@@ -141,8 +141,9 @@ def test_org_chart_reports_none_for_someone_who_has_not_signed_in():
     rows = {r["name"]: r for r in org_chart.resolve_reportees([])}
     assert rows["Brix Ayo"]["match"] == "none"
     assert rows["Brix Ayo"]["user_id"] is None
-    # The whole chart, nobody missing: 6 + 6 + 1 + 5 reportees.
-    assert len(rows) == 18
+    # The whole chart by name, nobody missing and nobody twice: the 18
+    # team members plus the three team managers and Raj, who report to Anushka.
+    assert len(rows) == 22
 
 
 def test_org_chart_identifies_a_manager_and_nobody_else():
@@ -152,11 +153,16 @@ def test_org_chart_identifies_a_manager_and_nobody_else():
     assert org_chart.manager_for_user(
         _u("k", "kier.delarosa@legalsoft.com", "K.")).person.name == "Kier Anthony M. Dela Rosa"
     assert org_chart.manager_for_user(_u("k2", "k@x.com", "Kier Dela Rosa")) is None
-    # Raj has no e-mail on the chart yet, so he is still found by name.
-    assert org_chart.manager_for_user(_u("r", "r@x.com", "Raj Dobariya")).person.name == "Raj Dobariya"
-    # A manager named with no reportees is still a manager, with an empty team.
-    assert org_chart.manager_for_user(
-        _u("a", "anushka.p@legalsoft.com", "Anushka")).reportees == ()
+    # Raj was set aside as a manager on 2026-10-08: a reportee now, not a manager.
+    assert org_chart.manager_for_user(_u("r", "r@x.com", "Raj Dobariya")) is None
+    # Everyone on the chart reports to Anushka — the three managers included.
+    anushka = org_chart.manager_for_user(_u("a", "anushka.p@legalsoft.com", "Anushka"))
+    names = [r.name for r in anushka.reportees]
+    assert len(names) == len(set(names)) == 22
+    for who in ("Kier Anthony M. Dela Rosa", "Angelica Mhay Canlas-David",
+                "Daniel Sernin Noche Amorsolo", "Raj Dobariya", "Brix Ayo", "Chelsea Estrella"):
+        assert who in names
+    assert "Anushka Prasad" not in names and "Haylie Anne Logan" not in names
     assert org_chart.manager_for_user(_u("h", "h@x.com", "Haylie Anne Logan")) is None
     assert org_chart.manager_for_user(_u("b", "brix.ayo@x.com", "Brix Ayo")) is None
 
