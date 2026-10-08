@@ -55,6 +55,41 @@ class ArtifactStoreUnavailable(RuntimeError):
     A run that silently lost a file must never be reported as finished."""
 
 
+#: What a run says when generation died for a reason that is not ours to word
+#: for the user (a builder crash, a provider error, a store fault). The cause
+#: goes to the log; upstream error text never goes into the run.
+_GENERIC_FAILURE = ("Generation stopped partway because of an internal error, so this "
+                    "run will not finish — please try again.")
+
+
+def _record_failure(run: dict, exc: BaseException) -> None:
+    """Mark a run that stopped mid-generation as ``progress.state: "failed"``
+    with a safe one-sentence ``progress.reason`` and a decision-log entry.
+
+    Without it any exception other than a store fault left the run on
+    "generating" for good, and a client watching the run past the relay's
+    300 s cut waited out its whole cap for an honest answer. A failure to
+    persist this is logged and swallowed: the caller re-raises ``exc``, which
+    must never be masked by the bookkeeping."""
+    reason = str(exc) if isinstance(exc, ArtifactStoreUnavailable) else _GENERIC_FAILURE
+    step = run_step_key(run)
+    logger.error("creative run %s failed during %s: %s", run.get("id"), step,
+                 type(exc).__name__, exc_info=exc)
+    prev = run.get("progress") or {}
+    this_attempt = prev.get("state") == "generating"
+    run["progress"] = {
+        "done": prev.get("done", 0) if this_attempt else 0,
+        "total": prev.get("total", 0) if this_attempt else 0,
+        "state": "failed",
+        "reason": reason,
+    }
+    try:
+        cruns.log_decision(run, step, "Generation failed", reason)
+        cruns.save_run(run)
+    except Exception:  # noqa: BLE001 - the original error is the report
+        logger.exception("creative run %s: could not record the failure", run.get("id"))
+
+
 # --------------------------------------------------------------------------- #
 # Step 2 — retrieve brand precedent (the grounding the agent must use)
 # --------------------------------------------------------------------------- #
@@ -180,15 +215,30 @@ def _expected_artifact_count(ctype: str, plan: dict) -> int:
     return 1  # brochure / presentation → one file
 
 
-def produce(run: dict, *, require_approval: bool = True) -> dict:
-    import threading
-
-    from . import document_builder as db
-
+def _require_ready(run: dict, *, require_approval: bool) -> None:
+    """Preconditions, checked before anything starts: a refusal here is the
+    request's own 400, not a failed generation, so it leaves the run as it was."""
     if not run.get("plan"):
         raise ValueError("Nothing to generate — create and approve a plan first.")
     if require_approval and not run.get("plan_approved"):
         raise ValueError("Plan must be approved before generation (or run autonomously).")
+
+
+def produce(run: dict, *, require_approval: bool = True) -> dict:
+    """Step 4. Any failure once generation has started is recorded on the run
+    (``progress.state: "failed"``, see ``_record_failure``) and re-raised."""
+    _require_ready(run, require_approval=require_approval)
+    try:
+        return _produce(run)
+    except Exception as exc:
+        _record_failure(run, exc)
+        raise
+
+
+def _produce(run: dict) -> dict:
+    import threading
+
+    from . import document_builder as db
 
     pack = _pack(run)
     ctype = run["creative_type"]
@@ -231,13 +281,6 @@ def produce(run: dict, *, require_approval: bool = True) -> dict:
                                       provenance=db.artifact_provenance(art))
         except Exception as exc:  # noqa: BLE001 - reported, not swallowed
             logger.exception("creative run %s: could not store artifact %s", run["id"], name)
-            run["progress"] = {**run["progress"], "state": "failed"}
-            cruns.log_decision(run, "output", "Could not save the generated files",
-                               f"{name} could not be written to file storage.")
-            try:
-                cruns.save_run(run)
-            except Exception:  # noqa: BLE001 - the raise below is the report
-                logger.exception("creative run %s: could not record the failure", run["id"])
             raise ArtifactStoreUnavailable(
                 "The creative was generated but its files could not be saved — "
                 "file storage is unavailable. Please try again.") from exc
@@ -283,14 +326,21 @@ def run_autonomous(run: dict, *, count: Optional[int] = None, use_llm: bool = Tr
     cruns.log_decision(run, "intent", "Autonomous run started",
                        "Agent is taking end-to-end control across all four steps "
                        "based on AI recommendations.")
-    # Step 1 → 2
-    cruns.advance_to(run, "strategy")
-    retrieve_grounding(run)
-    # Step 3 (plan) — auto-approved in autonomous mode
-    make_plan(run, count=count, use_llm=use_llm)
-    approve_plan(run, source="agent")
-    # Step 4
-    produce(run, require_approval=False)
+    # From here the run is under way: whichever step fails, the run says so
+    # (once — Step 4 uses the unrecorded ``_produce`` for that reason).
+    try:
+        # Step 1 → 2
+        cruns.advance_to(run, "strategy")
+        retrieve_grounding(run)
+        # Step 3 (plan) — auto-approved in autonomous mode
+        make_plan(run, count=count, use_llm=use_llm)
+        approve_plan(run, source="agent")
+        # Step 4
+        _require_ready(run, require_approval=False)
+        _produce(run)
+    except Exception as exc:
+        _record_failure(run, exc)
+        raise
     return run
 
 

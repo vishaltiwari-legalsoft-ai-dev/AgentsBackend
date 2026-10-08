@@ -370,6 +370,7 @@ def test_a_file_that_cannot_be_stored_fails_the_run_instead_of_vanishing(monkeyp
     assert "503" not in str(caught.value)              # safe message for the client
     stored = cruns.get_run(run["id"])
     assert stored["state"] != "DONE" and stored["progress"]["state"] == "failed"
+    assert stored["progress"]["reason"] == str(caught.value)
 
 
 def test_carousel_leaves_each_stage_its_own_image_model(monkeypatch):
@@ -389,3 +390,106 @@ def test_carousel_leaves_each_stage_its_own_image_model(monkeypatch):
     db.build("carousel", plan, PACK)
     slides = len(plan["frames"])
     assert stages.count(1) == slides and stages.count(2) == slides
+
+
+# --------------------------------------------------------------------------- #
+# A run that dies mid-generation says so (progress.state "failed"), whatever
+# killed it — a client watching it past the relay cut stops on that state.
+# --------------------------------------------------------------------------- #
+
+_UPSTREAM = 'OpenRouter image generation failed (502): {"error": "upstream secret body"}'
+
+
+def _approved_blog(monkeypatch, tmp_path) -> dict:
+    monkeypatch.setenv("GD_REFERENCE_DIR", str(tmp_path))
+    run = cruns.create_run("u1", "blog", brand_id="legalsoft", brief="tips")
+    pipeline.make_plan(run, count=2, use_llm=False)
+    pipeline.approve_plan(run)
+    return run
+
+
+def _crash(*_a, **_k):
+    raise RuntimeError(_UPSTREAM)
+
+
+def _failure_entries(run: dict) -> list:
+    return [d for d in run["decision_log"] if d["decision"] == "Generation failed"]
+
+
+def test_any_crash_mid_generation_marks_the_run_failed_with_a_safe_reason(monkeypatch, tmp_path):
+    run = _approved_blog(monkeypatch, tmp_path)
+    monkeypatch.setattr(db, "build", _crash)
+    with pytest.raises(RuntimeError) as caught:
+        pipeline.produce(run)
+    assert str(caught.value) == _UPSTREAM                 # the original error, re-raised
+    stored = cruns.get_run(run["id"])                     # what a poller on any instance sees
+    assert stored["state"] != "DONE"
+    assert stored["progress"]["state"] == "failed"
+    reason = stored["progress"]["reason"]
+    assert reason == pipeline._GENERIC_FAILURE
+    assert "502" not in reason and "upstream" not in reason
+    [entry] = _failure_entries(stored)
+    assert entry["step"] == "output" and entry["rationale"] == reason
+
+
+def test_autonomous_failure_before_generation_marks_the_run_failed(monkeypatch, tmp_path):
+    monkeypatch.setenv("GD_REFERENCE_DIR", str(tmp_path))
+    run = cruns.create_run("u1", "carousel", brand_id="legalsoft", brief="promo", autonomous=True)
+    pipeline.acknowledge(run)
+    monkeypatch.setattr(pipeline, "make_plan", _crash)
+    with pytest.raises(RuntimeError, match="upstream secret body"):
+        pipeline.run_autonomous(run, use_llm=False)
+    stored = cruns.get_run(run["id"])
+    assert stored["progress"] == {"done": 0, "total": 0, "state": "failed",
+                                  "reason": pipeline._GENERIC_FAILURE}
+    [entry] = _failure_entries(stored)
+    assert entry["step"] == "strategy"
+
+
+def test_autonomous_failure_during_generation_is_recorded_once(monkeypatch, tmp_path):
+    monkeypatch.setenv("GD_REFERENCE_DIR", str(tmp_path))
+    run = cruns.create_run("u1", "blog", brand_id="legalsoft", brief="tips", autonomous=True)
+    pipeline.acknowledge(run)
+    monkeypatch.setattr(db, "build", _crash)
+    with pytest.raises(RuntimeError):
+        pipeline.run_autonomous(run, use_llm=False)
+    stored = cruns.get_run(run["id"])
+    assert stored["progress"]["state"] == "failed"
+    assert len(_failure_entries(stored)) == 1
+
+
+def test_a_failure_that_cannot_be_recorded_never_masks_the_original_error(monkeypatch, tmp_path):
+    run = _approved_blog(monkeypatch, tmp_path)
+
+    class _BuildCrash(Exception):
+        pass
+
+    def crash(*_a, **_k):
+        raise _BuildCrash("builder fell over")
+
+    real_save = cruns.save_run
+    saves = {"n": 0}
+
+    def flaky_save(r):
+        saves["n"] += 1
+        if saves["n"] > 1:                    # the "generating" save lands; the next does not
+            raise RuntimeError("firestore down")
+        real_save(r)
+
+    monkeypatch.setattr(db, "build", crash)
+    monkeypatch.setattr(cruns, "save_run", flaky_save)
+    with pytest.raises(_BuildCrash):
+        pipeline.produce(run)
+    assert run["progress"]["state"] == "failed"   # set in memory even though it could not be saved
+
+
+def test_a_refused_precondition_is_not_a_failed_generation(monkeypatch, tmp_path):
+    """Nothing started, so nothing failed: the 400 is the answer and the run is
+    left exactly as it was."""
+    monkeypatch.setenv("GD_REFERENCE_DIR", str(tmp_path))
+    run = cruns.create_run("u1", "blog", brand_id="legalsoft", brief="tips")
+    pipeline.make_plan(run, count=2, use_llm=False)
+    with pytest.raises(ValueError):
+        pipeline.produce(run)                     # plan not approved
+    assert "progress" not in cruns.get_run(run["id"])
+    assert not _failure_entries(cruns.get_run(run["id"]))
