@@ -13,8 +13,12 @@ import pytest
 
 from datetime import datetime, timedelta, timezone
 
+from types import SimpleNamespace
+
+from app.main import app as fastapi_app
 from app.routers import admin as admin_router
 from app.routers.tests.conftest import client
+from app.security import require_admin
 from app.services import firestore_repo, org_chart
 
 
@@ -385,3 +389,268 @@ def test_team_usage_answers_502_when_the_caller_profile_cannot_be_read(as_caller
     r = client.get("/api/usage/team")
     assert r.status_code == 502, r.text
     assert "Could not read" in r.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# Asks — the feedback / problem / agent-request forms
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture()
+def as_member(as_caller):
+    """A plain member, with the module's admin pass-through removed so
+    ``require_admin`` really runs: the autouse harness overrides the gate
+    itself, which is right for the tests above and wrong for a 403 test."""
+
+    def _install(user: dict | None = None) -> dict:
+        caller = as_caller(_MEMBER if user is None else user)
+        fastapi_app.dependency_overrides.pop(require_admin, None)
+        return caller
+
+    return _install
+
+
+class _Snap:
+    def __init__(self, doc_id: str, data: dict | None):
+        self.id, self._data = doc_id, data
+
+    @property
+    def exists(self) -> bool:
+        return self._data is not None
+
+    def to_dict(self) -> dict | None:
+        return None if self._data is None else dict(self._data)
+
+
+class _AskRef:
+    def __init__(self, docs: dict, doc_id: str):
+        self._docs, self._id = docs, doc_id
+
+    def get(self, timeout=None):
+        return _Snap(self._id, self._docs.get(self._id))
+
+    def set(self, data: dict, timeout=None):
+        self._docs[self._id] = dict(data)
+
+    def update(self, data: dict, timeout=None):
+        self._docs[self._id].update(data)
+
+
+class _AskQuery:
+    """Enough of a Firestore collection for the asks repo: one equality
+    filter, one order_by, limit, stream, count, document."""
+
+    def __init__(self, docs: dict, flt=None, desc_on=None, lim=None):
+        self._docs, self._flt, self._desc_on, self._lim = docs, flt, desc_on, lim
+
+    def where(self, filter):
+        return _AskQuery(self._docs, (filter.field_path, filter.value), self._desc_on, self._lim)
+
+    def order_by(self, field, direction=None):
+        return _AskQuery(self._docs, self._flt, field, self._lim)
+
+    def limit(self, n):
+        return _AskQuery(self._docs, self._flt, self._desc_on, n)
+
+    def _rows(self) -> list[tuple[str, dict]]:
+        rows = [(i, d) for i, d in self._docs.items()
+                if self._flt is None or d.get(self._flt[0]) == self._flt[1]]
+        if self._desc_on:
+            rows.sort(key=lambda r: r[1].get(self._desc_on, ""), reverse=True)
+        return rows[: self._lim] if self._lim else rows
+
+    def stream(self, timeout=None):
+        return iter(_Snap(i, d) for i, d in self._rows())
+
+    def count(self):
+        n = len(self._rows())
+        return SimpleNamespace(get=lambda timeout=None: [[SimpleNamespace(value=n)]])
+
+    def document(self, doc_id: str) -> _AskRef:
+        return _AskRef(self._docs, doc_id)
+
+
+class _AskDb:
+    def __init__(self, docs: dict):
+        self.docs = docs
+
+    def collection(self, name: str) -> _AskQuery:
+        assert name == firestore_repo.ASKS_COLLECTION, name
+        return _AskQuery(self.docs)
+
+
+def _ask_doc(ask_id: str, created_at: str, status: str = "new", kind: str = "feedback") -> dict:
+    return {"id": ask_id, "kind": kind, "fields": {"note": f"n-{ask_id}"},
+            "from": {"user_id": "u9", "email": "m@legalsoft.com", "name": "M"},
+            "page": "/home", "status": status, "created_at": created_at, "updated_at": created_at}
+
+
+@pytest.fixture()
+def asks_db(monkeypatch) -> dict:
+    """An in-memory ``asks`` collection standing in for Firestore."""
+    docs: dict = {}
+    monkeypatch.setattr(firestore_repo, "_db", lambda: _AskDb(docs))
+    return docs
+
+
+# --- POST /api/asks: validation ---------------------------------------------
+
+@pytest.mark.parametrize("body, word", [
+    ({"kind": "feedback"}, "note"),
+    ({"kind": "feedback", "note": "   "}, "note"),
+    ({"kind": "issue", "where": "Home"}, "note"),
+    ({"kind": "agent", "job": "Sort mail"}, "name"),
+    ({"kind": "agent", "name": "Mailbot"}, "agent should do"),
+    ({"kind": "wish", "note": "x"}, "kind"),
+])
+def test_ask_without_its_required_text_is_422_with_a_plain_detail(as_caller, monkeypatch, body, word):
+    as_caller(_MEMBER)
+    monkeypatch.setattr(firestore_repo, "create_ask", _dead)
+    r = client.post("/api/asks", json=body)
+    assert r.status_code == 422, r.text
+    assert isinstance(r.json()["detail"], str) and word in r.json()["detail"]
+
+
+# --- POST /api/asks: the row ---------------------------------------------------
+
+def test_ask_files_one_row_in_the_callers_name(as_caller, asks_db, monkeypatch):
+    as_caller(_MEMBER)
+    monkeypatch.setattr(firestore_repo, "get_user_by_email",
+                        lambda e: {"id": "b1", "email": e, "name": "Brix Ayo"})
+    r = client.post("/api/asks", json={
+        "kind": "agent", "name": "  Mailbot ", "job": "Sort the inbox", "gets": "a sheet",
+        "cadence": "", "note": "ignored for this kind", "page": "/hub/agents",
+    })
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert set(body) == {"id", "created_at"}
+    doc = asks_db[body["id"]]
+    assert doc["kind"] == "agent" and doc["status"] == "new"
+    assert doc["fields"] == {"name": "Mailbot", "job": "Sort the inbox", "gets": "a sheet"}
+    assert doc["from"] == {"user_id": "b1", "email": "brix.ayo@legalsoft.com", "name": "Brix Ayo"}
+    assert doc["page"] == "/hub/agents"
+    assert doc["created_at"] == body["created_at"] == doc["updated_at"]
+
+
+def test_ask_trims_and_caps_every_field(as_caller, asks_db, monkeypatch):
+    as_caller(_MEMBER)
+    monkeypatch.setattr(firestore_repo, "get_user_by_email", lambda e: None)
+    r = client.post("/api/asks", json={
+        "kind": "issue", "note": " " + "x" * 5000, "where": "y" * 4100, "page": "/p" * 300,
+    })
+    assert r.status_code == 201, r.text
+    doc = asks_db[r.json()["id"]]
+    assert len(doc["fields"]["note"]) == 4000 and len(doc["fields"]["where"]) == 4000
+    assert len(doc["page"]) == 200
+    assert doc["from"]["name"] == ""      # no users doc -> blank, not invented
+
+
+def test_ask_still_files_when_the_profile_read_fails(as_caller, asks_db, monkeypatch):
+    as_caller(_MEMBER)
+    monkeypatch.setattr(firestore_repo, "get_user_by_email", _dead)
+    r = client.post("/api/asks", json={"kind": "feedback", "note": "Love it"})
+    assert r.status_code == 201, r.text
+    assert asks_db[r.json()["id"]]["from"] == {
+        "user_id": "b1", "email": "brix.ayo@legalsoft.com", "name": ""}
+
+
+def test_ask_answers_502_when_the_write_fails(as_caller, monkeypatch):
+    """The repo-root guard leaves ``_db`` raising: a dead store is a 502 with
+    the house sentence, never a 201 for a row that does not exist."""
+    as_caller(_MEMBER)
+    monkeypatch.setattr(firestore_repo, "get_user_by_email", lambda e: None)
+    r = client.post("/api/asks", json={"kind": "feedback", "note": "Love it"})
+    assert r.status_code == 502, r.text
+    assert "Could not save" in r.json()["detail"] and "Nothing was filed" in r.json()["detail"]
+
+
+# --- the repo layer: None means "could not read" ------------------------------
+
+def test_asks_repo_reports_none_on_a_failed_read(monkeypatch):
+    monkeypatch.setattr(firestore_repo, "_db", _dead)
+    assert firestore_repo.list_asks() is None
+    assert firestore_repo.list_asks("new") is None
+    assert firestore_repo.count_asks("new") is None
+    with pytest.raises(RuntimeError):
+        firestore_repo.set_ask_status("a1", "seen")
+    with pytest.raises(ValueError):
+        firestore_repo.set_ask_status("a1", "archived")
+
+
+# --- GET /api/admin/asks -----------------------------------------------------------
+
+def test_admin_inbox_is_newest_first_with_the_new_count(asks_db):
+    asks_db.update({
+        "old": _ask_doc("old", "2026-10-01T09:00:00+00:00", "done"),
+        "mid": _ask_doc("mid", "2026-10-05T09:00:00+00:00", "seen"),
+        "new1": _ask_doc("new1", "2026-10-08T09:00:00+00:00"),
+        "new2": _ask_doc("new2", "2026-10-09T09:00:00+00:00", kind="agent"),
+    })
+    r = client.get("/api/admin/asks")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [a["id"] for a in body["asks"]] == ["new2", "new1", "mid", "old"]
+    assert body["total"] == 4 and body["new"] == 2
+    assert set(body["asks"][0]) == {
+        "id", "kind", "fields", "from", "page", "status", "created_at", "updated_at"}
+
+    r = client.get("/api/admin/asks?status=new&limit=1")
+    assert r.status_code == 200, r.text
+    assert [a["id"] for a in r.json()["asks"]] == ["new2"]
+    assert r.json()["total"] == 1
+    assert r.json()["new"] == 2, "the badge count is the whole inbox's, not the page's"
+
+    assert client.get("/api/admin/asks?status=done").status_code == 422
+
+
+def test_admin_inbox_answers_502_when_it_cannot_be_read(monkeypatch):
+    monkeypatch.setattr(firestore_repo, "list_asks", lambda *a, **kw: None)
+    r = client.get("/api/admin/asks")
+    assert r.status_code == 502, r.text
+    assert "Could not read" in r.json()["detail"]
+    monkeypatch.setattr(firestore_repo, "list_asks", lambda *a, **kw: [])
+    monkeypatch.setattr(firestore_repo, "count_asks", lambda s: None)
+    assert client.get("/api/admin/asks").status_code == 502
+
+
+def test_admin_inbox_renders_a_genuinely_empty_inbox(asks_db):
+    r = client.get("/api/admin/asks")
+    assert r.status_code == 200 and r.json() == {"asks": [], "total": 0, "new": 0}
+
+
+# --- POST /api/admin/asks/{id}/status ---------------------------------------------
+
+def test_admin_marks_an_ask_seen_then_done(asks_db):
+    asks_db["a1"] = _ask_doc("a1", "2026-10-08T09:00:00+00:00")
+    r = client.post("/api/admin/asks/a1/status", json={"status": "seen"})
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == "a1" and r.json()["status"] == "seen"
+    assert r.json()["updated_at"] > r.json()["created_at"]
+    assert asks_db["a1"]["status"] == "seen"
+    assert asks_db["a1"]["updated_at"] == r.json()["updated_at"]
+    assert client.post("/api/admin/asks/a1/status", json={"status": "done"}).json()["status"] == "done"
+    assert client.get("/api/admin/asks").json()["new"] == 0
+
+
+def test_admin_status_change_404s_an_unknown_ask_and_422s_a_bad_status(asks_db):
+    assert client.post("/api/admin/asks/nope/status", json={"status": "seen"}).status_code == 404
+    asks_db["a1"] = _ask_doc("a1", "2026-10-08T09:00:00+00:00")
+    r = client.post("/api/admin/asks/a1/status", json={"status": "archived"})
+    assert r.status_code == 422 and isinstance(r.json()["detail"], str)
+    assert asks_db["a1"]["status"] == "new"
+
+
+def test_admin_status_change_answers_502_when_the_store_is_down():
+    # The repo-root guard leaves ``_db`` raising.
+    r = client.post("/api/admin/asks/a1/status", json={"status": "seen"})
+    assert r.status_code == 502, r.text
+    assert "Could not save" in r.json()["detail"]
+
+
+# --- the door ---------------------------------------------------------------------
+
+def test_a_member_is_refused_on_both_admin_ask_routes(as_member, monkeypatch):
+    as_member()
+    monkeypatch.setattr(firestore_repo, "list_asks", _dead)
+    monkeypatch.setattr(firestore_repo, "set_ask_status", _dead)
+    assert client.get("/api/admin/asks").status_code == 403
+    assert client.post("/api/admin/asks/a1/status", json={"status": "seen"}).status_code == 403

@@ -164,6 +164,10 @@ _AUDIENCES = {EXTERNAL_OK, INTERNAL_ONLY}
 ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     # --- admin / creator panels ------------------------------------------- #
     ("GET", "/api/admin/analytics"): (ADMIN_ONLY, INTERNAL_ONLY),
+    # The asks inbox (2026-10-09): what members typed into the feedback /
+    # problem / agent-request forms, read and marked seen/done by admins only.
+    ("GET", "/api/admin/asks"): (ADMIN_ONLY, INTERNAL_ONLY),
+    ("POST", "/api/admin/asks/{ask_id}/status"): (ADMIN_ONLY, INTERNAL_ONLY),
     ("POST", "/api/admin/brands/refresh-packs"): (ADMIN_ONLY, INTERNAL_ONLY),
     ("GET", "/api/admin/db/collections"): (ADMIN_ONLY, INTERNAL_ONLY),
     ("GET", "/api/admin/db/collections/{name}"): (ADMIN_ONLY, INTERNAL_ONLY),
@@ -240,6 +244,13 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("GET", "/api/ref-library/retrieve"): (SHARED_CATALOG, INTERNAL_ONLY),
     ("GET", "/api/ref-library/types"): (SHARED_CATALOG, INTERNAL_ONLY),
     # --- scoped to the caller ---------------------------------------------- #
+    # Filing an ask (2026-10-09) writes ONE new row whose ``from`` is the
+    # caller's own token identity (``user_id`` and ``email`` never come from
+    # the request) and reads nothing back; the rows are read only through the
+    # ADMIN_ONLY inbox above. INTERNAL_ONLY by default — opening the forms to
+    # a GEO-only account is a decision to type into ``app.scopes``, not a
+    # label to pick here.
+    ("POST", "/api/asks"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("GET", "/api/blog/runs"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("POST", "/api/blog/runs"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("GET", "/api/blog/runs/{run_id}"): (TENANT_SCOPED, INTERNAL_ONLY),

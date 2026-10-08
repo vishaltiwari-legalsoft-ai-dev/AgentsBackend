@@ -660,6 +660,154 @@ def get_team_usage(months: int = 3, user: dict = Depends(get_current_user)) -> d
     return payload
 
 
+# --------------------------------------------------------------------------- #
+# Asks: the console's "Submit feedback", "Report a problem" and "Request a new
+# agent" forms. Any signed-in user files one; it lands in the admins' inbox on
+# the console (this backend sends no e-mail — the inbox is the delivery), and
+# an admin marks it seen or done. Not an agent's work, so it carries no
+# activity trail: the row in ``asks`` is the record.
+# --------------------------------------------------------------------------- #
+
+_ASK_FIELD_CAP = 4000
+_ASK_PAGE_CAP = 200
+
+#: Per kind: the text a form must carry, and the text it may carry. Anything
+#: else in the body is dropped rather than stored.
+_ASK_REQUIRED: dict[str, tuple[str, ...]] = {
+    "feedback": ("note",),
+    "issue": ("note",),
+    "agent": ("name", "job"),
+}
+_ASK_OPTIONAL: dict[str, tuple[str, ...]] = {
+    "feedback": (),
+    "issue": ("where",),
+    "agent": ("gets", "cadence"),
+}
+_ASK_MISSING: dict[str, str] = {
+    "note": "Please write a note first.",
+    "name": "Please give the agent a name.",
+    "job": "Please say what the agent should do.",
+}
+
+_COULD_NOT_WRITE = (
+    "Could not save {what} to the database. "
+    "Nothing was filed, so please try again in a moment."
+)
+
+
+class AskBody(BaseModel):
+    kind: str
+    note: str | None = None
+    where: str | None = None
+    name: str | None = None
+    job: str | None = None
+    gets: str | None = None
+    cadence: str | None = None
+    page: str | None = None
+
+
+class AskStatusBody(BaseModel):
+    status: str
+
+
+def _ask_text(value: str | None, cap: int = _ASK_FIELD_CAP) -> str:
+    return (value or "").strip()[:cap]
+
+
+def _ask_fields(body: AskBody) -> dict[str, str]:
+    """The trimmed, capped text this ask carries — only the keys its kind
+    knows, only the ones with something in them. 422 names the first missing
+    required field in plain words."""
+    if body.kind not in firestore_repo.ASK_KINDS:
+        raise HTTPException(
+            422, "kind must be one of " + ", ".join(firestore_repo.ASK_KINDS) + ".")
+    fields: dict[str, str] = {}
+    for key in _ASK_REQUIRED[body.kind]:
+        text = _ask_text(getattr(body, key))
+        if not text:
+            raise HTTPException(422, _ASK_MISSING[key])
+        fields[key] = text
+    for key in _ASK_OPTIONAL[body.kind]:
+        text = _ask_text(getattr(body, key))
+        if text:
+            fields[key] = text
+    return fields
+
+
+def _ask_sender(user: dict) -> dict[str, str]:
+    """Who filed it: id and e-mail from the token, display name from their
+    ``users`` document when one exists. The name is a courtesy for the inbox;
+    a profile that cannot be read leaves it blank (and a warning in the log)
+    rather than stopping the ask."""
+    email = str(user.get("email") or "")
+    name = ""
+    try:
+        profile = firestore_repo.get_user_by_email(email) if email else None
+    except Exception:  # noqa: BLE001 — the ask still files; the inbox has the e-mail
+        logger.warning("asks: could not read the sender's profile", exc_info=True)
+        profile = None
+    if profile:
+        name = str(profile.get("name") or "")
+    return {"user_id": str(user.get("id") or ""), "email": email, "name": name}
+
+
+@router.post("/asks", status_code=201)
+def create_ask(body: AskBody, user: dict = Depends(get_current_user)) -> dict:
+    """Any signed-in user: file feedback, a problem report or an agent request.
+    Answers 201 only once the row is in the database; a failed write is a 502,
+    never a quiet "thanks"."""
+    fields = _ask_fields(body)
+    sender = _ask_sender(user)
+    page = _ask_text(body.page, _ASK_PAGE_CAP)
+    try:
+        ask = firestore_repo.create_ask(
+            kind=body.kind, fields=fields, sender=sender, page=page)
+    except Exception:  # noqa: BLE001 — the reason goes to the log, the fact to the caller
+        logger.warning("asks: could not file a %s ask from %s",
+                       body.kind, sender["email"], exc_info=True)
+        raise HTTPException(502, _COULD_NOT_WRITE.format(what="your " + body.kind))
+    logger.info("asks: %s filed %s ask %s from %r", sender["email"], body.kind,
+                ask["id"], page)
+    return {"id": ask["id"], "created_at": ask["created_at"]}
+
+
+@router.get("/admin/asks")
+def list_asks(
+    status: str = "all", limit: int = 200, _admin: dict = Depends(require_admin)
+) -> dict:
+    """Super Admin: the inbox, newest first. ``new`` is always the count of
+    unseen asks whatever the filter, so the badge is right on every view."""
+    if status not in ("all", "new"):
+        raise HTTPException(422, "status must be 'all' or 'new'.")
+    limit = max(1, min(int(limit), 500))
+    rows = firestore_repo.list_asks(None if status == "all" else "new", limit=limit)
+    if rows is None:
+        raise HTTPException(502, _COULD_NOT_READ.format(what="the inbox"))
+    new = firestore_repo.count_asks("new")
+    if new is None:
+        raise HTTPException(502, _COULD_NOT_READ.format(what="the inbox"))
+    return {"asks": rows, "total": len(rows), "new": new}
+
+
+@router.post("/admin/asks/{ask_id}/status")
+def set_ask_status(
+    ask_id: str, body: AskStatusBody, _admin: dict = Depends(require_admin)
+) -> dict:
+    """Super Admin: mark one ask new / seen / done. Answers the updated ask."""
+    if body.status not in firestore_repo.ASK_STATUSES:
+        raise HTTPException(
+            422, "status must be one of " + ", ".join(firestore_repo.ASK_STATUSES) + ".")
+    try:
+        ask = firestore_repo.set_ask_status(ask_id, body.status)
+    except Exception:  # noqa: BLE001
+        logger.warning("asks: could not update %s", ask_id, exc_info=True)
+        raise HTTPException(502, _COULD_NOT_WRITE.format(what="the ask's status"))
+    if ask is None:
+        raise HTTPException(404, "No such ask.")
+    logger.info("asks: %s marked %s as %s", _admin.get("email"), ask_id, body.status)
+    return ask
+
+
 @router.get("/admin/users")
 def list_users(_admin: dict = Depends(require_admin)) -> dict:
     """Super Admin: directory of everyone registered on the chatbot."""

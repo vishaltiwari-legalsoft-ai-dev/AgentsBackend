@@ -921,6 +921,116 @@ def list_users() -> list[dict[str, Any]]:
     return users
 
 
+# --------------------------------------------------------------------------- #
+# Asks — what people type into the console's "Submit feedback", "Report a
+# problem" and "Request a new agent" forms. One document each; the admins'
+# inbox on the console is the delivery (this backend sends no e-mail).
+# --------------------------------------------------------------------------- #
+
+ASKS_COLLECTION = "asks"
+ASK_KINDS = ("feedback", "issue", "agent")
+ASK_STATUSES = ("new", "seen", "done")
+
+#: Ceiling on any single Firestore call made for an ask. A form submit or the
+#: admin inbox must fail loudly, not hang a request on a cold channel.
+_ASKS_IO_TIMEOUT_S = 20.0
+
+#: How many asks a status-filtered read will pull before sorting. There is no
+#: ``(status, created_at)`` composite index, so "the newest N unseen" cannot
+#: be asked of Firestore directly: a ``limit`` on the filtered query would cut
+#: in document-id order and hand back N arbitrary unseen asks. The filtered
+#: read therefore pulls the whole status up to this cap and slices after
+#: sorting; at the cap it reports a failed read rather than a wrong page.
+_ASKS_SCAN_CAP = 2000
+
+
+def _ask_sort_key(row: dict[str, Any]) -> tuple[str, str]:
+    return (str(row.get("created_at") or ""), str(row.get("id") or ""))
+
+
+def create_ask(
+    *, kind: str, fields: dict[str, str], sender: dict[str, str], page: str
+) -> dict[str, Any]:
+    """File one ask. Raises when the write did not land — the caller answers
+    honestly rather than telling the person it was filed."""
+    now = _now()
+    ask_id = uuid.uuid4().hex
+    doc: dict[str, Any] = {
+        "id": ask_id,
+        "kind": kind,
+        "fields": dict(fields),
+        "from": dict(sender),
+        "page": page,
+        "status": "new",
+        "created_at": now,
+        "updated_at": now,
+    }
+    _db().collection(ASKS_COLLECTION).document(ask_id).set(doc, timeout=_ASKS_IO_TIMEOUT_S)
+    return doc
+
+
+def list_asks(status: Optional[str] = None, limit: int = 200) -> list[dict[str, Any]] | None:
+    """Asks newest first, optionally only those in one ``status``.
+
+    ``[]`` means the inbox is genuinely empty; ``None`` means the read failed
+    (the :func:`count_collection` contract). No composite index exists for
+    ``asks``: the unfiltered read orders on the single ``created_at`` field
+    and limits server-side; the filtered one is one equality filter pulled up
+    to :data:`_ASKS_SCAN_CAP`, sorted in process and sliced to ``limit`` —
+    both served by Firestore's automatic indexes.
+    """
+    try:
+        col = _db().collection(ASKS_COLLECTION)
+        if status:
+            query = (col.where(filter=firestore.FieldFilter("status", "==", status))
+                     .limit(_ASKS_SCAN_CAP))
+        else:
+            query = (col.order_by("created_at", direction=firestore.Query.DESCENDING)
+                     .limit(limit))
+        docs = query.stream(timeout=_ASKS_IO_TIMEOUT_S)
+        rows = [(doc.to_dict() or {}) | {"id": doc.id} for doc in docs]
+    except Exception:
+        logger.warning("could not read the asks inbox", exc_info=True)
+        return None
+    if status and len(rows) >= _ASKS_SCAN_CAP:
+        logger.warning("asks: %s+ rows in status %r; the filtered read is capped and "
+                       "reports failure rather than a wrong page", _ASKS_SCAN_CAP, status)
+        return None
+    rows.sort(key=_ask_sort_key, reverse=True)
+    return rows[:limit]
+
+
+def count_asks(status: str) -> int | None:
+    """How many asks sit in ``status`` — server-side, so the number is right
+    even when the listing is capped. ``None`` when it could not be read."""
+    try:
+        result = (
+            _db()
+            .collection(ASKS_COLLECTION)
+            .where(filter=firestore.FieldFilter("status", "==", status))
+            .count()
+            .get(timeout=_ASKS_IO_TIMEOUT_S)
+        )
+        return int(result[0][0].value) if result and result[0] else 0
+    except Exception:
+        logger.warning("could not count asks", exc_info=True)
+        return None
+
+
+def set_ask_status(ask_id: str, status: str) -> Optional[dict[str, Any]]:
+    """Move one ask to ``status`` and return it as it now stands. ``None`` when
+    no such ask exists; a failed read or write raises."""
+    if status not in ASK_STATUSES:
+        raise ValueError(f"unknown ask status: {status!r}")
+    ref = _db().collection(ASKS_COLLECTION).document(ask_id)
+    snap = ref.get(timeout=_ASKS_IO_TIMEOUT_S)
+    if not snap.exists:
+        return None
+    patch = {"status": status, "updated_at": _now()}
+    ref.update(patch, timeout=_ASKS_IO_TIMEOUT_S)
+    return (snap.to_dict() or {}) | {"id": snap.id} | patch
+
+
 # NOTE: The chat-agent "conversations" collection lost its last writer when the
 # V1 chat rail was removed; its accessors are gone too. The collection name
 # stays in TELEMETRY_COLLECTIONS so the admin purge can still clear old docs.
