@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import zipfile
 from typing import Any, Callable, Optional
 
@@ -34,6 +35,55 @@ Artifact = tuple[str, bytes, str]
 # Optional per-artifact callback — invoked the moment each artifact is ready so the
 # caller can persist it + advance a progress bar while a multi-file build streams in.
 OnArtifact = Optional[Callable[[Artifact], None]]
+
+
+# --------------------------------------------------------------------------- #
+# Provenance — which artifacts the image model really made (no fake success)
+# --------------------------------------------------------------------------- #
+#
+# Every builder that asks the image model for a picture says, per artifact,
+# whether it got one: ``{"ai": True, "fallback_reason": None}`` when every image
+# in the artifact came from the model, ``{"ai": False, "fallback_reason": "..."}``
+# when any of it is a locally drawn stand-in (a brand-gradient frame). The run
+# manifest copies the pair onto the artifact the UI already receives, so a
+# stand-in is never presented as AI output. Artifacts that never involve the
+# image model (the PPTX deck) carry no provenance at all.
+
+_MOCK_REASON = ("The offline mock image provider is configured (GD_IMAGE_PROVIDER=mock), "
+                "so this is a placeholder image, not an AI generation.")
+
+
+class _ProvenancedArtifact(tuple):
+    """An :data:`Artifact` 3-tuple that also carries its provenance. Unpacks,
+    compares and zips exactly like the plain tuple every caller already uses."""
+
+    provenance: dict
+
+    def __new__(cls, art: Artifact, provenance: dict):
+        name, data, mime = art
+        obj = super().__new__(cls, (name, data, mime))
+        obj.provenance = dict(provenance)
+        return obj
+
+
+def _from_model(art: Artifact) -> Artifact:
+    return _ProvenancedArtifact(art, {"ai": True, "fallback_reason": None})
+
+
+def _stand_in(art: Artifact, reason: str) -> Artifact:
+    return _ProvenancedArtifact(art, {"ai": False, "fallback_reason": reason})
+
+
+def artifact_provenance(art: Artifact) -> Optional[dict]:
+    """``{"ai": bool, "fallback_reason": str | None}`` for an artifact built from
+    image-model output, or ``None`` for one that never involved the model."""
+    prov = getattr(art, "provenance", None)
+    return dict(prov) if prov else None
+
+
+def _provider_reason(provider: Any) -> Optional[str]:
+    """Why output from ``provider`` is not an AI generation, or None if it is."""
+    return _MOCK_REASON if getattr(provider, "name", "") == "mock" else None
 
 
 def _emit(on_artifact: OnArtifact, artifacts: list[Artifact]) -> list[Artifact]:
@@ -282,14 +332,36 @@ def build_carousel_frames(plan: dict[str, Any], pack: Any,
     # composited; no headline/body/CTA copy is drawn. "text" (default) overlays the
     # per-slide copy via the deterministic Stage-3 renderer.
     images_only = plan.get("text_mode") == "images_only"
+
+    def _all_stand_ins(reason: str) -> list[Artifact]:
+        return _emit(on_artifact, [
+            _stand_in(_carousel_text_fallback(pack, fr, fr.get("index", i + 1), images_only),
+                      reason)
+            for i, fr in enumerate(frames)])
+
     try:
         refs = rl.reference_images_for(brand_id, "carousel", brief=brief, k=2)
         logo = pipeline.brand_logo_png(brand_id)
     except Exception as exc:  # noqa: BLE001 - setup failed → all-text fallback
         logger.warning("carousel setup failed (%s); using text-frame fallback", exc)
-        return _emit(on_artifact, [_carousel_text_fallback(pack, fr, fr.get("index", i + 1),
-                                                           images_only)
-                                   for i, fr in enumerate(frames)])
+        return _all_stand_ins(
+            "Carousel setup failed before any slide image could be generated, so this "
+            "frame is a locally drawn brand-gradient stand-in, not an AI image.")
+    # Resolved once for every slide (each used to resolve its own): no image
+    # model at all is one honest reason, stated once, not N identical failures.
+    try:
+        provider = providers.get_provider(agent_id=providers.GD_AGENT_ID)
+    except Exception as exc:  # noqa: BLE001 - ImageProviderUnavailable, or worse
+        why = getattr(exc, "fallback_reason", None) or "the image provider could not be resolved"
+        logger.warning("carousel: no image model (%s); text-frame fallback", why)
+        return _all_stand_ins(
+            f"No image model is available ({why}), so this frame is a "
+            "locally drawn brand-gradient stand-in, not an AI image.")
+    model_reason = _provider_reason(provider)
+
+    def _slide(idx: int, png: bytes) -> Artifact:
+        art = (f"frame-{idx:02d}.png", png, "image/png")
+        return _stand_in(art, model_reason) if model_reason else _from_model(art)
 
     def _render_slide(ordinal: int, fr: dict) -> tuple[int, Artifact]:
         idx = fr.get("index", ordinal + 1)
@@ -297,14 +369,14 @@ def build_carousel_frames(plan: dict[str, Any], pack: Any,
         try:
             run = pipeline.establish_base(
                 brand_id, "1:1", reference_images=refs,
-                subject=fr.get("subject") or None,
+                subject=fr.get("subject") or None, provider=provider,
             )
             if images_only:
                 # No copy — composite just the logo onto the approved base image.
                 # ``subheadings=[]`` clears the run's default sub-text so nothing but
                 # the logo is drawn (headline/cta are already empty here).
                 png = pipeline.render_frame_on_base(run, logo_png=logo, subheadings=[])
-                return idx, (f"frame-{idx:02d}.png", png, "image/png")
+                return idx, _slide(idx, png)
             # Layout brain: look at THIS slide's image and place the text in the
             # clean negative space away from the subject (font + gradient stay locked).
             # Carousel text is pinned to a left/right side column (``sides_only``) so a
@@ -330,10 +402,13 @@ def build_carousel_frames(plan: dict[str, Any], pack: Any,
                 logo_png=logo,
                 layout=layout,
             )
-            return idx, (f"frame-{idx:02d}.png", png, "image/png")
+            return idx, _slide(idx, png)
         except Exception as exc:  # noqa: BLE001 - one slide failing ≠ whole set
             logger.warning("slide %s generation failed (%s); text-frame fallback", idx, exc)
-            return idx, _carousel_text_fallback(pack, fr, idx, images_only)
+            return idx, _stand_in(
+                _carousel_text_fallback(pack, fr, idx, images_only),
+                "Image generation failed for this slide, so it is a locally drawn "
+                "brand-gradient stand-in, not an AI image.")
 
     workers = max(1, min(_CAROUSEL_CONCURRENCY, len(frames)))
     results: list[tuple[int, Artifact]] = []
@@ -368,37 +443,48 @@ def build_blog_images(plan: dict[str, Any], pack: Any,
     spec = rl.type_spec("blog")
     w, h = spec.get("target_dims", (1600, 900))
     ar = spec.get("aspect_ratio", "16:9")
+    no_provider_reason = ""
     try:
         provider = providers.get_provider(agent_id="a1")  # the GD agent's image model
     except Exception as exc:  # noqa: BLE001 - no provider configured → all fallback
         logger.warning("blog: no image provider (%s); using gradient frames", exc)
         provider = None
+        no_provider_reason = (getattr(exc, "fallback_reason", None)
+                              or "the image provider could not be resolved")
 
-    def _image(prompt: str, fb_head: str, fb_body: str, role: str) -> bytes:
+    def _image(name: str, prompt: str, fb_head: str, fb_body: str, role: str) -> Artifact:
         """A real generated image for ``prompt``; a branded gradient frame if that
-        isn't possible (so one failure never sinks the set)."""
-        if provider is not None and (prompt or "").strip():
+        isn't possible (so one failure never sinks the set) — marked as the
+        stand-in it is."""
+        if provider is None:
+            reason = (f"No image model is available ({no_provider_reason}), so this is a "
+                      "locally drawn brand-gradient stand-in, not an AI image.")
+        elif not (prompt or "").strip():
+            reason = ("The plan gave this image no visual prompt, so it is a locally drawn "
+                      "brand-gradient stand-in, not an AI image.")
+        else:
             try:
                 png, _mime = provider.generate(
                     prompt, width=w, height=h, aspect_ratio=ar, image_size="2K",
                 )
-                return png
+                art = (name, png, "image/png")
+                model_reason = _provider_reason(provider)
+                return _stand_in(art, model_reason) if model_reason else _from_model(art)
             except Exception as exc:  # noqa: BLE001 - one image failing ≠ whole set
                 logger.warning("blog image generation failed (%s); gradient fallback", exc)
-        return _render_text_frame(pack, (w, h), headline=fb_head, body=fb_body,
-                                  role=role, footer=getattr(pack, "name", ""))
+                reason = ("Image generation failed for this image, so it is a locally drawn "
+                          "brand-gradient stand-in, not an AI image.")
+        png = _render_text_frame(pack, (w, h), headline=fb_head, body=fb_body,
+                                 role=role, footer=getattr(pack, "name", ""))
+        return _stand_in((name, png, "image/png"), reason)
 
     out: list[Artifact] = []
     cover = plan.get("cover", {})
-    out.append(("cover.png",
-                _image(cover.get("visual", ""), cover.get("title", "Blog"),
-                       cover.get("subtitle", ""), "cover"),
-                "image/png"))
+    out.append(_image("cover.png", cover.get("visual", ""), cover.get("title", "Blog"),
+                      cover.get("subtitle", ""), "cover"))
     for i, inl in enumerate(plan.get("inline", []), 1):
-        out.append((f"inline-{i:02d}.png",
-                    _image(inl.get("visual", ""), inl.get("caption", f"Figure {i}"),
-                           inl.get("visual", ""), "body"),
-                    "image/png"))
+        out.append(_image(f"inline-{i:02d}.png", inl.get("visual", ""),
+                          inl.get("caption", f"Figure {i}"), inl.get("visual", ""), "body"))
     return _emit(on_artifact, out)
 
 
@@ -561,7 +647,21 @@ def _designed_brochure_pdf(plan: dict[str, Any], pack: Any, *,
     pdf = _assemble_brochure_pdf(assembled)
     cover = plan.get("cover", {})
     fname = _slug(cover.get("title", "brochure")) + ".pdf"
-    return (fname, pdf, "application/pdf"), rasters
+    art = (fname, pdf, "application/pdf")
+    missing = [i for i, bg in enumerate(backgrounds, 1) if bg is None]
+    if missing:
+        many = len(missing) > 1
+        reason = (f"{len(missing)} of {len(pages)} page backgrounds could not be generated by "
+                  f"the image model (page{'s' if many else ''} "
+                  f"{', '.join(str(i) for i in missing)}); "
+                  f"{'those pages use' if many else 'that page uses'} a plain brand "
+                  "gradient instead of an AI photo.")
+        return _stand_in(art, reason), rasters
+    # Same selector ``providers.get_provider`` uses: a mock-generated background
+    # is a placeholder, whatever else succeeded.
+    if (os.environ.get("GD_IMAGE_PROVIDER") or "").strip().lower() == "mock":
+        return _stand_in(art, _MOCK_REASON), rasters
+    return _from_model(art), rasters
 
 
 def _pdf_wrap(text: str, width: int) -> list[str]:
@@ -737,4 +837,13 @@ def zip_artifacts(artifacts: list[Artifact], archive_name: str = "creative") -> 
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, data, _mime in artifacts:
             zf.writestr(name, data)
-    return (f"{_slug(archive_name)}.zip", buf.getvalue(), "application/zip")
+    bundle = (f"{_slug(archive_name)}.zip", buf.getvalue(), "application/zip")
+    # The bundle is only as AI-made as its least AI-made member.
+    provs = [artifact_provenance(a) for a in artifacts]
+    if not any(provs):
+        return bundle
+    stand_ins = [a[0] for a, p in zip(artifacts, provs) if p and not p["ai"]]
+    if stand_ins:
+        return _stand_in(bundle, f"{len(stand_ins)} of {len(artifacts)} files in this bundle "
+                                 f"are stand-ins, not AI images: {', '.join(stand_ins)}.")
+    return _from_model(bundle)

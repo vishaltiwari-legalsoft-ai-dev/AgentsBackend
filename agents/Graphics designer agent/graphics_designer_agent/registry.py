@@ -246,13 +246,22 @@ _loaded_version: int | None = None      # version the current _PACKS was built f
 _version_seen: int | None = None        # last value the source returned
 _version_checked_at: float | None = None
 
+# The dynamic packs the source last returned successfully. A source that RAISES
+# means "could not read the brands" - not "there are none": the rebuild keeps
+# these, leaves ``_loaded_version`` where it was, and retries after
+# ``VERSION_CHECK_SECONDS``. Recording the version over an empty read used to
+# make every member brand 404 on that instance until the next brand write.
+_last_dynamic: dict[str, "BrandPack"] = {}
+_dynamic_failed_at: float | None = None  # monotonic time of the last failed read
+
 
 def register_dynamic_source(fn: Callable[[], list[dict]] | None) -> None:
     """App-level injection point: a callable returning templated-brand spec
     dicts (the templated_brands.SPECS contract). Keeps this package free of
     Firestore/app imports. Pass None to detach."""
-    global _DYNAMIC_SOURCE
+    global _DYNAMIC_SOURCE, _last_dynamic
     _DYNAMIC_SOURCE = fn
+    _last_dynamic = {}  # packs kept from a previous source are not this one's
     refresh()
 
 
@@ -269,10 +278,11 @@ def refresh() -> None:
     """Drop the pack cache; next access rebuilds (call after enrichment runs).
     Lock-guarded so it can't interleave mid-build with `_registry()` and clobber
     (or be clobbered by) a build that's already in flight."""
-    global _PACKS, _version_checked_at
+    global _PACKS, _version_checked_at, _dynamic_failed_at
     with _PACKS_LOCK:
         _PACKS = {}
         _version_checked_at = None  # the next access re-reads the version too
+        _dynamic_failed_at = None   # and retries a source that last failed
 
 
 def _dynamic_enabled() -> bool:
@@ -306,7 +316,11 @@ def _observe_version(*, force: bool = False) -> int | None:
 
 
 def _stale() -> bool:
-    """Whether the built registry predates the store's current version."""
+    """Whether the built registry predates the store's current version - or was
+    built while the dynamic source could not be read and the retry window has
+    passed (an outage must not pin an instance to a partial brand set)."""
+    if _dynamic_failed_at is not None:
+        return (time.monotonic() - _dynamic_failed_at) >= VERSION_CHECK_SECONDS
     seen = _observe_version()
     return seen is not None and seen != _loaded_version
 
@@ -319,7 +333,7 @@ def _registry() -> dict[str, BrandPack]:
     `_PACKS` until it's complete — and rebind it in one atomic assignment.
     A concurrent reader therefore only ever sees either the old registry or
     the fully-built new one, never a partially-populated dict."""
-    global _PACKS, _loaded_version
+    global _PACKS, _loaded_version, _last_dynamic, _dynamic_failed_at
     if _PACKS and not _stale():
         return _PACKS
     with _PACKS_LOCK:
@@ -341,14 +355,28 @@ def _registry() -> dict[str, BrandPack]:
         # is byte-identical to today when unset, and fault-isolated: one bad
         # spec is logged and skipped, never fatal to the whole registry. Static
         # packs always win on id collision (setdefault).
+        source_read = True
+        dynamic: dict[str, BrandPack] = {}
         if _dynamic_enabled():
-            for spec in _DYNAMIC_SOURCE():
-                try:
-                    pack = templated_brands.build_templated_pack(spec)
-                except Exception as exc:  # one bad brand must not kill the registry
-                    logger.warning("dynamic brand %r skipped: %s", spec.get("id"), exc)
-                    continue
-                local.setdefault(pack.id, pack)  # static packs win on collision
+            try:
+                specs = list(_DYNAMIC_SOURCE())
+            except Exception as exc:  # noqa: BLE001 - unreadable is not empty: keep what we had
+                source_read = False
+                dynamic = dict(_last_dynamic)
+                logger.warning(
+                    "GD brand source unreadable; serving the %d dynamic brand(s) from the "
+                    "last good read and retrying in %.0fs: %s",
+                    len(dynamic), VERSION_CHECK_SECONDS, exc)
+            else:
+                for spec in specs:
+                    try:
+                        pack = templated_brands.build_templated_pack(spec)
+                    except Exception as exc:  # one bad brand must not kill the registry
+                        logger.warning("dynamic brand %r skipped: %s", spec.get("id"), exc)
+                        continue
+                    dynamic.setdefault(pack.id, pack)
+            for pid, pack in dynamic.items():
+                local.setdefault(pid, pack)  # static packs win on collision
 
         # Design-library variants (distilled from each brand's real, human-made
         # creatives) are appended AFTER every pack is built — append-only and
@@ -360,7 +388,14 @@ def _registry() -> dict[str, BrandPack]:
                 logger.warning("library variants skipped for %r: %s", bid, exc)
 
         _PACKS = local
-        _loaded_version = version_at_build
+        if source_read:
+            _loaded_version = version_at_build
+            _last_dynamic = dynamic
+            _dynamic_failed_at = None
+        else:
+            # The version is NOT advanced: the next successful read still sees
+            # whatever moved, instead of the outage being recorded as current.
+            _dynamic_failed_at = time.monotonic()
         return _PACKS
 
 

@@ -250,3 +250,123 @@ def test_pdf_reference_ingestion():
     assert rec.extra.get("pages") == 1
     assert rec.orientation == "portrait" and rec.palette  # rendered → real palette
     assert "document" in rec.tags
+
+
+# --------------------------------------------------------------------------- #
+# B4 — no fake success: stand-ins are marked on the artifacts the UI receives
+# --------------------------------------------------------------------------- #
+
+class _ModelProvider:
+    """A real-looking (non-mock) image provider; ``fail`` makes every call raise."""
+
+    name = "openrouter"
+    supports_negative = False
+
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+
+    def generate(self, prompt, *, width=1080, height=1080, **_kw):
+        if self.fail:
+            raise RuntimeError("OpenRouter image generation failed (502): upstream")
+        from io import BytesIO
+
+        from PIL import Image
+
+        buf = BytesIO()
+        Image.new("RGB", (max(1, width // 8), max(1, height // 8)), (30, 70, 160)).save(buf, "PNG")
+        return buf.getvalue(), "image/png"
+
+
+def _produced(monkeypatch, tmp_path, ctype: str, provider) -> dict:
+    monkeypatch.setenv("GD_REFERENCE_DIR", str(tmp_path))
+    monkeypatch.setattr(db.providers, "get_provider", lambda *a, **k: provider)
+    run = cruns.create_run("u1", ctype, brand_id="legalsoft", brief="hiring")
+    pipeline.make_plan(run, count=3, use_llm=False)
+    pipeline.approve_plan(run)
+    pipeline.produce(run)
+    return cruns.get_run(run["id"])   # what a poller on any instance reads back
+
+
+def test_failed_generations_are_marked_stand_ins_on_the_run(monkeypatch, tmp_path):
+    run = _produced(monkeypatch, tmp_path, "blog", _ModelProvider(fail=True))
+    images = [a for a in run["artifacts"] if a["mime"] == "image/png"]
+    assert images and all(a["ai"] is False for a in images)
+    assert all("stand-in" in a["fallback_reason"] for a in images)
+    # The upstream error text never reaches the client-facing reason.
+    assert not any("502" in a["fallback_reason"] for a in images)
+    bundle = next(a for a in run["artifacts"] if a["name"].endswith(".zip"))
+    assert bundle["ai"] is False and "cover.png" in bundle["fallback_reason"]
+    assert any(d["decision"].endswith("is a stand-in, not an AI image")
+               for d in run["decision_log"])
+
+
+def test_model_made_artifacts_are_marked_ai(monkeypatch, tmp_path):
+    run = _produced(monkeypatch, tmp_path, "blog", _ModelProvider())
+    assert run["artifacts"]
+    assert all(a["ai"] is True and a["fallback_reason"] is None for a in run["artifacts"])
+
+
+def test_one_failed_carousel_slide_is_the_only_stand_in(monkeypatch, tmp_path):
+    from graphics_designer_agent import pipeline as gd_pipeline
+
+    real_base = gd_pipeline.establish_base
+
+    def flaky_base(*a, **k):
+        if k.get("subject") == "BREAK":
+            raise RuntimeError("image model timed out")
+        return real_base(*a, **k)
+
+    monkeypatch.setattr(gd_pipeline, "establish_base", flaky_base)
+    plan = planner.plan("carousel", "hiring", brand_name=PACK.name, count=3, use_llm=False)
+    plan["frames"][1]["subject"] = "BREAK"
+    monkeypatch.setattr(db.providers, "get_provider", lambda *a, **k: _ModelProvider())
+    arts = db.build("carousel", plan, PACK)
+    provs = {name: db.artifact_provenance(art) for art in arts for name in [art[0]]}
+    broken = f"frame-{plan['frames'][1]['index']:02d}.png"
+    assert provs[broken]["ai"] is False and "slide" in provs[broken]["fallback_reason"]
+    assert all(p["ai"] is True for n, p in provs.items() if n != broken)
+
+
+def test_carousel_without_an_image_model_names_the_reason(monkeypatch):
+    from graphics_designer_agent import providers
+
+    def unavailable(*a, **k):
+        raise providers.ImageProviderUnavailable("OPENROUTER_API_KEY is not configured")
+
+    monkeypatch.setattr(db.providers, "get_provider", unavailable)
+    plan = planner.plan("carousel", "hiring", brand_name=PACK.name, count=3, use_llm=False)
+    arts = db.build("carousel", plan, PACK)
+    assert len(arts) == 3
+    for art in arts:
+        prov = db.artifact_provenance(art)
+        assert prov["ai"] is False
+        assert "OPENROUTER_API_KEY is not configured" in prov["fallback_reason"]
+
+
+def test_mock_provider_output_is_never_badged_ai(monkeypatch, tmp_path):
+    from graphics_designer_agent.providers import MockImageProvider
+
+    run = _produced(monkeypatch, tmp_path, "blog", MockImageProvider())
+    assert all(a["ai"] is False for a in run["artifacts"])
+    images = [a for a in run["artifacts"] if a["mime"] == "image/png"]
+    assert images and all("mock" in a["fallback_reason"] for a in images)
+
+
+def test_a_file_that_cannot_be_stored_fails_the_run_instead_of_vanishing(monkeypatch, tmp_path):
+    """The streamed per-file save is best-effort mid-build; a file whose save
+    keeps failing (GCS down in cloud mode) must fail the request, not leave a
+    run marked DONE with that file silently missing."""
+    def storage_down(*_a, **_k):
+        raise RuntimeError("503 storage unavailable")
+
+    monkeypatch.setenv("GD_REFERENCE_DIR", str(tmp_path))
+    monkeypatch.setattr(db.providers, "get_provider", lambda *a, **k: _ModelProvider())
+    run = cruns.create_run("u1", "blog", brand_id="legalsoft", brief="tips")
+    pipeline.make_plan(run, count=2, use_llm=False)
+    pipeline.approve_plan(run)
+    monkeypatch.setattr(cruns, "save_artifact", storage_down)
+    with pytest.raises(pipeline.ArtifactStoreUnavailable) as caught:
+        pipeline.produce(run)
+    assert "503" not in str(caught.value)              # safe message for the client
+    stored = cruns.get_run(run["id"])
+    assert stored["state"] != "DONE" and stored["progress"]["state"] == "failed"

@@ -71,9 +71,19 @@ def _call_model(prompt: str, images_png: list[bytes]) -> str:
     # get_for_agent, not get — see placement_brain._call_model.
     model = runtime_config.get_for_agent(GD_AGENT_ID, "openrouter_vision_model")
     pairs = [(png, "image/png") for png in images_png]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(analyze_images, prompt, pairs, model)
-        return future.result(timeout=_VISION_TIMEOUT_S)
+    return _bounded(analyze_images, prompt, pairs, model)
+
+
+def _bounded(fn, *args):
+    """``fn(*args)`` waited on for at most ``_VISION_TIMEOUT_S`` — see
+    ``placement_brain._bounded``: the executor is shut down without joining the
+    worker, so the budget is the real bound, not httpx's 180 s."""
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                                                 thread_name_prefix="gd-vision-qa")
+    try:
+        return pool.submit(fn, *args).result(timeout=_VISION_TIMEOUT_S)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _build_prompt(layout_desc: str) -> str:

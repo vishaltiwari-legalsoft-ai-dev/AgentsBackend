@@ -103,3 +103,25 @@ def test_designed_brochure_pdf_still_builds_offline(monkeypatch):
     (fname, pdf, mime), rasters = db._designed_brochure_pdf(plan, _pack())
     assert mime == "application/pdf" and pdf[:4] == b"%PDF"
     assert len(rasters) == 2
+
+
+def test_brochure_with_gradient_pages_is_marked_a_stand_in(monkeypatch):
+    """B4: pages whose background generation failed fall back to the gradient —
+    the PDF then says so (``ai: False`` + which pages), never passes as AI."""
+    monkeypatch.setattr(db.providers, "get_provider", lambda **kw: _FakeProvider(fail_on={2}))
+    monkeypatch.setattr(db, "_study_brand_brochures", lambda brand_id: "")
+    monkeypatch.setenv("GD_IMAGE_PROVIDER", "openrouter")
+    art, _rasters = db._designed_brochure_pdf(_plan(), _pack())
+    prov = db.artifact_provenance(art)
+    assert prov["ai"] is False
+    assert "1 of" in prov["fallback_reason"] and "page backgrounds" in prov["fallback_reason"]
+
+
+def test_brochure_with_every_background_generated_is_marked_ai(monkeypatch):
+    monkeypatch.setattr(db.providers, "get_provider", lambda **kw: _FakeProvider())
+    monkeypatch.setattr(db, "_study_brand_brochures", lambda brand_id: "")
+    monkeypatch.setenv("GD_IMAGE_PROVIDER", "openrouter")
+    art, _rasters = db._designed_brochure_pdf(_plan(), _pack())
+    assert db.artifact_provenance(art) == {"ai": True, "fallback_reason": None}
+    name, data, mime = art   # still the plain 3-tuple every caller unpacks
+    assert mime == "application/pdf"

@@ -18,6 +18,7 @@ decision; keep human override one click away.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any, Optional
@@ -40,8 +41,18 @@ def _pack(run: dict):
     return registry.get_pack(run.get("brand_id"))
 
 
+logger = logging.getLogger("graphics_designer.creative.pipeline")
+
+
 class AutonomyError(RuntimeError):
     """Raised when autonomous mode is asked to proceed without acknowledgement."""
+
+
+class ArtifactStoreUnavailable(RuntimeError):
+    """A produced file could not be saved to the run store (GCS in cloud mode).
+
+    The message is safe to show the user; the storage detail is in the log.
+    A run that silently lost a file must never be reported as finished."""
 
 
 # --------------------------------------------------------------------------- #
@@ -196,22 +207,52 @@ def produce(run: dict, *, require_approval: bool = True) -> dict:
     def _on_artifact(art: tuple[str, bytes, str]) -> None:
         name, data, mime = art
         with lock:
-            cruns.append_artifact(run, run["id"], name, data, mime)
+            cruns.append_artifact(run, run["id"], name, data, mime,
+                                  provenance=db.artifact_provenance(art))
             run["progress"]["done"] = len(run["artifacts"])
             cruns.save_run(run)
 
     artifacts = db.build(ctype, plan, pack, on_artifact=_on_artifact)
+    # The streaming save above is best-effort inside the builders (a failing
+    # callback is logged, never fatal mid-build), so a file whose save failed
+    # would otherwise just be missing from a run marked DONE. Retry each one
+    # once here, where a second failure fails the request honestly.
+    to_store = [a for a in artifacts
+                if a[0] not in {m["name"] for m in run.get("artifacts", [])}]
     # Multi-file outputs (carousel frames, blog images) also get a single zip so the
     # user can download the whole set in one click — appended after the primaries.
     if len(artifacts) > 1:
-        zname, zdata, zmime = db.zip_artifacts(artifacts, f"{pack.name}-{ctype}")
-        with lock:
-            cruns.append_artifact(run, run["id"], zname, zdata, zmime)
+        to_store.append(db.zip_artifacts(artifacts, f"{pack.name}-{ctype}"))
+    for art in to_store:
+        name, data, mime = art
+        try:
+            with lock:
+                cruns.append_artifact(run, run["id"], name, data, mime,
+                                      provenance=db.artifact_provenance(art))
+        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+            logger.exception("creative run %s: could not store artifact %s", run["id"], name)
+            run["progress"] = {**run["progress"], "state": "failed"}
+            cruns.log_decision(run, "output", "Could not save the generated files",
+                               f"{name} could not be written to file storage.")
+            try:
+                cruns.save_run(run)
+            except Exception:  # noqa: BLE001 - the raise below is the report
+                logger.exception("creative run %s: could not record the failure", run["id"])
+            raise ArtifactStoreUnavailable(
+                "The creative was generated but its files could not be saved — "
+                "file storage is unavailable. Please try again.") from exc
 
     out_fmt = run.get("output_format", "image")
     cruns.log_decision(run, "output", f"Generated {total} artifact(s)",
                        f"Rendered the {ctype} as {out_fmt} via the structured layout engine, "
                        f"on-brand for {pack.name}.")
+    # No fake success: a stand-in the image model did not make is said so in
+    # the audit trail too, not only on the artifact.
+    for art in artifacts:
+        prov = db.artifact_provenance(art)
+        if prov and not prov["ai"]:
+            cruns.log_decision(run, "output", f"{art[0]} is a stand-in, not an AI image",
+                               prov["fallback_reason"])
     run["state"] = "DONE"
     run["progress"] = {"done": total, "total": total, "state": "done"}
     cruns.save_run(run)

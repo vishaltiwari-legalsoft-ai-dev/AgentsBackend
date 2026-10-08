@@ -14,7 +14,6 @@ import logging
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from starlette.concurrency import run_in_threadpool
 
 from app.security import get_current_user
 from app.services import firestore_repo, imaging, storage
@@ -33,12 +32,14 @@ from graphics_designer_agent import (
 )
 from graphics_designer_agent.pipeline import PipelineError
 from graphics_designer_agent.runs import (
+    artifact_url_ref,
     get_run,
     is_own_artifact_ref,
     log_manifest,
     read_artifact,
     save_artifact,
     save_run,
+    uses_cloud_storage,
 )
 from graphics_designer_agent.stage3_text import elements as elements_mod
 from graphics_designer_agent.stage3_text import icons as icons_mod
@@ -242,21 +243,18 @@ def _valid_color(v) -> str:
 
 # ── serialization ─────────────────────────────────────────────────────────────
 def _artifact_url(run_id: str, ref: str) -> str:
-    """Browser-facing URL for a stored artifact reference.
+    """Browser-facing URL for a stored artifact reference: always the relative
+    API byte-proxy path, in both storage modes.
 
-    Cloud artifacts are GCS ``gs://`` URIs → return a short-lived signed URL so the
-    browser pulls straight from GCS (re-signed on every serialization, mirroring
-    ``storage.rehydrate_result``). Filesystem artifacts keep the API byte-proxy.
+    Never an absolute or signed GCS URL. The live frontend fetches
+    ``${API_URL}${url}`` with ``API_URL=/backend`` (the Vercel relay), so an
+    absolute URL became ``/backendhttps://…`` and a ``gs://`` segment lost its
+    ``//`` in the relay's path rejoin. The proxy (``get_artifact``) checks
+    ownership and, in cloud mode, reads from GCS — so any instance can answer.
+    Building the URL is pure: no signing round trip per attempt on every run
+    serialization.
     """
-    if ref.startswith("gs://"):
-        from app.services import storage
-
-        try:
-            return storage.signed_url_for_gs_uri(ref)
-        except Exception:  # noqa: BLE001 - fall back to the proxy if signing fails
-            logger.exception("GD: failed to sign artifact URL for %s", ref)
-            return f"/api/gd/runs/{run_id}/artifact/{ref}"
-    return f"/api/gd/runs/{run_id}/artifact/{ref}"
+    return f"/api/gd/runs/{run_id}/artifact/{artifact_url_ref(run_id, ref)}"
 
 
 def _to_client(run: dict) -> dict:
@@ -1136,8 +1134,25 @@ def brand_logo_library(run_id: str, user: dict = Depends(get_current_user)) -> d
     return {"logos": _list_brand_logos(pack), "brand_name": pack.name}
 
 
+#: Upload ceilings. The handlers read at most one byte past these, so an
+#: oversized upload is refused without being pulled into memory whole.
+_ELEMENT_UPLOAD_MAX_BYTES = 8 * 1024 * 1024
+_SUBJECT_UPLOAD_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _read_upload(file: UploadFile, limit: int | None = None) -> bytes:
+    """An upload's bytes, read synchronously from Starlette's spooled temp file.
+
+    The upload handlers are plain ``def`` (FastAPI runs them on the threadpool)
+    because everything after the read is blocking: Firestore + GCS calls in
+    cloud mode, and Pillow decode/encode. Their ``async`` versions ran all of
+    that on the event loop and stalled every other request on the instance."""
+    file.file.seek(0)
+    return file.file.read() if limit is None else file.file.read(limit + 1)
+
+
 @router.post("/gd/runs/{run_id}/stage4")
-async def stage4_endpoint(
+def stage4_endpoint(
     run_id: str,
     logo: UploadFile | None = File(default=None),
     use_ai: bool = Form(default=False),
@@ -1145,16 +1160,16 @@ async def stage4_endpoint(
     user: dict = Depends(get_current_user),
     act: StagedActivity = trail.stages("stage4", "Composed the final logo stage"),
 ) -> dict:
+    # Sync on purpose (see ``_read_upload``): the run read/write, the brand-logo
+    # download, the logo decode and the composite are all blocking — a 2000²
+    # white-background logo keyed on the event loop once stalled every other
+    # request for tens of seconds.
     run = _owned_run(run_id, user)
     # An uploaded file always wins (override); otherwise fall back to the brand's
     # logo from Firestore so the user isn't forced to re-supply it every run.
-    # This handler is async only for ``logo.read()``; everything that decodes,
-    # downloads or composites is CPU/IO-bound and runs on the threadpool — a
-    # 2000² white-background logo keyed on the event loop stalled every other
-    # request for tens of seconds.
     png: bytes | None = None
     if logo is not None:
-        raw = await logo.read()
+        raw = _read_upload(logo)
         if raw:
             name, mime = logo.filename or "", logo.content_type or ""
             try:
@@ -1163,32 +1178,32 @@ async def stage4_endpoint(
                 if exc.code == "image_too_large":
                     raise HTTPException(415, exc.code) from exc
                 raise HTTPException(415, f"Couldn't read '{logo.filename}' as an image (PNG/JPG/SVG).") from exc
-            png = await run_in_threadpool(imaging.to_png_logo, raw, file_name=name, mime=mime)
+            png = imaging.to_png_logo(raw, file_name=name, mime=mime)
             if not png:
                 raise HTTPException(415, f"Couldn't read '{logo.filename}' as an image (PNG/JPG/SVG).")
     if png is None:
-        png = await run_in_threadpool(_brand_logo_png, run, logo_id=logo_id)
+        png = _brand_logo_png(run, logo_id=logo_id)
     if png is None:
         raise HTTPException(
             400,
             "No logo available — upload one, or pick a brand that has a logo in its kit.",
         )
-    attempt = await run_in_threadpool(_guard, lambda: pipeline.generate_stage4(run, png, use_ai=use_ai))
+    attempt = _guard(lambda: pipeline.generate_stage4(run, png, use_ai=use_ai))
     _advance_run(act, run, stage=4, stage_status="generated", attempt=attempt)
     return {"attempt": {**attempt, "url": _artifact_url(run_id, attempt["artifact"])}, "run": _to_client(run)}
 
 
 @router.post("/gd/runs/{run_id}/elements/upload")
 @silent("stores an asset the caller supplied into an open run — no agent work")
-async def gd_element_upload(run_id: str, file: UploadFile = File(...),
-                            user: dict = Depends(get_current_user)) -> dict:
+def gd_element_upload(run_id: str, file: UploadFile = File(...),
+                      user: dict = Depends(get_current_user)) -> dict:
     """Upload a transparent PNG/WebP to use as an ``image`` element. Returns the
     artifact ref the client stores as the element's ``ref``."""
     run = _owned_run(run_id, user)
     if (file.content_type or "") not in ("image/png", "image/webp"):
         raise HTTPException(400, "Only PNG/WebP uploads are supported.")
-    data = await file.read()
-    if len(data) > 8 * 1024 * 1024:
+    data = _read_upload(file, _ELEMENT_UPLOAD_MAX_BYTES)
+    if len(data) > _ELEMENT_UPLOAD_MAX_BYTES:
         raise HTTPException(400, "Image too large (max 8 MB).")
     # Reuse the run artifact store; stage=3, kind="upload". Name the artifact by
     # a content hash (not a dead upload counter) so distinct images never
@@ -1200,9 +1215,9 @@ async def gd_element_upload(run_id: str, file: UploadFile = File(...),
 
 @router.post("/gd/runs/{run_id}/subject/upload")
 @silent("stores an asset the caller supplied into an open run — no agent work")
-async def gd_subject_upload(run_id: str, file: UploadFile = File(...),
-                            role: str = "subject",
-                            user: dict = Depends(get_current_user)) -> dict:
+def gd_subject_upload(run_id: str, file: UploadFile = File(...),
+                      role: str = "subject",
+                      user: dict = Depends(get_current_user)) -> dict:
     """Upload an image for this run — the Stage-2 subject (``role=subject``,
     default), the Stage-1 background (``role=background``), or a brief-attached
     prompt image (``role=prompt``). Accepts PNG/WebP/JPEG and normalizes to
@@ -1217,10 +1232,12 @@ async def gd_subject_upload(run_id: str, file: UploadFile = File(...),
     run = _owned_run(run_id, user)
     if (file.content_type or "") not in ("image/png", "image/webp", "image/jpeg"):
         raise HTTPException(400, "Only PNG, WebP or JPEG uploads are supported.")
-    data = await file.read()
-    if len(data) > 10 * 1024 * 1024:
+    data = _read_upload(file, _SUBJECT_UPLOAD_MAX_BYTES)
+    if len(data) > _SUBJECT_UPLOAD_MAX_BYTES:
         raise HTTPException(400, "Image too large (max 10 MB).")
-    # Normalize to PNG so the artifact store serves one consistent format.
+    # Normalize to PNG so the artifact store serves one consistent format. A
+    # 10 MB photo decode → RGBA → PNG encode is seconds of CPU: this handler is
+    # sync so it costs one threadpool slot, not the whole event loop.
     from io import BytesIO
 
     from PIL import Image, UnidentifiedImageError
@@ -1232,6 +1249,8 @@ async def gd_subject_upload(run_id: str, file: UploadFile = File(...),
         data = buf.getvalue()
     except UnidentifiedImageError as exc:
         raise HTTPException(400, "That file doesn't look like a valid image.") from exc
+    except Image.DecompressionBombError as exc:
+        raise HTTPException(400, "Image dimensions are too large.") from exc
     token = hashlib.sha256(data).hexdigest()[:16]
     if role == "prompt":
         refs = list(run["config"].get("prompt_image_refs") or [])
@@ -1414,13 +1433,28 @@ def get_artifact(run_id: str, rel: str, user: dict = Depends(get_current_user)):
     _owned_run(run_id, user)
     from graphics_designer_agent.runs import artifact_abspath, read_artifact
 
-    # Cloud artifacts (gs:// refs) are normally served as signed URLs; this branch
-    # is the defensive fallback when signing failed at serialization time.
+    # A full gs:// ref in the path: what older serializations emitted when URL
+    # signing failed. Ownership-checked like any other ref.
     if rel.startswith("gs://"):
         try:
             return Response(content=read_artifact(run_id, rel), media_type="image/png")
         except Exception:  # noqa: BLE001
             raise HTTPException(404, "Artifact not found")
+
+    if uses_cloud_storage():
+        # ``rel`` is the object name inside this run's GCS partition — the run
+        # may have been created on any instance, so nothing here touches disk.
+        try:
+            data = read_artifact(run_id, rel)
+        except ValueError:
+            raise HTTPException(400, "Invalid path")
+        except FileNotFoundError:
+            logger.warning("GD artifact missing in storage: run=%s name=%s", run_id, rel)
+            raise HTTPException(404, "Artifact not found")
+        except Exception:  # noqa: BLE001 - storage fault: say so, keep the detail in logs
+            logger.exception("GD artifact read failed: run=%s name=%s", run_id, rel)
+            raise HTTPException(503, "artifact_storage_unavailable")
+        return Response(content=data, media_type="image/png")
 
     try:
         path = artifact_abspath(run_id, rel)

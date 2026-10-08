@@ -103,3 +103,29 @@ def test_tweak_prompt_carries_instruction_and_guardrails():
     p = qa_brain._build_tweak_prompt("make the plant smaller")
     assert "make the plant smaller" in p
     assert "logo_ok" in p and "gradient_ok" in p and "text_ok" in p
+
+
+def test_vision_qa_is_cut_at_the_budget_not_at_httpx_180s(monkeypatch):
+    """S2: same bound as placement_brain — QA answers "unavailable" at the
+    budget instead of holding the Stage-3 request until httpx gives up."""
+    import threading
+    import time
+
+    from app.services import openrouter, runtime_config
+
+    release = threading.Event()
+
+    def never_answers(*_a, **_k):
+        release.wait(10)
+        return "{}"
+
+    monkeypatch.setattr(openrouter, "analyze_images", never_answers)
+    monkeypatch.setattr(runtime_config, "get_for_agent", lambda *_a, **_k: "vision-model")
+    monkeypatch.setattr(qa_brain, "_VISION_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(qa_brain, "_vision_available", lambda: True)
+    try:
+        t0 = time.monotonic()
+        assert qa_brain.check(PNG, PNG, "desc") is None
+        assert time.monotonic() - t0 < 2.0
+    finally:
+        release.set()

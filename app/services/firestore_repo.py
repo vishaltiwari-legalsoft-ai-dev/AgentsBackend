@@ -28,10 +28,18 @@ logger = logging.getLogger("agentos.firestore")
 
 _client: Optional[firestore.Client] = None
 
-# Brands change only on ingest, so a short in-process cache keeps the opening
-# brand picker instant and avoids re-hitting Firestore mid-conversation.
+# Brands change rarely, so a short in-process cache keeps the opening brand
+# picker instant and avoids re-hitting Firestore mid-conversation. The cache is
+# keyed on ``meta/brands.version`` (re-read at most once per
+# ``_BRANDS_VERSION_CHECK_SECONDS``, the GD registry's window), so a brand
+# written on ANOTHER Cloud Run instance is listed here within ~10 s instead of
+# after the full TTL; the TTL stays as the backstop for writers that do not bump
+# the version (the enrichment CLI). (fetched_at, version_at_fetch, brands)
 _BRANDS_TTL_SECONDS = 60.0
-_brands_cache: tuple[float, list[dict[str, Any]]] | None = None
+_BRANDS_VERSION_CHECK_SECONDS = 10.0
+_brands_cache: tuple[float, int | None, list[dict[str, Any]]] | None = None
+# (checked_at, version | None) — None when the version doc could not be read.
+_brands_version_seen: tuple[float, int | None] | None = None
 
 
 def _db() -> firestore.Client:
@@ -57,17 +65,46 @@ def list_brands(
 ) -> list[dict[str, Any]]:
     """Every brand, ordered by name. Soft-archived brands (``archived_at`` set)
     are left out unless ``include_archived`` — legacy docs have no such field
-    and always count as active. The cache holds the unfiltered list."""
+    and always count as active. The cache holds the unfiltered list.
+
+    A cached list is served only while it is inside the TTL AND was fetched at
+    the brand-set version currently observed; an unreadable version degrades
+    to the TTL alone."""
     global _brands_cache
-    if use_cache and _brands_cache and (time.monotonic() - _brands_cache[0]) < _BRANDS_TTL_SECONDS:
-        brands = _brands_cache[1]
+    # The version is read BEFORE the list: a write landing between the two is
+    # then newer than the version recorded and triggers the next refetch.
+    version = _observed_brands_version()
+    cached = _brands_cache
+    if (use_cache and cached
+            and (time.monotonic() - cached[0]) < _BRANDS_TTL_SECONDS
+            and (version is None or cached[1] == version)):
+        brands = cached[2]
     else:
         docs = _db().collection("brands").order_by("brand_name").stream()
         brands = [doc.to_dict() | {"id": doc.id} for doc in docs]
-        _brands_cache = (time.monotonic(), brands)
+        _brands_cache = (time.monotonic(), version, brands)
     if include_archived:
         return brands
     return [b for b in brands if not b.get("archived_at")]
+
+
+def _observed_brands_version() -> int | None:
+    """``meta/brands.version`` as last read, re-read at most once per
+    ``_BRANDS_VERSION_CHECK_SECONDS`` — one small doc read per window per
+    instance, never one per request. ``None`` when it cannot be read."""
+    global _brands_version_seen
+    now = time.monotonic()
+    seen = _brands_version_seen
+    if seen is not None and (now - seen[0]) < _BRANDS_VERSION_CHECK_SECONDS:
+        return seen[1]
+    try:
+        version: int | None = brands_version()
+    except Exception as exc:  # noqa: BLE001 - the list still works on its TTL
+        logger.warning("brand version unreadable; brand list cache falls back to its "
+                       "%.0fs TTL: %s", _BRANDS_TTL_SECONDS, exc)
+        version = None
+    _brands_version_seen = (now, version)
+    return version
 
 
 def get_brand(brand_id: str) -> Optional[dict[str, Any]]:
@@ -88,8 +125,11 @@ def find_brand_by_name(name: str) -> Optional[dict[str, Any]]:
 
 
 def _invalidate_brands_cache() -> None:
-    global _brands_cache
+    """After a write on THIS instance: drop the list and the observed version,
+    so the next read refetches and records the version the write produced."""
+    global _brands_cache, _brands_version_seen
     _brands_cache = None
+    _brands_version_seen = None
 
 
 def upsert_brand(brand_name: str, brand_metadata: dict[str, Any]) -> dict[str, Any]:

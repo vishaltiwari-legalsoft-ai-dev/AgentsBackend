@@ -27,9 +27,11 @@ from __future__ import annotations
 from typing import Optional
 
 import io
+import logging
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import Response, StreamingResponse
+from google.api_core.exceptions import NotFound
 from pydantic import BaseModel
 
 from app.security import get_current_user
@@ -44,6 +46,7 @@ from graphics_designer_agent.creative import runs as cruns
 from graphics_designer_agent.creative import types as ctypes
 
 router = APIRouter()
+logger = logging.getLogger("agentos.creative")
 
 # The Creative rail is the Graphics Designer's document arm — same agent (a1)
 # in the catalog, so its activity lands in the same per-agent run table.
@@ -271,8 +274,14 @@ def artifact(run_id: str, name: str, user: dict = Depends(get_current_user)) -> 
         raise HTTPException(404, "Unknown artifact")
     try:
         data = cruns.read_artifact(run_id, meta["ref"])
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(404, f"Artifact unavailable: {exc}") from exc
+    except (FileNotFoundError, NotFound, ValueError) as exc:
+        logger.warning("creative artifact missing: run=%s name=%s ref=%s", run_id, name, meta["ref"])
+        raise HTTPException(404, "Artifact unavailable") from exc
+    except Exception as exc:  # noqa: BLE001 - storage fault: say so, keep the detail in logs
+        # In cloud mode this is a GCS read; its error text (bucket, object
+        # path) belongs in the log, not in the response.
+        logger.exception("creative artifact read failed: run=%s name=%s", run_id, name)
+        raise HTTPException(503, "artifact_storage_unavailable") from exc
     # Stream rather than buffer: Cloud Run caps a buffered response at 32 MiB,
     # which a large brochure/carousel can exceed — the download then fails
     # client-side with "Failed to fetch". A StreamingResponse with NO

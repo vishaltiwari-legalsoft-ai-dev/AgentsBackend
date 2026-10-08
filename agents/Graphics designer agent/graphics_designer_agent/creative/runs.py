@@ -176,17 +176,21 @@ def get_run(run_id: str) -> Optional[dict]:
 
 
 def save_artifact(run_id: str, name: str, data: bytes, content_type: str) -> str:
-    """Persist one produced artifact; return an opaque reference (fs path or gs URI)."""
+    """Persist one produced artifact; return an opaque reference (fs path or gs URI).
+
+    Cloud mode writes ``generated/creative/<run_id>/<name>`` and records the
+    durable ``gs://`` URI; the browser never uses it as a URL — artifacts are
+    served by name through ``/api/creative/runs/<id>/artifact/<name>``, which
+    any instance can answer from the run manifest in Firestore."""
     if _use_cloud():
         from app.services import storage
 
-        gs_uri, _signed = storage.upload_generated(
+        return storage.put_generated(
             partition=f"{_GCS_PARTITION}/{run_id}",
             file_name=name,
             data=data,
             content_type=content_type,
         )
-        return gs_uri
     rel = f"artifacts/{name}"
     abspath = run_dir(run_id) / rel
     abspath.parent.mkdir(parents=True, exist_ok=True)
@@ -198,6 +202,11 @@ def read_artifact(run_id: str, ref: str) -> bytes:
     if ref.startswith("gs://"):
         from app.services import storage
 
+        # Only this run's own partition — refs are server-written today, and
+        # this keeps it that way if one is ever echoed back from a client.
+        object_path = ref[len("gs://"):].partition("/")[2]
+        if not object_path.startswith(f"generated/{_GCS_PARTITION}/{run_id}/"):
+            raise ValueError(f"artifact ref does not belong to run {run_id!r}")
         return storage.download_bytes(ref)
     base = run_dir(run_id).resolve()
     target = (run_dir(run_id) / ref).resolve()
@@ -206,24 +215,39 @@ def read_artifact(run_id: str, ref: str) -> bytes:
     return target.read_bytes()
 
 
+def _artifact_meta(name: str, mime: str, ref: str, data: bytes,
+                   provenance: Optional[dict] = None) -> dict:
+    """One artifact's manifest entry. ``provenance`` (``{"ai", "fallback_reason"}``,
+    see ``document_builder.artifact_provenance``) rides along verbatim when the
+    builder supplied it, so a locally drawn stand-in is never listed as if the
+    image model had made it."""
+    meta = {"name": name, "mime": mime, "ref": ref, "bytes": len(data)}
+    if provenance:
+        meta.update(provenance)
+    return meta
+
+
 def record_artifacts(run: dict, run_id: str, artifacts: list[tuple[str, bytes, str]]) -> list[dict]:
     """Persist each (name, bytes, mime) and append metadata to the run."""
+    from .document_builder import artifact_provenance
+
     out: list[dict] = []
-    for name, data, mime in artifacts:
+    for art in artifacts:
+        name, data, mime = art
         ref = save_artifact(run_id, name, data, mime)
-        meta = {"name": name, "mime": mime, "ref": ref, "bytes": len(data)}
-        out.append(meta)
+        out.append(_artifact_meta(name, mime, ref, data, artifact_provenance(art)))
     run.setdefault("artifacts", [])
     run["artifacts"] = out  # latest generation replaces prior outputs
     return out
 
 
-def append_artifact(run: dict, run_id: str, name: str, data: bytes, mime: str) -> dict:
+def append_artifact(run: dict, run_id: str, name: str, data: bytes, mime: str,
+                    *, provenance: Optional[dict] = None) -> dict:
     """Persist ONE artifact and append its metadata to the run (incremental output).
 
     Used while a multi-file creative streams in — each frame is saved + recorded the
     moment it finishes, so a poller sees the set grow instead of all-or-nothing."""
     ref = save_artifact(run_id, name, data, mime)
-    meta = {"name": name, "mime": mime, "ref": ref, "bytes": len(data)}
+    meta = _artifact_meta(name, mime, ref, data, provenance)
     run.setdefault("artifacts", []).append(meta)
     return meta

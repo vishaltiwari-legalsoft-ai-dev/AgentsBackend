@@ -764,3 +764,229 @@ def test_picker_reply_keeps_the_pre_contract_keys(brand_store):
     assert all(row["id"] == row["brand_id"] for row in body["brands"])
     assert all(isinstance(row["name"], str) and row["name"] for row in body["brands"])
     assert ids.index("acme-co") < ids.index("legalsoft")   # self-serve first, then built-ins
+
+
+# =========================================================================== #
+# Cloud storage across instances (B1). GD_STORAGE_BACKEND=cloud with an
+# in-memory Firestore + GCS standing in for the shared stores. A run is started
+# on "instance A", then every later request is served by an instance with a
+# fresh, empty disk and fresh process-local caches - which is what Cloud Run
+# does on scale-out, scale-down and every deploy. Nothing may come from disk.
+# =========================================================================== #
+
+OTHER_TENANT = {"id": "gd-cloud-stranger", "email": "s@legalsoft.com", "is_admin": False,
+                "is_creator": False, "session_id": "", "timezone": "UTC"}
+
+
+class _FakeGcs:
+    """The slice of ``google.cloud.storage.Client`` the storage service uses.
+    Signing is refused outright: artifact URLs must never be signed GCS links."""
+
+    def __init__(self):
+        self.objects: dict[str, bytes] = {}
+
+    def bucket(self, bucket_name):
+        objects = self.objects
+
+        class _Blob:
+            def __init__(self, path):
+                self.key = f"{bucket_name}/{path}"
+
+            def upload_from_string(self, data, content_type=None, timeout=None, **_kw):
+                objects[self.key] = bytes(data)
+
+            def download_as_bytes(self, timeout=None, **_kw):
+                from google.api_core.exceptions import NotFound
+
+                if self.key not in objects:
+                    raise NotFound(self.key)
+                return objects[self.key]
+
+            def exists(self, timeout=None, **_kw):
+                return self.key in objects
+
+            def generate_signed_url(self, **_kw):
+                raise AssertionError("artifact URLs must be API proxy paths, never signed GCS URLs")
+
+        class _Bucket:
+            def blob(self, path):
+                return _Blob(path)
+
+        return _Bucket()
+
+
+@pytest.fixture()
+def cloud_instances(monkeypatch, tmp_path):
+    import copy
+    import types
+
+    from tests.test_brand_enrichment import _MemCol, _MemDb, _MemDoc
+
+    from app.config import settings
+    from app.services import firestore_repo, storage
+    from graphics_designer_agent import registry
+    from graphics_designer_agent import runs as gd_runs
+    from graphics_designer_agent.creative import runs as cr_runs
+
+    class _Doc(_MemDoc):
+        def set(self, data, merge=False):   # a real store keeps a copy, never the live dict
+            super().set(copy.deepcopy(data), merge=merge)
+
+    class _Col(_MemCol):
+        def document(self, doc_id):
+            return _Doc(self._db, self._col, doc_id)
+
+    class _Db(_MemDb):
+        def collection(self, name):
+            return _Col(self, name)
+
+    db, gcs = _Db(), _FakeGcs()
+    monkeypatch.setattr(firestore_repo, "_db", lambda: db)
+    monkeypatch.setattr(settings, "gcp_project_id", "test-project", raising=False)
+    monkeypatch.setattr(settings, "gcs_bucket_name", "test-bucket", raising=False)
+    monkeypatch.setattr(storage, "_storage", lambda: gcs)
+    monkeypatch.setattr(storage, "is_configured", lambda: True)   # over the root guard
+    monkeypatch.setattr(storage, "read_reference_index", lambda: None)
+    monkeypatch.setattr(gd_runs, "GD_STORAGE_BACKEND", "cloud")
+    monkeypatch.setattr(cr_runs, "GD_STORAGE_BACKEND", "cloud")
+    monkeypatch.setenv("GD_IMAGE_PROVIDER", "mock")
+    monkeypatch.setenv("GD_REFERENCE_DIR", str(tmp_path / "no-refs"))
+    disks: list = []
+
+    def boot():
+        """A new instance: its own empty disk, nothing cached in-process."""
+        disk = tmp_path / f"instance-{len(disks)}"
+        disks.append(disk)
+        monkeypatch.setattr(gd_runs, "RUNS_ROOT", disk / "gd")
+        monkeypatch.setattr(cr_runs, "CREATIVE_RUNS_ROOT", disk / "creative")
+        monkeypatch.setattr(firestore_repo, "_brands_cache", None)
+        monkeypatch.setattr(firestore_repo, "_brands_version_seen", None)
+        registry.refresh()
+
+    boot()
+    return types.SimpleNamespace(db=db, gcs=gcs, boot=boot, disks=disks)
+
+
+def _urls(payload) -> list[str]:
+    """Every ``url`` value anywhere in a JSON payload."""
+    found: list[str] = []
+    if isinstance(payload, dict):
+        for k, v in payload.items():
+            if k == "url" and isinstance(v, str):
+                found.append(v)
+            else:
+                found += _urls(v)
+    elif isinstance(payload, list):
+        for v in payload:
+            found += _urls(v)
+    return found
+
+
+def _disk_files(instances) -> list:
+    return [p for d in instances.disks if d.exists() for p in d.rglob("*") if p.is_file()]
+
+
+def test_a_cloud_run_is_served_by_any_instance_from_shared_storage(cloud_instances, as_caller):
+    gcs = cloud_instances.gcs
+
+    # -- instance A: start the run, generate + approve Stage 1, upload a subject
+    rid = client.post("/api/gd/runs", json={}).json()["id"]
+    r = client.post(f"/api/gd/runs/{rid}/generate", json={"stage": 1, "variant": "A"})
+    assert r.status_code == 200, r.text
+    assert r.json()["attempt"]["artifact"] == "stage-1-A-1.png"
+    assert client.post(f"/api/gd/runs/{rid}/approve", json={"stage": 1}).status_code == 200
+    r = client.post(f"/api/gd/runs/{rid}/subject/upload",
+                    files={"file": ("me.png", io.BytesIO(_png_bytes((200, 30, 30, 255))), "image/png")})
+    assert r.status_code == 200, r.text
+    subject_ref = r.json()["ref"]
+    assert "/" not in subject_ref and not subject_ref.startswith("gs:")
+    assert client.post(f"/api/gd/runs/{rid}/config",
+                       json={"subject_asset_ref": subject_ref}).status_code == 200
+
+    # -- instance B: fresh disk, nothing cached
+    cloud_instances.boot()
+    r = client.get(f"/api/gd/runs/{rid}")
+    assert r.status_code == 200, r.text
+    run = r.json()
+    approved_url = run["stages"]["1"]["approved"]["url"]
+    assert approved_url == f"/api/gd/runs/{rid}/artifact/stage-1-A-1.png"
+    # Every URL handed to the browser is a relative API path - the relay prefixes
+    # "/backend" to it, so an absolute or gs:// URL could never load.
+    assert _urls(run) and all(u.startswith(f"/api/gd/runs/{rid}/artifact/") for u in _urls(run))
+    img = client.get(approved_url)
+    assert img.status_code == 200
+    assert img.content == gcs.objects[f"test-bucket/generated/gd/{rid}/stage-1-A-1.png"]
+    # The lab frontend builds this path itself from config.subject_asset_ref.
+    assert client.get(f"/api/gd/runs/{rid}/artifact/{subject_ref}").status_code == 200
+
+    # Stage 2 chains the Stage-1 image (and the uploaded subject) from storage.
+    r = client.post(f"/api/gd/runs/{rid}/generate", json={"stage": 2, "variant": "UPLOAD"})
+    assert r.status_code == 200, r.text
+    r = client.post(f"/api/gd/runs/{rid}/generate", json={"stage": 2, "variant": "A"})
+    assert r.status_code == 200, r.text
+    assert client.post(f"/api/gd/runs/{rid}/approve", json={"stage": 2}).status_code == 200
+
+    # -- instance C: Stage 3 reads the approved Stage-2 base from storage
+    cloud_instances.boot()
+    cfg = client.get(f"/api/gd/runs/{rid}").json()["config"]
+    subs = [{**s, "approved": True} for s in cfg["subheadings"]]
+    r = client.post(f"/api/gd/runs/{rid}/config", json={
+        "subheadings": subs,
+        "token_approvals": {t: {"approved": True} for t in ("headline", "highlight", "cta")}})
+    assert r.status_code == 200, r.text
+    r = client.post(f"/api/gd/runs/{rid}/generate", json={"stage": 3})
+    assert r.status_code == 200, r.text
+    assert client.post(f"/api/gd/runs/{rid}/approve", json={"stage": 3}).status_code == 200
+
+    # -- instance D: Stage 4 composites the logo onto the Stage-3 image from storage
+    cloud_instances.boot()
+    r = client.post(f"/api/gd/runs/{rid}/stage4", data={"use_ai": "false"},
+                    files=[("logo", ("logo.png", io.BytesIO(_png_bytes((0, 0, 0, 255))), "image/png"))])
+    assert r.status_code == 200, r.text
+    assert client.get(r.json()["attempt"]["url"]).status_code == 200
+
+    # Honest edges of the proxy: missing -> 404, an fs-style path -> 400,
+    # another tenant -> the usual indistinguishable 404.
+    assert client.get(f"/api/gd/runs/{rid}/artifact/stage-9-Z-1.png").status_code == 404
+    assert client.get(f"/api/gd/runs/{rid}/artifact/stage-1/A-1.png").status_code == 400
+    as_caller(OTHER_TENANT)
+    r = client.get(approved_url)
+    assert r.status_code == 404 and r.json()["detail"] == "Run not found"
+
+    # Nothing touched any instance disk; everything sits in this run partition.
+    assert not _disk_files(cloud_instances)
+    assert gcs.objects and all(k.startswith(f"test-bucket/generated/gd/{rid}/") for k in gcs.objects)
+
+
+def test_a_cloud_creative_run_is_polled_and_downloaded_from_any_instance(cloud_instances):
+    gcs = cloud_instances.gcs
+    rid = client.post("/api/creative/runs", json={"creative_type": "blog", "brief": "tips"}).json()["id"]
+    assert client.post(f"/api/creative/runs/{rid}/plan",
+                       json={"count": 2, "use_llm": False}).status_code == 200
+    assert client.post(f"/api/creative/runs/{rid}/plan/approve").status_code == 200
+    r = client.post(f"/api/creative/runs/{rid}/generate")
+    assert r.status_code == 200, r.text
+
+    cloud_instances.boot()   # the 2 s poller and the downloads land elsewhere
+    r = client.get(f"/api/creative/runs/{rid}")
+    assert r.status_code == 200, r.text
+    run = r.json()
+    assert run["progress"]["state"] == "done" and run["artifacts"]
+    for art in run["artifacts"]:
+        assert art["url"] == f"/api/creative/runs/{rid}/artifact/{art['name']}"
+        assert art["ai"] is False and art["fallback_reason"]   # mock provider: placeholders
+        body = client.get(art["url"])
+        assert body.status_code == 200
+        assert body.content == gcs.objects[f"test-bucket/generated/creative/{rid}/{art['name']}"]
+    assert not _disk_files(cloud_instances)
+
+
+def test_upload_and_stage4_handlers_are_sync_so_blocking_io_stays_off_the_event_loop():
+    """B1(b): in cloud mode these handlers make Firestore/GCS calls and decode
+    images; as ``async def`` all of that ran on the event loop."""
+    import inspect
+
+    from app.routers import graphics_designer as gd
+
+    for handler in (gd.stage4_endpoint, gd.gd_subject_upload, gd.gd_element_upload):
+        assert not inspect.iscoroutinefunction(handler), handler.__name__

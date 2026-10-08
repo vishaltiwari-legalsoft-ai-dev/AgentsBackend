@@ -72,3 +72,30 @@ def test_parse_extracts_json_from_prose():
     raw = 'Sure! Here you go:\n{"zone":"bottom","text_color":"dark","density":"clean","reason":"open floor"}'
     out = placement_brain._parse(raw)
     assert out is not None and out["zone"] == "bottom"
+
+
+def test_vision_call_is_cut_at_the_budget_not_at_httpx_180s(monkeypatch):
+    """S2: a ``with ThreadPoolExecutor()`` block joins its worker on exit, so a
+    model that never answers held the request for httpx's 180 s, not the 45 s
+    budget. The bounded call returns at the budget and ``decide`` falls back."""
+    import threading
+    import time
+
+    from app.services import openrouter, runtime_config
+
+    release = threading.Event()
+
+    def never_answers(*_a, **_k):
+        release.wait(10)
+        return "{}"
+
+    monkeypatch.setattr(openrouter, "analyze_images", never_answers)
+    monkeypatch.setattr(runtime_config, "get_for_agent", lambda *_a, **_k: "vision-model")
+    monkeypatch.setattr(placement_brain, "_VISION_TIMEOUT_S", 0.2)
+    _force_available(monkeypatch)
+    try:
+        t0 = time.monotonic()
+        assert placement_brain.decide(PNG_STUB, headline="Hi") is None
+        assert time.monotonic() - t0 < 2.0
+    finally:
+        release.set()

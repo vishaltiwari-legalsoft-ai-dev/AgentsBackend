@@ -152,30 +152,36 @@ def brand_logo_record(firestore_brand_id: str | None) -> dict | None:
 def firestore_spec_source() -> list[dict]:
     """``registry.register_dynamic_source`` callable: Firestore brand docs
     with a baked ``brand_metadata.gd_spec`` -> spec dicts with locally-present
-    fonts. Never raises — any Firestore error (or anything else going wrong
-    while listing/reading brands) yields ``[]`` with a logged warning, so a
-    down Firestore or a malformed brand can never break app startup or the
-    registry.
+    fonts.
+
+    A brand list that cannot be READ raises (after a logged warning): the
+    registry treats a raising source as "unreadable" - it keeps the brands it
+    last read and does not record the brand version as loaded. Returning ``[]``
+    here used to say the opposite ("there are no member brands"), so one
+    Firestore blip made every member brand 404 on that instance until the next
+    brand write. A malformed individual doc is still logged and skipped.
+    Startup never builds the registry eagerly, so the raise cannot break boot.
     """
     try:
-        specs: list[dict] = []
-        for doc in _list_brands():
-            # Per-doc fault isolation: one malformed brand doc is logged and
-            # skipped — it must never drop the other, valid dynamic brands.
-            try:
-                meta = doc.get("brand_metadata") or {}
-                gd_spec = meta.get("gd_spec")
-                if not gd_spec:
-                    continue
-                font_file_uris = (meta.get("enrichment") or {}).get("font_files") or []
-                specs.append(_materialize_fonts(dict(gd_spec), font_file_uris))
-            except Exception as exc:  # noqa: BLE001 - isolate the bad doc, keep the rest
-                doc_id = doc.get("id") if isinstance(doc, dict) else None
-                logger.warning(
-                    "gd_brand_source: brand doc %r skipped (malformed): %s", doc_id, exc
-                )
+        brand_docs = _list_brands()
+    except Exception as exc:
+        logger.warning("gd_brand_source: brand list unreadable: %s", exc)
+        raise
+    specs: list[dict] = []
+    for doc in brand_docs:
+        # Per-doc fault isolation: one malformed brand doc is logged and
+        # skipped - it must never drop the other, valid dynamic brands.
+        try:
+            meta = doc.get("brand_metadata") or {}
+            gd_spec = meta.get("gd_spec")
+            if not gd_spec:
                 continue
-        return specs
-    except Exception as exc:  # noqa: BLE001 - Firestore must never break startup/the registry
-        logger.warning("gd_brand_source: firestore_spec_source failed: %s", exc)
-        return []
+            font_file_uris = (meta.get("enrichment") or {}).get("font_files") or []
+            specs.append(_materialize_fonts(dict(gd_spec), font_file_uris))
+        except Exception as exc:  # noqa: BLE001 - isolate the bad doc, keep the rest
+            doc_id = doc.get("id") if isinstance(doc, dict) else None
+            logger.warning(
+                "gd_brand_source: brand doc %r skipped (malformed): %s", doc_id, exc
+            )
+            continue
+    return specs

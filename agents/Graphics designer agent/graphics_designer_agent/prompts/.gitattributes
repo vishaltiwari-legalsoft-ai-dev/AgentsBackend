@@ -1,0 +1,4 @@
+# Canonical prompts are hashed byte-for-byte against prompts.CANONICAL_SHA256.
+# Without this, core.autocrlf=true checks them out with CRLF on Windows and the
+# frozen-hash integrity tests fail in every fresh Windows checkout.
+*.txt text eol=lf

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,13 +28,24 @@ RUNS_ROOT = Path(os.environ.get("GD_RUNS_DIR") or (Path(__file__).resolve().pare
 # but per-instance and ephemeral on Cloud Run. ``cloud`` persists manifests to the
 # ``gd_runs`` Firestore collection and artifacts to GCS (via ``app.services``), so
 # state is shared across instances and survives redeploys. Default is ``fs`` so the
-# offline test suite and the standalone package are unchanged; Cloud Run sets
-# ``GD_STORAGE_BACKEND=cloud``. App-service imports stay lazy (inside the cloud
-# branch) so the package still imports without the backend app installed.
+# offline test suite and the standalone package are unchanged; a multi-instance
+# deployment must set ``GD_STORAGE_BACKEND=cloud`` (on ``fs`` every run lives on
+# the instance that created it and is lost on scale-down or deploy). Read at
+# import, so flipping it takes a new revision. App-service imports stay lazy
+# (inside the cloud branch) so the package still imports without the backend app.
 GD_STORAGE_BACKEND = (os.environ.get("GD_STORAGE_BACKEND") or "fs").strip().lower()
 
 # GCS object prefix for this agent's artifacts: ``generated/gd/<run_id>/...``.
 _GCS_PARTITION = "gd"
+
+# A cloud-mode artifact ref is the object's flat file name inside its run's
+# partition (``stage-2-A-1.png``) — never a ``gs://`` URI and never a path. That
+# is what lets the browser fetch it through the API proxy (a ``gs://`` ref did
+# not survive the Vercel relay's path rejoin: ``//`` collapses), and what makes
+# a client-supplied ref unable to name anything outside its own run: there is
+# no bucket and no "/" in it to point elsewhere.
+_ARTIFACT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+_UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 
 STATE_FOR_STAGE_CONFIG = {1: "STAGE1_CONFIG", 2: "STAGE2_CONFIG", 3: "STAGE3_CONFIG", 4: "STAGE4_CONFIG"}
 STATE_FOR_STAGE_REVIEW = {1: "STAGE1_REVIEW", 2: "STAGE2_REVIEW", 3: "STAGE3_REVIEW", 4: "STAGE4_REVIEW"}
@@ -41,6 +53,12 @@ STATE_FOR_STAGE_REVIEW = {1: "STAGE1_REVIEW", 2: "STAGE2_REVIEW", 3: "STAGE3_REV
 
 def _use_cloud() -> bool:
     return GD_STORAGE_BACKEND == "cloud"
+
+
+def uses_cloud_storage() -> bool:
+    """Whether run manifests + artifacts live in Firestore/GCS (shared by every
+    instance) rather than on this instance's disk."""
+    return _use_cloud()
 
 
 def _gd_runs_collection():
@@ -153,26 +171,39 @@ def get_run(run_id: str) -> dict | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _artifact_object_name(stage: int, variant: str, attempt) -> str:
+    """The flat object name a cloud-mode artifact is stored (and referenced) by.
+    Anything outside ``[A-Za-z0-9._-]`` is folded to ``_`` (and ``..`` to ``.``)
+    so the name is always a valid ref (see ``_ARTIFACT_NAME_RE``) and never needs
+    URL escaping."""
+    name = _UNSAFE_NAME_CHARS.sub("_", f"stage-{stage}-{variant}-{attempt}.png")
+    return re.sub(r"\.{2,}", ".", name)
+
+
+def _is_artifact_name(ref: str) -> bool:
+    return bool(_ARTIFACT_NAME_RE.match(ref)) and ".." not in ref
+
+
 def save_artifact(run_id: str, stage: int, variant: str, attempt: int, png: bytes) -> str:
     """Persist a generated PNG and return an opaque reference to it.
 
     The reference is stored verbatim on the attempt and round-tripped through
     ``read_artifact`` / the router. In ``fs`` mode it is the run-relative path
-    (``stage-<n>/<variant>-<attempt>.png``); in ``cloud`` mode it is the GCS
-    ``gs://`` URI returned by the shared storage service.
+    (``stage-<n>/<variant>-<attempt>.png``); in ``cloud`` mode it is the flat
+    object name inside the run's GCS partition (``stage-<n>-<variant>-<attempt>.png``
+    under ``generated/gd/<run_id>/``), readable from any instance.
     """
     if _use_cloud():
         from app.services import storage
 
-        # ``_safe_name`` flattens "/" in the object name, so the per-run folder is
-        # carried in the partition and the stage is folded into a flat file name.
-        gs_uri, _signed = storage.upload_generated(
+        name = _artifact_object_name(stage, variant, attempt)
+        storage.put_generated(
             partition=f"{_GCS_PARTITION}/{run_id}",
-            file_name=f"stage-{stage}-{variant}-{attempt}.png",
+            file_name=name,
             data=png,
             content_type="image/png",
         )
-        return gs_uri
+        return name
     rel = f"stage-{stage}/{variant}-{attempt}.png"
     abspath = run_dir(run_id) / rel
     abspath.parent.mkdir(parents=True, exist_ok=True)
@@ -183,9 +214,24 @@ def save_artifact(run_id: str, stage: int, variant: str, attempt: int, png: byte
 def _gcs_partition_prefix(run_id: str) -> str:
     """The GCS object prefix (no bucket) that ``save_artifact`` writes this run's
     artifacts under: ``generated/gd/<run_id>/``. Any legitimate ``gs://`` ref for
-    this run MUST live under this prefix — see ``upload_generated`` in
+    this run MUST live under this prefix — see ``put_generated`` in
     ``app.services.storage`` (``generated/<partition>/<file_name>``)."""
     return f"generated/{_GCS_PARTITION}/{run_id}/"
+
+
+def _own_gs_object_name(run_id: str, ref: str) -> str | None:
+    """For a legacy ``gs://`` ref (stored before refs became bare object
+    names): the flat object name when the URI sits directly inside this run's
+    own partition, else None."""
+    rest = ref[len("gs://"):]
+    bucket, _, object_path = rest.partition("/")
+    if not bucket or not object_path:
+        return None
+    prefix = _gcs_partition_prefix(run_id)
+    if not object_path.startswith(prefix):
+        return None
+    name = object_path[len(prefix):]
+    return name if _is_artifact_name(name) else None
 
 
 def is_own_artifact_ref(run_id: str, ref: str) -> bool:
@@ -195,33 +241,32 @@ def is_own_artifact_ref(run_id: str, ref: str) -> bool:
     ``artifact_abspath``'s path-traversal guard, so a bare non-empty relative
     ref is accepted here (the traversal guard runs at read time).
 
-    cloud mode: the object path must sit under this run's own
-    ``generated/gd/<run_id>/`` partition (the prefix ``save_artifact`` writes
-    to via ``upload_generated``). A ref naming a different run — or any other
-    GCS object entirely — is rejected. This is the fix for the cross-run /
-    arbitrary GCS-read vulnerability (C1): without this check, any
-    authenticated user could set an ``image`` element's ``ref`` to another
-    run's (or any SA-readable) ``gs://`` object and have the server fetch it
-    with its own service-account credentials.
+    cloud mode: the ref is a flat object name (``[A-Za-z0-9._-]``, no ``/``,
+    no ``..``) that is only ever resolved inside this run's own
+    ``generated/gd/<run_id>/`` partition, so it cannot name another run's — or
+    any other — object. Legacy ``gs://`` refs must sit under that same
+    partition. This is the fix for the cross-run / arbitrary GCS-read
+    vulnerability (C1): without it, any authenticated user could set an
+    ``image`` element's ``ref`` to another run's (or any SA-readable) object
+    and have the server fetch it with its own service-account credentials.
 
-    The bucket itself is additionally pinned to the configured
+    For ``gs://`` refs the bucket is additionally pinned to the configured
     ``gcs_bucket_name`` when that setting is available, as defense in depth
     against a ref pointing at a *different* bucket; the partition-prefix
-    check above is the primary (and only strictly required) gate, so this
-    stays safe to run even where settings aren't wired up (e.g. tests that
-    fake only ``app.services.storage``).
+    check is the primary (and only strictly required) gate, so this stays safe
+    to run even where settings aren't wired up (e.g. tests that fake only
+    ``app.services.storage``).
     """
     if not isinstance(ref, str) or not ref.strip():
         return False
     if not ref.startswith("gs://"):
+        if _use_cloud():
+            return _is_artifact_name(ref)
         # fs-mode relative ref — containment checked by artifact_abspath at read time.
         return True
-    rest = ref[len("gs://"):]
-    bucket, _, object_path = rest.partition("/")
-    if not bucket or not object_path:
+    if _own_gs_object_name(run_id, ref) is None:
         return False
-    if not object_path.startswith(_gcs_partition_prefix(run_id)):
-        return False
+    bucket = ref[len("gs://"):].partition("/")[0]
     try:
         from app.config import settings
 
@@ -233,14 +278,32 @@ def is_own_artifact_ref(run_id: str, ref: str) -> bool:
     return True
 
 
-def read_artifact(run_id: str, ref: str) -> bytes:
-    """Read an artifact's bytes from its stored reference (fs path or gs:// URI).
+def artifact_url_ref(run_id: str, ref: str) -> str:
+    """The path segment the API proxy serves ``ref`` under
+    (``/api/gd/runs/<run_id>/artifact/<this>``).
 
-    Enforces that ``ref`` belongs to ``run_id``'s own artifact partition (cloud
-    mode) — see ``is_own_artifact_ref`` — so a foreign/cross-run ``gs://`` ref
-    can never be fetched with the server's service-account credentials (C1
-    fix). Every legitimate caller already only ever reads its own run's
-    artifacts, so this check is safe to apply unconditionally.
+    Cloud names and fs relative paths are returned as-is; a legacy ``gs://``
+    ref of this run is reduced to its object name, so every URL the client
+    receives is a plain relative path that survives the frontend's
+    ``${API_URL}${path}`` join and the relay's per-segment re-encoding."""
+    if isinstance(ref, str) and ref.startswith("gs://"):
+        return _own_gs_object_name(run_id, ref) or ref
+    return ref
+
+
+def read_artifact(run_id: str, ref: str) -> bytes:
+    """Read an artifact's bytes from its stored reference (fs path, cloud
+    object name, or a legacy gs:// URI).
+
+    Enforces that ``ref`` belongs to ``run_id``'s own artifact space — see
+    ``is_own_artifact_ref`` — so a foreign/cross-run ref can never be fetched
+    with the server's service-account credentials (C1 fix). Every legitimate
+    caller already only ever reads its own run's artifacts, so this check is
+    safe to apply unconditionally.
+
+    Cloud mode reads from GCS, never this instance's disk, so a run created on
+    another instance (or before the last deploy) resolves the same here. A
+    missing object raises :class:`FileNotFoundError`.
     """
     if not is_own_artifact_ref(run_id, ref):
         raise ValueError(f"artifact ref does not belong to run {run_id!r}")
@@ -248,6 +311,10 @@ def read_artifact(run_id: str, ref: str) -> bytes:
         from app.services import storage
 
         return storage.download_bytes(ref)
+    if _use_cloud():
+        from app.services import storage
+
+        return storage.read_generated(f"{_GCS_PARTITION}/{run_id}", ref)
     return artifact_abspath(run_id, ref).read_bytes()
 
 

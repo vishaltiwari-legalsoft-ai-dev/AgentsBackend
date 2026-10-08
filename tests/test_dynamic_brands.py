@@ -156,15 +156,82 @@ def test_firestore_spec_source_isolates_malformed_doc(monkeypatch, tmp_path, val
     assert specs[0]["id"] == valid_dyn_spec["id"]
 
 
-def test_firestore_spec_source_returns_empty_on_firestore_error(monkeypatch):
-    """A Firestore failure yields [] with a warning — never an exception."""
+def test_firestore_spec_source_raises_when_the_brand_list_is_unreadable(monkeypatch):
+    """An unreadable brand list is NOT "no brands": the source raises so the
+    registry can keep what it last read (S4). Returning [] here used to make
+    every member brand 404 on that instance until the next brand write."""
     from app.services import gd_brand_source
 
     def boom():
         raise RuntimeError("firestore down")
 
     monkeypatch.setattr(gd_brand_source, "_list_brands", boom)
-    assert gd_brand_source.firestore_spec_source() == []
+    with pytest.raises(RuntimeError, match="firestore down"):
+        gd_brand_source.firestore_spec_source()
+
+
+def test_a_failed_brand_read_keeps_the_brands_and_does_not_advance_the_version(
+        monkeypatch, valid_dyn_spec, version_source):
+    """S4: instance built at v1 with a member brand; the store moves to v2 and
+    the re-read fails. The member brand stays served, v2 is NOT recorded as
+    loaded, and the read is retried (once) after the window — not per request."""
+    monkeypatch.setenv("GD_DYNAMIC_BRANDS", "1")
+    state = {"fail": False, "calls": 0}
+
+    def source():
+        state["calls"] += 1
+        if state["fail"]:
+            raise RuntimeError("firestore down")
+        return [valid_dyn_spec]
+
+    registry.register_dynamic_source(source)
+    assert registry.get_pack(valid_dyn_spec["id"]).id == valid_dyn_spec["id"]
+    assert registry._loaded_version == 1
+
+    state["fail"] = True
+    version_source["version"] = 2
+    monkeypatch.setattr(registry, "_version_checked_at", None)   # past the throttle
+    assert registry.get_pack(valid_dyn_spec["id"]).id == valid_dyn_spec["id"]  # kept
+    assert registry._loaded_version == 1                          # not advanced
+    calls = state["calls"]
+    for _ in range(5):                                            # inside the retry window
+        registry.get_pack(valid_dyn_spec["id"])
+    assert state["calls"] == calls                                # no read storm
+
+    state["fail"] = False
+    monkeypatch.setattr(registry, "_dynamic_failed_at",
+                        registry._dynamic_failed_at - registry.VERSION_CHECK_SECONDS)
+    assert registry.get_pack(valid_dyn_spec["id"]).id == valid_dyn_spec["id"]
+    assert registry._loaded_version == 2                          # recovered
+    assert registry._dynamic_failed_at is None
+
+
+def test_a_cold_start_read_failure_is_retried_after_the_window(monkeypatch, valid_dyn_spec,
+                                                               version_source):
+    """Nothing kept yet: the built-ins serve, the member brand answers 404 —
+    and the next read after the window brings it in instead of waiting for a
+    brand write that may never come."""
+    monkeypatch.setenv("GD_DYNAMIC_BRANDS", "1")
+    monkeypatch.setattr(registry, "_loaded_version", None)   # a fresh process
+    version_source["version"] = 7
+    state = {"fail": True}
+
+    def source():
+        if state["fail"]:
+            raise RuntimeError("firestore down")
+        return [valid_dyn_spec]
+
+    registry.register_dynamic_source(source)
+    with pytest.raises(registry.UnknownBrand):
+        registry.get_pack(valid_dyn_spec["id"])
+    assert registry.get_pack("legalsoft").name == "Legal Soft"
+    assert registry._loaded_version is None
+
+    state["fail"] = False
+    monkeypatch.setattr(registry, "_dynamic_failed_at",
+                        registry._dynamic_failed_at - registry.VERSION_CHECK_SECONDS)
+    assert registry.get_pack(valid_dyn_spec["id"]).id == valid_dyn_spec["id"]
+    assert registry._loaded_version == 7
 
 
 # --------------------------------------------------------------------------- #
@@ -213,10 +280,70 @@ def test_list_brands_bypasses_stale_firestore_cache(monkeypatch):
     # this stale value instead of hitting the fake db above.
     monkeypatch.setattr(
         firestore_repo, "_brands_cache",
-        (time.monotonic(), [{"id": "stale1", "brand_name": "Stale Brand"}]))
+        (time.monotonic(), None, [{"id": "stale1", "brand_name": "Stale Brand"}]))
 
     result = gd_brand_source._list_brands()
     assert [b["id"] for b in result] == ["fresh1"]
+
+
+@pytest.fixture()
+def remote_brand_store(monkeypatch):
+    """A brands collection + ``meta/brands`` version another instance writes to
+    directly — nothing on this instance invalidates its cache."""
+    from tests.test_brand_enrichment import _MemDb
+
+    from app.services import firestore_repo
+
+    db = _MemDb()
+    db.data["brands"] = {"b1": {"brand_name": "Alpha"}}
+    db.data["meta"] = {"brands": {"version": 1}}
+    monkeypatch.setattr(firestore_repo, "_db", lambda: db)
+    monkeypatch.setattr(firestore_repo, "_brands_cache", None)
+    monkeypatch.setattr(firestore_repo, "_brands_version_seen", None)
+    return db
+
+
+def test_brand_list_cache_follows_the_version_another_instance_bumped(monkeypatch,
+                                                                      remote_brand_store):
+    """S3: a brand created on another instance is listed here once the version
+    check window passes — not after the full 60 s TTL."""
+    from app.services import firestore_repo
+
+    assert [b["id"] for b in firestore_repo.list_brands()] == ["b1"]
+    streams = len(remote_brand_store.streams)
+
+    # Another instance writes a brand and bumps the version (no local invalidate).
+    remote_brand_store.data["brands"]["b2"] = {"brand_name": "Beta"}
+    remote_brand_store.data["meta"]["brands"]["version"] = 2
+
+    # Inside the version window the cached list serves — one version read per window.
+    assert [b["id"] for b in firestore_repo.list_brands()] == ["b1"]
+    assert len(remote_brand_store.streams) == streams
+
+    seen_at, seen = firestore_repo._brands_version_seen
+    monkeypatch.setattr(firestore_repo, "_brands_version_seen",
+                        (seen_at - firestore_repo._BRANDS_VERSION_CHECK_SECONDS, seen))
+    assert [b["id"] for b in firestore_repo.list_brands()] == ["b1", "b2"]
+    assert firestore_repo._brands_cache[1] == 2
+
+
+def test_brand_list_cache_falls_back_to_its_ttl_when_the_version_is_unreadable(
+        monkeypatch, remote_brand_store):
+    from app.services import firestore_repo
+
+    assert [b["id"] for b in firestore_repo.list_brands()] == ["b1"]
+    remote_brand_store.data["brands"]["b2"] = {"brand_name": "Beta"}
+
+    def boom():
+        raise RuntimeError("meta unreadable")
+
+    monkeypatch.setattr(firestore_repo, "brands_version", boom)
+    monkeypatch.setattr(firestore_repo, "_brands_version_seen", None)
+    assert [b["id"] for b in firestore_repo.list_brands()] == ["b1"]   # TTL still serves
+    fetched_at, version, brands = firestore_repo._brands_cache
+    monkeypatch.setattr(firestore_repo, "_brands_cache",
+                        (fetched_at - firestore_repo._BRANDS_TTL_SECONDS, version, brands))
+    assert [b["id"] for b in firestore_repo.list_brands()] == ["b1", "b2"]
 
 
 def test_firestore_repo_builtin_pack_ids_match_the_static_registry(monkeypatch):

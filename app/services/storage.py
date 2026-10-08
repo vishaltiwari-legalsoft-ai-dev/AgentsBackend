@@ -166,6 +166,43 @@ def upload_generated(
     )
 
 
+def put_generated(partition: str, file_name: str, data: bytes, content_type: str) -> str:
+    """Store an agent's per-run artifact at ``generated/<partition>/<file_name>``
+    and return its durable ``gs://`` URI.
+
+    ``upload_generated``'s sibling for artifacts that are only ever served back
+    through an authenticated API proxy (GD + Creative runs): no signed URL is
+    minted, so a write is one GCS round trip instead of that plus an IAM
+    signBlob call per image. Raises when the bucket is not configured or the
+    write fails — an artifact that did not land must never be recorded.
+    """
+    return _put_object(f"generated/{partition}/{_safe_name(file_name)}", data, content_type)
+
+
+def read_generated(partition: str, file_name: str) -> bytes:
+    """Bytes of ``generated/<partition>/<file_name>`` in the configured bucket.
+
+    The caller names the object by partition + file name only — never a bucket
+    or a full path — so a client-supplied name cannot reach outside the
+    partition. Raises :class:`FileNotFoundError` when the object does not exist
+    (an ordinary "not there", answered 404); every other failure propagates for
+    the caller to report as a storage fault.
+    """
+    from google.api_core.exceptions import NotFound
+
+    bucket_name = settings.require("gcs_bucket_name")
+    object_path = f"generated/{partition}/{_safe_name(file_name)}"
+    try:
+        return (
+            _storage()
+            .bucket(bucket_name)
+            .blob(object_path)
+            .download_as_bytes(timeout=_TRANSFER_TIMEOUT_SECONDS)
+        )
+    except NotFound as exc:
+        raise FileNotFoundError(f"gs://{bucket_name}/{object_path}") from exc
+
+
 def upload_brand_asset(
     brand_id: str,
     kind: str,

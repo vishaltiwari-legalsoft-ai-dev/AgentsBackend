@@ -99,9 +99,23 @@ def _call_model(prompt: str, image_png: bytes) -> str:
     # creator's per-agent vision model must reach all three or the Agent
     # Configuration dropdown is a switch that changes one path in three.
     model = runtime_config.get_for_agent(GD_AGENT_ID, "openrouter_vision_model")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(analyze_images, prompt, [(image_png, "image/png")], model)
-        return future.result(timeout=_VISION_TIMEOUT_S)
+    return _bounded(analyze_images, prompt, [(image_png, "image/png")], model)
+
+
+def _bounded(fn, *args):
+    """``fn(*args)`` on a worker thread, waited on for at most ``_VISION_TIMEOUT_S``.
+
+    Not a ``with ThreadPoolExecutor()`` block: its ``__exit__`` joins the worker,
+    so a timed-out call still held the request until httpx's own 180 s deadline —
+    past the 300 s relay cut once retried — while the user saw nothing. Here the
+    pool is shut down without waiting: the caller gets ``TimeoutError`` at the
+    budget and falls back; the abandoned worker ends when httpx gives up."""
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                                                 thread_name_prefix="gd-vision-placement")
+    try:
+        return pool.submit(fn, *args).result(timeout=_VISION_TIMEOUT_S)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _build_prompt(headline: str, subheading_count: int, cta: str,

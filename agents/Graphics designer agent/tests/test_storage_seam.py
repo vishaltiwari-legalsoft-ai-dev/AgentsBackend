@@ -53,16 +53,25 @@ def _install_cloud_fakes(monkeypatch):
     fr = types.ModuleType("app.services.firestore_repo")
     fr._db = lambda: _DB()
 
-    blobs: dict = {}
+    blobs: dict = {}   # object path (no bucket) -> bytes
     st = types.ModuleType("app.services.storage")
 
-    def _upload(partition, file_name, data, content_type):
-        uri = f"gs://bucket/generated/{partition}/{file_name}"
-        blobs[uri] = data
-        return uri, uri + "?sig"
+    def _put(partition, file_name, data, content_type):
+        blobs[f"generated/{partition}/{file_name}"] = data
+        return f"gs://bucket/generated/{partition}/{file_name}"
 
-    st.upload_generated = _upload
-    st.download_bytes = lambda uri: blobs[uri]
+    def _read(partition, file_name):
+        try:
+            return blobs[f"generated/{partition}/{file_name}"]
+        except KeyError:
+            raise FileNotFoundError(file_name) from None
+
+    def _download(uri):
+        return blobs[uri.split("/", 3)[3]]
+
+    st.put_generated = _put
+    st.read_generated = _read
+    st.download_bytes = _download
 
     services = types.ModuleType("app.services")
     services.storage = st
@@ -97,8 +106,41 @@ def test_cloud_routes_runs_to_firestore_and_artifacts_to_gcs(monkeypatch):
     assert runs.get_run(run["id"])["id"] == run["id"]   # read back from Firestore
 
     ref = runs.save_artifact(run["id"], 2, "B", 1, b"CLOUDPNG")
-    assert ref.startswith("gs://") and blobs[ref] == b"CLOUDPNG"   # artifact in GCS
-    assert runs.read_artifact(run["id"], ref) == b"CLOUDPNG"       # gs:// read routes to GCS
+    # The ref is the flat object name inside the run's partition — no bucket, no
+    # "/", nothing the Vercel relay's path rejoin can mangle.
+    assert ref == "stage-2-B-1.png"
+    assert blobs[f"generated/gd/{run['id']}/stage-2-B-1.png"] == b"CLOUDPNG"  # artifact in GCS
+    assert runs.read_artifact(run["id"], ref) == b"CLOUDPNG"                 # read routes to GCS
+    assert runs.artifact_url_ref(run["id"], ref) == ref
+
+
+def test_cloud_names_are_always_valid_refs(monkeypatch):
+    """Whatever a variant id carries, the stored name is a ref the ownership
+    gate accepts and a URL segment that needs no escaping."""
+    _install_cloud_fakes(monkeypatch)
+    run = runs.create_run("u", "legalsoft")
+    ref = runs.save_artifact(run["id"], 3, "weird/../id é", "ab12", b"X")
+    assert "/" not in ref and ".." not in ref
+    assert runs.is_own_artifact_ref(run["id"], ref)
+    assert runs.read_artifact(run["id"], ref) == b"X"
+
+
+def test_legacy_gs_ref_still_reads_and_serves_by_name(monkeypatch):
+    """Docs written before refs became names carry full gs:// URIs: they still
+    read, and the URL handed to the browser is the plain object name."""
+    _, blobs = _install_cloud_fakes(monkeypatch)
+    run = runs.create_run("u", "legalsoft")
+    legacy = f"gs://bucket/generated/gd/{run['id']}/stage-1-A-1.png"
+    blobs[legacy.split("/", 3)[3]] = b"OLD"
+    assert runs.read_artifact(run["id"], legacy) == b"OLD"
+    assert runs.artifact_url_ref(run["id"], legacy) == "stage-1-A-1.png"
+
+
+def test_missing_cloud_artifact_is_file_not_found(monkeypatch):
+    _install_cloud_fakes(monkeypatch)
+    run = runs.create_run("u", "legalsoft")
+    with pytest.raises(FileNotFoundError):
+        runs.read_artifact(run["id"], "stage-9-Z-1.png")
 
 
 # ── C1 regression: cross-run / arbitrary GCS object read ──────────────────────
@@ -111,10 +153,28 @@ def test_read_artifact_rejects_foreign_run_gs_ref(monkeypatch):
     _install_cloud_fakes(monkeypatch)
     victim = runs.create_run("victim", "legalsoft")
     attacker = runs.create_run("attacker", "legalsoft")
-    victim_ref = runs.save_artifact(victim["id"], 3, "upload", 1, b"SECRET")
+    runs.save_artifact(victim["id"], 3, "upload", 1, b"SECRET")
+    victim_uri = f"gs://bucket/generated/gd/{victim['id']}/stage-3-upload-1.png"
 
     with pytest.raises(ValueError):
+        runs.read_artifact(attacker["id"], victim_uri)
+
+
+def test_a_bare_name_only_ever_resolves_inside_the_callers_own_run(monkeypatch):
+    """The victim's object NAME, replayed on the attacker's run, is looked up in
+    the attacker's partition — it can never return the victim's bytes."""
+    _install_cloud_fakes(monkeypatch)
+    victim = runs.create_run("victim", "legalsoft")
+    attacker = runs.create_run("attacker", "legalsoft")
+    victim_ref = runs.save_artifact(victim["id"], 3, "upload", 1, b"SECRET")
+
+    with pytest.raises(FileNotFoundError):
         runs.read_artifact(attacker["id"], victim_ref)
+    for escape in (f"../{victim['id']}/{victim_ref}", f"{victim['id']}/{victim_ref}",
+                   "..", ".hidden", "a\b.png"):
+        assert runs.is_own_artifact_ref(attacker["id"], escape) is False
+        with pytest.raises(ValueError):
+            runs.read_artifact(attacker["id"], escape)
 
 
 def test_read_artifact_rejects_arbitrary_gs_uri(monkeypatch):
