@@ -17,6 +17,7 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -435,11 +436,63 @@ def archive_brand(brand_id: str) -> dict[str, Any]:
     return result
 
 
-def add_brand_asset(brand_id: str, kind: str, data: bytes, ext: str) -> dict[str, Any]:
-    """Upload a kit file (``logo`` | ``font`` | ``guidelines``) to
-    ``brands/<id>/<kind>s/<sha256[:16]>.<ext>`` and record its ``gs://`` URI
-    under ``brand_metadata.enrichment.{logo,font,guideline}_files``; a logo
-    also becomes ``logo_uri``. The same bytes twice is one entry.
+@dataclass(frozen=True)
+class StoredUpload:
+    """A file a direct upload's finalize step has ALREADY placed in GCS: the
+    working copy GD reads (``working_uri`` — what every existing consumer of
+    ``logo_uri`` / ``*_files`` / a reference's ``gs_uri`` resolves to) and the
+    untouched original it was derived from. For fonts and PDFs, which are not
+    derived, the working copy IS the original.
+
+    ``content_id`` is the GCS MD5 of the original (hex) — measured by GCS, so
+    finalizing the same upload twice lands on the same ids."""
+
+    content_id: str
+    working_uri: str
+    working_object_path: str
+    working_content_type: str
+    original_uri: str
+    original_bytes: int
+    working_width: int | None = None
+    working_height: int | None = None
+    original_width: int | None = None
+    original_height: int | None = None
+    flags: tuple[str, ...] = ()
+    pages_used: str | None = None
+    pages: int | None = None
+
+    def original_fields(self) -> dict[str, Any]:
+        """The optional fields a stored record carries (read with defaults)."""
+        return {
+            "working_uri": self.working_uri,
+            "original_uri": self.original_uri,
+            "original_bytes": self.original_bytes,
+            "original_width": self.original_width,
+            "original_height": self.original_height,
+            "flags": list(self.flags),
+            "pages_used": self.pages_used,
+            "pages": self.pages,
+        }
+
+
+#: ``brand_metadata.enrichment.originals``: one record per directly-uploaded
+#: kit file, keyed by ``working_uri`` — the ``*_files`` lists stay plain URI
+#: strings because every existing reader iterates them as such.
+_ENRICHMENT_ORIGINALS_KEY = "originals"
+
+
+def add_brand_asset(brand_id: str, kind: str, data: bytes | None = None, ext: str | None = None,
+                    *, stored: StoredUpload | None = None) -> dict[str, Any]:
+    """Record a kit file (``logo`` | ``font`` | ``guidelines``) under
+    ``brand_metadata.enrichment.{logo,font,guideline}_files``; a logo also
+    becomes ``logo_uri``. The same file twice is one entry.
+
+    Two sources, one transaction:
+    - ``data`` + ``ext`` (multipart route): uploaded here to
+      ``brands/<id>/<kind>s/<sha256[:16]>.<ext>``;
+    - ``stored`` (direct upload, already in GCS): its ``working_uri`` is the
+      URI recorded, and its original's facts are appended to
+      ``enrichment.originals``.
 
     Font caveat for whoever builds ``gd_spec``: ``gd_brand_source`` matches
     ``font_variants[].file`` to these URIs by BASENAME, i.e. the hash name.
@@ -448,9 +501,11 @@ def add_brand_asset(brand_id: str, kind: str, data: bytes, ext: str) -> dict[str
 
     if kind not in _ASSET_KIND_KEY:
         raise ValueError(f"unknown brand asset kind {kind!r}")
+    if (stored is None) == (data is None):
+        raise ValueError("pass either the file bytes or a stored upload")
     ref = _db().collection("brands").document(brand_id)
     _require_user_brand(ref.get(), brand_id)  # refuse before any bytes move
-    uri = storage.put_brand_asset(brand_id, kind, data, ext)
+    uri = stored.working_uri if stored else storage.put_brand_asset(brand_id, kind, data, ext or "")
     list_key = _ASSET_KIND_KEY[kind]
 
     def _apply(txn) -> dict[str, Any]:
@@ -458,9 +513,15 @@ def add_brand_asset(brand_id: str, kind: str, data: bytes, ext: str) -> dict[str
         meta = dict(doc.get("brand_metadata") or {})
         enrichment = dict(meta.get("enrichment") or {})
         files = list(enrichment.get(list_key) or [])
-        if uri not in files:
+        already = uri in files
+        if not already:
             files.append(uri)
         enrichment[list_key] = files
+        if stored is not None:
+            originals = [r for r in (enrichment.get(_ENRICHMENT_ORIGINALS_KEY) or [])
+                         if isinstance(r, dict) and r.get("working_uri") != uri]
+            originals.append({"kind": kind, **stored.original_fields()})
+            enrichment[_ENRICHMENT_ORIGINALS_KEY] = originals
         meta["enrichment"] = enrichment
         now = _now()
         fields: dict[str, Any] = {"brand_metadata": meta, "updated_at": now}
@@ -468,11 +529,19 @@ def add_brand_asset(brand_id: str, kind: str, data: bytes, ext: str) -> dict[str
             fields["logo_uri"] = uri
         txn.update(ref, fields)
         _bump_brands_version(txn, now)
-        return {"brand_id": brand_id, "kind": kind, "uri": uri}
+        return {"brand_id": brand_id, "kind": kind, "uri": uri, "already_recorded": already}
 
     result = _transact(_apply)
     _invalidate_brands_cache()
     return result
+
+
+def brand_asset_originals(brand: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """``{working_uri: original record}`` for a brand doc (``{}`` for kits
+    uploaded before direct uploads existed — read with a default)."""
+    enrichment = (brand.get("brand_metadata") or {}).get("enrichment") or {}
+    return {r["working_uri"]: r for r in enrichment.get(_ENRICHMENT_ORIGINALS_KEY) or []
+            if isinstance(r, dict) and r.get("working_uri")}
 
 
 def list_brand_assets(brand_id: str) -> dict[str, Any]:
@@ -509,14 +578,15 @@ def _active_count(snap) -> int:
 def add_reference(
     brand_id: str,
     *,
-    data: bytes,
-    ext: str,
+    data: bytes | None = None,
+    ext: str | None = None,
     kind: str,
     uploaded_by: str,
     width: int | None = None,
     height: int | None = None,
     note: str = "",
     creative_type: str | None = None,
+    stored: StoredUpload | None = None,
 ) -> dict[str, Any]:
     """Store one reference file and its doc; returns the doc.
 
@@ -526,13 +596,26 @@ def add_reference(
     enforced on a counter doc written in the same transaction as the
     reference, so parallel uploads cannot overshoot. Legacy Drive-synced
     references do not count toward the cap.
+
+    ``stored`` (a direct upload already in GCS) replaces ``data``/``ext``:
+    nothing is uploaded here, ``ref_id`` is the original's GCS MD5, the doc's
+    ``gs_uri``/``object_path`` are the WORKING copy's (what generation reads)
+    and the original's facts ride along as optional fields.
     """
     from app.services import storage
 
     if kind not in ("creative", "reference"):
         raise ValueError("kind must be 'creative' or 'reference'")
-    ref_id = storage.content_hash(data)
-    object_path = storage.reference_object_path(brand_id, data, ext)  # validates ext
+    if (stored is None) == (data is None):
+        raise ValueError("pass either the file bytes or a stored upload")
+    if stored is not None:
+        ref_id = stored.content_id
+        object_path = stored.working_object_path
+        content_type = stored.working_content_type
+    else:
+        ref_id = storage.content_hash(data)
+        object_path = storage.reference_object_path(brand_id, data, ext or "")  # validates ext
+        content_type = storage.content_type_for_ext(ext or "")
     brand_ref = _db().collection("brands").document(brand_id)
     counter_ref = _db().collection(_REFERENCE_COUNTS_COLLECTION).document(brand_id)
     doc_ref = _db().collection(_REFERENCES_COLLECTION).document(_reference_doc_id(brand_id, ref_id))
@@ -550,7 +633,7 @@ def add_reference(
     if brand_id not in BUILTIN_GD_PACK_IDS:
         _require_reference_target(brand_id, brand_ref.get())
     _refuse_if_full(doc_ref.get(), counter_ref.get())
-    gs_uri = storage.put_reference_file(brand_id, data, ext)
+    gs_uri = stored.working_uri if stored else storage.put_reference_file(brand_id, data, ext or "")
 
     def _apply(txn) -> dict[str, Any]:
         if brand_id not in BUILTIN_GD_PACK_IDS:
@@ -566,7 +649,7 @@ def add_reference(
             "creative_type": creative_type,
             "object_path": object_path,
             "gs_uri": gs_uri,
-            "content_type": storage.content_type_for_ext(ext),
+            "content_type": content_type,
             "width": width,
             "height": height,
             "note": note or "",
@@ -574,6 +657,8 @@ def add_reference(
             "created_at": now,
             "deleted_at": None,
         }
+        if stored is not None:
+            doc |= stored.original_fields()
         txn.set(doc_ref, doc)
         txn.set(counter_ref, {"active": firestore.Increment(1), "updated_at": now}, merge=True)
         return doc | {"id": doc_ref.id}

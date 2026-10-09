@@ -990,3 +990,503 @@ def test_upload_and_stage4_handlers_are_sync_so_blocking_io_stays_off_the_event_
 
     for handler in (gd.stage4_endpoint, gd.gd_subject_upload, gd.gd_element_upload):
         assert not inspect.iscoroutinefunction(handler), handler.__name__
+
+
+# =========================================================================== #
+# Direct-to-GCS uploads (2026-10-09) — sign, browser PUT, finalize.
+#
+# ``_DirectGcs`` behaves like the bucket for this flow: the browser PUT is
+# refused unless it carries exactly the signed headers (content type, length
+# range, write-once), metadata reports GCS's own MD5, and rewrite / ranged
+# read / stream / delete work. It writes into the same ``uploads`` dict the
+# brand store fake uses, so font materialization reads the same objects.
+# The GD agent suites import ``install_direct_gcs`` / ``direct_upload`` from
+# here. Large and adversarial files are generated per test, never committed.
+# =========================================================================== #
+
+class _DirectGcs:
+    def __init__(self, store=None, bucket="test-bucket"):
+        self.store: dict = {} if store is None else store   # path -> (bytes, content type)
+        self.meta: dict = {}                                 # path -> {generation, disposition}
+        self.signed: dict = {}                               # path -> signing kwargs
+        self.bucket_name = bucket
+        self._generation = 0
+
+    # -- the browser ---------------------------------------------------------
+    def browser_put(self, signed: dict, data: bytes, headers: dict | None = None) -> int:
+        """PUT ``data`` to a signed URL the way GCS checks it: 403 when the
+        headers are not exactly the signed ones, 400 outside the length
+        range, 412 when the object already exists (write-once)."""
+        path = signed["upload_url"].split(f"/{self.bucket_name}/", 1)[1].split("?", 1)[0]
+        kw = self.signed[path]
+        assert kw["method"] == "PUT" and kw["version"] == "v4"
+        sent = signed["headers"] if headers is None else headers
+        if sent != {"Content-Type": kw["content_type"], **kw["headers"]}:
+            return 403
+        low, high = map(int, sent["x-goog-content-length-range"].split(","))
+        if not low <= len(data) <= high:
+            return 400
+        if sent.get("x-goog-if-generation-match") == "0" and path in self.store:
+            return 412
+        self._write(path, data, sent["Content-Type"])
+        return 200
+
+    def pending(self) -> list[str]:
+        return sorted(p for p in self.store if p.startswith("uploads/pending/")
+                      and not p.endswith(".receipt.json"))
+
+    # -- the client library surface ------------------------------------------
+    def _write(self, path, data, content_type, disposition=None):
+        self._generation += 1
+        self.store[path] = (bytes(data), content_type)
+        self.meta[path] = {"generation": self._generation, "disposition": disposition}
+
+    def bucket(self, name):
+        assert name == self.bucket_name, name
+        return _DirectBucket(self)
+
+
+class _DirectBucket:
+    def __init__(self, gcs):
+        self.gcs = gcs
+
+    def blob(self, path, **_kw):
+        return _DirectBlob(self.gcs, path)
+
+    def get_blob(self, path, timeout=None, **_kw):
+        return _DirectBlob(self.gcs, path) if path in self.gcs.store else None
+
+
+class _DirectBlob:
+    def __init__(self, gcs, path):
+        import base64
+        import hashlib
+
+        self.gcs, self.name = gcs, path
+        self.content_type = None
+        self.content_disposition = None
+        if path in gcs.store:
+            data, self.content_type = gcs.store[path]
+            self.size = len(data)
+            self.md5_hash = base64.b64encode(hashlib.md5(data).digest()).decode()
+            self.generation = gcs.meta.get(path, {}).get("generation", 1)
+
+    def _data(self, if_generation_match=None):
+        from google.api_core.exceptions import NotFound, PreconditionFailed
+
+        if self.name not in self.gcs.store:
+            raise NotFound(self.name)
+        generation = self.gcs.meta.get(self.name, {}).get("generation", 1)
+        if if_generation_match is not None and generation != if_generation_match:
+            raise PreconditionFailed(self.name)
+        return self.gcs.store[self.name][0]
+
+    def generate_signed_url(self, *, version, expiration, method, content_type=None, headers=None,
+                            response_disposition=None, **_kw):
+        self.gcs.signed[self.name] = {"version": version, "expiration": expiration, "method": method,
+                                      "content_type": content_type, "headers": dict(headers or {}),
+                                      "response_disposition": response_disposition}
+        query = f"X-Goog-Signature=fake&X-Goog-Method={method}"
+        if response_disposition:
+            query += "&response-content-disposition=" + response_disposition.replace(" ", "%20")
+        return f"https://storage.test/{self.gcs.bucket_name}/{self.name}?{query}"
+
+    def upload_from_string(self, data, content_type=None, timeout=None, **_kw):
+        self.gcs._write(self.name, data, content_type)
+
+    def download_as_bytes(self, start=None, end=None, if_generation_match=None, timeout=None, **_kw):
+        data = self._data(if_generation_match)
+        if start is None:
+            return data
+        return data[start:(end + 1) if end is not None else None]
+
+    def open(self, mode="rb", chunk_size=None, if_generation_match=None, timeout=None, **_kw):
+        assert mode == "rb"
+        return io.BytesIO(self._data(if_generation_match))
+
+    def rewrite(self, source, token=None, if_source_generation_match=None, if_generation_match=None,
+                timeout=None, **_kw):
+        from google.api_core.exceptions import PreconditionFailed
+
+        data = source._data(if_source_generation_match)
+        if if_generation_match == 0 and self.name in self.gcs.store:
+            raise PreconditionFailed(self.name)
+        self.gcs._write(self.name, data, self.content_type, self.content_disposition)
+        return None, len(data), len(data)
+
+    def delete(self, timeout=None, **_kw):
+        from google.api_core.exceptions import NotFound
+
+        if self.name not in self.gcs.store:
+            raise NotFound(self.name)
+        del self.gcs.store[self.name]
+        self.gcs.meta.pop(self.name, None)
+
+
+def install_direct_gcs(monkeypatch, store: dict | None = None) -> _DirectGcs:
+    """Direct uploads ON over a ``_DirectGcs`` (and nothing real)."""
+    from app.config import settings
+    from app.services import storage
+
+    gcs = _DirectGcs(store)
+    monkeypatch.setattr(storage, "_storage", lambda: gcs)
+    monkeypatch.setattr(storage, "_signing_kwargs", lambda: {})
+    monkeypatch.setattr(storage, "is_configured", lambda: True)
+    monkeypatch.setattr(settings, "gcs_bucket_name", "test-bucket", raising=False)
+    monkeypatch.setattr(settings, "jwt_secret", "test-jwt-secret-for-tickets", raising=False)
+    monkeypatch.setenv("GD_DIRECT_UPLOADS", "1")
+    return gcs
+
+
+def direct_upload(base: str, surface: str, data: bytes, gcs: _DirectGcs, *,
+                  content_type: str = "application/octet-stream", file_name: str = "file.bin",
+                  finalize: bool = True, http=None, **extra):
+    """sign -> browser PUT -> finalize. Returns ``(signed, finalize_response)``."""
+    http = http or client
+    r = http.post(f"{base}/uploads", json={"surface": surface, "content_type": content_type,
+                                           "size": len(data), "file_name": file_name})
+    assert r.status_code == 200, r.text
+    signed = r.json()
+    assert gcs.browser_put(signed, data) == 200
+    if not finalize:
+        return signed, None
+    return signed, http.post(f"{base}/uploads/finalize",
+                             json={"ticket": signed["ticket"], "file_name": file_name, **extra})
+
+
+def _md5(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.md5(data).hexdigest()
+
+
+def _real_ttf(family: str = "Acme Sans", style: str = "Bold") -> bytes:
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+
+    pen = TTGlyphPen(None)
+    pen.moveTo((0, 0))
+    pen.lineTo((500, 700))
+    pen.lineTo((1000, 0))
+    pen.closePath()
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder([".notdef", "A"])
+    fb.setupCharacterMap({0x41: "A"})
+    fb.setupGlyf({".notdef": TTGlyphPen(None).glyph(), "A": pen.glyph()})
+    fb.setupHorizontalMetrics({".notdef": (1000, 0), "A": (1000, 0)})
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({"familyName": family, "styleName": style})
+    fb.setupOS2()
+    fb.setupPost()
+    buf = io.BytesIO()
+    fb.save(buf)
+    return buf.getvalue()
+
+
+def _pdf(pages: int) -> bytes:
+    from pypdf import PdfWriter
+
+    w = PdfWriter()
+    for _ in range(pages):
+        w.add_blank_page(width=200, height=200)
+    buf = io.BytesIO()
+    w.write(buf)
+    return buf.getvalue()
+
+
+def _jpeg(w: int, h: int, color=(200, 40, 40), mode: str = "RGB", **save) -> bytes:
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new(mode, (w, h), color).save(buf, format="JPEG", **save)
+    return buf.getvalue()
+
+
+@pytest.fixture()
+def direct(brand_store, monkeypatch):
+    gcs = install_direct_gcs(monkeypatch, store=brand_store.uploads)
+    assert _create().status_code == 201
+    return gcs
+
+
+BRAND = "/api/gd/brands/acme-co"
+
+
+def test_direct_upload_routes_answer_503_while_the_flag_is_off(direct, monkeypatch):
+    monkeypatch.delenv("GD_DIRECT_UPLOADS", raising=False)
+    r = client.post(f"{BRAND}/uploads", json={"surface": "logo", "content_type": "image/png"})
+    assert r.status_code == 503 and r.json()["detail"]["code"] == "direct_uploads_disabled"
+    r = client.post(f"{BRAND}/uploads/finalize", json={"ticket": "x.y"})
+    assert r.status_code == 503 and r.json()["detail"]["code"] == "direct_uploads_disabled"
+    monkeypatch.setenv("GD_DIRECT_UPLOADS", "0")      # anything but 1/true/yes/on is off
+    rid = client.post("/api/gd/runs", json={}).json()["id"]
+    r = client.post(f"/api/gd/runs/{rid}/uploads", json={"surface": "subject"})
+    assert r.status_code == 503 and r.json()["detail"]["code"] == "direct_uploads_disabled"
+    r = client.post(f"/api/gd/runs/{rid}/uploads/finalize", json={"ticket": "x.y"})
+    assert r.status_code == 503 and r.json()["detail"]["code"] == "direct_uploads_disabled"
+    assert direct.signed == {}
+
+
+def test_sign_contract_is_a_write_once_size_ranged_put_for_a_server_named_object(direct):
+    r = client.post(f"{BRAND}/uploads", json={"surface": "logo", "content_type": "image/png",
+                                               "size": 1234, "file_name": "../../etc/passwd.png"})
+    assert r.status_code == 200, r.text
+    s = r.json()
+    assert s["method"] == "PUT" and s["surface"] == "logo" and s["max_bytes"] == 50 * MB
+    assert s["headers"] == {"Content-Type": "image/png",
+                            "x-goog-content-length-range": f"1,{50 * MB}",
+                            "x-goog-if-generation-match": "0"}
+    (path,) = direct.signed
+    assert path.startswith("uploads/pending/logo/acme-co/u1/") and "passwd" not in path
+    assert direct.signed[path]["expiration"].total_seconds() == 600
+    assert s["ticket"] and s["expires_at"] and s["ticket_expires_at"]
+    # GCS refuses a PUT that changes a signed header, is empty, or overwrites
+    assert direct.browser_put(s, b"x", headers={**s["headers"], "Content-Type": "text/html"}) == 403
+    assert direct.browser_put(s, b"") == 400
+    assert direct.browser_put(s, _brand_png()) == 200
+    assert direct.browser_put(s, _brand_png(3, 3)) == 412
+    # an SVG is signed with the SVG cap; a declared HEIC is refused before any upload
+    r = client.post(f"{BRAND}/uploads", json={"surface": "logo", "content_type": "image/svg+xml"})
+    assert r.json()["max_bytes"] == 5 * MB
+    r = client.post(f"{BRAND}/uploads", json={"surface": "reference", "content_type": "image/heic",
+                                               "file_name": "IMG_0001.HEIC"})
+    assert r.status_code == 415
+    d = r.json()["detail"]
+    assert d["code"] == "unsupported_file_type" and d["got"] == "heic" and "JPEG/PNG" in d["message"]
+    assert d["accepted"] == ["png", "jpeg", "webp", "tiff"] and d["file"] == "IMG_0001.HEIC"
+    r = client.post(f"{BRAND}/uploads", json={"surface": "reference", "content_type": "image/png",
+                                               "size": 50 * MB + 1})
+    assert r.status_code == 413 and r.json()["detail"]["code"] == "file_too_large"
+
+
+def test_logo_finalize_keeps_the_original_and_gd_reads_the_working_copy(direct):
+    from app.services import firestore_repo, gd_brand_source
+
+    png = _brand_png(64, 32)
+    md5 = _md5(png)
+    _, r = direct_upload(BRAND, "logo", png, direct, content_type="image/png",
+                         file_name="Acme Logo.png")
+    assert r.status_code == 200, r.text
+    up = r.json()["upload"]
+    assert up["status"] == "stored" and up["already_finalized"] is False and up["kind"] == "png"
+    assert up["file"] == "Acme Logo.png" and up["content_id"] == md5
+    assert up["original"]["bytes"] == len(png)
+    assert (up["original"]["width"], up["original"]["height"]) == (64, 32)
+    assert up["working"] == {"width": 64, "height": 32, "format": "png"}
+    assert "response-content-disposition=attachment" in up["original"]["download_url"]
+
+    working = f"brands/acme-co/logos/{md5}-w4096.png"
+    original = f"brands/acme-co/originals/{md5}.png"
+    (logo,) = r.json()["brand"]["assets"]["logos"]
+    assert logo["path"] == working and logo["original"]["bytes"] == len(png)
+    assert firestore_repo.get_brand("acme-co")["logo_uri"] == f"gs://test-bucket/{working}"
+    # the original is a byte-identical server-side copy, stored as an attachment
+    assert direct.store[original][0] == png
+    assert direct.meta[original]["disposition"] == "attachment"
+    assert direct.store[working][1] == "image/png"
+    # Stage 4 resolves the brand's logo to the WORKING copy
+    assert gd_brand_source.brand_logo_record("acme-co")["file_url"] == f"gs://test-bucket/{working}"
+    assert direct.pending() == []
+
+
+def test_finalize_twice_is_a_no_op_that_answers_the_same(direct):
+    png = _brand_png(20, 20)
+    signed, first = direct_upload(BRAND, "logo", png, direct, content_type="image/png")
+    assert first.status_code == 200, first.text
+    objects = set(direct.store)
+    again = client.post(f"{BRAND}/uploads/finalize", json={"ticket": signed["ticket"]})
+    assert again.status_code == 200, again.text
+    assert again.json()["upload"]["already_finalized"] is True
+    assert again.json()["upload"]["content_id"] == first.json()["upload"]["content_id"]
+    assert again.json()["brand"]["assets"] == first.json()["brand"]["assets"]
+    assert set(direct.store) == objects
+    # the SAME bytes through a second ticket land on the same ids: still one logo
+    _, third = direct_upload(BRAND, "logo", png, direct, content_type="image/png")
+    assert third.status_code == 200, third.text
+    assert len(third.json()["brand"]["assets"]["logos"]) == 1
+
+
+def test_ticket_problems_are_refused_and_touch_nothing(direct, as_caller):
+    from app.services import gd_direct_uploads, upload_intake
+
+    signed, _ = direct_upload(BRAND, "logo", _brand_png(), direct, content_type="image/png",
+                              finalize=False)
+    ticket = signed["ticket"]
+    (pending,) = direct.pending()
+
+    def finalize(tok, base=BRAND):
+        return client.post(f"{base}/uploads/finalize", json={"ticket": tok})
+
+    # tampered: point the claims at someone else's object, keep the signature
+    body, sig = ticket.split(".")
+    claims = json.loads(upload_intake._unb64(body))
+    claims["object"] = "uploads/pending/logo/acme-co/someone-else/victim"
+    forged = upload_intake._b64(json.dumps(claims).encode()) + "." + sig
+    r = finalize(forged)
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "upload_ticket_invalid"
+    assert finalize("garbage").json()["detail"]["code"] == "upload_ticket_invalid"
+    # expired: a genuinely signed ticket whose hour is over
+    expired, _ = upload_intake.mint_ticket(
+        gd_direct_uploads._ticket_key(), sub="u1", surface="logo", target="acme-co",
+        object_name=pending, cap=50 * MB, now=0)
+    r = finalize(expired)
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "upload_ticket_expired"
+    # wrong target: a ticket for acme-co cannot finalize into another brand
+    assert _create(name="Beta Co").status_code == 201
+    r = finalize(ticket, base="/api/gd/brands/beta-co")
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "upload_ticket_wrong_target"
+    # a brand ticket never finalizes on the run route
+    rid = client.post("/api/gd/runs", json={}).json()["id"]
+    r = client.post(f"/api/gd/runs/{rid}/uploads/finalize", json={"ticket": ticket})
+    assert r.status_code == 403
+    # wrong user: another member cannot finalize someone else's upload
+    as_caller({"id": "u2", "email": "other@legalsoft.com"})
+    r = finalize(ticket)
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "upload_ticket_wrong_user"
+    as_caller()
+    assert direct.pending() == [pending]          # none of the above touched it
+    assert not any("/originals/" in p for p in direct.store)
+    assert finalize(ticket).status_code == 200
+
+
+def test_rights_revoked_before_finalize_refuse_it_and_delete_the_pending_object(direct, brand_store):
+    signed, _ = direct_upload(BRAND, "logo", _brand_png(), direct, content_type="image/png",
+                              finalize=False)
+    assert len(direct.pending()) == 1
+    brand_store.data["brands"]["acme-co"]["archived_at"] = "2026-10-09T00:00:00+00:00"
+    r = client.post(f"{BRAND}/uploads/finalize", json={"ticket": signed["ticket"]})
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "brand_not_editable"
+    assert direct.pending() == []
+    assert not any("/originals/" in p for p in direct.store)
+
+
+def test_built_in_packs_take_references_only(direct):
+    r = client.post("/api/gd/brands/legalsoft/uploads", json={"surface": "logo"})
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "brand_not_editable"
+    jpg = _jpeg(300, 200)
+    _, r = direct_upload("/api/gd/brands/legalsoft", "reference", jpg, direct,
+                         content_type="image/jpeg", note="launch post", kind="reference")
+    assert r.status_code == 200, r.text
+    ref = r.json()["references"][0]
+    assert ref["ref_id"] == _md5(jpg) and ref["kind"] == "reference" and ref["note"] == "launch post"
+    assert r.json()["reference_count"] == 1
+    assert ref["original"]["bytes"] == len(jpg)
+    assert direct.store[f"reference_library/legalsoft/{_md5(jpg)}-w4096.jpg"][1] == "image/jpeg"
+
+
+def test_reference_working_copy_is_a_jpeg_that_generation_reads(direct):
+    from graphics_designer_agent import reference_library as rl
+
+    from app.services import firestore_repo
+
+    png = _brand_png(400, 300)
+    _, r = direct_upload(BRAND, "reference", png, direct, content_type="image/png",
+                         creative_type="social_story", note="Spring promo")
+    assert r.status_code == 200, r.text
+    assert r.json()["upload"]["working"]["format"] == "jpeg"
+    assert r.json()["references"][0]["creative_type"] == "social_story"
+    recs = firestore_repo.references_for_brand("acme-co", legacy_records=[])
+    assert len(recs) == 1 and recs[0]["file_name"] == f"{_md5(png)}-w4096.jpg"
+    data, mime = rl.load_reference_bytes(recs[0])
+    assert mime == "image/jpeg" and data[:3] == b"\xff\xd8\xff"
+
+
+def test_reference_cap_is_checked_before_upload(direct, brand_store):
+    brand_store.data.setdefault("brand_reference_counts", {})["acme-co"] = {"active": 200}
+    r = client.post(f"{BRAND}/uploads", json={"surface": "reference", "content_type": "image/png"})
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "reference_cap_reached"
+
+
+def test_logo_cap_of_eight_holds_at_sign_time(direct, brand_store):
+    meta = brand_store.data["brands"]["acme-co"]["brand_metadata"]
+    meta["enrichment"]["logo_files"] = [f"gs://test-bucket/brands/acme-co/logos/{i:032x}.png"
+                                        for i in range(8)]
+    r = client.post(f"{BRAND}/uploads", json={"surface": "logo", "content_type": "image/png"})
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "logo_limit_reached"
+
+
+def test_guidelines_pdf_is_page_counted_and_offered_only_as_a_download(direct):
+    pdf = _pdf(3)
+    _, r = direct_upload(BRAND, "guidelines", pdf, direct, content_type="application/pdf",
+                         file_name="Brand Book.pdf")
+    assert r.status_code == 200, r.text
+    up = r.json()["upload"]
+    assert up["original"]["pages"] == 3 and up["working"] is None and up["kind"] == "pdf"
+    (g,) = r.json()["brand"]["assets"]["guidelines"]
+    assert g["path"] == f"brands/acme-co/originals/{_md5(pdf)}.pdf"
+    assert "response-content-disposition=attachment" in g["url"]
+
+
+def test_pdf_with_a_bad_tail_or_too_many_pages_is_refused_and_deleted(direct):
+    truncated = _pdf(1).replace(b"%%EOF", b"")
+    _, r = direct_upload(BRAND, "guidelines", truncated, direct, content_type="application/pdf",
+                         file_name="cut.pdf")
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "pdf_truncated"
+    assert r.json()["detail"]["file"] == "cut.pdf"
+    _, r = direct_upload(BRAND, "guidelines", _pdf(301), direct, content_type="application/pdf")
+    assert r.status_code == 422
+    d = r.json()["detail"]
+    assert (d["code"], d["pages"], d["limit_pages"]) == ("pdf_too_many_pages", 301, 300)
+    # a PNG renamed .pdf is a type refusal, not a PDF refusal
+    _, r = direct_upload(BRAND, "guidelines", _brand_png(), direct, content_type="application/pdf")
+    assert r.status_code == 415 and r.json()["detail"]["got"] == "png"
+    assert direct.pending() == []
+    assert not any("/originals/" in p for p in direct.store)
+
+
+def test_a_real_font_is_wired_into_the_pack_and_a_fake_one_is_refused(direct, brand_store):
+    from graphics_designer_agent import registry
+
+    ttf = _real_ttf()
+    _, r = direct_upload(BRAND, "font", ttf, direct, content_type="font/ttf",
+                         file_name="AcmeSans-Bold.ttf")
+    assert r.status_code == 200, r.text
+    name = f"{_md5(ttf)}.ttf"
+    meta = brand_store.data["brands"]["acme-co"]["brand_metadata"]
+    assert meta["enrichment"]["font_files"] == [f"gs://test-bucket/brands/acme-co/originals/{name}"]
+    assert [v["file"] for v in meta["gd_spec"]["font_variants"]] == [name]
+    pack = registry.get_pack("acme-co")
+    assert len(pack.font_names()) == 1 and pack.font_names()[0].endswith("Bold")
+    assert (brand_store.fonts_root / "acme-co" / "fonts" / name).read_bytes() == ttf
+    (f,) = r.json()["brand"]["assets"]["fonts"]
+    assert "response-content-disposition=attachment" in f["url"]
+
+    _, r = direct_upload(BRAND, "font", _TTF, direct, content_type="font/ttf", file_name="fake.ttf")
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "font_unreadable"
+    _, r = direct_upload(BRAND, "font", b"wOFF" + b"\0" * 60, direct, file_name="web.woff")
+    assert r.status_code == 415 and r.json()["detail"]["got"] == "woff"
+    assert direct.pending() == []
+
+
+def test_a_busy_decode_slot_answers_503_retry_after_and_keeps_the_upload(direct, monkeypatch):
+    from app.services import upload_intake
+
+    signed, _ = direct_upload(BRAND, "logo", _brand_png(), direct, content_type="image/png",
+                              finalize=False)
+    monkeypatch.setattr(upload_intake, "DECODE_SLOT_TIMEOUT_SECONDS", 0.05)
+    assert upload_intake._DECODE_SLOT.acquire(timeout=1)
+    try:
+        r = client.post(f"{BRAND}/uploads/finalize", json={"ticket": signed["ticket"]})
+    finally:
+        upload_intake._DECODE_SLOT.release()
+    assert r.status_code == 503 and r.json()["detail"]["code"] == "upload_busy"
+    assert r.headers["Retry-After"] == str(upload_intake.DECODE_RETRY_AFTER_SECONDS)
+    assert len(direct.pending()) == 1               # not a rejection: the retry works
+    r = client.post(f"{BRAND}/uploads/finalize", json={"ticket": signed["ticket"]})
+    assert r.status_code == 200, r.text
+
+
+def test_storage_fault_mid_finalize_is_a_503_and_keeps_the_upload(direct, monkeypatch):
+    from app.services import storage
+
+    signed, _ = direct_upload(BRAND, "logo", _brand_png(), direct, content_type="image/png",
+                              finalize=False)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("GCS upload failed: 503 backend error")
+
+    monkeypatch.setattr(storage, "put_object", boom)
+    r = client.post(f"{BRAND}/uploads/finalize", json={"ticket": signed["ticket"]})
+    assert r.status_code == 503 and r.json()["detail"]["code"] == "upload_storage_unavailable"
+    assert "backend error" not in r.text            # internals stay in the log
+    assert len(direct.pending()) == 1

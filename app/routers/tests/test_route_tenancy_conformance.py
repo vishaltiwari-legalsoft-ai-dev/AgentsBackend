@@ -285,6 +285,10 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("GET", "/api/gd/runs/{run_id}/prompt"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("POST", "/api/gd/runs/{run_id}/stage4"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("POST", "/api/gd/runs/{run_id}/subject/upload"): (TENANT_SCOPED, INTERNAL_ONLY),
+    # Direct-to-GCS uploads (2026-10-09): sign + finalize, both behind
+    # ``_owned_run``; the ticket also binds the caller's id and the run id.
+    ("POST", "/api/gd/runs/{run_id}/uploads"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/gd/runs/{run_id}/uploads/finalize"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("POST", "/api/gd/runs/{run_id}/suggest"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("POST", "/api/gd/runs/{run_id}/suggest-placement"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("POST", "/api/gd/runs/{run_id}/text-preview"): (TENANT_SCOPED, INTERNAL_ONLY),
@@ -386,6 +390,11 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("PATCH", "/api/gd/brands/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("POST", "/api/gd/brands/{brand_id}/assets"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("POST", "/api/gd/brands/{brand_id}/references"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    # Direct-to-GCS kit/reference uploads (2026-10-09): the same company-wide
+    # write the multipart routes above already allow, behind the same
+    # ``_editable_brand`` check (built-in packs: references only).
+    ("POST", "/api/gd/brands/{brand_id}/uploads"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/gd/brands/{brand_id}/uploads/finalize"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("DELETE", "/api/gd/brands/{brand_id}/references/{ref_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     # GEO: every doc id is ``…-{brand_id}``; no user or workspace key exists.
     ("GET", "/api/geo/brands"): (WORKSPACE_SHARED, EXTERNAL_OK),
@@ -621,7 +630,12 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
 #: is the org chart and ``is_admin`` inside the handler, not a tenancy filter,
 #: so it is counted here where a cross-user read belongs. See its ledger entry.
 # 77 -> 76 on 2026-10-08: GET /api/issues moved to ADMIN_ONLY (see its entry).
-WORKSPACE_SHARED_BASELINE = 76
+#: 76 -> 78 on 2026-10-09: ``POST /api/gd/brands/{brand_id}/uploads`` and
+#: ``…/uploads/finalize`` — direct-to-GCS uploads for the same brand kit and
+#: references the two multipart routes already write. No new reach: the same
+#: company-wide brand set, the same ``_editable_brand`` gate, a second
+#: transport for files over the relay's 4.5 MB limit.
+WORKSPACE_SHARED_BASELINE = 78
 
 #: The GEO editor surface, BY NAME. Not a count — a count would let a future
 #: route join the role while another left it and say nothing, and the thing

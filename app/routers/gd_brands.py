@@ -30,7 +30,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, Upl
 from pydantic import BaseModel, Field, StringConstraints
 
 from app.security import get_current_user, require_admin
-from app.services import firestore_repo, imaging, storage
+from app.services import firestore_repo, gd_direct_uploads, imaging, storage
 from app.services.firestore_repo import (
     BRAND_REFERENCE_CAP,
     BUILTIN_GD_PACK_IDS,
@@ -170,16 +170,53 @@ def _view_url(gs_uri: str | None) -> str | None:
         return None
 
 
-def _asset(gs_uri: str) -> dict:
+def _download_url(gs_uri: str | None) -> str | None:
+    """Signed ATTACHMENT link for an uploaded original — an original (an SVG,
+    a PDF, a 50 MB TIFF) is only ever offered as a download, never rendered."""
+    if not gs_uri or not storage.is_configured():
+        return None
+    try:
+        return storage.signed_download_url(gs_uri, file_name=gs_uri.rsplit("/", 1)[-1])
+    except Exception:  # noqa: BLE001 - a link is decorative
+        logger.warning("could not sign download %s", gs_uri, exc_info=True)
+        return None
+
+
+def _is_original(gs_uri: str) -> bool:
+    return "/originals/" in gs_uri
+
+
+def _original(rec: dict | None) -> dict | None:
+    """The ``original`` block of an asset/reference that came in as a direct
+    upload; ``None`` for everything uploaded before (read with defaults)."""
+    if not rec or not rec.get("original_uri"):
+        return None
+    return {
+        "bytes": rec.get("original_bytes"),
+        "width": rec.get("original_width"),
+        "height": rec.get("original_height"),
+        "pages": rec.get("pages"),
+        "download_url": _download_url(rec.get("original_uri")),
+    }
+
+
+def _asset(gs_uri: str, originals: dict[str, dict] | None = None) -> dict:
     path = gs_uri[len("gs://"):].partition("/")[2] if gs_uri.startswith("gs://") else gs_uri
-    return {"path": path, "url": _view_url(gs_uri), "name": path.rsplit("/", 1)[-1]}
+    # A font or a PDF from a direct upload IS its original: download only.
+    url = _download_url(gs_uri) if _is_original(gs_uri) else _view_url(gs_uri)
+    out = {"path": path, "url": url, "name": path.rsplit("/", 1)[-1]}
+    original = _original((originals or {}).get(gs_uri))
+    if original:   # only direct uploads carry one; the key is absent otherwise
+        out["original"] = original
+    return out
 
 
 def _reference(rec: dict) -> dict:
     """Contract ``Reference`` for an uploaded doc OR a legacy index record.
     ``url`` is always a string — empty when there is no object or it could
-    not be signed — so the sheet never branches on ``null``."""
-    return {
+    not be signed — so the sheet never branches on ``null``. ``url`` is the
+    working copy GD reads; a direct upload's original is ``original``."""
+    out = {
         "ref_id": rec.get("ref_id") or rec.get("id"),
         "url": _view_url(rec.get("gs_uri")) or "",
         "kind": rec.get("kind") or "reference",
@@ -187,6 +224,10 @@ def _reference(rec: dict) -> dict:
         "note": rec.get("note") or rec.get("summary") or "",
         "created_at": rec.get("created_at") or rec.get("ingested_at"),
     }
+    original = _original(rec)
+    if original:   # only direct uploads carry one; the key is absent otherwise
+        out["original"] = original
+    return out
 
 
 def _legacy_records() -> list[dict]:
@@ -261,6 +302,7 @@ def _references_for(brand_id: str, legacy: list[dict]) -> list[dict]:
 def _detail_from_doc(doc: dict) -> dict:
     meta = doc.get("brand_metadata") or {}
     enrichment = meta.get("enrichment") or {}
+    originals = firestore_repo.brand_asset_originals(doc)
     refs = _references_for(_pack_id(doc), _legacy_records())
     return {
         **_summary_from_doc(doc, reference_count=len(refs)),
@@ -275,9 +317,9 @@ def _detail_from_doc(doc: dict) -> dict:
             "accent": list(meta.get("accent_colors") or []),
         },
         "assets": {
-            "logos": [_asset(u) for u in enrichment.get("logo_files") or []],
-            "fonts": [_asset(u) for u in enrichment.get("font_files") or []],
-            "guidelines": [_asset(u) for u in enrichment.get("guideline_files") or []],
+            "logos": [_asset(u, originals) for u in enrichment.get("logo_files") or []],
+            "fonts": [_asset(u, originals) for u in enrichment.get("font_files") or []],
+            "guidelines": [_asset(u, originals) for u in enrichment.get("guideline_files") or []],
         },
         "references": refs,
         "reference_cap": BRAND_REFERENCE_CAP,
@@ -572,6 +614,128 @@ def upload_references(
     ]
     count = firestore_repo.reference_counts([brand_id]).get(brand_id, 0)
     return {"references": [_reference(r) for r in added], "reference_count": count}
+
+
+# --------------------------------------------------------------------------- #
+# Direct-to-GCS uploads (``GD_DIRECT_UPLOADS``; off -> 503 and the frontend
+# uses the multipart routes above). See ``app/services/gd_direct_uploads.py``.
+# --------------------------------------------------------------------------- #
+BrandUploadSurface = Literal["logo", "font", "guidelines", "reference"]
+
+
+class BrandUploadSign(BaseModel):
+    surface: BrandUploadSurface
+    # What the browser reports (``File.type``); "" is sent as octet-stream.
+    content_type: str = Field(default="", max_length=200)
+    size: int | None = Field(default=None, ge=0)
+    file_name: str | None = Field(default=None, max_length=255)
+
+
+class BrandUploadFinalize(BaseModel):
+    ticket: str = Field(min_length=1, max_length=4096)
+    file_name: str | None = Field(default=None, max_length=255)
+    # references only — the same fields the multipart references route takes
+    kind: ReferenceKind = "creative"
+    creative_type: str | None = Field(default=None, max_length=120)
+    note: str = Field(default="", max_length=2000)
+
+
+def _brand_upload_target(brand_id: str, surface: str) -> dict | None:
+    """The brand the caller may upload ``surface`` files to RIGHT NOW: a
+    self-serve brand that is not archived (``_editable_brand``), or — for
+    references only — a built-in pack. Re-run at finalize, so an archive
+    between sign and finalize refuses it."""
+    if surface == "reference" and brand_id in BUILTIN_GD_PACK_IDS:
+        return None
+    return _editable_brand(brand_id)
+
+
+def _brand_upload_room(brand_id: str, surface: str, doc: dict | None,
+                       content_id: str | None = None) -> None:
+    """The per-brand caps (8 logos, 16 fonts, 200 references), checked before
+    a byte is uploaded and again before any decode. A file already recorded
+    (same GCS MD5) is a repeat, not a new one, so it never trips the cap."""
+    if surface == "reference":
+        if firestore_repo.reference_counts([brand_id]).get(brand_id, 0) >= BRAND_REFERENCE_CAP:
+            raise HTTPException(409, "reference_cap_reached")
+        return
+    per_brand = ASSET_RULES[surface].get("per_brand")
+    if not per_brand or doc is None:
+        return
+    files = ((doc.get("brand_metadata") or {}).get("enrichment") or {}).get(f"{surface}_files") or []
+    if content_id and any(content_id in f for f in files):
+        return
+    if len(files) >= per_brand:
+        raise HTTPException(409, f"{surface}_limit_reached")
+
+
+def _record_brand_upload(brand_id: str, placed, body: BrandUploadFinalize, user: dict) -> dict:
+    """Write a finalized upload through the existing store transactions."""
+    stored = placed.stored_upload()
+    if placed.surface == "reference":
+        doc = _store_call(
+            firestore_repo.add_reference, brand_id, kind=body.kind,
+            uploaded_by=str(user.get("email") or ""), width=placed.working_width,
+            height=placed.working_height, note=body.note.strip()[:500],
+            creative_type=(body.creative_type or "").strip() or None, stored=stored)
+        keep = ("ref_id", "id", "gs_uri", "kind", "creative_type", "note", "created_at",
+                "original_uri", "original_bytes", "original_width", "original_height")
+        return {"reference": {k: doc.get(k) for k in keep}}
+    rec = _store_call(firestore_repo.add_brand_asset, brand_id, placed.surface, stored=stored)
+    if placed.surface == "font":
+        # Same wiring as the multipart route: the pack loads a font by
+        # ``font_variants[].file`` == the stored basename.
+        variant = font_variant_for_upload(placed.file or "font", rec["uri"].rsplit("/", 1)[-1])
+        _store_call(firestore_repo.update_brand, brand_id,
+                    {"gd_spec": _spec_for(_user_brand_or_404(brand_id), extra_font_variants=[variant])})
+    registry.refresh()
+    return {"uri": rec["uri"]}
+
+
+def _brand_upload_response(brand_id: str, placed, result: dict, *, already: bool) -> dict:
+    summary = gd_direct_uploads.upload_summary(placed, already_finalized=already)
+    if placed.surface == "reference":
+        count = firestore_repo.reference_counts([brand_id]).get(brand_id, 0)
+        return {"references": [_reference(result["reference"])], "reference_count": count,
+                "upload": summary}
+    return {"brand": _detail_from_doc(_brand_doc_or_404(brand_id)), "upload": summary}
+
+
+@router.post("/gd/brands/{brand_id}/uploads")
+def sign_brand_upload(brand_id: str, body: BrandUploadSign,
+                      user: dict = Depends(get_current_user)) -> dict:
+    """Signed URL + ticket for ONE logo / font / guidelines PDF / reference.
+    The browser PUTs the file to ``upload_url`` with exactly ``headers``, then
+    calls ``…/uploads/finalize`` with the ticket. 503
+    ``direct_uploads_disabled`` while ``GD_DIRECT_UPLOADS`` is off."""
+    gd_direct_uploads.require_enabled()
+    with gd_direct_uploads.coded_refusals():
+        doc = _brand_upload_target(brand_id, body.surface)
+        _brand_upload_room(brand_id, body.surface, doc)
+    return gd_direct_uploads.sign(surface=body.surface, target=brand_id, user_id=str(user["id"]),
+                                  content_type=body.content_type, size=body.size,
+                                  file_name=body.file_name)
+
+
+@router.post("/gd/brands/{brand_id}/uploads/finalize")
+def finalize_brand_upload(brand_id: str, body: BrandUploadFinalize,
+                          user: dict = Depends(get_current_user)) -> dict:
+    """Validate the uploaded bytes, keep the original, derive the working copy
+    GD reads, record it. Same shape as the multipart routes' answers
+    (``brand`` / ``references`` + ``reference_count``) plus ``upload``."""
+    up = gd_direct_uploads.begin(body.ticket, user=user, target=brand_id, scope="brand",
+                                 file_name=body.file_name)
+    if up.replay is not None:
+        return _brand_upload_response(brand_id, up.replay["placed"], up.replay["result"],
+                                      already=True)
+    with up.rejecting():
+        doc = _brand_upload_target(brand_id, up.surface)
+        inspected = up.inspect()
+        _brand_upload_room(brand_id, up.surface, doc, inspected.content_id)
+        placed = up.derive_and_place(inspected)
+        result = _record_brand_upload(brand_id, placed, body, user)
+    up.complete(placed, result)
+    return _brand_upload_response(brand_id, placed, result, already=False)
 
 
 @router.delete("/gd/brands/{brand_id}/references/{ref_id}", status_code=204)

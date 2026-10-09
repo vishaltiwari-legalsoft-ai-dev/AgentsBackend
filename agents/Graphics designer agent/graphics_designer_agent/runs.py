@@ -211,6 +211,37 @@ def save_artifact(run_id: str, stage: int, variant: str, attempt: int, png: byte
     return rel
 
 
+def save_upload_artifact(run_id: str, name: str, data: bytes, content_type: str) -> str:
+    """Persist a user upload's WORKING copy under a caller-chosen flat name
+    (``<md5>-w4096.png`` / ``.jpg``) and return its ref.
+
+    ``save_artifact``'s sibling for direct uploads, whose names are
+    content-addressed by the original's GCS MD5 (so a repeated finalize lands
+    on the same ref) and whose extension says the real format — a background's
+    working copy is a JPEG. The name must already be a valid flat artifact
+    name; it is resolved only inside this run's own space, exactly like every
+    other ref (``is_own_artifact_ref``)."""
+    if not _is_artifact_name(name):
+        raise ValueError(f"invalid upload artifact name {name!r}")
+    if _use_cloud():
+        from app.services import storage
+
+        storage.put_generated(partition=f"{_GCS_PARTITION}/{run_id}", file_name=name,
+                              data=data, content_type=content_type)
+        return name
+    abspath = artifact_abspath(run_id, name)
+    abspath.parent.mkdir(parents=True, exist_ok=True)
+    abspath.write_bytes(data)
+    return name
+
+
+def originals_prefix(run_id: str) -> str:
+    """GCS object prefix (no bucket) for a run's uploaded ORIGINALS:
+    ``generated/gd/<run_id>/originals/``. Nothing in the pipeline reads it and
+    no artifact ref can name it (a ref carries no ``/``)."""
+    return f"{_gcs_partition_prefix(run_id)}originals/"
+
+
 def _gcs_partition_prefix(run_id: str) -> str:
     """The GCS object prefix (no bucket) that ``save_artifact`` writes this run's
     artifacts under: ``generated/gd/<run_id>/``. Any legitimate ``gs://`` ref for

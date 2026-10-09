@@ -7,8 +7,10 @@ is not yet set up.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import re
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
 
@@ -356,6 +358,179 @@ def read_reference_index() -> Optional[bytes]:
     if not blob.exists(timeout=_METADATA_TIMEOUT_SECONDS):
         return None
     return blob.download_as_bytes(timeout=_TRANSFER_TIMEOUT_SECONDS)
+
+
+# --- Direct-to-GCS uploads ----------------------------------------------------
+# The browser PUTs a file straight to the bucket with a V4 signed URL (the
+# Vercel relay caps a request body at 4.5 MB, Cloud Run HTTP/1 at 32 MiB), and
+# the API then finalizes it. Every function here names objects by the full
+# server-built object path inside the configured bucket — never a client
+# string, never another bucket — and refuses to run when the bucket is not
+# configured, which is also what keeps them behind the test suite's GCS guard.
+
+#: A signed upload URL lives this long: long enough for a 50 MB PUT on a slow
+#: link, short enough that a leaked URL is soon useless.
+SIGNED_PUT_TTL = timedelta(minutes=10)
+#: The GCS stream reader's buffer; a 50 MB object is read in a few round trips
+#: and never held whole just to be decoded.
+_READER_CHUNK_BYTES = 8 * 1024 * 1024
+#: Server-side rewrite of one ≤50 MB object normally finishes in one call; the
+#: loop is bounded anyway so a misbehaving rewrite cannot spin forever.
+_MAX_REWRITE_CALLS = 32
+
+
+@dataclass(frozen=True)
+class ObjectInfo:
+    """What GCS says about a stored object — the size and MD5 are measured by
+    GCS from the bytes it received, so they are facts, not client claims."""
+
+    size: int
+    md5_hex: Optional[str]
+    generation: int
+    content_type: Optional[str]
+
+
+def _bucket():
+    if not is_configured():
+        raise RuntimeError("Cloud Storage is not configured — direct uploads need a bucket")
+    return _storage().bucket(settings.require("gcs_bucket_name"))
+
+
+def gs_uri(object_path: str) -> str:
+    """``gs://<configured bucket>/<object_path>``."""
+    return f"gs://{settings.require('gcs_bucket_name')}/{object_path}"
+
+
+def object_path_of(uri: str) -> Optional[str]:
+    """The object path of a ``gs://`` URI in the CONFIGURED bucket, else None."""
+    prefix = f"gs://{settings.gcs_bucket_name}/"
+    return uri[len(prefix):] if settings.gcs_bucket_name and uri.startswith(prefix) else None
+
+
+def signed_put_url(object_path: str, *, content_type: str, max_bytes: int) -> tuple[str, dict[str, str]]:
+    """A V4 signed URL for ONE ``PUT`` of ``object_path``, valid
+    :data:`SIGNED_PUT_TTL`, and the exact headers the client must send.
+
+    The signature covers ``content-type``, ``x-goog-content-length-range:
+    1,<max_bytes>`` (GCS refuses a body outside the range) and
+    ``x-goog-if-generation-match: 0`` (the object can be created once and
+    never overwritten). A request without those headers, or with other values,
+    fails GCS's signature check."""
+    headers = {
+        "x-goog-content-length-range": f"1,{int(max_bytes)}",
+        "x-goog-if-generation-match": "0",
+    }
+    blob = _bucket().blob(object_path)
+    url = blob.generate_signed_url(
+        version="v4", expiration=SIGNED_PUT_TTL, method="PUT",
+        content_type=content_type, headers=headers, **_signing_kwargs(),
+    )
+    return url, {"Content-Type": content_type, **headers}
+
+
+def object_info(object_path: str) -> Optional[ObjectInfo]:
+    """Metadata of ``object_path`` (one small round trip), or None if absent."""
+    blob = _bucket().get_blob(object_path, timeout=_METADATA_TIMEOUT_SECONDS)
+    if blob is None:
+        return None
+    md5 = base64.b64decode(blob.md5_hash).hex() if blob.md5_hash else None
+    return ObjectInfo(size=int(blob.size or 0), md5_hex=md5, generation=int(blob.generation or 0),
+                      content_type=blob.content_type)
+
+
+def read_object_range(object_path: str, start: int, end: int, *, generation: int) -> bytes:
+    """Bytes ``start..end`` (inclusive) of exactly that generation."""
+    return _bucket().blob(object_path).download_as_bytes(
+        start=start, end=end, if_generation_match=generation, timeout=_TRANSFER_TIMEOUT_SECONDS)
+
+
+def open_object_reader(object_path: str, *, generation: int):
+    """A seekable read stream over exactly that generation — Pillow and pypdf
+    read it in buffered ranges instead of the whole object landing in memory."""
+    return _bucket().blob(object_path).open(
+        "rb", chunk_size=_READER_CHUNK_BYTES, if_generation_match=generation,
+        timeout=_TRANSFER_TIMEOUT_SECONDS)
+
+
+def read_object(object_path: str, *, max_bytes: int) -> Optional[bytes]:
+    """A SMALL object's bytes (a font, a receipt), None if absent. Refuses
+    anything over ``max_bytes`` rather than pulling it into memory."""
+    blob = _bucket().get_blob(object_path, timeout=_METADATA_TIMEOUT_SECONDS)
+    if blob is None:
+        return None
+    if int(blob.size or 0) > max_bytes:
+        raise ValueError(f"{object_path} is {blob.size} bytes, over the {max_bytes}-byte read limit")
+    return blob.download_as_bytes(if_generation_match=blob.generation,
+                                  timeout=_TRANSFER_TIMEOUT_SECONDS)
+
+
+def copy_object(src_path: str, dst_path: str, *, src_generation: int, content_type: str,
+                content_disposition: Optional[str] = None) -> str:
+    """Server-side copy (GCS rewrite — no bytes pass through this service) of
+    exactly ``src_generation`` to ``dst_path``; returns the destination
+    ``gs://`` URI. Write-once and idempotent: an existing destination is left
+    as it is (destination names are content-addressed by the caller), and a
+    concurrent copy that lands first is treated as done."""
+    from google.api_core.exceptions import PreconditionFailed
+
+    bucket = _bucket()
+    if bucket.get_blob(dst_path, timeout=_METADATA_TIMEOUT_SECONDS) is not None:
+        return gs_uri(dst_path)
+    src = bucket.blob(src_path)
+    dst = bucket.blob(dst_path)
+    dst.content_type = content_type
+    if content_disposition:
+        dst.content_disposition = content_disposition
+    token = None
+    try:
+        for _ in range(_MAX_REWRITE_CALLS):
+            token, _done, _total = dst.rewrite(
+                src, token=token, if_source_generation_match=src_generation,
+                if_generation_match=0, timeout=_TRANSFER_TIMEOUT_SECONDS)
+            if token is None:
+                return gs_uri(dst_path)
+    except PreconditionFailed:
+        if bucket.get_blob(dst_path, timeout=_METADATA_TIMEOUT_SECONDS) is not None:
+            return gs_uri(dst_path)   # someone else's identical copy won the race
+        raise
+    raise RuntimeError(f"GCS rewrite of {src_path} -> {dst_path} did not finish "
+                       f"in {_MAX_REWRITE_CALLS} calls")
+
+
+def put_object(object_path: str, data: bytes, content_type: str) -> str:
+    """Store bytes at a server-built object path; durable ``gs://`` URI."""
+    return _put_object(object_path, data, content_type)
+
+
+def delete_object(object_path: str) -> bool:
+    """Delete ``object_path``; False when it was already gone."""
+    from google.api_core.exceptions import NotFound
+
+    try:
+        _bucket().blob(object_path).delete(timeout=_METADATA_TIMEOUT_SECONDS)
+        return True
+    except NotFound:
+        return False
+
+
+def signed_download_url(gs_uri_value: str, *, file_name: str, expires_in_hours: int = 1) -> str:
+    """A signed GET that the browser SAVES rather than renders
+    (``response-content-disposition: attachment``) — how an uploaded original
+    (an SVG, a PDF, a 50 MB TIFF) is handed back, so none of them is ever
+    rendered by a browser from a link this service minted."""
+    if not is_configured():
+        raise RuntimeError("Cloud Storage is not configured — cannot sign a download")
+    if not gs_uri_value.startswith("gs://"):
+        raise ValueError(f"Not a gs:// URI: {gs_uri_value}")
+    bucket_name, _, object_path = gs_uri_value[len("gs://"):].partition("/")
+    if not bucket_name or not object_path:
+        raise ValueError(f"Malformed gs:// URI: {gs_uri_value}")
+    safe = re.sub(r'[^\w.\-() ]', "_", file_name or "download")[:120] or "download"
+    blob = _storage().bucket(bucket_name).blob(object_path)
+    return blob.generate_signed_url(
+        version="v4", expiration=timedelta(hours=expires_in_hours), method="GET",
+        response_disposition=f'attachment; filename="{safe}"', **_signing_kwargs(),
+    )
 
 
 def signed_url_for_gs_uri(gs_uri: str, expires_in_hours: int = 1) -> str:

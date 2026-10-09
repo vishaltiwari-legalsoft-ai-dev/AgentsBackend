@@ -11,12 +11,14 @@ import base64
 import hashlib
 import logging
 
+from typing import Literal
+
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from app.security import get_current_user
-from app.services import firestore_repo, imaging, storage
+from app.services import firestore_repo, gd_direct_uploads, imaging, storage
 from app.services.gd_brand_source import brand_logo_record
 from app.services.openrouter import ImageProviderError
 from app.services.run_tracking import (CHANGE, JOB, ActivityTrail, StagedActivity,
@@ -1268,6 +1270,91 @@ def gd_subject_upload(run_id: str, file: UploadFile = File(...),
     return {"ref": rel, "role": role}
 
 
+# ── direct-to-GCS uploads (GD_DIRECT_UPLOADS; off -> 503, multipart above) ────
+RunUploadSurface = Literal["subject", "background", "prompt", "element"]
+
+
+class RunUploadSign(BaseModel):
+    surface: RunUploadSurface
+    # What the browser reports (``File.type``); "" is sent as octet-stream.
+    content_type: str = Field(default="", max_length=200)
+    size: int | None = Field(default=None, ge=0)
+    file_name: str | None = Field(default=None, max_length=255)
+
+
+class RunUploadFinalize(BaseModel):
+    ticket: str = Field(min_length=1, max_length=4096)
+    file_name: str | None = Field(default=None, max_length=255)
+
+
+def _prompt_room(run: dict, ref: str | None = None) -> None:
+    refs = (run.get("config") or {}).get("prompt_image_refs") or []
+    if ref is not None and ref in refs:
+        return  # re-attaching the same image is a no-op, never a cap hit
+    if len(refs) >= MAX_PROMPT_IMAGES:
+        raise HTTPException(409, {"code": "prompt_image_limit_reached",
+                                  "message": f"Max {MAX_PROMPT_IMAGES} attached images per creative."})
+
+
+def _record_run_upload(run_id: str, user: dict, surface: str, ref: str) -> dict:
+    """The same results the multipart upload routes give. A prompt image is
+    appended to the run's config on a FRESH read of the run — the decode
+    before this took seconds and the editor may have saved in between."""
+    if surface == "prompt":
+        run = _owned_run(run_id, user)
+        _prompt_room(run, ref)
+        refs = list(run["config"].get("prompt_image_refs") or [])
+        if ref not in refs:
+            refs.append(ref)
+            run["config"]["prompt_image_refs"] = refs
+            save_run(run)
+    return {"ref": ref, "role": surface}
+
+
+@router.post("/gd/runs/{run_id}/uploads")
+@silent("hands out a signed upload URL for a file the caller supplies — no agent work")
+def sign_run_upload(run_id: str, body: RunUploadSign,
+                    user: dict = Depends(get_current_user)) -> dict:
+    """Signed URL + ticket for ONE subject / background / prompt / element
+    image (PNG, JPEG, WebP or TIFF, up to 50 MB). The browser PUTs the file to
+    ``upload_url`` with exactly ``headers``, then calls ``…/uploads/finalize``.
+    503 ``direct_uploads_disabled`` while ``GD_DIRECT_UPLOADS`` is off."""
+    gd_direct_uploads.require_enabled()
+    with gd_direct_uploads.coded_refusals():
+        run = _owned_run(run_id, user)
+    if body.surface == "prompt":
+        _prompt_room(run)
+    return gd_direct_uploads.sign(surface=body.surface, target=run_id, user_id=str(user["id"]),
+                                  content_type=body.content_type, size=body.size,
+                                  file_name=body.file_name)
+
+
+@router.post("/gd/runs/{run_id}/uploads/finalize")
+@silent("stores an asset the caller supplied into an open run — no agent work")
+def finalize_run_upload(run_id: str, body: RunUploadFinalize,
+                        user: dict = Depends(get_current_user)) -> dict:
+    """Validate the uploaded bytes, keep the original, store the bounded
+    working copy as this run's artifact. Answers ``{ref, role, upload}`` —
+    ``ref`` is used exactly like the multipart routes' (``subject_asset_ref``,
+    ``background_asset_ref``, an image element's ``ref``; a prompt image is
+    already attached server-side)."""
+    up = gd_direct_uploads.begin(body.ticket, user=user, target=run_id, scope="run",
+                                 file_name=body.file_name)
+    if up.replay is not None:
+        return {**up.replay["result"],
+                "upload": gd_direct_uploads.upload_summary(up.replay["placed"],
+                                                           already_finalized=True)}
+    with up.rejecting():
+        run = _owned_run(run_id, user)
+        inspected = up.inspect()
+        if up.surface == "prompt":
+            _prompt_room(run, up.planned_run_ref(inspected))
+        placed = up.derive_and_place(inspected)
+        result = _record_run_upload(run_id, user, up.surface, placed.working_ref)
+    up.complete(placed, result)
+    return {**result, "upload": gd_direct_uploads.upload_summary(placed, already_finalized=False)}
+
+
 class TweakBody(BaseModel):
     instruction: str
 
@@ -1428,6 +1515,12 @@ def plan_endpoint(run_id: str, body: PlanBody, user: dict = Depends(get_current_
 
 
 # ── artifact streaming ────────────────────────────────────────────────────────
+def _artifact_media_type(ref: str) -> str:
+    """Every generated artifact is a PNG; a direct upload's opaque working
+    copy (a background) is a JPEG and says so in its name."""
+    return "image/jpeg" if ref.lower().endswith((".jpg", ".jpeg")) else "image/png"
+
+
 @router.get("/gd/runs/{run_id}/artifact/{rel:path}")
 def get_artifact(run_id: str, rel: str, user: dict = Depends(get_current_user)):
     _owned_run(run_id, user)
@@ -1454,7 +1547,7 @@ def get_artifact(run_id: str, rel: str, user: dict = Depends(get_current_user)):
         except Exception:  # noqa: BLE001 - storage fault: say so, keep the detail in logs
             logger.exception("GD artifact read failed: run=%s name=%s", run_id, rel)
             raise HTTPException(503, "artifact_storage_unavailable")
-        return Response(content=data, media_type="image/png")
+        return Response(content=data, media_type=_artifact_media_type(rel))
 
     try:
         path = artifact_abspath(run_id, rel)
@@ -1462,4 +1555,4 @@ def get_artifact(run_id: str, rel: str, user: dict = Depends(get_current_user)):
         raise HTTPException(400, "Invalid path")
     if not path.exists():
         raise HTTPException(404, "Artifact not found")
-    return Response(content=path.read_bytes(), media_type="image/png")
+    return Response(content=path.read_bytes(), media_type=_artifact_media_type(rel))
