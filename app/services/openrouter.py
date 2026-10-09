@@ -268,23 +268,59 @@ def _upstream_reason(response: httpx.Response) -> str:
     return str(message or response.text or response.reason_phrase)[:300]
 
 
-def _post_image(url: str, body: dict, headers: dict, model: str) -> dict:
+def _post_image(url: str, body: dict, headers: dict, model: str,
+                empty_reason=None) -> dict:
     """One image call under the per-instance concurrency cap (one slot held
     for both attempts). Raises a 503 :class:`ImageProviderError` when no slot
-    frees up within ``IMAGE_SLOT_WAIT_S``."""
+    frees up within ``IMAGE_SLOT_WAIT_S``. ``empty_reason(data)`` returns why a
+    200 body carries no image (None when it has one) — see
+    :func:`_post_image_attempts`."""
     if not _IMAGE_SLOTS.acquire(timeout=IMAGE_SLOT_WAIT_S):
         raise ImageProviderError(
             f"image generation is busy on this server ({IMAGE_CALL_CONCURRENCY} image "
             f"calls already running) — retry shortly", model=model, status=503)
     try:
-        return _post_image_attempts(url, body, headers, model)
+        return _post_image_attempts(url, body, headers, model, empty_reason)
     finally:
         _IMAGE_SLOTS.release()
 
 
-def _post_image_attempts(url: str, body: dict, headers: dict, model: str) -> dict:
+# Back-off before re-asking after an empty 200: there is no rate limit to wait
+# out — the model simply returned no image (seen live on Gemini 3 Pro Image).
+_EMPTY_RETRY_WAIT_S = 1.0
+
+
+def _chat_empty_reason(data: dict) -> str | None:
+    """Why a chat-surface 200 carries no image, or None when it has one."""
+    try:
+        choice = data["choices"][0]
+        message = choice["message"]
+    except (KeyError, IndexError, TypeError):
+        return "an unexpected response shape"
+    if message.get("images"):
+        return None
+    finish = choice.get("native_finish_reason") or choice.get("finish_reason")
+    return "no image" + (f" (finish reason: {finish})" if finish else "")
+
+
+def _images_empty_reason(data: dict) -> str | None:
+    """Why an Images-API 200 carries no image, or None when it has one."""
+    try:
+        return None if data["data"][0]["b64_json"] else "no image"
+    except (KeyError, IndexError, TypeError):
+        return "no image"
+
+
+def _post_image_attempts(url: str, body: dict, headers: dict, model: str,
+                         empty_reason=None) -> dict:
     """POST with a bounded, jittered retry. Returns the parsed JSON body or
-    raises :class:`ImageProviderError` naming the model and the real cause."""
+    raises :class:`ImageProviderError` naming the model and the real cause.
+
+    A 200 that carries no image (``empty_reason`` says why) costs nothing and
+    is usually a one-off, so it takes the same single retry as a 429/5xx —
+    inside the same two attempts and the same slot, so the per-call bound
+    (``IMAGE_CALL_BUDGET_S``) still holds. A second empty answer fails loudly
+    with the model's own finish reason."""
     last: ImageProviderError | None = None
     for attempt in range(1, IMAGE_MAX_ATTEMPTS + 1):
         response: httpx.Response | None = None
@@ -299,11 +335,22 @@ def _post_image_attempts(url: str, body: dict, headers: dict, model: str) -> dic
         else:
             if response.status_code < 400:
                 try:
-                    return response.json()
+                    data = response.json()
                 except ValueError as exc:
                     raise ImageProviderError(
                         f"image model {model} returned a non-JSON body", model=model,
                         status=response.status_code) from exc
+                why = empty_reason(data) if empty_reason else None
+                if why is None:
+                    return data
+                last = ImageProviderError(
+                    f"image model {model} returned {why}"
+                    + (" twice" if attempt > 1 else ""), model=model,
+                    status=response.status_code)
+                if attempt < IMAGE_MAX_ATTEMPTS:
+                    logger.warning("image call %s returned %s — retrying once", model, why)
+                    _sleep(_EMPTY_RETRY_WAIT_S + random.uniform(0, _JITTER_MAX_S))
+                continue
             last = ImageProviderError(
                 f"image model {model} failed ({response.status_code}): "
                 f"{_upstream_reason(response)}",
@@ -499,7 +546,8 @@ def generate_image(
                  "image_url": {"url": f"data:{mime};base64,{base64.b64encode(raw).decode()}"}}
                 for raw, mime in reference_images
             ]
-        data = _post_image(f"{settings.openrouter_base_url}/images", body, headers, image_model)
+        data = _post_image(f"{settings.openrouter_base_url}/images", body, headers, image_model,
+                           empty_reason=_images_empty_reason)
         try:
             item = data["data"][0]
             raw = base64.b64decode(item["b64_json"])
@@ -531,7 +579,8 @@ def generate_image(
         if image_config:
             body["image_config"] = image_config
         data = _post_image(
-            f"{settings.openrouter_base_url}/chat/completions", body, headers, image_model)
+            f"{settings.openrouter_base_url}/chat/completions", body, headers, image_model,
+            empty_reason=_chat_empty_reason)
         try:
             message = data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:

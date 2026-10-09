@@ -366,3 +366,65 @@ def test_concurrency_cap_reads_its_env_knob(monkeypatch):
     assert openrouter._concurrency_from_env() == 12       # junk -> the default
     monkeypatch.delenv("IMAGE_CALL_CONCURRENCY")
     assert openrouter._concurrency_from_env() == 12
+
+
+# --- an HTTP 200 with no image (2026-10-09) ---------------------------------
+# Gemini 3 Pro Image sometimes answers 200 with no image (it costs $0). It used
+# to fail the call outright; it now takes the same single retry as a 429/5xx,
+# inside the same two attempts and slot, so the per-call bound still holds.
+
+def _chat_empty(finish="IMAGE_OTHER"):
+    return _Resp(200, {"id": "gen-0", "choices": [{"native_finish_reason": finish,
+                                                   "message": {"content": "", "images": []}}]})
+
+
+def _images_empty():
+    return _Resp(200, {"data": []})
+
+
+def test_an_empty_chat_answer_is_retried_once_and_the_image_ships(wire):
+    calls, queue = wire
+    queue += [_chat_empty(), _chat_ok(1024, 1024)]
+    raw, _mime = openrouter.generate_image("x", model="google/gemini-3-pro-image",
+                                           aspect_ratio="1:1", image_size="2K")
+    assert raw
+    assert sum(1 for c in calls if "url" in c) == 2
+    assert len([c for c in calls if "slept" in c]) == 1
+
+
+def test_an_empty_images_api_answer_is_retried_once(wire):
+    calls, queue = wire
+    queue += [_images_empty(), _images_ok(1088, 1088)]
+    openrouter.generate_image("x", model="openai/gpt-image-2.5-sunburst",
+                              aspect_ratio="1:1", image_size="1K")
+    assert sum(1 for c in calls if "url" in c) == 2
+
+
+def test_two_empty_answers_fail_loudly_with_the_models_reason(wire):
+    calls, queue = wire
+    queue += [_chat_empty(), _chat_empty("IMAGE_SAFETY")]
+    with pytest.raises(openrouter.ImageProviderError) as exc:
+        openrouter.generate_image("x", model="google/gemini-3-pro-image",
+                                  aspect_ratio="1:1", image_size="2K")
+    assert "google/gemini-3-pro-image" in str(exc.value)
+    assert "no image" in str(exc.value) and "IMAGE_SAFETY" in str(exc.value)
+    assert "twice" in str(exc.value)
+    # Never a third request: the attempt budget (and so the time bound) holds.
+    assert sum(1 for c in calls if "url" in c) == openrouter.IMAGE_MAX_ATTEMPTS == 2
+
+
+def test_a_429_then_an_empty_answer_does_not_exceed_two_attempts(wire):
+    calls, queue = wire
+    queue += [_Resp(429, {"error": {"message": "slow down"}}, {"Retry-After": "3"}),
+              _chat_empty()]
+    with pytest.raises(openrouter.ImageProviderError, match="no image"):
+        openrouter.generate_image("x", model="google/gemini-3-pro-image",
+                                  aspect_ratio="1:1", image_size="2K")
+    assert sum(1 for c in calls if "url" in c) == 2
+
+
+def test_the_empty_retry_wait_fits_inside_the_call_budget():
+    # The empty retry waits less than the capped back-off the budget already
+    # reserves, so 2 x timeout + cap + jitter is still the worst case.
+    assert openrouter._EMPTY_RETRY_WAIT_S <= openrouter._RETRY_AFTER_CAP_S
+    assert openrouter.IMAGE_CALL_BUDGET_S <= 200
