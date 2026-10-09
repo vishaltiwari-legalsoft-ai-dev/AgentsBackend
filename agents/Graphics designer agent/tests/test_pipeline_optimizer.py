@@ -138,3 +138,107 @@ def test_returned_attempt_prefers_qa_passed_style(monkeypatch):
     _seed(run)
     attempt = pipeline._generate_stage3(run, provider=_FakeProvider())
     assert attempt["style"] == "highlighted" and attempt["qa"] == "passed"
+
+
+# ── Text geometry gate (2026-10-09) ──────────────────────────────────────────
+# The polish model re-renders the text and sometimes indents a line (1:1 final,
+# 2026-10-08: "Build your team…" started right of the headline's edge). Vision
+# QA reads words, not pixels, so a pixel check against the deterministic line
+# geometry now gates every polish before the vision call.
+
+from io import BytesIO  # noqa: E402
+
+from PIL import Image  # noqa: E402
+
+from graphics_designer_agent import registry  # noqa: E402
+from graphics_designer_agent.stage3_text import layout as gd_layout  # noqa: E402
+from graphics_designer_agent.stage3_text import text_geometry  # noqa: E402
+
+_ARS = ["1:1", "4:5", "9:16", "16:9"]
+
+
+def _pinned_run(ar: str, uid: str) -> dict:
+    run = create_run(uid)
+    run["config"]["aspect_ratio"] = ar
+    _seed(run)
+    # A left-aligned stack the way the subject guard sets one (shared "ml" edge).
+    run["config"]["layout"] = {
+        "headline": {"x": 0.06, "y": 0.22, "w": 0.5, "anchor": "ml"},
+        "subheading-0": {"x": 0.06, "y": 0.40, "w": 0.5, "anchor": "ml"},
+        "subheading-1": {"x": 0.06, "y": 0.50, "w": 0.5, "anchor": "ml"},
+        "cta": {"x": 0.06, "y": 0.64, "w": 0.5, "anchor": "ml"},
+    }
+    return run
+
+
+class _IndentingProvider:
+    """Returns the composite with one line of sub-heading 0 pushed right — the
+    live failure. ``fix_after`` faithful answers come after that many drifts."""
+
+    name = "indent"
+    supports_negative = False
+
+    def __init__(self, run: dict, shift: float = 0.025, drifts: int = 99):
+        self.run, self.shift, self.drifts, self.prompts = run, shift, drifts, []
+
+    def generate(self, prompt, *, reference_images=None, width=1080, height=1350, **_kw):
+        self.prompts.append(prompt)
+        composite = reference_images[0][0]
+        if len(self.prompts) > self.drifts:
+            return composite, "image/png"
+        pack = registry.get_pack(self.run.get("brand_id"))
+        lines = text_geometry.spec_lines(gd_layout.resolve_layers(self.run), width, height,
+                                         pack=pack, px_scale=width / 1080)
+        x0, y0, x1, y1 = next(ln["box"] for ln in lines if ln["layer"] == "subheading-0")
+        img = Image.open(BytesIO(composite)).convert("RGB")
+        base = Image.open(BytesIO(pipeline._approved_png(self.run, 2))).convert("RGB").resize(img.size)
+        dx = round(self.shift * width)
+        strip = img.crop((x0, y0, x1, y1))
+        img.paste(base.crop((x0, y0, x1, y1)), (x0, y0))
+        img.paste(strip, (x0 + dx, y0))
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue(), "image/png"
+
+
+@pytest.mark.parametrize("ar", _ARS)
+def test_a_polish_that_indents_a_line_ships_the_deterministic_render(ar, monkeypatch):
+    monkeypatch.setenv("GD_TEXT_OPTIMIZER", "1")
+    qa_calls = []
+    monkeypatch.setattr(qa_brain, "check",
+                        lambda *a, **k: qa_calls.append(1) or {"passed": True, "violations": []})
+    run = _pinned_run(ar, f"u-geo-drift-{ar}")
+    provider = _IndentingProvider(run)
+    pipeline._generate_stage3(run, provider=provider)
+    attempts = run["stages"]["3"]["attempts"]
+    assert len(attempts) == 3
+    for a in attempts:
+        assert a["ai"] is False and a["provider"] == "deterministic"
+        assert a["fallback_reason"].startswith("polish moved the text off the verified layout")
+        assert "subheading-0 line 1 drifted" in a["fallback_reason"]
+        assert a["geometry"]["passed"] is False and a["geometry"]["max_align_dev"] > 0.02
+    # Retried once per style with the violation fed back; the vision QA was
+    # never paid for a drifted image.
+    assert len(provider.prompts) == 6
+    assert sum("the text layout moved" in p for p in provider.prompts) == 3
+    assert not qa_calls
+
+
+@pytest.mark.parametrize("ar", _ARS)
+def test_a_corrected_retry_ships_as_ai_with_its_geometry(ar, monkeypatch):
+    monkeypatch.setenv("GD_TEXT_OPTIMIZER", "1")
+    monkeypatch.setattr(qa_brain, "check", lambda *a, **k: {"passed": True, "violations": []})
+    run = _pinned_run(ar, f"u-geo-fix-{ar}")
+    pipeline._generate_stage3(run, provider=_IndentingProvider(run, drifts=3))
+    for a in run["stages"]["3"]["attempts"]:
+        assert a["ai"] is True and a["qa"] == "passed"
+        assert a["geometry"]["passed"] is True and a["geometry"]["max_align_dev"] <= 0.002
+
+
+def test_sub_tolerance_drift_is_not_a_violation(monkeypatch):
+    """Re-rendered glyphs land a pixel or two off; that is not drift."""
+    monkeypatch.setenv("GD_TEXT_OPTIMIZER", "1")
+    monkeypatch.setattr(qa_brain, "check", lambda *a, **k: {"passed": True, "violations": []})
+    run = _pinned_run("1:1", "u-geo-tol")
+    pipeline._generate_stage3(run, provider=_IndentingProvider(run, shift=0.002))
+    assert all(a["ai"] and a["geometry"]["passed"] for a in run["stages"]["3"]["attempts"])

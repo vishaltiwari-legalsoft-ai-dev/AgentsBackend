@@ -100,3 +100,133 @@ def test_reference_images_reach_stage1_and_stage2():
     assert seen[0] >= 1
     # Stage 2: the chained Stage-1 base PLUS the reference (>=2).
     assert seen[1] >= 2
+
+
+# ── Subject guard on carousel slides (2026-10-09) ─────────────────────────────
+# Slides render through ``render_frame_on_base`` and never passed the studio's
+# subject guard, but a campaign ships carousels too. Every slide now gets the
+# same guarantee: copy off the subject and off the logo, logo off both.
+
+import pytest  # noqa: E402
+from PIL import ImageDraw  # noqa: E402
+
+from graphics_designer_agent.runs import read_artifact, save_artifact  # noqa: E402
+from graphics_designer_agent.stage3_text import render as gd_render  # noqa: E402
+from graphics_designer_agent.stage3_text import subject_guard  # noqa: E402
+
+
+def _person_on(stage1_png: bytes, cx: float, scale: float = 1.0) -> bytes:
+    img = Image.open(BytesIO(stage1_png)).convert("RGB")
+    w, h = img.size
+    d = ImageDraw.Draw(img)
+    r = 0.11 * min(w, h) * scale
+    hx, hy = cx * w, 0.45 * h
+    d.ellipse([hx - r, hy - r, hx + r, hy + r], fill=(60, 40, 30))
+    d.rectangle([hx - 2.4 * r, hy + 1.1 * r, hx + 2.4 * r, h], fill=(20, 28, 60))
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _logo() -> bytes:
+    buf = BytesIO()
+    Image.new("RGBA", (300, 300), (3, 4, 94, 255)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _put_person(run: dict, cx: float, scale: float = 1.0) -> None:
+    """Overwrite the approved Stage-2 base with Stage 1 + a person at ``cx``."""
+    s1 = read_artifact(run["id"], run["stages"]["1"]["approved"]["artifact"])
+    last = run["stages"]["2"]["attempts"][-1]
+    save_artifact(run["id"], 2, last["variant"], last["attempt"], _person_on(s1, cx, scale))
+
+
+def _base_with_person(cx: float, scale: float = 1.0):
+    real = pipeline.establish_base
+
+    def base(*a, **k):
+        run = real(*a, **k)
+        _put_person(run, cx, scale)
+        return run
+    return base
+
+
+def test_slide_copy_is_moved_off_the_subject_and_recorded(monkeypatch):
+    monkeypatch.setattr(pipeline, "establish_base", _base_with_person(0.30))
+    monkeypatch.setattr(pipeline, "brand_logo_png", lambda brand_id: _logo())
+    # The layout brain puts the copy in the left column — right on the subject.
+    from graphics_designer_agent.creative import layout_brain
+    monkeypatch.setattr(layout_brain, "decide_placement",
+                        lambda *a, **k: {"placement": "left", "color": "dark", "source": "test"})
+    out = db.build("carousel", _carousel_plan(), registry.get_pack("legalsoft"))
+    assert [name for name, _d, _m in out] == ["frame-01.png", "frame-02.png", "frame-03.png"]
+    for art in out:
+        prov = db.artifact_provenance(art)
+        assert prov["placement_guard"]["moved"]           # the move is on the record
+        assert "fallback_reason" in prov                   # the honesty pair is kept
+
+
+@pytest.mark.parametrize("cx", [0.30, 0.70])
+def test_render_frame_leaves_zero_copy_on_the_subject(cx, monkeypatch):
+    """Direct contract on the frame renderer the carousel uses."""
+    monkeypatch.setattr(pipeline, "brand_logo_png", lambda brand_id: None)
+    run = pipeline.establish_base("legalsoft", "1:1")
+    _put_person(run, cx)
+    captured = {}
+    real_render = gd_render.render_layers
+
+    def spy(base, layers, w, h, **kw):
+        captured.update(layers=[dict(l) for l in layers], w=w, h=h)
+        return real_render(base, layers, w, h, **kw)
+
+    monkeypatch.setattr(pipeline.render, "render_layers", spy)
+    report: dict = {}
+    pipeline.render_frame_on_base(
+        run, headline="We're hiring remote legal staff", highlight="remote",
+        subheadings=["Work anywhere, start fast"], logo_png=_logo(),
+        layout={"placement": "left" if cx < 0.5 else "right", "color": "dark"}, report=report)
+    assert report["placement_guard"]["moved"]
+    mask = subject_guard.subject_mask(pipeline._approved_png(run, 1), pipeline._approved_png(run, 2))
+    pack = registry.get_pack("legalsoft")
+    hits = subject_guard.overlap_report(captured["layers"], mask, captured["w"], captured["h"], pack)
+    assert hits and set(hits.values()) == {0}
+
+
+def test_a_slide_with_no_clean_space_is_an_honest_stand_in(monkeypatch):
+    monkeypatch.setattr(pipeline, "establish_base", _base_with_person(0.5, 2.6))
+    monkeypatch.setattr(pipeline, "brand_logo_png", lambda brand_id: None)
+    out = db.build("carousel", _carousel_plan(), registry.get_pack("legalsoft"))
+    for art in out:
+        prov = db.artifact_provenance(art)
+        assert prov["ai"] is False
+        assert "no clean space" in prov["fallback_reason"]
+        assert "not an AI image" in prov["fallback_reason"]
+
+
+def test_a_slide_shows_only_the_plans_copy_and_legible_ink(monkeypatch):
+    """Live 2026-10-09: the CTA slide (no body copy) showed the brand's default
+    sub-texts, and white ink chosen for the brain's zone stayed white after the
+    guard moved the copy onto a light area."""
+    monkeypatch.setattr(pipeline, "establish_base", _base_with_person(0.70))
+    monkeypatch.setattr(pipeline, "brand_logo_png", lambda brand_id: None)
+    from graphics_designer_agent.creative import layout_brain
+    monkeypatch.setattr(layout_brain, "decide_placement",
+                        lambda *a, **k: {"placement": "right", "color": "white", "source": "test"})
+    rendered = []
+    real_render = gd_render.render_layers
+
+    def spy(base, layers, w, h, **kw):
+        rendered.append([dict(l) for l in layers])
+        return real_render(base, layers, w, h, **kw)
+
+    monkeypatch.setattr(pipeline.render, "render_layers", spy)
+    plan = {"creative_type": "carousel", "rationale": "cta",
+            "frames": [{"index": 1, "role": "cta", "headline": "Apply now"}]}
+    out = db.build("carousel", plan, registry.get_pack("legalsoft"))
+    (layers,) = rendered
+    assert not [l for l in layers if str(l.get("id", "")).startswith("subheading-")]
+    prov = db.artifact_provenance(out[0])
+    head = next(l for l in layers if l["id"] == "headline")
+    # The mock base is a light brand gradient: white ink is flipped and recorded.
+    assert head["color"] == "dark"
+    assert any(r["layer"] == "headline" and r["to"] == "dark" for r in prov["contrast_guard"])

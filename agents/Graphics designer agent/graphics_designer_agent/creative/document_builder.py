@@ -304,6 +304,20 @@ def _carousel_text_fallback(pack: Any, fr: dict, idx: int,
     return (f"frame-{idx:02d}.png", png, "image/png")
 
 
+class _NoCleanLayout(Exception):
+    """A slide whose copy or logo the subject guard could not place clear of the
+    subject (the reason is the guard's own, user-facing)."""
+
+
+def _guarded(render: Callable[[], bytes]) -> bytes:
+    from .. import pipeline
+
+    try:
+        return render()
+    except pipeline.PipelineError as exc:
+        raise _NoCleanLayout(str(exc)) from exc
+
+
 def build_carousel_frames(plan: dict[str, Any], pack: Any,
                           on_artifact: OnArtifact = None) -> list[Artifact]:
     """Render a TRUE carousel: a DISTINCT on-brand image per slide, not one photo ×N.
@@ -361,9 +375,12 @@ def build_carousel_frames(plan: dict[str, Any], pack: Any,
             "locally drawn brand-gradient stand-in, not an AI image.")
     model_reason = _provider_reason(provider)
 
-    def _slide(idx: int, png: bytes) -> Artifact:
+    def _slide(idx: int, png: bytes, guard: dict | None = None) -> Artifact:
         art = (f"frame-{idx:02d}.png", png, "image/png")
-        return _stand_in(art, model_reason) if model_reason else _from_model(art)
+        out = _stand_in(art, model_reason) if model_reason else _from_model(art)
+        if guard:  # what the subject/logo guard moved on this slide, on the record
+            out.provenance.update(guard)
+        return out
 
     def _render_slide(ordinal: int, fr: dict) -> tuple[int, Artifact]:
         idx = fr.get("index", ordinal + 1)
@@ -373,12 +390,14 @@ def build_carousel_frames(plan: dict[str, Any], pack: Any,
                 brand_id, "1:1", reference_images=refs,
                 subject=fr.get("subject") or None,
             )
+            guard: dict = {}
             if images_only:
                 # No copy — composite just the logo onto the approved base image.
                 # ``subheadings=[]`` clears the run's default sub-text so nothing but
                 # the logo is drawn (headline/cta are already empty here).
-                png = pipeline.render_frame_on_base(run, logo_png=logo, subheadings=[])
-                return idx, _slide(idx, png)
+                png = _guarded(lambda: pipeline.render_frame_on_base(
+                    run, logo_png=logo, subheadings=[], report=guard))
+                return idx, _slide(idx, png, guard)
             # Layout brain: look at THIS slide's image and place the text in the
             # clean negative space away from the subject (font + gradient stay locked).
             # Carousel text is pinned to a left/right side column (``sides_only``) so a
@@ -395,16 +414,27 @@ def build_carousel_frames(plan: dict[str, Any], pack: Any,
                 )
                 if base_png else None
             )
-            png = pipeline.render_frame_on_base(
+            png = _guarded(lambda: pipeline.render_frame_on_base(
                 run,
                 headline=fr.get("headline", ""),
                 highlight=fr.get("highlight", ""),
-                subheadings=[fr.get("body", "")] if fr.get("body") else None,
+                # Only the plan's own copy: a slide without body copy gets none
+                # (None kept the run's default brand sub-texts on the slide).
+                subheadings=[fr.get("body", "")] if fr.get("body") else [],
                 cta=fr.get("headline", "") if role == "cta" else "",
                 logo_png=logo,
                 layout=layout,
-            )
-            return idx, _slide(idx, png)
+                report=guard,
+            ))
+            return idx, _slide(idx, png, guard)
+        except _NoCleanLayout as exc:
+            # The subject guard found no clean spot for this slide's copy or logo:
+            # say so instead of shipping text on the subject.
+            logger.warning("slide %s: no clean layout (%s); text-frame fallback", idx, exc)
+            return idx, _stand_in(
+                _carousel_text_fallback(pack, fr, idx, images_only),
+                f"This slide's AI image left no clean space for its copy ({exc}), so it is "
+                "a locally drawn brand-gradient stand-in, not an AI image.")
         except Exception as exc:  # noqa: BLE001 - one slide failing ≠ whole set
             logger.warning("slide %s generation failed (%s); text-frame fallback", idx, exc)
             return idx, _stand_in(

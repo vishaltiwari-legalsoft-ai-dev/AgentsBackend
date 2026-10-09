@@ -376,9 +376,10 @@ def render_overlay(base_png: bytes, spec: dict, base_w: int, base_h: int,
     return out.getvalue()
 
 
-def _draw_text_abs(canvas, layer: dict, base_w, base_h, theme: _Theme, px_scale):
-    """Draw a PINNED text layer at its absolute anchor coords. Honors ``\\n`` as
-    hard line breaks (multi-line) and word-wraps each segment to ``w``."""
+def _text_abs_lines(layer: dict, base_w, base_h, theme: _Theme, px_scale):
+    """Line layout of a PINNED text layer: ``(font, main_fill, hl_fill, runs)``
+    where ``runs`` is one list per line of ``(x, y, word, is_highlight)``. The
+    single source of truth for both drawing and geometry measurement."""
     td = _theme_dict(theme)
     font = _font(layer["font"], layer["size_pct"] / 100 * base_w, theme)
     max_w = max(1, int(layer["w"] * base_w))
@@ -406,6 +407,7 @@ def _draw_text_abs(canvas, layer: dict, base_w, base_h, theme: _Theme, px_scale)
     # Per-line alignment inside the wrapped box. Default "left" is the
     # historical behavior, so runs without ``align`` stay byte-identical.
     align = layer.get("align") or "left"
+    runs: list[list[tuple]] = []
     for i, ln in enumerate(lines):
         if align == "center":
             cx = left + (box_w - widths[i]) / 2
@@ -414,10 +416,21 @@ def _draw_text_abs(canvas, layer: dict, base_w, base_h, theme: _Theme, px_scale)
         else:
             cx = left
         yy = top + i * lh
+        line_runs = []
         for tok in ln:
-            fill = hl if (is_head and tok[1]) else main
-            _draw_run(canvas, int(cx), int(yy), tok[0], font, fill)
+            line_runs.append((int(cx), int(yy), tok[0], bool(is_head and tok[1])))
             cx += font.getlength(tok[0]) + space
+        runs.append(line_runs)
+    return font, main, hl, runs
+
+
+def _draw_text_abs(canvas, layer: dict, base_w, base_h, theme: _Theme, px_scale):
+    """Draw a PINNED text layer at its absolute anchor coords. Honors ``\\n`` as
+    hard line breaks (multi-line) and word-wraps each segment to ``w``."""
+    font, main, hl, runs = _text_abs_lines(layer, base_w, base_h, theme, px_scale)
+    for line_runs in runs:
+        for x, y, word, is_hl in line_runs:
+            _draw_run(canvas, x, y, word, font, hl if is_hl else main)
 
 
 def _layers_from_spec(spec: dict) -> list[dict]:
@@ -605,3 +618,34 @@ def layer_ink_bbox(layer: dict, base_w: int, base_h: int, *, pack=None,
                        base_w, base_h, theme, px_scale)
     # Ignore the faint tail of the CTA drop shadow; count real ink.
     return canvas.getchannel("A").point(lambda a: 255 if a > 40 else 0).getbbox()
+
+
+def layer_line_boxes(layer: dict, base_w: int, base_h: int, *, pack=None,
+                     px_scale: float = 1.0) -> list[tuple[int, int, int, int]]:
+    """Ink bbox ``(x0, y0, x1, y1)`` of every rendered LINE of one pinned text
+    layer, top to bottom — from the same line layout the renderer draws, so the
+    geometry is exact. A CTA is one "line" (its pill). Empty lines are skipped."""
+    theme = _theme_from_pack(pack) if pack is not None else _default_theme()
+    if layer.get("type") == "cta":
+        box = layer_ink_bbox(layer, base_w, base_h, pack=pack, px_scale=px_scale)
+        return [box] if box else []
+    font, _main, _hl, runs = _text_abs_lines(
+        {**layer, "offset": layer.get("offset", (0, 0))}, base_w, base_h, theme, px_scale)
+    asc, desc = font.getmetrics()
+    out = []
+    for line_runs in runs:
+        boxes = []
+        for x, y, word, _is_hl in line_runs:
+            if not word:
+                continue
+            w = max(1, int(round(font.getlength(word))))
+            bx0, by0, bx1, by1 = font.getbbox(word)
+            # _draw_run clips each word to its (getlength x asc+desc) layer.
+            bx0, by0 = max(0, bx0), max(0, by0)
+            bx1, by1 = min(w, bx1), min(asc + desc, by1)
+            if bx1 > bx0 and by1 > by0:
+                boxes.append((x + bx0, y + by0, x + bx1, y + by1))
+        if boxes:
+            out.append((min(b[0] for b in boxes), min(b[1] for b in boxes),
+                        max(b[2] for b in boxes), max(b[3] for b in boxes)))
+    return out

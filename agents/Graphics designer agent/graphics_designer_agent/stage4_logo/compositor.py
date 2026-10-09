@@ -83,8 +83,17 @@ def logo_placement(
     edge inset (% of base width, default 4%). ``offset_x``/``offset_y`` are fine
     pixel nudges applied after anchoring. The box is clamped inside the canvas.
     """
-    ratio = (size_pct / 100.0) if size_pct else _logo_width_ratio(logo_w, logo_h)
-    target_w = max(1, round(base_w * ratio))
+    if size_pct:
+        target_w = max(1, round(base_w * size_pct / 100.0))
+    else:
+        # Aspect-aware default. A square or tall mark is sized off the SHORTER
+        # canvas side: on a 16:9 frame "20% of the width" made a square logo
+        # over a third of the height. Portrait/square canvases and wide
+        # wordmarks are unchanged (the shorter side is the width / the mark is
+        # height-light anyway).
+        ratio = _logo_width_ratio(logo_w, logo_h)
+        wide = logo_h and logo_w / logo_h > 3.0
+        target_w = max(1, round((base_w if wide else min(base_w, base_h)) * ratio))
     target_h = max(1, round(target_w * (logo_h / logo_w))) if logo_w else 1
     margin = round(base_w * (margin_pct / 100.0 if margin_pct is not None else MARGIN_RATIO))
     x, y = _anchor(position, base_w, base_h, target_w, target_h, margin)

@@ -36,3 +36,15 @@ def test_width_ratios_follow_logo_aspect():
     assert logo_placement(1000, 1000, 400, 100)["w"] == 250   # wide (>3:1) → 25%
     assert logo_placement(1000, 1000, 100, 400)["w"] == 150   # tall (>1:2) → 15%
     assert logo_placement(1000, 1000, 200, 100)["x"] == 40    # 4% margin
+
+
+def test_square_and_tall_logos_are_sized_off_the_shorter_side_on_landscape():
+    # 16:9: "20% of the width" made a square mark over a third of the height.
+    assert logo_placement(1920, 1080, 400, 400)["w"] == 216    # 20% of 1080
+    assert logo_placement(1920, 1080, 100, 400)["w"] == 162    # 15% of 1080
+    assert logo_placement(1920, 1080, 1000, 200)["w"] == 480   # wide wordmark: 25% of width
+    # Portrait / square canvases are unchanged.
+    assert logo_placement(1080, 1350, 400, 400)["w"] == 216
+    assert logo_placement(1080, 1920, 400, 400)["w"] == 216
+    # An explicit size is always % of the width.
+    assert logo_placement(1920, 1080, 400, 400, size_pct=20)["w"] == 384

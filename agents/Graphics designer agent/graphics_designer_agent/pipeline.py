@@ -486,24 +486,127 @@ def _hires_canvas(base_png: bytes, canvas_w: int, canvas_h: int) -> tuple[int, i
 
 
 # The logo is chosen at Stage 4, after the copy is set, so Stage 3 reserves the
-# box it will most likely take: the run's logo position/size/margin with a
-# typical wide wordmark (h = 0.45 w) at the wide-logo default width (25%) when
-# no size is set. Stage 4 re-checks the real logo box against the real ink.
+# box it will most likely take: the run's logo position/size/margin with the
+# brand's REAL logo (its aspect and its inked area — a square or tall mark needs
+# a taller corner than a wordmark). Only when no logo can be found at all is a
+# typical wide wordmark (h = 0.45 w, 25% wide) assumed. Stage 4 re-checks the
+# real logo box against the real ink either way.
 _RESERVE_LOGO_W, _RESERVE_LOGO_H = 1000, 450
+# Corners the logo may move to so the copy keeps a readable size — only while
+# the run still has the factory logo placement (the user never picked a spot).
+_LOGO_ALTERNATIVES = ("top-right", "top-left", "bottom-left", "bottom-right")
 
 
-def _logo_reserve(run: dict, canvas_w: int, canvas_h: int) -> tuple[float, float, float, float]:
+def _reserve_logo_png(run: dict) -> tuple[bytes | None, str]:
+    """The logo Stage 4 will most likely composite, mirroring its resolution
+    order: the logo this run already used, then the brand's logo (Firestore),
+    then the bundled brand logo. ``(None, "none")`` when there is none."""
+    rel = (run.get("logo") or {}).get("artifact")
+    if rel:
+        try:
+            return read_artifact(run["id"], rel), "run_logo"
+        except Exception:  # noqa: BLE001 - a missing artifact falls through
+            logger.warning("reserve: run logo %s unreadable", rel, exc_info=True)
+    png = brand_logo_png(run.get("brand_id"))
+    if png:
+        return png, "brand_logo"
+    try:
+        p = getattr(registry.get_pack(run.get("brand_id")), "logo_path", None)
+        if p and p.exists():
+            raw = p.read_bytes()
+            try:
+                from app.services import imaging
+
+                return imaging.to_png_logo(raw, file_name=p.name, mime="image/png") or raw, "bundled_logo"
+            except ImportError:
+                return raw, "bundled_logo"
+    except Exception:  # noqa: BLE001 - no logo is a supported state
+        logger.warning("reserve: bundled logo unreadable", exc_info=True)
+    return None, "none"
+
+
+def _logo_geometry(logo_png: bytes | None) -> tuple[int, int, tuple[float, float, float, float]]:
+    """``(w, h, ink)`` of a logo: pixel size plus its inked (alpha > 40) part as
+    fractions of it. A logo on a transparent canvas keeps its canvas size for
+    placement (the compositor scales the whole file) but only its ink can
+    collide. Unknown logo → the wide-wordmark assumption, fully inked."""
+    if not logo_png:
+        return _RESERVE_LOGO_W, _RESERVE_LOGO_H, (0.0, 0.0, 1.0, 1.0)
+    from PIL import Image
+
+    try:
+        im = Image.open(BytesIO(logo_png))
+        w, h = im.size
+        box = None
+        if im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info:
+            alpha = im.convert("RGBA").getchannel("A")
+            box = alpha.point(lambda a: 255 if a > 40 else 0).getbbox()
+        if not box:
+            box = (0, 0, w, h)
+        return w, h, (box[0] / w, box[1] / h, box[2] / w, box[3] / h)
+    except Exception:  # noqa: BLE001 - unreadable logo → the default assumption
+        return _RESERVE_LOGO_W, _RESERVE_LOGO_H, (0.0, 0.0, 1.0, 1.0)
+
+
+def _logo_ink_box(box: dict, ink: tuple[float, float, float, float]) -> dict:
+    """The inked part of a compositor placement box (same ``x,y,w,h`` shape)."""
+    x0 = box["x"] + ink[0] * box["w"]
+    y0 = box["y"] + ink[1] * box["h"]
+    return {"x": x0, "y": y0, "w": (ink[2] - ink[0]) * box["w"], "h": (ink[3] - ink[1]) * box["h"]}
+
+
+def _logo_reserve(run: dict, canvas_w: int, canvas_h: int, *, position: str | None = None,
+                  logo_png: bytes | None = None) -> tuple[float, float, float, float]:
+    """The inked box (fractions of the frame) the Stage-4 logo will take."""
     from .stage4_logo.compositor import DEFAULT_LOGO_POSITION, WIDTH_RATIO_WIDE
 
     lay = run["config"].get("logo_layout") or {}
-    box = logo_placement(
-        canvas_w, canvas_h, _RESERVE_LOGO_W, _RESERVE_LOGO_H,
-        position=lay.get("position") or DEFAULT_LOGO_POSITION,
-        size_pct=lay.get("size_pct") or WIDTH_RATIO_WIDE * 100,
-        margin_pct=lay.get("margin_pct"),
-        offset_x=int(lay.get("offset_x", 0) or 0), offset_y=int(lay.get("offset_y", 0) or 0))
+    lw, lh, ink = _logo_geometry(logo_png)
+    size_pct = lay.get("size_pct") or (None if logo_png else WIDTH_RATIO_WIDE * 100)
+    box = _logo_ink_box(logo_placement(
+        canvas_w, canvas_h, lw, lh,
+        position=position or lay.get("position") or DEFAULT_LOGO_POSITION,
+        size_pct=size_pct, margin_pct=lay.get("margin_pct"),
+        offset_x=int(lay.get("offset_x", 0) or 0), offset_y=int(lay.get("offset_y", 0) or 0)), ink)
     return (box["x"] / canvas_w, box["y"] / canvas_h,
             (box["x"] + box["w"]) / canvas_w, (box["y"] + box["h"]) / canvas_h)
+
+
+def _logo_is_factory_placed(run: dict) -> bool:
+    from .stage4_logo.compositor import DEFAULT_LOGO_POSITION
+
+    lay = run["config"].get("logo_layout") or {}
+    return ((lay.get("position") or DEFAULT_LOGO_POSITION) == DEFAULT_LOGO_POSITION
+            and not int(lay.get("offset_x", 0) or 0) and not int(lay.get("offset_y", 0) or 0))
+
+
+def _guard_copy(run: dict, layers: list[dict], base: bytes, canvas_w: int, canvas_h: int,
+                pack, logo_png: bytes | None, logo_source: str,
+                logo_layout: dict | None = None) -> dict | None:
+    """The subject guard on ``layers`` (mutated in place when the copy moves),
+    keeping the copy off the Stage-2 subject and off the box ``logo_png`` will
+    take. Persists nothing. Returns the ``placement_guard`` record or None;
+    raises :class:`PipelineError` when no clean arrangement exists."""
+    from .stage3_text import subject_guard
+
+    view = run if logo_layout is None else {
+        **run, "config": {**run["config"], "logo_layout": logo_layout}}
+    reserve = _logo_reserve(view, canvas_w, canvas_h, logo_png=logo_png)
+    requested = (view["config"].get("logo_layout") or {}).get("position") or "top-left"
+    alternatives = ([(pos, _logo_reserve(view, canvas_w, canvas_h, position=pos, logo_png=logo_png))
+                     for pos in _LOGO_ALTERNATIVES if pos != requested]
+                    if _logo_is_factory_placed(view) else None)
+    try:
+        _layers, record = subject_guard.enforce(
+            layers, _approved_png(run, 1), base, canvas_w, canvas_h, pack,
+            reserve=[reserve], alternatives=alternatives)
+    except subject_guard.SubjectGuardError as exc:
+        raise PipelineError(str(exc)) from exc
+    if record:
+        lw, lh, _ink = _logo_geometry(logo_png)
+        record["logo_reserve"] = {"source": logo_source,
+                                  "aspect": round(lw / lh, 2) if lh else None}
+    return record
 
 
 def _enforce_subject_clearance(run: dict, layers: list[dict], base: bytes,
@@ -511,18 +614,17 @@ def _enforce_subject_clearance(run: dict, layers: list[dict], base: bytes,
     """Run the Stage-3 subject guard on ``layers`` (mutated in place when the
     copy has to move) and persist any move into the run config, so the editor
     shows where the text really is and the config hash matches the render.
-    Returns the ``placement_guard`` record, or None when nothing moved."""
-    from .stage3_text import subject_guard
-
-    try:
-        _layers, record = subject_guard.enforce(
-            layers, _approved_png(run, 1), base, canvas_w, canvas_h, pack,
-            reserve=[_logo_reserve(run, canvas_w, canvas_h)])
-    except subject_guard.SubjectGuardError as exc:
-        raise PipelineError(str(exc)) from exc
+    ``canvas_w`` x ``canvas_h`` must be the size the creative is RENDERED at:
+    text wraps per resolution, so a stack planned at another size can come out
+    with a ragged left edge. Returns the ``placement_guard`` record, or None
+    when nothing moved."""
+    logo_png, logo_source = _reserve_logo_png(run)
+    record = _guard_copy(run, layers, base, canvas_w, canvas_h, pack, logo_png, logo_source)
     if not record:
         return None
     cfg = run["config"]
+    if record.get("logo_position"):
+        cfg["logo_layout"] = {**(cfg.get("logo_layout") or {}), "position": record["logo_position"]}
     lay = cfg.setdefault("layout", {})
     styles = cfg.setdefault("element_styles", {})
     # Layer ids number the NON-EMPTY sub-headings; map back to config indices.
@@ -583,10 +685,12 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
 
     layers = gd_layout.resolve_layers(view)
     canvas_w, canvas_h = _stage_dims(run, 3)
+    w, h, px_scale = _hires_canvas(base, canvas_w, canvas_h)
     # Subject guard (both paths): copy must never sit on the Stage-2 subject.
     # A colliding arrangement is re-flowed into clean space and the move is
     # persisted + recorded; when no clean space exists this is an honest error.
-    placement_guard = _enforce_subject_clearance(run, layers, base, canvas_w, canvas_h, pack)
+    # Planned at the RENDER size so the shipped stack's left edges line up.
+    placement_guard = _enforce_subject_clearance(run, layers, base, w, h, pack)
     # Legibility guard (optimizer path only, so flag-off stays byte-identical):
     # a brand-gradient highlight whose light stop vanishes on a light background
     # is rendered with the gradient's dark stop instead — recorded honestly.
@@ -598,7 +702,6 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
     contrast_guard = (
         text_optimizer.ensure_text_contrast(layers, base) if use_optimizer else []
     )
-    w, h, px_scale = _hires_canvas(base, canvas_w, canvas_h)
     png = render.render_layers(
         base, layers, w, h, px_scale=px_scale, pack=pack,
         image_loader=lambda ref: read_artifact(run["id"], ref),
@@ -629,11 +732,15 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
         save_run(run)
         return attempt
 
+    from .stage3_text import text_geometry
+
     results = text_optimizer.optimize(
         composite_png=png, layers=layers, provider=provider,
         notes=(run["config"].get("polish_notes") or ""),
         width=w, height=h, aspect_ratio=_stage_ar(run),
         image_size=STAGE_IMAGE_SIZE[3],
+        lines=text_geometry.spec_lines(layers, w, h, pack=pack, px_scale=px_scale),
+        base_png=base,
     )
     set_id = uuid.uuid4().hex[:8]
     stored: list[dict] = []
@@ -659,6 +766,7 @@ def _generate_stage3(run: dict, provider: ImageProvider | None = None) -> dict:
             "ai": res["ai"],
             "fallback_reason": res["fallback_reason"],
             "qa": res["qa"],
+            "geometry": res.get("geometry", "not_run"),
             "set_id": set_id,
             "config_hash": cfg_hash,
             "fonts": chosen_fonts,
@@ -923,19 +1031,25 @@ def _clear_logo_layout(run: dict, base: bytes, logo_png: bytes,
 
     pack = registry.get_pack(run.get("brand_id"))
     canvas_w, canvas_h = _stage_dims(run, 3)
-    view, _fonts = text_optimizer.resolved_fonts_view(run, pack)
-    ink = subject_guard.text_ink_mask(gd_layout.resolve_layers(view), canvas_w, canvas_h, pack)
     s1, s2 = _approved_png(run, 1), _approved_png(run, 2)
+    # The copy's ink at the size Stage 3 rendered it (text wraps per resolution).
+    ink_w, ink_h, ink_scale = (_hires_canvas(s2, canvas_w, canvas_h) if s2 is not None
+                               else (canvas_w, canvas_h, 1.0))
+    view, _fonts = text_optimizer.resolved_fonts_view(run, pack)
+    ink = subject_guard.text_ink_mask(gd_layout.resolve_layers(view), ink_w, ink_h, pack,
+                                      px_scale=ink_scale)
     subject = subject_guard.subject_mask(s1, s2) if s1 is not None and s2 is not None else None
     base_w, base_h = Image.open(BytesIO(base)).size
-    logo_w, logo_h = Image.open(BytesIO(logo_png)).size
+    logo_w, logo_h, logo_ink = _logo_geometry(logo_png)
 
     def place(position: str) -> dict:
-        return logo_placement(
+        # Only the logo's ink can collide — a mark on a transparent square
+        # canvas must not be refused for its empty padding.
+        return _logo_ink_box(logo_placement(
             base_w, base_h, logo_w, logo_h, position=position,
             size_pct=layout.get("size_pct"), margin_pct=layout.get("margin_pct"),
             offset_x=int(layout.get("offset_x", 0) or 0),
-            offset_y=int(layout.get("offset_y", 0) or 0))
+            offset_y=int(layout.get("offset_y", 0) or 0)), logo_ink)
 
     requested = layout.get("position") or DEFAULT_LOGO_POSITION
     try:
@@ -1182,9 +1296,17 @@ def render_frame_on_base(
     logo_png: bytes | None = None,
     logo_layout: dict | None = None,
     layout: dict | None = None,
+    report: dict | None = None,
 ) -> bytes:
     """Apply Stage 3 (deterministic text) + Stage 4 (logo composite) for ONE frame
     onto the run's approved Stage-2 base, and return the finished PNG.
+
+    The same guarantees as the studio: the copy is kept off the Stage-2 subject
+    and off the logo's box (re-flowed by ``subject_guard`` when it collides),
+    and the logo lands in a corner clear of the copy and the subject. What
+    moved is written into ``report`` (``placement_guard`` / ``logo_guard``)
+    when the caller passes a dict; no clean arrangement raises
+    :class:`PipelineError` with the reason — never a frame with text on a face.
 
     Pure render — it does NOT append attempts or mutate the run's saved state — so
     it is called once per frame of a carousel/blog/deck without disturbing the
@@ -1230,13 +1352,65 @@ def render_frame_on_base(
     layers = gd_layout.resolve_layers(view)
     canvas_w, canvas_h = _stage_dims(view, 3)
     w, h, px_scale = _hires_canvas(base, canvas_w, canvas_h)
-    png = render.render_layers(
-        base, layers, w, h, px_scale=px_scale, pack=registry.get_pack(run.get("brand_id"))
-    )
+    pack = registry.get_pack(run.get("brand_id"))
+    lay = dict(logo_layout if logo_layout is not None else (run["config"].get("logo_layout") or {}))
+    guard = _guard_copy(run, layers, base, w, h, pack, logo_png,
+                        "frame_logo" if logo_png else "none", logo_layout=lay)
+    if guard and guard.get("logo_position"):
+        lay["position"] = guard["logo_position"]
+    # Legibility where the copy really ended up: the layout brain picked the ink
+    # for the zone it chose, and the guard may have moved the copy since.
+    highlight_guard = text_optimizer.ensure_highlight_contrast(layers, base, pack)
+    contrast_guard = text_optimizer.ensure_text_contrast(layers, base)
+    png = render.render_layers(base, layers, w, h, px_scale=px_scale, pack=pack)
+    logo_guard = None
     if logo_png:
-        layout = logo_layout if logo_layout is not None else (run["config"].get("logo_layout") or {})
-        png = composite_logo(png, logo_png, layout)
+        lay, logo_guard = _clear_frame_logo(run, png, logo_png, lay, layers, w, h,
+                                            px_scale, pack)
+        png = composite_logo(png, logo_png, lay)
+    if report is not None:
+        if guard:
+            report["placement_guard"] = guard
+        if logo_guard:
+            report["logo_guard"] = logo_guard
+        if highlight_guard:
+            report["highlight_guard"] = highlight_guard
+        if contrast_guard:
+            report["contrast_guard"] = contrast_guard
     return png
+
+
+def _clear_frame_logo(run: dict, frame_png: bytes, logo_png: bytes, layout: dict,
+                      layers: list[dict], w: int, h: int, px_scale: float,
+                      pack) -> tuple[dict, dict | None]:
+    """The Stage-4 logo check for a frame rendered outside the studio: the
+    requested corner when clear of the copy and the subject, else the first
+    clear one. No clear corner is an honest :class:`PipelineError`."""
+    from PIL import Image
+
+    from .stage3_text import subject_guard
+    from .stage4_logo.compositor import DEFAULT_LOGO_POSITION
+
+    ink = subject_guard.text_ink_mask(layers, w, h, pack, px_scale=px_scale)
+    s1, s2 = _approved_png(run, 1), _approved_png(run, 2)
+    subject = subject_guard.subject_mask(s1, s2) if s1 is not None and s2 is not None else None
+    base_w, base_h = Image.open(BytesIO(frame_png)).size
+    logo_w, logo_h, logo_ink = _logo_geometry(logo_png)
+
+    def place(position: str) -> dict:
+        return _logo_ink_box(logo_placement(
+            base_w, base_h, logo_w, logo_h, position=position,
+            size_pct=layout.get("size_pct"), margin_pct=layout.get("margin_pct"),
+            offset_x=int(layout.get("offset_x", 0) or 0),
+            offset_y=int(layout.get("offset_y", 0) or 0)), logo_ink)
+
+    try:
+        position, record = subject_guard.logo_clear_position(
+            requested=layout.get("position") or DEFAULT_LOGO_POSITION, place=place,
+            base_w=base_w, base_h=base_h, ink=ink, subject=subject)
+    except subject_guard.SubjectGuardError as exc:
+        raise PipelineError(str(exc)) from exc
+    return ({**layout, "position": position} if record else layout), record
 
 
 def brand_logo_png(brand_id: str | None) -> bytes | None:

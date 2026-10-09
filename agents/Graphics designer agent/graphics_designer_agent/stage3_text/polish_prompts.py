@@ -22,12 +22,11 @@ PRESERVATION_BLOCK = (
     "6. Never ADD new text of any kind — no labels, tags, captions, stamps,\n"
     "   watermarks or vertical micro-text anywhere, not even tiny ones. The only\n"
     "   letters in the finished image are the ones already there.\n"
-    "THE ONE ALLOWED ADJUSTMENT — collision fix: if any text block or the CTA\n"
-    "button overlaps the photo/subject or another element, MOVE that whole block\n"
-    "(unchanged, as one unit) to the nearest clean negative space so NOTHING\n"
-    "overlaps the subject and every word stays fully readable. Reposition only —\n"
-    "never resize, restyle or reflow it.\n"
-    "Your job is finishing, integration and collision-free placement ONLY."
+    "7. Never move, indent, re-align, resize or re-wrap any text line or the CTA.\n"
+    "   The layout is final and already verified clear of the subject and the\n"
+    "   logo: every line keeps its exact position, its left edge (lines that\n"
+    "   share a left edge keep sharing it), its line breaks and its order.\n"
+    "Your job is finishing and integration ONLY."
 )
 
 STYLE_RECIPES = [

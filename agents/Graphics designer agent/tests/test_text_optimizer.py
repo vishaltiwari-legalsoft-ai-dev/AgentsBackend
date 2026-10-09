@@ -106,7 +106,7 @@ def test_optimize_provider_error_falls_back_honestly():
     results = to.optimize(composite_png=b"BASE", layers=_LAYERS,
                           provider=_FakeProvider(fail=True), width=480, height=600)
     assert all(not r["ai"] and r["png"] == b"BASE" and r["qa"] == "not_run" for r in results)
-    assert all(r["fallback_reason"] == "image model call failed" for r in results)
+    assert all(r["fallback_reason"].startswith("image model call failed") for r in results)
 
 
 # ── highlight contrast guard (live-run fix 2026-07-14) ────────────────────────

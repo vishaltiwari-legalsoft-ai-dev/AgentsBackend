@@ -225,22 +225,39 @@ def resolved_fonts_view(run: dict, pack, judgment: dict | None = None) -> tuple[
     return {**run, "config": cfg}, chosen
 
 
+def _geometry_summary(g: dict | None) -> dict | str:
+    if g is None:
+        return "not_run"
+    return {"passed": g["passed"], "max_align_dev": g["max_align_dev"], "shift": g["shift"],
+            **({"violations": g["violations"]} if g["violations"] else {})}
+
+
 def optimize(*, composite_png: bytes, layers: list[dict], provider, notes: str = "",
              width: int = 1080, height: int = 1350,
-             aspect_ratio: str | None = None, image_size: str | None = None) -> list[dict]:
+             aspect_ratio: str | None = None, image_size: str | None = None,
+             lines: list[dict] | None = None, base_png: bytes | None = None) -> list[dict]:
     """Fan the composite out to the three style recipes, QA-gate each result.
 
     Returns one result per recipe (order = STYLE_RECIPES):
-    ``{"style","label","png","ai","fallback_reason","qa","prompt"}``. Honest by
-    construction: a result that isn't genuinely the model's output has
+    ``{"style","label","png","ai","fallback_reason","qa","geometry","prompt"}``.
+    Two gates per polish, cheapest first: the text GEOMETRY check (pixels, no
+    model call — ``lines`` is the deterministic per-line spec from
+    ``text_geometry.spec_lines``; every line keeps its alignment edge, its row,
+    its order and its width), then the vision QA. A violation of either is fed
+    back for the one retry. Honest by construction: a result that isn't
+    genuinely the model's output — or never passed the gates — has
     ``ai: False`` + a ``fallback_reason``, and its ``png`` is the untouched
     deterministic composite. Never raises."""
+    from . import text_geometry
+
     layout_desc = polish_prompts.describe_layout(layers)
 
     def one(recipe: dict) -> dict:
         base_prompt = polish_prompts.build_polish_prompt(recipe["key"], layout_desc, notes)
-        result = {"style": recipe["key"], "label": recipe["label"], "prompt": base_prompt}
+        result = {"style": recipe["key"], "label": recipe["label"], "prompt": base_prompt,
+                  "geometry": "not_run"}
         violations: list[str] = []
+        geometry_failed = False
         for _ in range(_MAX_POLISH_ATTEMPTS):
             prompt = base_prompt if not violations else (
                 base_prompt
@@ -254,10 +271,19 @@ def optimize(*, composite_png: bytes, layers: list[dict], provider, notes: str =
                     width=width, height=height,
                     aspect_ratio=aspect_ratio, image_size=image_size,
                 )
-            except Exception:
+            except Exception as exc:
                 logger.warning("polish call failed for %s", recipe["key"], exc_info=True)
                 return {**result, "png": composite_png, "ai": False,
-                        "fallback_reason": "image model call failed", "qa": "not_run"}
+                        "fallback_reason": f"image model call failed: {exc}"[:300],
+                        "qa": "not_run"}
+            geometry = (text_geometry.check(composite_png, png, lines, width, height, base_png)
+                        if lines else None)
+            result["geometry"] = _geometry_summary(geometry)
+            if geometry is not None and not geometry["passed"]:
+                geometry_failed = True
+                violations = ["the text layout moved: " + v for v in geometry["violations"]]
+                continue
+            geometry_failed = False
             verdict = qa_brain.check(composite_png, png, layout_desc)
             if verdict is None:
                 return {**result, "png": png, "ai": True, "fallback_reason": None,
@@ -266,6 +292,11 @@ def optimize(*, composite_png: bytes, layers: list[dict], provider, notes: str =
                 return {**result, "png": png, "ai": True, "fallback_reason": None,
                         "qa": "passed", "prompt": prompt}
             violations = verdict["violations"] or ["preservation check failed"]
+        if geometry_failed:
+            return {**result, "png": composite_png, "ai": False,
+                    "fallback_reason": ("polish moved the text off the verified layout: "
+                                        + "; ".join(violations))[:300],
+                    "qa": "not_run"}
         return {**result, "png": composite_png, "ai": False,
                 "fallback_reason": ("QA kept failing: " + "; ".join(violations))[:300],
                 "qa": "failed"}

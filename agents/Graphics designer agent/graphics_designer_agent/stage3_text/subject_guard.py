@@ -54,7 +54,13 @@ MAX_SUBJECT_SHARE = 0.7
 MARGIN = 0.06          # canvas safe margin (matches the renderer's 6%)
 PAD = 0.015            # clearance kept between any text and the subject (x canvas W)
 MIN_COLUMN = 0.24      # narrowest column worth setting copy in (x canvas W)
-SCALES = (1.0, 0.9, 0.8, 0.7, 0.6)
+# Readability floor: (headline, body) size steps, tried in order, every plan at
+# each step. Every arrangement (column, column following the subject's contour,
+# band above, headline-above-rest-beside) is tried at full, 90% and 80% before
+# anything smaller; below 80% the HEADLINE gives way first so the sub-headings
+# and CTA — the copy that turns illegible first — keep 80%.
+SCALE_STEPS = ((1.0, 1.0), (0.9, 0.9), (0.8, 0.8), (0.7, 0.8), (0.6, 0.8),
+               (0.7, 0.7), (0.6, 0.6))
 GAP_AFTER_HEADLINE = 0.03
 GAP_BETWEEN = 0.02
 GAP_BEFORE_CTA = 0.04
@@ -267,10 +273,10 @@ def _clean(placed: dict | None, mask: np.ndarray, canvas_w: int, canvas_h: int) 
         for v in placed.values())
 
 
-def _column_stack(text, mask, side, y_top, scale, canvas_w, canvas_h, pack):
+def _column_stack(text, mask, side, y_top, scale, canvas_w, canvas_h, pack, probe=0.35):
     """Stack ``text`` in the clean column on ``side`` from ``y_top`` down,
     re-fitting the column to the rows the stack really occupies."""
-    cx0, cx1 = _free_column(mask, side, y_top, y_top + 0.35 * canvas_h, canvas_w, canvas_h)
+    cx0, cx1 = _free_column(mask, side, y_top, y_top + probe * canvas_h, canvas_w, canvas_h)
     for _ in range(6):
         if cx1 - cx0 < MIN_COLUMN * canvas_w:
             return None
@@ -317,14 +323,47 @@ def _plans(text, mask, prefer, canvas_w, canvas_h, pack, start_y=None, subject=N
             return {**head, **rest} if rest else None
         return plan
 
-    plans = [(s, column(s)) for s in sides] + [("top", band)]
+    def contour(sc):
+        return _contour_stack(text, mask, top, sc, canvas_w, canvas_h, pack)
+
+    plans = [(sides[0], column(sides[0]))]
+    if sides[0] == "left":
+        plans.append(("left-contour", contour))
+    plans.append((sides[1], column(sides[1])))
+    if sides[1] == "left":
+        plans.append(("left-contour", contour))
+    plans += [("top", band)]
     plans += [(f"top+{s}", split(s)) for s in sides]
     return plans
 
 
+def _contour_stack(text, mask, y_top, scale, canvas_w, canvas_h, pack):
+    """Left-aligned stack on the frame's left margin where EACH element gets the
+    clean width beside the subject at its own rows — the headline beside the
+    head is wider than the sub-headings beside the shoulders. One shared left
+    edge, so the copy still reads as one aligned block."""
+    y = y_top
+    out: dict[str, dict] = {}
+    prev = None
+    for layer in text:
+        if prev is not None:
+            gap = (GAP_AFTER_HEADLINE if prev == "headline"
+                   else GAP_BEFORE_CTA if layer["type"] == "cta" else GAP_BETWEEN)
+            y += gap * canvas_h
+        one = _column_stack([layer], mask, "left", y, scale, canvas_w, canvas_h, pack,
+                            probe=0.12)
+        if one is None:
+            return None
+        out.update(one)
+        y = one[layer["id"]]["box"][3]
+        prev = layer["id"]
+    return out
+
+
 def arrange(layers: list[dict], mask: np.ndarray, canvas_w: int, canvas_h: int,
             pack=None, prefer: str = "left", start_y: float | None = None,
-            subject: np.ndarray | None = None) -> tuple[dict[str, dict], dict] | None:
+            subject: np.ndarray | None = None,
+            steps=SCALE_STEPS) -> tuple[dict[str, dict], dict] | None:
     """A clean arrangement for the movable copy, or None if none exists.
     Largest size first across every plan, the preferred side breaking ties — a
     roomy column on the far side beats a cramped one on the near side."""
@@ -334,14 +373,19 @@ def arrange(layers: list[dict], mask: np.ndarray, canvas_w: int, canvas_h: int,
     order = {"headline": 0, "cta": 99}
     text.sort(key=lambda l: order.get(l["id"], 1 + int(str(l["id"]).rsplit("-", 1)[-1])
                                       if str(l["id"]).startswith("subheading-") else 50))
-    plans = _plans(text, mask, prefer, canvas_w, canvas_h, pack, start_y, subject)
-    for scale in SCALES:
+    for head_scale, body_scale in steps:
+        scaled = [{**l, "size_pct": float(l["size_pct"])
+                   * (head_scale if l["id"] == "headline" else body_scale)} for l in text]
+        plans = _plans(scaled, mask, prefer, canvas_w, canvas_h, pack, start_y, subject)
         for name, plan in plans:
-            placed = plan(scale)
+            placed = plan(1.0)
             if _clean(placed, mask, canvas_w, canvas_h):
                 xs = [v["box"][0] for v in placed.values()] + [v["box"][2] for v in placed.values()]
-                return placed, {"side": name, "scale": scale,
-                                "column": [round(min(xs) / canvas_w, 3), round(max(xs) / canvas_w, 3)]}
+                how = {"side": name, "scale": head_scale,
+                       "column": [round(min(xs) / canvas_w, 3), round(max(xs) / canvas_w, 3)]}
+                if body_scale != head_scale:
+                    how["body_scale"] = body_scale
+                return placed, how
     return None
 
 
@@ -360,6 +404,7 @@ def _with_reserve(mask: np.ndarray, reserve) -> np.ndarray:
 def enforce(layers: list[dict], stage1_png: bytes | None, stage2_png: bytes,
             canvas_w: int, canvas_h: int, pack=None,
             reserve: list[tuple[float, float, float, float]] | None = None,
+            alternatives: list[tuple[str, tuple[float, float, float, float]]] | None = None,
             ) -> tuple[list[dict], dict | None]:
     """Keep the copy off the subject. Returns ``(layers, record)``: the layers
     unchanged and ``record`` None when already clean; re-flowed layers plus a
@@ -384,14 +429,34 @@ def enforce(layers: list[dict], stage1_png: bytes | None, stage2_png: bytes,
         return layers, None
     head = next((l for l in layers if l.get("id") == "headline"), None)
     prefer = "right" if head is not None and float(head.get("x", 0.0)) > 0.5 else "left"
-    top_reserve = [r for r in (reserve or []) if r[1] < 0.25]
-    # Start the copy below a top logo, with the same clearance the check uses.
-    start_y = (max(MARGIN * canvas_h,
-                   (max(r[3] for r in top_reserve) + GAP_BETWEEN) * canvas_h
-                   + (PAD + _PLAN_SLACK) * canvas_w + 1)
-               if top_reserve else None)
-    found = arrange(layers, mask, canvas_w, canvas_h, pack, prefer=prefer,
-                    start_y=start_y, subject=subject)
+    # Where the logo may go instead (``alternatives``, only corners clear of the
+    # subject). Readability beats the logo corner, the logo corner beats size:
+    # every arrangement at >= 80% is tried with the requested logo spot, then
+    # with each alternative, before anything smaller is tried. A requested spot
+    # that already sits on the subject is skipped when an alternative exists —
+    # Stage 4 would move the logo off the subject anyway, into a corner the copy
+    # was never kept clear of.
+    def clear_of_subject(boxes) -> bool:
+        return all(_box_hits(subject, _frac_to_px(b, canvas_w, canvas_h), canvas_w, canvas_h) == 0
+                   for b in boxes or [])
+
+    others = [(pos, [box]) for pos, box in (alternatives or []) if clear_of_subject([box])]
+    options = ([(None, reserve)] if clear_of_subject(reserve) or not others else []) + others
+    readable = tuple(st for st in SCALE_STEPS if min(st) >= 0.8)
+    small = tuple(st for st in SCALE_STEPS if min(st) < 0.8)
+    found, logo_position, mask_used = None, None, mask
+    for steps in (readable, small):
+        for pos, res in options:
+            m = _with_reserve(subject, res)
+            found = arrange(layers, m, canvas_w, canvas_h, pack, prefer=prefer,
+                            start_y=_start_below(res, prefer, canvas_w, canvas_h),
+                            subject=subject, steps=steps)
+            if found is not None:
+                logo_position, mask_used = pos, m
+                break
+        if found is not None:
+            break
+    mask = mask_used
     if found is None:
         hit = sorted(k for k, v in before.items() if v)
         raise SubjectGuardError(
@@ -412,11 +477,34 @@ def enforce(layers: list[dict], stage1_png: bytes | None, stage2_png: bytes,
         raise SubjectGuardError("The text could not be placed clear of the subject.")
     record = {
         "moved": moved, **how,
+        **({"logo_position": logo_position} if logo_position else {}),
         "overlap_before": {k: v for k, v in before.items() if v},
         "reason": (f"Text sat on the subject or the logo's spot; re-flowed into the clean "
-                   f"{how['side']} area at {round(how['scale'] * 100)}% size."),
+                   f"{how['side']} area at {round(how['scale'] * 100)}% size"
+                   + (f" (sub-headings and CTA at {round(how['body_scale'] * 100)}%)."
+                      if "body_scale" in how else ".")
+                   + (f" The logo goes {logo_position} so the copy keeps a readable size."
+                      if logo_position else "")),
     }
     return layers, record
+
+
+def _frac_to_px(box, canvas_w: int, canvas_h: int) -> tuple[float, float, float, float]:
+    x0, y0, x1, y1 = box
+    return (x0 * canvas_w, y0 * canvas_h, x1 * canvas_w, y1 * canvas_h)
+
+
+def _start_below(reserve, prefer: str, canvas_w: int, canvas_h: int) -> float | None:
+    """Copy starts below a top logo on the copy's preferred side, with the same
+    clearance the check uses. A logo in the opposite top corner does not push
+    the copy down — the column beside it already keeps clear of it."""
+    top = [r for r in (reserve or []) if r[1] < 0.25
+           and (r[0] < 0.5 if prefer == "left" else r[2] > 0.5)]
+    if not top:
+        return None
+    return max(MARGIN * canvas_h,
+               (max(r[3] for r in top) + GAP_BETWEEN) * canvas_h
+               + (PAD + _PLAN_SLACK) * canvas_w + 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -430,14 +518,16 @@ LOGO_POSITIONS = ("top-right", "top-left", "bottom-right", "bottom-left",
                   "top-center", "bottom-center", "middle-right", "middle-left")
 
 
-def text_ink_mask(layers: list[dict], canvas_w: int, canvas_h: int, pack=None) -> np.ndarray:
+def text_ink_mask(layers: list[dict], canvas_w: int, canvas_h: int, pack=None,
+                  px_scale: float = 1.0) -> np.ndarray:
     """Boolean mask (canvas px) of every pixel the Stage-3 copy inks — pinned or
     legacy-stacked — rendered on a flat key colour by the real renderer."""
     key = (255, 0, 255)
     buf = BytesIO()
     Image.new("RGB", (canvas_w, canvas_h), key).save(buf, "PNG")
     only_text = _normalized(_text_layers(layers), canvas_w, canvas_h)
-    png = text_overlay.render_layers(buf.getvalue(), only_text, canvas_w, canvas_h, pack=pack)
+    png = text_overlay.render_layers(buf.getvalue(), only_text, canvas_w, canvas_h, pack=pack,
+                                     px_scale=px_scale)
     return np.any(np.asarray(Image.open(BytesIO(png)).convert("RGB")) != key, axis=2)
 
 
