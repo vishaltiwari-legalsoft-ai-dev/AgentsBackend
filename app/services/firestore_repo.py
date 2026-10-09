@@ -1440,6 +1440,52 @@ def list_runs_for_user_months(
     return [r for r in rows if run_row_month(r) in wanted]
 
 
+def run_row_day(row: dict[str, Any], tz: Any = None) -> str:
+    """The ``YYYY-MM-DD`` a ``runs`` row belongs to, on ``tz``'s calendar.
+
+    ``created_at`` (UTC ISO, both writers stamp it) is converted when it
+    parses; otherwise the stamped ``day`` / ``date`` (UTC) is used as is.
+    """
+    created = str(row.get("created_at") or "")
+    if created:
+        try:
+            when = datetime.fromisoformat(created)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            return when.astimezone(tz or timezone.utc).date().isoformat()
+        except ValueError:
+            pass
+    return str(row.get("day") or row.get("date") or "")[:10]
+
+
+def run_rollup_for_user(user_id: str, tz: Any = None) -> dict[str, Any] | None:
+    """One user's rows rolled up two ways from ONE projected read:
+    ``by_month`` — ``{"2026-10": {"a1": 12, "a2": 3}}`` (the rows' own UTC
+    month, see :func:`run_row_month`) — and ``by_day`` — ``{"2026-10-07": 4}``
+    on ``tz``'s calendar.
+
+    ``None`` when the read failed, never an empty rollup that would read as
+    "did nothing". A row without an agent counts as "unknown".
+    """
+    if not user_id:
+        return {"by_month": {}, "by_day": {}}
+    rows = _user_run_rows(user_id, ("date", "day", "agent_id"))
+    if rows is None:
+        return None
+    by_month: dict[str, dict[str, int]] = {}
+    by_day: dict[str, int] = {}
+    for r in rows:
+        ym = run_row_month(r)
+        if ym:
+            agent = str(r.get("agent_id") or "unknown")
+            month = by_month.setdefault(ym, {})
+            month[agent] = month.get(agent, 0) + 1
+        day = run_row_day(r, tz)
+        if day:
+            by_day[day] = by_day.get(day, 0) + 1
+    return {"by_month": by_month, "by_day": by_day}
+
+
 def runs_for_user_by_month_and_agent(user_id: str) -> dict[str, dict[str, int]] | None:
     """One user's rows, per ``YYYY-MM`` and per agent — one read per user.
 
@@ -1447,20 +1493,8 @@ def runs_for_user_by_month_and_agent(user_id: str) -> dict[str, dict[str, int]] 
     an empty map that would read as "did nothing". A month absent from the
     map is a month with no rows; a row without an agent counts as "unknown".
     """
-    if not user_id:
-        return {}
-    rows = _user_run_rows(user_id, ("date", "agent_id"))
-    if rows is None:
-        return None
-    out: dict[str, dict[str, int]] = {}
-    for r in rows:
-        ym = run_row_month(r)
-        if not ym:
-            continue
-        agent = str(r.get("agent_id") or "unknown")
-        month = out.setdefault(ym, {})
-        month[agent] = month.get(agent, 0) + 1
-    return out
+    rollup = run_rollup_for_user(user_id)
+    return None if rollup is None else rollup["by_month"]
 
 
 def count_runs_for_user_by_month(user_id: str) -> dict[str, int] | None:

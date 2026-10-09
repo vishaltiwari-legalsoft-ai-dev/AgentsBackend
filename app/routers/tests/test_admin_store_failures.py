@@ -223,6 +223,15 @@ def test_user_run_rows_retries_one_cold_deadline_then_reads(monkeypatch):
     assert firestore_repo.count_runs_for_user_by_month("u1") is None
 
 
+def test_run_row_day_reads_created_at_in_the_viewers_zone():
+    from zoneinfo import ZoneInfo
+    late = {"created_at": "2026-10-07T20:30:00+00:00", "day": "2026-10-07"}
+    assert firestore_repo.run_row_day(late) == "2026-10-07"
+    assert firestore_repo.run_row_day(late, ZoneInfo("Asia/Kolkata")) == "2026-10-08"
+    assert firestore_repo.run_row_day({"date": "2026-10-03"}) == "2026-10-03"
+    assert firestore_repo.run_row_day({}) == ""
+
+
 def test_run_row_month_reads_whichever_date_field_a_row_carries():
     # record_activity rows carry year_month; create_run rows (GD / Blog /
     # Creative — most human work) historically carried only date + created_at.
@@ -338,11 +347,17 @@ def test_team_usage_admin_view_counts_humans_only_newest_month_first(as_caller, 
         "y1": {},
     }
 
-    def count(uid):
-        asked.append(uid)
-        return counts.get(uid, {})
+    today = datetime.now(timezone.utc).date()
+    days = {
+        "k1": {today.isoformat(): 2, (today - timedelta(days=1)).isoformat(): 3},
+        "c1": {today.isoformat(): 4, (today - timedelta(days=90)).isoformat(): 7},
+    }
 
-    monkeypatch.setattr(firestore_repo, "runs_for_user_by_month_and_agent", count)
+    def rollup(uid, tz=None):
+        asked.append(uid)
+        return {"by_month": counts.get(uid, {}), "by_day": days.get(uid, {})}
+
+    monkeypatch.setattr(firestore_repo, "run_rollup_for_user", rollup)
 
     r = client.get("/api/usage/team?months=2")
     assert r.status_code == 200, r.text
@@ -360,13 +375,22 @@ def test_team_usage_admin_view_counts_humans_only_newest_month_first(as_caller, 
     assert newest["by_user"][1]["by_agent"] == {"a2": 5}
     assert months[1] == {"year_month": months[1]["year_month"], "runs": 0, "users": 0, "by_user": []}
     assert "cron" in body["humans"]["excluded"]
+    # The daily trend: every one of the last 60 days, oldest first, today
+    # last, zeros present, a day older than the window not counted.
+    daily = body["humans"]["daily"]
+    assert len(daily) == admin_router._DAILY_DAYS
+    assert daily[-1] == {"day": today.isoformat(), "runs": 6, "people": 2}
+    assert daily[-2] == {"day": (today - timedelta(days=1)).isoformat(), "runs": 3, "people": 1}
+    assert daily[0]["day"] == (today - timedelta(days=admin_router._DAILY_DAYS - 1)).isoformat()
+    assert sum(d["runs"] for d in daily) == 9
+    assert [d["day"] for d in daily] == sorted(d["day"] for d in daily)
 
 
 def test_team_usage_admin_view_answers_502_when_any_month_cannot_be_read(as_caller, directory, monkeypatch):
     as_caller(_HAYLIE)
     monkeypatch.setattr(
-        firestore_repo, "runs_for_user_by_month_and_agent",
-        lambda uid: None if uid == "y1" else {"2026-01": {"a1": 1}},
+        firestore_repo, "run_rollup_for_user",
+        lambda uid, tz=None: None if uid == "y1" else {"by_month": {"2026-01": {"a1": 1}}, "by_day": {}},
     )
     r = client.get("/api/usage/team")
     assert r.status_code == 502, r.text

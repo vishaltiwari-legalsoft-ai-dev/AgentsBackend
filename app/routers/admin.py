@@ -559,6 +559,10 @@ def _team_payload(manager: org_chart.Manager, users: list[dict], viewer: dict) -
     }
 
 
+#: How many calendar days the admin's daily trend carries.
+_DAILY_DAYS = 60
+
+
 def _humans_payload(users: list[dict], viewer: dict, months: int) -> dict:
     """Per month, agent work done by signed-in people — the scheduler's rows
     (``run_tracking.CRON_USER``) are never counted. Months are the ``runs``
@@ -573,20 +577,35 @@ def _humans_payload(users: list[dict], viewer: dict, months: int) -> dict:
     ids = [str(u["id"]) for u in humans]
 
     # One projected read per person (every row they filed, a few bytes each),
-    # bucketed by whichever date field the row carries — see
-    # ``firestore_repo.run_row_month``.
+    # rolled up by month and by day — see ``firestore_repo.run_rollup_for_user``.
     with ThreadPoolExecutor(max_workers=_TEAM_READ_WORKERS) as pool:
-        counts = list(pool.map(firestore_repo.runs_for_user_by_month_and_agent, ids))
-    if any(c is None for c in counts):
+        rollups = list(pool.map(lambda uid: firestore_repo.run_rollup_for_user(uid, tz), ids))
+    if any(r is None for r in rollups):
         raise HTTPException(502, _COULD_NOT_READ.format(what="the team's monthly activity"))
 
     # month -> user -> {agent -> runs}; a user with no rows in a month is absent.
     per_month: dict[str, dict[str, dict[str, int]]] = {ym: {} for ym in year_months}
-    for uid, by_month in zip(ids, counts):
+    runs_by_day: Counter[str] = Counter()
+    people_by_day: defaultdict[str, set[str]] = defaultdict(set)
+    for uid, rollup in zip(ids, rollups):
+        by_month = (rollup or {}).get("by_month") or {}
         for ym in year_months:
-            agents = dict((by_month or {}).get(ym, {}))
+            agents = dict(by_month.get(ym, {}))
             if sum(agents.values()):
                 per_month[ym][uid] = agents
+        for day, n in ((rollup or {}).get("by_day") or {}).items():
+            if n:
+                runs_by_day[day] += int(n)
+                people_by_day[day].add(uid)
+
+    # Every one of the last _DAILY_DAYS calendar days in the viewer's zone,
+    # oldest first, zeros included, today (a partial day) last.
+    today = datetime.now(timezone.utc).astimezone(tz).date()
+    daily = []
+    for back in range(_DAILY_DAYS - 1, -1, -1):
+        day = (today - timedelta(days=back)).isoformat()
+        daily.append({"day": day, "runs": int(runs_by_day.get(day, 0)),
+                      "people": len(people_by_day.get(day, ()))})
     by_id = {str(u["id"]): u for u in humans}
     out = []
     for ym in year_months:
@@ -609,7 +628,11 @@ def _humans_payload(users: list[dict], viewer: dict, months: int) -> dict:
             "users": len(by_user),
             "by_user": by_user,
         })
-    return {"months": out, "excluded": "Scheduled runs (the cron user) are not counted."}
+    return {
+        "months": out,
+        "daily": daily,
+        "excluded": "Scheduled runs (the cron user) are not counted.",
+    }
 
 
 @router.get("/usage/team")
