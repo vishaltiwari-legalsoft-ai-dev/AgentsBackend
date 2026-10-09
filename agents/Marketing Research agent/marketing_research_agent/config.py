@@ -87,3 +87,42 @@ ICP = {
     "min_score_to_surface": 0.5,
     "stale_outreach_days": 14,        # flag shows with no response after 14 days
 }
+
+# --- Report template extraction (Phase 2: a sample report -> a layout) -------
+# ``template_extract`` reads an uploaded sample report ONCE and maps it onto
+# the vendor report's section catalog. The model only picks layout — numbers
+# never come from it — so the step is priced per upload and bounded up front.
+
+#: OpenRouter model id. Vision + strict JSON-schema output are both required;
+#: the request asks OpenRouter to route only to providers that honour them.
+#: Sonnet 5.5 because it matched Opus 5.5 on the six-sample eval (12/12 over
+#: two runs vs Opus 6/6) at half the price; Haiku 5.5 dropped to 4/6 on a
+#: rerun (split the highlights block, invented a footer). 2026-10-08,
+#: ``tests/template_extract_eval.py``. Re-run it before changing this.
+TEMPLATE_EXTRACT_MODEL = os.environ.get("MR_TEMPLATE_MODEL", "anthropic/claude-sonnet-5.5")
+#: Output cap for the first read, thinking included. A full layout is ~1.5K
+#: tokens of JSON; the rest is headroom for the model's reasoning.
+TEMPLATE_EXTRACT_MAX_TOKENS = int(os.environ.get("MR_TEMPLATE_MAX_TOKENS", "8000"))
+#: Output cap for the one text-only repair call.
+TEMPLATE_REPAIR_MAX_TOKENS = int(os.environ.get("MR_TEMPLATE_REPAIR_MAX_TOKENS", "4000"))
+TEMPLATE_EXTRACT_TIMEOUT_S = float(os.environ.get("MR_TEMPLATE_TIMEOUT_S", "150"))
+#: Hard per-upload ceiling. Checked BEFORE the first call against the worst
+#: case (every input token plus both calls running to their output caps);
+#: an upload whose worst case exceeds it is refused, never sent. Sized for the
+#: default model at the 10-image limit (worst case ~$0.19; a typical 5-page
+#: upload measured $0.042). Switching to Opus 5.5 (worst ~$0.38) needs this
+#: raised too, deliberately.
+TEMPLATE_EXTRACT_COST_CEILING_USD = float(
+    os.environ.get("MR_TEMPLATE_COST_CEILING_USD", "0.25"))
+#: USD per million tokens (input, output) as OpenRouter lists them on
+#: 2026-10-08. A model missing here is refused unless both
+#: ``MR_TEMPLATE_PRICE_IN_PER_M`` and ``MR_TEMPLATE_PRICE_OUT_PER_M`` are set —
+#: the ceiling cannot be enforced against an unknown price.
+TEMPLATE_EXTRACT_PRICES: dict[str, tuple[float, float]] = {
+    "anthropic/claude-opus-5.5": (4.00, 20.00),
+    "anthropic/claude-sonnet-5.5": (2.00, 10.00),
+    "anthropic/claude-haiku-5.5": (0.10, 0.50),
+}
+#: OpenRouter ``reasoning.effort`` for the read. Layout mapping is recognition,
+#: not deep reasoning; "low" holds the eval and keeps output tokens down.
+TEMPLATE_EXTRACT_EFFORT = os.environ.get("MR_TEMPLATE_EFFORT", "low")

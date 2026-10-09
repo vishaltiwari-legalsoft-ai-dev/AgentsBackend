@@ -452,6 +452,49 @@ def vision_extract_text(
     return str(content).strip()
 
 
+class OpenRouterHTTPError(RuntimeError):
+    """OpenRouter answered with an HTTP error. ``status`` is the code, so a
+    caller can tell an empty account (402) from a rate limit (429) from an
+    upstream outage (5xx) without reading the message."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(f"OpenRouter request failed ({status}): {detail}")
+        self.status = status
+
+
+def chat_completion(body: dict, *, timeout: float = 120) -> dict:
+    """POST one raw chat-completions ``body`` with the shared key and headers;
+    return the whole parsed payload, ``usage`` included.
+
+    For callers that need what the convenience wrappers above hide: a
+    ``response_format`` JSON schema, ``max_tokens``, the provider's ``usage``
+    and ``cost``, and a bounded timeout. The key resolves through
+    ``runtime_config.require`` first, exactly as every other entry point here,
+    so a blank key raises before any network I/O (the test suite relies on it).
+
+    Raises ``httpx.TimeoutException`` on a timeout (left unwrapped so callers
+    can tell it apart), :class:`OpenRouterHTTPError` on an HTTP error status,
+    and ``RuntimeError`` on a transport failure or a non-JSON reply. Error text
+    is the provider's response body, truncated — never the request, which may
+    carry a user's document.
+    """
+    api_key = runtime_config.require("openrouter_api_key")
+    url = f"{settings.openrouter_base_url}/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", **_default_headers()}
+    try:
+        response = httpx.post(url, json=body, headers=headers, timeout=timeout)
+    except httpx.TimeoutException:
+        raise
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"OpenRouter request failed: {type(exc).__name__}") from exc
+    if response.status_code >= 400:
+        raise OpenRouterHTTPError(response.status_code, response.text[:400])
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError("OpenRouter returned a non-JSON reply") from exc
+
+
 def analyze_images(
     prompt: str,
     images: list[tuple[bytes, str]],
