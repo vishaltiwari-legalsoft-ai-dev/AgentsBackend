@@ -563,6 +563,25 @@ def test_the_registry_is_the_placeholder_vocabulary(golden):
     ({"theme": {"colors": {"chartreuse": "#0f0"}}, "sections": [{"type": "header"}]},
      "unknown theme colour"),
     ({"sections": []}, "at least one section"),
+    # A layout can arrive from a client (the template save route), and theme
+    # values are written verbatim into <style> and SVG fill="…": refused, not
+    # escaped somewhere downstream.
+    ({"theme": {"colors": {"ink": "#000}</style><script>alert(1)</script>"}},
+      "sections": [{"type": "header"}]}, "must be a colour"),
+    ({"theme": {"colors": {"gold": "url(https://evil.example/x)"}},
+      "sections": [{"type": "header"}]}, "must be a colour"),
+    ({"theme": {"colors": {"pos": 7}}, "sections": [{"type": "header"}]}, "must be a colour"),
+    ({"theme": {"serif": "x;}</style><script>"}, "sections": [{"type": "header"}]},
+     "plain font list"),
+    ({"sections": [{"type": "demos_by_vendor", "options": {"min_booked": "lots"}}]},
+     "wrong type"),
+    ({"sections": [{"type": "action_summary", "options": {"include_catch_all": "yes"}}]},
+     "wrong type"),
+    ({"sections": [{"type": "header", "title": {"x": 1}}]}, "title must be text"),
+    ({"sections": [{"type": "header"}] * 41}, "at most 40"),
+    ({"sections": [{"title": "no type"}]}, "must be an object with a 'type'"),
+    ({"sections": "header"}, "must be a list"),
+    (["header"], "must be an object"),
 ])
 def test_a_layout_the_registry_cannot_honour_is_refused_before_rendering(spec, fragment):
     with pytest.raises(ValueError, match=fragment):
@@ -584,12 +603,27 @@ def test_a_layout_round_trips_and_reorders_and_retheme(golden):
     assert "All other vendors" not in html
 
 
-def test_the_builtin_template_is_the_default_layout_by_definition():
+def test_the_builtin_template_is_the_default_layout_by_definition(golden):
+    from marketing_research_agent import report_templates as rt
+
     assert runs.builtin_template()["spec"] is None
-    assert vrr.layout_for_template({"kind": "builtin"}) is vrr.DEFAULT_LAYOUT
-    assert vrr.layout_for_template(None) is vrr.DEFAULT_LAYOUT
-    with pytest.raises(ValueError):
-        vrr.layout_for_template({"kind": "version", "version": "abc"})
+    assert rt.render_with_template(golden, runs.builtin_template()) == vrr.render(golden)
+    assert rt.render_with_template(golden, {"kind": "builtin"}) == vrr.render(golden)
+
+
+@pytest.mark.parametrize("template, label", [
+    (None, "built-in"),
+    ({"kind": "builtin", "number": None, "id": None}, "built-in"),
+    ({"kind": "layout", "number": 5, "id": "t5"}, "team template, version 5"),
+    ({"kind": "html", "number": 2, "id": "t2"}, "team template, version 2"),
+    ({"kind": "builtin", "fallback": {"number": 3, "id": "t3", "reason": "x"}},
+     "built-in, because the team template (version 3) failed"),
+    ({"kind": "builtin", "override_of": {"number": 3, "id": "t3"}},
+     "built-in, chosen instead of the team template (version 3)"),
+    ({"kind": "preview"}, "a preview of an unsaved template"),
+])
+def test_the_template_label_is_a_real_name_never_version_none(template, label):
+    assert vrr.template_label(template) == label
 
 
 # --- build: persistence, idempotency, template, empty month ----------------------------
@@ -599,8 +633,8 @@ def test_build_persists_a_run_with_its_metadata_and_is_idempotent(store):
     assert first["reused"] is False
     assert first["kind"] == "vendor_report" and first["user_id"] == "ws-1"
     assert first["sweep_date"] == "2026-09-02" and first["built_at"]
-    assert first["template"] == {"kind": "builtin"}
-    assert first["structured"]["build"]["template"] == {"kind": "builtin"}
+    assert first["template"] == {"kind": "builtin", "number": None, "id": None}
+    assert first["structured"]["build"]["template"] == first["template"]
     assert first["ai"] is False and "no model" in first["fallback_reason"]
     again = vr.build(workspace_id="ws-1", year_month="2026-09")
     assert again["reused"] is True and again["id"] == first["id"]
@@ -626,15 +660,91 @@ def test_an_empty_month_is_refused_with_the_specs_message(store):
                               "workbook, then build again.")
 
 
-def test_template_builtin_is_the_only_fallback_and_nothing_swaps_silently(store, monkeypatch):
-    with pytest.raises(vr.TemplateRefused):
+def _save_layout(ws, sections, who="a@x.com"):
+    return runs.save_template_version(ws, uploaded_by=who, source_kind="builder",
+                                      spec={"sections": sections})
+
+
+def test_a_template_name_other_than_builtin_is_refused(store):
+    with pytest.raises(vr.TemplateRefused) as exc:
         vr.build(workspace_id="ws-1", year_month="2026-09", template="v7")
-    uploaded = {"id": "t1", "builtin": False, "spec": {"sections": []}}
-    monkeypatch.setattr(runs, "active_template", lambda ws, **k: uploaded)
-    with pytest.raises(vr.TemplateRefused, match="template: \"builtin\""):
-        vr.build(workspace_id="ws-1", year_month="2026-09")
-    ok = vr.build(workspace_id="ws-1", year_month="2026-09", template="builtin")
-    assert ok["template"] == {"kind": "builtin"}
+    assert exc.value.code == "invalid_template"
+    with pytest.raises(vr.EmptyMonth) as exc:
+        vr.build(workspace_id="ws-1", year_month="2026-05")
+    assert exc.value.code == "empty_month"
+
+
+def test_the_active_team_template_is_used_only_while_templates_are_on(store):
+    v = _save_layout("ws-1", [{"type": "header"}, {"type": "vendor_scorecard"}])
+    off = vr.build(workspace_id="ws-1", year_month="2026-09")
+    assert off["template"] == {"kind": "builtin", "number": None, "id": None}
+    on = vr.build(workspace_id="ws-1", year_month="2026-09", use_templates=True)
+    assert on["template"] == {"kind": "layout", "number": 1, "id": v["id"]}
+    assert on["id"] != off["id"]                                # a different document
+    again = vr.build(workspace_id="ws-1", year_month="2026-09", use_templates=True)
+    assert again["reused"] is True and again["id"] == on["id"]
+    # Another workspace's template is never this workspace's.
+    other = vr.build(workspace_id="ws-2", year_month="2026-09", use_templates=True)
+    assert other["template"]["kind"] == "builtin"
+
+
+def test_a_team_template_that_cannot_render_saves_nothing_and_says_why(store, monkeypatch):
+    from marketing_research_agent import report_templates as rt
+
+    v = _save_layout("ws-1", [{"type": "header"}])
+
+    def broken(report, version):
+        raise rt.TemplateRenderError("The team template broke on this month.")
+
+    monkeypatch.setattr(rt, "render_with_template", broken)
+    with pytest.raises(vr.TemplateFailed) as exc:
+        vr.build(workspace_id="ws-1", year_month="2026-09", use_templates=True)
+    assert exc.value.code == "template_failed"
+    assert exc.value.reason == "The team template broke on this month."
+    assert exc.value.template == {"kind": "layout", "number": 1, "id": v["id"]}
+    assert runs.list_runs("ws-1", kind="vendor_report") == []    # nothing saved
+
+
+def test_the_builtin_after_a_team_failure_says_so_in_the_report(store, monkeypatch):
+    from marketing_research_agent import report_templates as rt
+
+    v = _save_layout("ws-1", [{"type": "header"}])
+    real = rt.render_with_template
+
+    def team_breaks(report, version):
+        if version.get("id") == v["id"]:
+            raise rt.TemplateRenderError("The team template broke on this month.")
+        return real(report, version)
+
+    monkeypatch.setattr(rt, "render_with_template", team_breaks)
+    run = vr.build(workspace_id="ws-1", year_month="2026-09", template="builtin",
+                   use_templates=True)
+    assert run["template"] == {"kind": "builtin", "number": None, "id": None,
+                               "fallback": {"number": 1, "id": v["id"],
+                                            "reason": "The team template broke on this month."}}
+    html = vrr.render(run["structured"])
+    assert html.count(vrr.FALLBACK_SENTENCE) == 2                # header band and footer
+    assert "Template: built-in, because the team template (version 1) failed." in html
+    assert "The team template broke on this month." in html
+
+
+def test_choosing_the_builtin_over_a_working_team_template_is_not_called_a_failure(store):
+    v = _save_layout("ws-1", [{"type": "header"}])
+    run = vr.build(workspace_id="ws-1", year_month="2026-09", template="builtin",
+                   use_templates=True)
+    assert run["template"]["override_of"] == {"number": 1, "id": v["id"]}
+    assert "fallback" not in run["template"]
+    html = vrr.render(run["structured"])
+    assert vrr.FALLBACK_SENTENCE not in html
+    assert "Template: built-in, chosen instead of the team template (version 1)." in html
+
+
+def test_a_preview_report_is_computed_never_stored(store):
+    report = vr.preview_report(workspace_id="ws-1")
+    assert report["year_month"] == "2026-09"
+    assert report["build"]["template"] == {"kind": "preview"}
+    assert runs.list_runs("ws-1", kind="vendor_report") == []
+    assert vr.preview_report(workspace_id="ws-1", year_month="2026-05") is None
 
 
 def test_periods_lists_the_months_with_a_sweep(store):

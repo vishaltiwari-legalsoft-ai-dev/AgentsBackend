@@ -568,23 +568,139 @@ def test_workspace_b_can_never_read_or_revert_workspace_as_templates(tpl_store):
     assert runs.list_template_versions("ws-b") == []
     assert runs.active_template("ws-b")["builtin"] is True
     with pytest.raises(LookupError):
-        runs.revert_template("ws-b", va["id"], uploaded_by="b@x.com")
+        runs.revert_template("ws-b", va["id"], set_by="b@x.com")
     assert runs.list_template_versions("ws-b") == []          # nothing copied across
     assert runs.active_template("ws-a")["id"] == va["id"]     # A untouched
 
 
 def test_revert_appends_a_copy_and_never_rewrites_history(tpl_store):
     v1, v2 = _upload("ws-a", 1), _upload("ws-a", 2)
-    r = runs.revert_template("ws-a", v1["id"], uploaded_by="b@x.com")
+    r = runs.revert_template("ws-a", v1["id"], set_by="b@x.com")
     assert r["id"] not in (v1["id"], v2["id"]) and r["reverted_from"] == v1["id"]
-    assert r["spec"] == {"layout": "v1"} and r["uploaded_by"] == "b@x.com"
+    assert r["spec"] == {"layout": "v1"}
+    # The content's author and number travel with it; the activation is B's.
+    assert r["uploaded_by"] == "a@x.com" and r["created_at"] == v1["created_at"]
+    assert r["number"] == v1["number"] == 1 and r["content_id"] == v1["id"]
+    assert r["set_by"] == "b@x.com" and r["set_at"] > v2["set_at"]
     assert runs.active_template("ws-a")["id"] == r["id"]
     assert len(runs.list_template_versions("ws-a")) == 3
 
 
+def test_versions_are_numbered_per_workspace_and_a_revert_issues_no_number(tpl_store):
+    v1, v2 = _upload("ws-a", 1), _upload("ws-a", 2)
+    other = _upload("ws-b", 1)
+    assert (v1["number"], v2["number"], other["number"]) == (1, 2, 1)
+    assert v2["set_by"] == v2["uploaded_by"] and v2["set_at"] == v2["created_at"]
+    runs.revert_template("ws-a", v1["id"], set_by="b@x.com")
+    builtin = runs.revert_template("ws-a", runs.BUILTIN_TEMPLATE_ID, set_by="b@x.com")
+    assert builtin["number"] is None
+    assert _upload("ws-a", 3)["number"] == 3
+
+
+def test_the_next_number_survives_retention_evicting_the_one_that_issued_it(
+        tpl_store, monkeypatch):
+    monkeypatch.setenv("MR_RUN_RETENTION_PER_KIND", "2")
+    v1 = _upload("ws-a", 1)
+    for _ in range(3):
+        runs.revert_template("ws-a", v1["id"], set_by="b@x.com")  # evicts v1's record
+    assert all(r["number"] == 1 for r in runs.list_template_versions("ws-a"))
+    assert _upload("ws-a", 2)["number"] == 2
+    # A version whose own record was evicted is still found by its content id.
+    assert runs.revert_template("ws-a", v1["id"], set_by="c@x.com")["number"] == 1
+
+
+def test_a_version_is_found_by_id_only_inside_its_own_workspace(tpl_store):
+    va = _upload("ws-a", 1)
+    assert runs.find_template_version("ws-a", va["id"])["id"] == va["id"]
+    assert runs.find_template_version("ws-b", va["id"]) is None
+    assert runs.find_template_version("ws-a", "nope") is None
+    assert runs.find_template_version("ws-a", runs.BUILTIN_TEMPLATE_ID) is None
+    runs.save_run({"id": "notatemplate", "kind": "board_report", "user_id": "ws-a",
+                   "generated_at": "2026-10-01T00:00:00+00:00"})
+    assert runs.find_template_version("ws-a", "notatemplate") is None
+
+
+def test_the_daily_reading_allowance_is_counted_per_workspace(tpl_store):
+    a = [runs.reserve_template_reading("ws-a", by="a@x.com", filename="s.pdf",
+                                       source_kind="pdf") for _ in range(3)]
+    runs.reserve_template_reading("ws-b", by="b@x.com", filename=None, source_kind="image")
+    assert runs.template_readings_today("ws-a") == 3
+    assert runs.template_readings_today("ws-b") == 1
+    runs.settle_template_reading(a[0], status="ok", usage={"calls": 1, "cost_usd": 0.02})
+    runs.settle_template_reading(a[1], status="failed", code="timeout",
+                                 usage={"calls": 1, "cost_usd": 0.01})
+    runs.release_template_reading(a[2])                       # nothing was billed
+    assert runs.template_readings_today("ws-a") == 2
+    from marketing_research_agent import reports
+    assert runs.TEMPLATE_READING_KIND not in reports.KINDS
+
+
+def test_a_reading_the_store_cannot_meter_is_refused_not_unmetered(tpl_store, monkeypatch):
+    def broken(path, payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runs, "_atomic_write", broken)
+    with pytest.raises(runs.RunStoreError):
+        runs.reserve_template_reading("ws-a", by="a@x.com", filename=None, source_kind="pdf")
+
+
+def test_the_meter_is_one_doc_per_workspace_that_resets_each_utc_day(tpl_store, monkeypatch):
+    for _ in range(3):
+        runs.reserve_template_reading("ws-a", by="a@x.com", filename=None, source_kind="pdf")
+    meters = [p for p in tpl_store.glob("tplmeter_*.meter")]
+    assert len(meters) == 1
+    monkeypatch.setattr(runs, "_utc_day", lambda iso=None: "2099-01-01" if not iso else iso[:10])
+    assert runs.template_readings_today("ws-a") == 0              # a new day
+    r = runs.reserve_template_reading("ws-a", by="a@x.com", filename=None, source_kind="pdf")
+    assert runs.template_readings_today("ws-a") == 1
+    assert len(list(tpl_store.glob("tplmeter_*.meter"))) == 1       # reset in place
+    runs.release_template_reading({**r, "day": "2098-12-31"})      # yesterday's reservation
+    assert runs.template_readings_today("ws-a") == 1               # never lowers today
+
+
+def test_a_burst_of_40_simultaneous_readings_admits_exactly_10(tpl_store):
+    import threading
+
+    gate = threading.Barrier(40, timeout=10)
+    admitted, refused, errors = [], [], []
+
+    def one():
+        gate.wait()
+        try:
+            admitted.append(runs.reserve_template_reading(
+                "ws-a", by="a@x.com", filename=None, source_kind="pdf"))
+        except runs.ReadingLimitReached:
+            refused.append(1)
+        except Exception as exc:  # noqa: BLE001 - recorded for the assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=one) for _ in range(40)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert errors == [] and len(admitted) == 10 and len(refused) == 30
+    for r in admitted:                    # settled and billed: still counted
+        runs.settle_template_reading(r, status="ok", usage={"calls": 1})
+    assert runs.template_readings_today("ws-a") == 10
+
+
+def test_retention_can_trim_reading_history_without_freeing_the_allowance(
+        tpl_store, monkeypatch):
+    monkeypatch.setenv("MR_RUN_RETENTION_PER_KIND", "2")
+    for _ in range(10):
+        r = runs.reserve_template_reading("ws-a", by="a@x.com", filename=None,
+                                          source_kind="pdf")
+        runs.settle_template_reading(r, status="failed", code="timeout", usage={"calls": 1})
+    assert len(runs.list_runs("ws-a", kind=runs.TEMPLATE_READING_KIND)) <= 3
+    assert runs.template_readings_today("ws-a") == 10
+    with pytest.raises(runs.ReadingLimitReached):
+        runs.reserve_template_reading("ws-a", by="a@x.com", filename=None, source_kind="pdf")
+
+
 def test_revert_to_builtin_is_a_version_too(tpl_store):
     _upload("ws-a", 1)
-    r = runs.revert_template("ws-a", runs.BUILTIN_TEMPLATE_ID, uploaded_by="a@x.com")
+    r = runs.revert_template("ws-a", runs.BUILTIN_TEMPLATE_ID, set_by="a@x.com")
     active = runs.active_template("ws-a")
     assert active["id"] == r["id"] and active["builtin"] is True and active["spec"] is None
     assert len(runs.list_template_versions("ws-a")) == 2
@@ -632,35 +748,295 @@ def test_templates_are_validated_before_they_are_stored(tpl_store):
     assert runs.list_template_versions("ws-a") == []
 
 
-def test_a_version_that_misses_the_durable_store_is_a_loud_failure(tpl_store, monkeypatch):
-    """No fake success: a template only one instance's disk holds would be
-    'active' there and invisible everywhere else."""
-    class _Doc:
-        def set(self, _payload):
-            raise RuntimeError("503")
+class _Conflict(Exception):
+    """What Firestore's commit raises when a doc the transaction read changed."""
 
-        def delete(self):
-            pass
 
-    class _Coll:
-        def document(self, _id):
-            return _Doc()
+class _Snap:
+    def __init__(self, data):
+        self._data = data
+        self.exists = data is not None
 
+    def to_dict(self):
+        return None if self._data is None else dict(self._data)
+
+
+class _FakeFirestore:
+    """An in-memory ``mr_runs`` with Firestore's OPTIMISTIC transaction contract:
+    a transaction's reads are versioned, its writes are buffered, and a commit
+    whose read set changed underneath it is rejected and retried. Every billed
+    read is logged so a test can count them."""
+
+    def __init__(self):
+        import threading
+
+        self.docs: dict[str, dict] = {}
+        self.versions: dict[str, int] = {}
+        self.log: list[tuple] = []
+        self.lock = threading.Lock()
+        self.fail_commit = False
+        self.after_txn_read = None          # hook(doc_id) — lets a test interleave
+
+    # -- client surface -------------------------------------------------------
+    def collection(self, name):
+        assert name == "mr_runs"
+        return _FakeQuery(self)
+
+    def transaction(self):
+        return _FakeTxn(self)
+
+
+class _FakeTxn:
+    def __init__(self, db):
+        self.db, self.read_versions, self.writes = db, {}, []
+
+    def set(self, ref, data):
+        self.writes.append((ref.id, dict(data)))
+
+
+class _FakeRef:
+    def __init__(self, db, doc_id):
+        self.db, self.id = db, doc_id
+
+    def get(self, transaction=None):
+        db = self.db
+        with db.lock:
+            data = db.docs.get(self.id)
+            version = db.versions.get(self.id, 0)
+        db.log.append(("get", self.id, transaction is not None))
+        if transaction is not None:
+            transaction.read_versions[self.id] = version
+        if db.after_txn_read:                     # any head read, in a txn or not
+            db.after_txn_read(self.id)
+        return _Snap(None if data is None else dict(data))
+
+    def set(self, data):
+        raise AssertionError("template writes must go through the transaction")
+
+    def delete(self):
+        with self.db.lock:
+            self.db.docs.pop(self.id, None)
+            self.db.versions[self.id] = self.db.versions.get(self.id, 0) + 1
+
+
+class _FakeQuery:
+    def __init__(self, db, filters=(), fields=None, limit=None):
+        self.db, self.filters, self.fields, self._limit = db, list(filters), fields, limit
+
+    def document(self, doc_id):
+        return _FakeRef(self.db, doc_id)
+
+    def where(self, filter=None, **_kw):  # noqa: A002
+        assert filter.op_string == "=="
+        return _FakeQuery(self.db, self.filters + [(filter.field_path, filter.value)],
+                          self.fields, self._limit)
+
+    def select(self, fields):
+        return _FakeQuery(self.db, self.filters, list(fields), self._limit)
+
+    def limit(self, n):
+        return _FakeQuery(self.db, self.filters, self.fields, n)
+
+    def stream(self):
+        with self.db.lock:
+            rows = [dict(d) for d in self.db.docs.values()
+                    if all(d.get(f) == v for f, v in self.filters)]
+        if self._limit is not None:
+            rows = rows[: self._limit]
+        if self.fields is not None:
+            rows = [{k: d[k] for k in self.fields if k in d} for d in rows]
+        self.db.log.append(("query", tuple(self.filters), self.fields, len(rows)))
+        return iter(_Snap(r) for r in rows)
+
+
+def _fake_transactional(fn):
+    def run(txn):
+        db = txn.db
+        for _attempt in range(10):
+            txn.read_versions, txn.writes = {}, []
+            fn(txn)
+            with db.lock:
+                if db.fail_commit:
+                    raise RuntimeError("503 commit failed")
+                if any(db.versions.get(k, 0) != v for k, v in txn.read_versions.items()):
+                    continue                                   # contention: retry
+                for doc_id, data in txn.writes:
+                    db.docs[doc_id] = data
+                    db.versions[doc_id] = db.versions.get(doc_id, 0) + 1
+                return
+        raise _Conflict("too much contention")
+    return run
+
+
+@pytest.fixture
+def cloud_tpl(tmp_path, monkeypatch):
+    from app.services import firestore_repo
+
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    monkeypatch.delenv("MR_RUN_RETENTION_PER_KIND", raising=False)
+    db = _FakeFirestore()
     monkeypatch.setattr(runs, "_use_cloud", lambda: True)
-    monkeypatch.setattr(runs, "_collection", lambda: _Coll())
-    monkeypatch.setattr(runs, "_cloud_list", lambda *a, **kw: [])
+    monkeypatch.setattr(firestore_repo, "_db", lambda: db)
+    monkeypatch.setattr(runs, "_transactional", _fake_transactional)
+    return db
+
+
+def _reads(db):
+    """Billed reads: one per doc returned by a query (min 1), one per get."""
+    return sum(max(e[3], 1) if e[0] == "query" else 1 for e in db.log)
+
+
+def test_two_simultaneous_saves_never_share_a_number_in_the_cloud(cloud_tpl):
+    """Both saves read the head BEFORE either commits — the race that let two
+    versions be called "Version 3". The loser's commit is rejected and retried
+    against the winner's head."""
+    import threading
+
+    db = cloud_tpl
+    both_read = threading.Barrier(2, timeout=5)
+    first_attempt = threading.local()
+
+    def hold(doc_id):
+        if doc_id.startswith("tplhead_") and not getattr(first_attempt, "done", False):
+            first_attempt.done = True
+            both_read.wait()                    # each thread has read the SAME head
+
+    db.after_txn_read = hold
+    out: list[dict] = []
+    threads = [threading.Thread(target=lambda n=n: out.append(_upload("ws-a", n)))
+               for n in (1, 2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    db.after_txn_read = None
+    assert sorted(r["number"] for r in out) == [1, 2]
+    assert len(runs.list_template_versions("ws-a")) == 2       # no orphaned loser
+    head = runs.active_template_meta("ws-a")
+    assert head["number"] == 2 and head["last_number"] == 2
+    assert head["id"] == next(r["id"] for r in out if r["number"] == 2)
+
+
+def test_two_simultaneous_saves_never_share_a_number_offline(tpl_store, monkeypatch):
+    """The disk store gives the same guarantee: the second save cannot read the
+    head until the first has written it."""
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+    real = runs._local_head
+    calls = [0]
+
+    def slow_head(ws, report):
+        head = real(ws, report)
+        calls[0] += 1
+        if calls[0] == 1:
+            entered.set()
+            release.wait(5)                     # A holds the head it read
+        return head
+
+    monkeypatch.setattr(runs, "_local_head", slow_head)
+    out: list[dict] = []
+    a = threading.Thread(target=lambda: out.append(_upload("ws-a", 1)))
+    a.start()
+    assert entered.wait(5)
+    b = threading.Thread(target=lambda: out.append(_upload("ws-a", 2)))
+    b.start()
+    b.join(0.3)
+    assert b.is_alive(), "the second save read the head while the first held it"
+    release.set()
+    a.join(5)
+    b.join(5)
+    assert sorted(r["number"] for r in out) == [1, 2]
+    assert runs.active_template_meta("ws-a")["last_number"] == 2
+
+
+def test_which_template_is_active_is_one_small_read(cloud_tpl):
+    db = cloud_tpl
+    for n in range(5):
+        runs.save_template_version("ws-a", uploaded_by="a@x.com", source_kind="html",
+                                   html="<p>" + "x" * 200_000 + "</p>")
+    db.log.clear()
+    meta = runs.active_template_meta("ws-a")
+    assert _reads(db) == 1 and db.log[0][0] == "get"            # the head, nothing else
+    assert meta["number"] == 5 and "html" not in meta and "spec" not in meta
+    from marketing_research_agent import report_templates as rt
+    summary = rt.summarize(meta)
+    assert (summary["kind"], summary["number"], summary["set_by"]) == ("html", 5, "a@x.com")
+
+
+def test_a_build_loads_only_the_active_body(cloud_tpl):
+    db = cloud_tpl
+    for n in range(4):
+        _upload("ws-a", n)
+    db.log.clear()
+    active = runs.active_template("ws-a")
+    assert active["spec"] == {"layout": "v3"}
+    assert [e[0] for e in db.log] == ["get", "get"]             # head + one record
+
+
+def test_the_version_list_ships_no_bodies(cloud_tpl):
+    db = cloud_tpl
+    for n in range(3):
+        runs.save_template_version("ws-a", uploaded_by="a@x.com", source_kind="html",
+                                   html="<p>" + "x" * 100_000 + "</p>")
+    db.log.clear()
+    rows = runs.list_template_versions("ws-a")
+    (query,) = db.log
+    assert query[0] == "query" and set(query[1]) == {
+        ("user_id", "ws-a"), ("kind", "report_template:vendor_performance")}
+    assert "html" not in query[2] and "spec" not in query[2]
+    assert all("html" not in r and "spec" not in r for r in rows) and len(rows) == 3
+
+
+def test_a_save_is_one_transaction_plus_a_projected_retention_read(cloud_tpl):
+    db = cloud_tpl
+    _upload("ws-a", 1)
+    db.log.clear()
+    _upload("ws-a", 2)
+    kinds = [(e[0], e[2] if e[0] == "get" else e[2] is not None) for e in db.log]
+    assert kinds == [("get", True), ("query", True)]            # txn head read; projected list
+
+
+def test_cloud_workspaces_are_isolated(cloud_tpl):
+    va = _upload("ws-a", 1)
+    assert runs.list_template_versions("ws-b") == []
+    assert runs.active_template_meta("ws-b")["builtin"] is True
+    assert runs.active_template("ws-b")["builtin"] is True
+    assert runs.find_template_version("ws-b", va["id"]) is None
+    with pytest.raises(LookupError):
+        runs.revert_template("ws-b", va["id"], set_by="b@x.com")
+    assert _upload("ws-b", 1)["number"] == 1                    # B's own counter
+
+
+def test_cloud_retention_keeps_the_newest_and_the_active(cloud_tpl, monkeypatch):
+    monkeypatch.setenv("MR_RUN_RETENTION_PER_KIND", "3")
+    ids = [_upload("ws-a", i)["id"] for i in range(5)]
+    assert [r["id"] for r in runs.list_template_versions("ws-a")] == ids[:1:-1]
+    assert runs.active_template("ws-a")["id"] == ids[-1]
+    assert runs.active_template_meta("ws-a")["last_number"] == 5
+
+
+def test_a_commit_that_fails_writes_nothing_and_says_so(cloud_tpl):
+    """No fake success: nothing half-written, the head unchanged, and a loud
+    RunStoreError for the route to turn into a 502."""
+    db = cloud_tpl
+    v1 = _upload("ws-a", 1)
+    db.fail_commit = True
+    with pytest.raises(runs.RunStoreError):
+        _upload("ws-a", 2)
+    db.fail_commit = False
+    assert [r["id"] for r in runs.list_template_versions("ws-a")] == [v1["id"]]
+    assert runs.active_template_meta("ws-a")["id"] == v1["id"]
+
+
+def test_a_head_that_names_another_workspace_is_refused(cloud_tpl):
+    db = cloud_tpl
+    db.docs[runs._head_id("ws-a", "vendor_performance")] = {"user_id": "ws-b",
+                                                             "active": {"id": "x"}}
+    with pytest.raises(runs.RunStoreError):
+        runs.active_template_meta("ws-a")
     with pytest.raises(runs.RunStoreError):
         _upload("ws-a", 1)
-    assert list(tpl_store.glob("*.json")) == []                # local copy removed
-
-
-def test_the_template_read_is_one_scoped_equality_query(tpl_store, monkeypatch):
-    seen = []
-    monkeypatch.setattr(runs, "_use_cloud", lambda: True)
-    monkeypatch.setattr(runs, "_cloud_list",
-                        lambda user_id=None, kind=None: seen.append((user_id, kind)) or [])
-    runs.list_template_versions("ws-a")
-    assert seen == [("ws-a", "report_template:vendor_performance")]
 
 
 def test_templates_never_appear_as_saved_reports():
@@ -668,3 +1044,35 @@ def test_templates_never_appear_as_saved_reports():
 
     kind = runs.template_kind()
     assert kind not in reports.KINDS and kind not in runs.STATE_KINDS
+
+
+def test_the_cloud_meter_admits_exactly_10_of_a_40_burst(cloud_tpl):
+    """The same burst through the Firestore transaction (the fake rejects and
+    retries a commit whose read changed underneath it). Never more than 10; a
+    reading that could not get a decision is refused as a store error, never
+    admitted."""
+    import threading
+
+    gate = threading.Barrier(40, timeout=10)
+    admitted, refused, errors = [], [], []
+
+    def one():
+        gate.wait()
+        try:
+            admitted.append(runs.reserve_template_reading(
+                "ws-a", by="a@x.com", filename=None, source_kind="pdf"))
+        except runs.ReadingLimitReached:
+            refused.append(1)
+        except runs.RunStoreError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=one) for _ in range(40)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert len(admitted) == 10
+    assert len(refused) + len(errors) == 30
+    assert runs.template_readings_today("ws-a") == 10
+    meters = [d for d in cloud_tpl.docs.values() if d.get("kind") == runs.TEMPLATE_METER_KIND]
+    assert len(meters) == 1 and meters[0]["used"] == 10 and meters[0]["user_id"] == "ws-a"

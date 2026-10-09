@@ -22,6 +22,7 @@ PyJWT>=2.8
 google-auth>=2.30
 cryptography>=44   # Inbox Triage (a12) — Fernet seals the stored Gmail refresh token
 pypdf>=5.1
+pypdfium2>=4.30  # MR sample-report reader: rasterise PDF pages (Apache-2.0/BSD-3; not PyMuPDF, which is AGPL)
 python-docx>=1.1
 svglib>=1.5
 pillow>=10.0
@@ -31,6 +32,7 @@ python-pptx>=0.6.23     # presentation (PPTX) generation
 PyMuPDF>=1.24           # render reference PDF pages for the reference library
 google-api-python-client>=2.130  # Google Drive ingestion for the reference library
 openpyxl>=3.1
+nh3>=0.3.7         # MR report templates — sanitizes uploaded HTML (ammonia/html5ever); test_report_templates' bypass corpus gates any bump
 cairosvg           # Element Library — rasterize icon/sticker SVGs (Linux/Cloud Run; optional locally)
 PyYAML>=6.0        # GEO Content Optimizer — opt_config.yaml is the single source of truth for weights
 trafilatura>=2.0   # GEO optimizer Layer 2 — article extraction + boilerplate removal

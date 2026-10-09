@@ -14,9 +14,11 @@ is really unbounded memory.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import threading
 import uuid
 from pathlib import Path
 
@@ -330,15 +332,32 @@ def list_runs(user_id, kind: str | tuple[str, ...] | None = None) -> list[dict]:
 #
 # Owner decisions (2026-10-08): a template applies to the WHOLE workspace; any
 # member may upload or replace it; every version is kept for history and
-# one-click revert; the built-in default is always available.
+# one-click revert; the built-in default is always available. The uploaded
+# original (a client's sample PDF) is NOT kept anywhere: a version stores what
+# it renders from (a layout ``spec`` or sanitized ``html``), the upload's
+# ``filename`` and a ``sha256`` of the stored content, and nothing else.
 #
 # Stored as ordinary ``mr_runs`` docs — this module is the shared MR store, so
 # templates inherit its tenancy (``user_id`` = the workspace key the router
 # resolves with ``workspace.workspace_id``, so they follow ``MR_WORKSPACE_SHARED``)
 # and its lifecycle (``_enforce_retention``: the newest :func:`retention_cap`
-# versions per workspace per report, 25 by default). Append-only: a revert, and
-# "back to built-in", each WRITE a new version, so the active template is always
-# simply the newest one and retention can never evict it.
+# records per workspace per report, 25 by default). Append-only: an activation
+# (a revert, or "back to built-in") WRITES a new record, so the active template
+# is always simply the newest record and retention can never evict it.
+#
+# Two kinds of record share the kind ``report_template:<report>``:
+#
+# * a CONTENT version — what someone saved. It gets the next ``number`` (1, 2,
+#   3… per workspace, for "Version 5" in the UI), and its ``content_id`` is its
+#   own id. ``uploaded_by``/``created_at`` are its author and time.
+# * an ACTIVATION — a revert. It copies the content, keeps the content's
+#   ``number``, ``content_id``, author and ``created_at``, and records who set it
+#   active and when (``set_by``/``set_at``). A content version is also stamped
+#   ``set_by``/``set_at`` = its own author and time: saving activates it.
+#
+# ``last_number`` rides on EVERY record (the highest number issued so far), so
+# the next number survives retention evicting the record that issued the last
+# one — the newest record is never evicted.
 #
 # One ``kind`` per report (``report_template:<report>``) so each report's history
 # is retained on its own — under a shared kind, 25 uploads of one report's
@@ -371,34 +390,293 @@ def builtin_template(report: str = "vendor_performance") -> dict:
     """The built-in default. Synthesised, never stored, always available."""
     return {"id": BUILTIN_TEMPLATE_ID, "kind": template_kind(report), "report": report,
             "builtin": True, "source_kind": None, "spec": None, "html": None,
-            "original_gcs_path": None, "sha256": None, "created_at": None,
-            "uploaded_by": None, "reverted_from": None}
+            "sha256": None, "filename": None, "number": None, "content_id": BUILTIN_TEMPLATE_ID,
+            "created_at": None, "uploaded_by": None, "set_by": None, "set_at": None,
+            "reverted_from": None}
+
+
+def _clean_person(value, what: str) -> str:
+    if not value or not str(value).strip():
+        raise ValueError(f"{what} is required — template history names who changed it")
+    return str(value).strip()
+
+
+def _display(name, fallback: str) -> str:
+    """A person's display name for the history, or their email when there is
+    none. Plain text, capped; the console escapes it."""
+    clean = " ".join(str(name or "").split())[:120]
+    return clean or fallback
+
+
+# --- the head: one small pointer doc per workspace per report ------------------
+#
+# Every template write is ONE atomic step against a head doc (``mr_runs`` id
+# :func:`_head_id`, kind ``report_template_head:<report>``) holding
+# ``last_number``, the ordering floor and the ACTIVE record's metadata (no
+# body). In the cloud that step is a Firestore transaction — read the head,
+# assign the number, write the record and the head together — so two
+# simultaneous saves can never share a number: the loser's commit is rejected
+# and retried against the winner's head. Offline (disk) the same step runs
+# under a process lock plus a lock file.
+#
+# Reads follow from it: "which template is active" is the head alone (1 small
+# doc); a build reads the head and then the one active record (2 docs); the
+# version list is a projection without the ``spec``/``html`` bodies.
+#
+# Template records are written ONLY through this path. In the cloud they are
+# not mirrored to the instance's disk (the head is the source of truth, and a
+# disk copy would let one instance serve a version the head does not know).
+
+TEMPLATE_HEAD_PREFIX = "report_template_head"
+
+#: Everything a template record carries except its BODY (``spec``/``html``).
+_TEMPLATE_META_FIELDS = (
+    "id", "kind", "user_id", "report", "generated_at", "created_at", "uploaded_by",
+    "created_by_name", "source_kind", "sha256", "filename", "builtin", "reverted_from",
+    "content_id", "number", "last_number", "set_by", "set_by_name", "set_at",
+)
+
+#: Seconds an offline lock file may be held before it is treated as abandoned.
+_LOCAL_LOCK_STALE_S = 30.0
+_LOCAL_LOCK = threading.Lock()
+
+
+def _head_id(workspace, report: str) -> str:
+    """Deterministic, path-safe and tenant-exact (``repr`` keeps ``7`` and
+    ``"7"`` two workspaces, as everywhere else in MR)."""
+    digest = hashlib.sha256(f"{report}\x00{workspace!r}".encode("utf-8")).hexdigest()
+    return f"tplhead_{digest[:40]}"
+
+
+def _meta(record: dict) -> dict:
+    return {k: record.get(k) for k in _TEMPLATE_META_FIELDS}
+
+
+def _head_for(workspace, report: str, record: dict) -> dict:
+    return {"id": _head_id(workspace, report), "kind": f"{TEMPLATE_HEAD_PREFIX}:{report}",
+            "user_id": workspace, "report": report,
+            "last_number": record.get("last_number") or 0,
+            "generated_at": record["generated_at"], "active": _meta(record)}
+
+
+def _next_ordering(head: dict | None) -> str:
+    """"Active" is "newest", so a new record must sort strictly after the current
+    one even when the clock ties (coarse on some hosts) or skews."""
+    from datetime import datetime, timedelta, timezone
+
+    now_dt = datetime.now(timezone.utc)
+    if head:
+        try:
+            floor = datetime.fromisoformat(head["generated_at"]) + timedelta(microseconds=1)
+            now_dt = max(now_dt, floor)
+        except (KeyError, TypeError, ValueError):
+            pass
+    return now_dt.isoformat()
+
+
+def _check_size(record: dict) -> dict:
+    payload = json.loads(json.dumps(record, default=str))
+    if len(json.dumps(payload).encode("utf-8")) > _TEMPLATE_MAX_BYTES:
+        raise ValueError("template version is larger than the store's document limit")
+    return payload
+
+
+def _own_head(head: dict | None, workspace) -> dict | None:
+    if head is not None and head.get("user_id") != workspace:
+        # A digest collision, or a doc written by something else. Never build
+        # on another tenant's head.
+        raise RunStoreError("the template head belongs to another workspace")
+    return head
+
+
+def _transactional(fn):
+    """Seam over ``firestore.transactional`` (tests substitute a fake that
+    enforces the same optimistic-concurrency contract)."""
+    from google.cloud import firestore as _fs
+
+    return _fs.transactional(fn)
+
+
+def _cloud_commit(workspace, report: str, build) -> dict:
+    from app.services import firestore_repo
+
+    db = firestore_repo._db()
+    col = db.collection(_MR_COLLECTION)
+    head_ref = col.document(_head_id(workspace, report))
+    out: dict = {}
+
+    def body(txn):
+        snap = head_ref.get(transaction=txn)
+        head = _own_head(snap.to_dict() if snap.exists else None, workspace)
+        record = build(head)               # pure: a retried attempt rebuilds it
+        txn.set(col.document(record["id"]), record)
+        txn.set(head_ref, _head_for(workspace, report, record))
+        out["record"] = record
+
+    _transactional(body)(db.transaction())
+    return out["record"]
+
+
+class _LocalFileLock:
+    """Cross-process exclusion for the offline store (O_EXCL lock file)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def __enter__(self):
+        import time
+
+        deadline = time.monotonic() + 2 * _LOCAL_LOCK_STALE_S
+        while True:
+            try:
+                os.close(os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - self.path.stat().st_mtime > _LOCAL_LOCK_STALE_S:
+                        self.path.unlink(missing_ok=True)
+                        continue
+                except FileNotFoundError:
+                    continue
+                if time.monotonic() > deadline:
+                    raise RunStoreError("the template store is locked by another writer")
+                time.sleep(0.01)
+
+    def __exit__(self, *_exc):
+        self.path.unlink(missing_ok=True)
+
+
+def _atomic_write(path: Path, payload: dict) -> None:
+    import time
+
+    tmp = path.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp")
+    tmp.write_text(json.dumps(payload, default=str, indent=2), encoding="utf-8")
+    # Windows refuses to replace a file another thread or process has open for
+    # reading (any ``list_runs`` glob may be reading it); that lasts
+    # milliseconds, so wait it out briefly rather than fail the write.
+    for attempt in range(100):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 99:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.005)
+
+
+def _local_head(workspace, report: str) -> dict | None:
+    p = _path(_head_id(workspace, report))
+    if not p.exists():
+        return None
+    return _own_head(json.loads(p.read_text(encoding="utf-8")), workspace)
+
+
+def _local_commit(workspace, report: str, build) -> dict:
+    head_id = _head_id(workspace, report)
+    with _LOCAL_LOCK, _LocalFileLock(_root() / f"{head_id}.lock"):
+        record = build(_local_head(workspace, report))
+        _atomic_write(_path(record["id"]), record)
+        _atomic_write(_path(head_id), _head_for(workspace, report, record))
+    return record
+
+
+def _commit_template(workspace, report: str, build) -> dict:
+    """Run ``build(head) -> record`` and write the record + head atomically.
+    ``ValueError`` from ``build`` passes through; any store failure is a
+    :class:`RunStoreError` and nothing was written."""
+    if not _use_cloud():
+        record = _local_commit(workspace, report, build)
+    else:
+        try:
+            record = _cloud_commit(workspace, report, build)
+        except (ValueError, RunStoreError):
+            raise
+        except Exception as exc:
+            logger.warning("MR template commit failed", exc_info=True)
+            raise RunStoreError("the template version could not be saved durably") from exc
+    _trim_templates(workspace, report, keep_id=record["id"])
+    return record
+
+
+def _list_template_meta(workspace, report: str) -> list[dict]:
+    """Every template record's METADATA for this workspace, newest first. One
+    projected equality query on ``(user_id, kind)``: no composite index, no
+    bodies on the wire."""
+    kind = template_kind(report)
+    rows: list[dict] = []
+    if _use_cloud():
+        try:
+            from google.cloud import firestore as _fs
+
+            query = (_collection()
+                     .where(filter=_fs.FieldFilter("user_id", "==", workspace))
+                     .where(filter=_fs.FieldFilter("kind", "==", kind))
+                     .select(list(_TEMPLATE_META_FIELDS)))
+            rows = [d.to_dict() for d in query.stream()]
+        except Exception as exc:
+            logger.warning("MR template list failed", exc_info=True)
+            raise RunStoreError("the template store could not be read") from exc
+    else:
+        for p in _root().glob("*.json"):
+            try:
+                r = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(r, dict) and r.get("kind") == kind and r.get("user_id") == workspace:
+                rows.append(_meta(r))
+    rows = [r for r in rows if r.get("user_id") == workspace and r.get("id")]
+    rows.sort(key=lambda r: r.get("generated_at") or "", reverse=True)
+    return rows
+
+
+def _trim_templates(workspace, report: str, *, keep_id: str) -> list[str]:
+    """Retention: the newest :func:`retention_cap` records per workspace per
+    report. Reads metadata only; never evicts ``keep_id`` (the record just
+    written, which IS the active one) or anything outside this workspace.
+    Best effort: over-retention, never a failed save."""
+    try:
+        rows = _list_template_meta(workspace, report)
+    except RunStoreError:
+        return []
+    evicted = []
+    for r in rows[retention_cap():]:
+        if r.get("id") == keep_id or r.get("user_id") != workspace:
+            continue
+        try:
+            delete_run(r["id"])
+            evicted.append(r["id"])
+        except Exception:
+            logger.warning("MR template retention could not evict %s", r.get("id"))
+    return evicted
 
 
 def save_template_version(workspace, *, uploaded_by: str, source_kind: str | None = None,
                           spec: dict | None = None, html: str | None = None,
-                          original_gcs_path: str | None = None, sha256: str | None = None,
-                          builtin: bool = False, reverted_from: str | None = None,
+                          sha256: str | None = None, filename: str | None = None,
+                          builtin: bool = False, uploaded_by_name: str | None = None,
                           report: str = "vendor_performance") -> dict:
-    """Append a new version; it becomes the active template. Returns the record.
+    """Save a new CONTENT version (or, with ``builtin=True``, a "use the built-in
+    default" record). It becomes the active template. Returns the record.
 
-    ``html`` must ALREADY be sanitized by the caller — this layer stores it, it
-    does not clean it — and is accepted only for ``source_kind == "html"``.
-    ``builtin=True`` records "use the built-in default" (no spec/html/source).
+    The number and the write are one atomic step (see the head, above), so two
+    simultaneous saves get two numbers. ``html`` must ALREADY be sanitized by
+    the caller (this layer stores it, it does not clean it) and is accepted
+    only for ``source_kind == "html"``.
 
-    Raises ``ValueError`` for a blank workspace/uploader, an unknown
-    report/source kind, or a payload over Firestore's document limit, and
-    :class:`RunStoreError` when the version did not reach the durable store (its
-    local copy is removed, so no instance serves a version others cannot see).
+    Cost: 1 head read + 2 writes in one transaction, then a projected retention
+    read (metadata of <= 26 records).
+
+    Raises ``ValueError`` for a blank workspace/author, an unknown report/source
+    kind, or a payload over Firestore's document limit, and
+    :class:`RunStoreError` when nothing could be written durably.
     """
-    from datetime import datetime, timedelta, timezone
-
     _require_workspace(workspace)
     kind = template_kind(report)
-    if not uploaded_by or not str(uploaded_by).strip():
-        raise ValueError("uploaded_by is required — template history names who changed it")
+    who = _clean_person(uploaded_by, "uploaded_by")
+    who_name = _display(uploaded_by_name, who)
     if builtin:
-        source_kind, spec, html, original_gcs_path, sha256 = None, None, None, None, None
+        source_kind, spec, html, sha256, filename = None, None, None, None, None
     else:
         if source_kind not in TEMPLATE_SOURCE_KINDS:
             raise ValueError(f"source_kind must be one of {sorted(TEMPLATE_SOURCE_KINDS)}")
@@ -406,65 +684,372 @@ def save_template_version(workspace, *, uploaded_by: str, source_kind: str | Non
             raise ValueError("html is stored only for source_kind 'html'")
         if spec is None and html is None:
             raise ValueError("a template version needs a spec or html")
-    # "Active" is "newest", so a new version must sort strictly after the
-    # current one even when the clock ties (coarse on some hosts) or skews.
-    now_dt = datetime.now(timezone.utc)
-    newest = list_template_versions(workspace, report=report, limit=1)
-    if newest:
-        try:
-            floor = datetime.fromisoformat(newest[0]["generated_at"]) + timedelta(microseconds=1)
-            now_dt = max(now_dt, floor)
-        except (KeyError, TypeError, ValueError):
-            pass
-    now = now_dt.isoformat()
-    record = {
-        "id": new_run_id(), "kind": kind, "user_id": workspace, "report": report,
-        "generated_at": now, "created_at": now, "uploaded_by": str(uploaded_by).strip(),
-        "source_kind": source_kind, "spec": spec, "html": html,
-        "original_gcs_path": original_gcs_path, "sha256": sha256,
-        "builtin": bool(builtin), "reverted_from": reverted_from,
-    }
-    if len(json.dumps(record, default=str).encode("utf-8")) > _TEMPLATE_MAX_BYTES:
-        raise ValueError("template version is larger than the store's document limit")
-    if not save_run(record):
-        delete_run(record["id"])
-        raise RunStoreError("the template version could not be saved durably")
-    return record
+
+    def build(head: dict | None) -> dict:
+        now = _next_ordering(head)
+        last = int((head or {}).get("last_number") or 0)
+        number = None if builtin else last + 1
+        record_id = new_run_id()
+        return _check_size({
+            "id": record_id, "kind": kind, "user_id": workspace, "report": report,
+            "generated_at": now, "created_at": now, "uploaded_by": who,
+            "created_by_name": who_name,
+            "source_kind": source_kind, "spec": spec, "html": html, "sha256": sha256,
+            "filename": filename, "builtin": bool(builtin), "reverted_from": None,
+            "content_id": BUILTIN_TEMPLATE_ID if builtin else record_id,
+            "number": number, "last_number": last if builtin else number,
+            "set_by": who, "set_by_name": who_name, "set_at": now,
+        })
+
+    return _commit_template(workspace, report, build)
 
 
 def list_template_versions(workspace, *, report: str = "vendor_performance",
                            limit: int | None = None) -> list[dict]:
-    """This workspace's versions of one report's template, newest first — at most
-    :func:`retention_cap` exist, ``limit`` trims further. One equality query on
-    ``(user_id, kind)``: no composite index."""
+    """This workspace's template records (content versions and activations),
+    newest first, as METADATA: no ``spec``/``html`` body (load one with
+    :func:`find_template_version`). At most :func:`retention_cap` exist,
+    ``limit`` trims further. One projected equality query: no composite index."""
     _require_workspace(workspace)
-    rows = list_runs(workspace, kind=template_kind(report))
+    template_kind(report)
+    rows = _list_template_meta(workspace, report)
     return rows if limit is None else rows[: max(limit, 0)]
 
 
+def active_template_meta(workspace, *, report: str = "vendor_performance") -> dict:
+    """Which template is active: the head alone, ONE small doc read, no body.
+    :func:`builtin_template` when nothing was ever saved. Same keys as a record
+    minus ``spec``/``html`` (``rt.summarize`` takes it as-is)."""
+    _require_workspace(workspace)
+    template_kind(report)
+    if _use_cloud():
+        try:
+            snap = _collection().document(_head_id(workspace, report)).get()
+            head = _own_head(snap.to_dict() if snap.exists else None, workspace)
+        except RunStoreError:
+            raise
+        except Exception as exc:
+            logger.warning("MR template head read failed", exc_info=True)
+            raise RunStoreError("the template store could not be read") from exc
+    else:
+        head = _local_head(workspace, report)
+    if not head or not head.get("active"):
+        return builtin_template(report)
+    return dict(head["active"])
+
+
 def active_template(workspace, *, report: str = "vendor_performance") -> dict:
-    """The newest version, or :func:`builtin_template` when none was ever saved.
-    A version saved with ``builtin=True`` is returned as-is (``builtin`` is
-    True, ``spec``/``html`` None): the consumer renders the default for either."""
-    rows = list_template_versions(workspace, report=report, limit=1)
-    return rows[0] if rows else builtin_template(report)
+    """The active template WITH its body, for a build: the head, then the one
+    active record (2 doc reads). A ``builtin=True`` activation is returned as
+    its metadata with ``spec``/``html`` None, like :func:`builtin_template`."""
+    meta = active_template_meta(workspace, report=report)
+    if meta.get("builtin") or meta.get("id") == BUILTIN_TEMPLATE_ID:
+        return {**meta, "spec": None, "html": None}
+    record = find_template_version(workspace, meta["id"], report=report)
+    if record is None:
+        # Retention never evicts the active record, so this is a broken store.
+        raise RunStoreError("the active template version could not be read")
+    return record
 
 
-def revert_template(workspace, version_id: str, *, uploaded_by: str,
+def find_template_version(workspace, version_id: str, *,
+                          report: str = "vendor_performance") -> dict | None:
+    """One template record by id, WITH its body, or None, including when the id
+    belongs to another workspace or another kind (so a caller cannot tell the
+    two apart). A single document read; the workspace check is what scopes it."""
+    _require_workspace(workspace)
+    if not version_id or version_id == BUILTIN_TEMPLATE_ID:
+        return None
+    record = get_run(str(version_id))
+    if (not isinstance(record, dict) or record.get("kind") != template_kind(report)
+            or record.get("user_id") != workspace):
+        return None
+    return record
+
+
+def find_template_content(workspace, version_id: str, *,
+                          report: str = "vendor_performance") -> dict | None:
+    """The template content a console version id names, WITH its body: the
+    record itself, or — when retention evicted the original — an activation
+    that copied it. None for another workspace's id, exactly like a missing one."""
+    _require_workspace(workspace)
+    if not version_id or version_id == BUILTIN_TEMPLATE_ID:
+        return None
+    return (find_template_version(workspace, version_id, report=report)
+            or _find_by_content_id(workspace, version_id, report))
+
+
+def _find_by_content_id(workspace, content_id: str, report: str) -> dict | None:
+    """A record carrying ``content_id``: how a version whose ORIGINAL record
+    retention evicted is still reachable through an activation that copied it.
+    Equality-only on three fields (no composite index); limit 1, because every
+    match is a copy of the same content."""
+    kind = template_kind(report)
+    if _use_cloud():
+        try:
+            from google.cloud import firestore as _fs
+
+            query = (_collection()
+                     .where(filter=_fs.FieldFilter("user_id", "==", workspace))
+                     .where(filter=_fs.FieldFilter("kind", "==", kind))
+                     .where(filter=_fs.FieldFilter("content_id", "==", content_id))
+                     .limit(1))
+            found = [d.to_dict() for d in query.stream()]
+        except Exception as exc:
+            raise RunStoreError("the template store could not be read") from exc
+    else:
+        found = []
+        for p in _root().glob("*.json"):
+            try:
+                r = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if (isinstance(r, dict) and r.get("kind") == kind
+                    and r.get("content_id") == content_id):
+                found.append(r)
+    return next((r for r in found
+                 if r.get("user_id") == workspace and not r.get("builtin")), None)
+
+
+def revert_template(workspace, version_id: str, *, set_by: str,
+                    set_by_name: str | None = None,
                     report: str = "vendor_performance") -> dict:
-    """One-click revert: append a NEW version copying ``version_id``
-    (``"builtin"`` = back to the built-in default). The version is looked up
-    inside THIS workspace's list only, so another workspace's id is not found —
-    it raises ``LookupError`` exactly like a missing one."""
+    """One-click revert: append an ACTIVATION of ``version_id`` (``"builtin"`` =
+    back to the built-in default). The version is looked up inside THIS
+    workspace only, so another workspace's id is not found: it raises
+    ``LookupError`` exactly like a missing one.
+
+    Cost: 1 read for the source (2 when found through its content id), then the
+    same transaction as a save (1 head read + 2 writes)."""
+    _require_workspace(workspace)
+    who = _clean_person(set_by, "set_by")
+    who_name = _display(set_by_name, who)
+    kind = template_kind(report)
     if version_id == BUILTIN_TEMPLATE_ID:
-        return save_template_version(workspace, uploaded_by=uploaded_by, builtin=True,
-                                     reverted_from=BUILTIN_TEMPLATE_ID, report=report)
-    old = next((r for r in list_template_versions(workspace, report=report)
-                if r.get("id") == version_id), None)
-    if old is None:
-        raise LookupError(f"no template version {version_id!r} in this workspace")
-    return save_template_version(
-        workspace, uploaded_by=uploaded_by, source_kind=old.get("source_kind"),
-        spec=old.get("spec"), html=old.get("html"),
-        original_gcs_path=old.get("original_gcs_path"), sha256=old.get("sha256"),
-        builtin=bool(old.get("builtin")), reverted_from=version_id, report=report)
+        old = builtin_template(report)
+    else:
+        old = find_template_content(workspace, version_id, report=report)
+        if old is None:
+            raise LookupError(f"no template version {version_id!r} in this workspace")
+
+    def build(head: dict | None) -> dict:
+        now = _next_ordering(head)
+        return _check_size({
+            "id": new_run_id(), "kind": kind, "user_id": workspace, "report": report,
+            "generated_at": now,
+            # The CONTENT's author and time travel with it; the activation is
+            # attributed separately, so history never claims B wrote A's template.
+            "created_at": old.get("created_at"), "uploaded_by": old.get("uploaded_by"),
+            "created_by_name": old.get("created_by_name") or old.get("uploaded_by"),
+            "source_kind": old.get("source_kind"), "spec": old.get("spec"),
+            "html": old.get("html"), "sha256": old.get("sha256"),
+            "filename": old.get("filename"), "builtin": bool(old.get("builtin")),
+            "reverted_from": version_id,
+            "content_id": old.get("content_id") or old.get("id"),
+            "number": old.get("number"),
+            "last_number": int((head or {}).get("last_number") or 0),
+            "set_by": who, "set_by_name": who_name, "set_at": now,
+        })
+
+    return _commit_template(workspace, report, build)
+
+
+# --- template readings: the per-workspace daily allowance -----------------------
+#
+# Reading a sample report is one billed model call (``template_extract``). A
+# workspace gets :data:`TEMPLATE_READINGS_PER_DAY` of them per UTC day.
+#
+# The allowance is ONE counter doc per workspace (``mr_runs`` id
+# :func:`_meter_id`, kind :data:`TEMPLATE_METER_KIND`) holding ``{day, used}``,
+# checked and incremented in one atomic step: a Firestore transaction in the
+# cloud (the same ``_transactional`` seam the template head uses), the process
+# lock plus a lock file offline. Two simultaneous readings therefore cannot both
+# take the last slot, and nothing else — retention, a failed list, an evicted
+# doc — can make the count read low. A new UTC day resets it in place: one doc
+# per workspace, ever.
+#
+# Each reading ALSO leaves an audit doc of kind :data:`TEMPLATE_READING_KIND`
+# (who, which file, ``ok`` / ``failed`` with the billed usage / ``error``) so a
+# failed-but-billed call is on record. Those docs are history only — retention
+# may trim them freely, because the counter alone decides.
+#
+# A reading that never reached the provider is given back (:func:`release`); one
+# that was billed stays counted, whether it succeeded or not.
+
+TEMPLATE_READING_KIND = "report_template_reading"
+TEMPLATE_METER_KIND = "report_template_meter"
+TEMPLATE_READINGS_PER_DAY = 10
+
+
+class ReadingLimitReached(RuntimeError):
+    """This workspace has spent today's readings. Nothing was written."""
+
+
+def _utc_day(iso: str | None = None) -> str:
+    from datetime import datetime, timezone
+
+    if iso:
+        return str(iso)[:10]
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _meter_id(workspace) -> str:
+    """Deterministic and tenant-exact, like the template head's id."""
+    digest = hashlib.sha256(f"reading-meter\x00{workspace!r}".encode("utf-8")).hexdigest()
+    return f"tplmeter_{digest[:40]}"
+
+
+def _meter_path(workspace) -> Path:
+    """Offline the meter is NOT a ``*.json`` run file: it is not a run, and
+    keeping it out of ``list_runs``'s glob means no reader holds it open."""
+    return _root() / f"{_meter_id(workspace)}.meter"
+
+
+def _meter_used(doc: dict | None, workspace, day: str) -> int:
+    if not doc:
+        return 0
+    if doc.get("user_id") != workspace:
+        raise RunStoreError("the reading meter belongs to another workspace")
+    return int(doc.get("used") or 0) if doc.get("day") == day else 0
+
+
+def _meter_doc(workspace, day: str, used: int) -> dict:
+    from datetime import datetime, timezone
+
+    return {"id": _meter_id(workspace), "kind": TEMPLATE_METER_KIND, "user_id": workspace,
+            "day": day, "used": used,
+            "generated_at": datetime.now(timezone.utc).isoformat()}
+
+
+def _meter_step(workspace, change) -> tuple[int, int | None]:
+    """Atomically: read today's count, ``new = change(used, day)``, and write
+    ``new`` unless it is None. Returns ``(used, new)``. Raises
+    :class:`RunStoreError` when the store cannot do it — the caller refuses."""
+    day = _utc_day()
+    meter_id = _meter_id(workspace)
+    if _use_cloud():
+        from app.services import firestore_repo
+
+        out: dict = {}
+        try:
+            db = firestore_repo._db()
+            ref = db.collection(_MR_COLLECTION).document(meter_id)
+
+            def body(txn):
+                snap = ref.get(transaction=txn)
+                used = _meter_used(snap.to_dict() if snap.exists else None, workspace, day)
+                new = change(used, day)
+                out["used"], out["new"] = used, new
+                if new is not None:
+                    txn.set(ref, _meter_doc(workspace, day, new))
+
+            _transactional(body)(db.transaction())
+        except RunStoreError:
+            raise
+        except Exception as exc:
+            logger.warning("MR template reading meter could not be updated", exc_info=True)
+            raise RunStoreError("the reading allowance could not be checked") from exc
+        return out["used"], out["new"]
+    try:
+        with _LOCAL_LOCK, _LocalFileLock(_root() / f"{meter_id}.lock"):
+            p = _meter_path(workspace)
+            doc = json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+            used = _meter_used(doc, workspace, day)
+            new = change(used, day)
+            if new is not None:
+                _atomic_write(p, _meter_doc(workspace, day, new))
+    except (OSError, ValueError) as exc:
+        logger.warning("MR template reading meter could not be updated", exc_info=True)
+        raise RunStoreError("the reading allowance could not be checked") from exc
+    return used, new
+
+
+def template_readings_today(workspace) -> int:
+    """Readings this workspace has spent (or has in flight) today, UTC: the
+    meter alone, one small doc read."""
+    _require_workspace(workspace)
+    meter_id = _meter_id(workspace)
+    day = _utc_day()
+    if _use_cloud():
+        try:
+            snap = _collection().document(meter_id).get()
+            return _meter_used(snap.to_dict() if snap.exists else None, workspace, day)
+        except RunStoreError:
+            raise
+        except Exception as exc:
+            raise RunStoreError("the reading allowance could not be read") from exc
+    try:
+        # Under the writers' lock: on Windows a reader holding the file open makes
+        # a concurrent os.replace fail, and a read between two writes is stale.
+        with _LOCAL_LOCK, _LocalFileLock(_root() / f"{meter_id}.lock"):
+            p = _meter_path(workspace)
+            doc = json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+    except (OSError, ValueError) as exc:
+        raise RunStoreError("the reading allowance could not be read") from exc
+    return _meter_used(doc, workspace, day)
+
+
+def reserve_template_reading(workspace, *, by: str, filename: str | None,
+                             source_kind: str) -> dict:
+    """Take one of today's readings BEFORE the model call — or raise
+    :class:`ReadingLimitReached` (nothing taken), or :class:`RunStoreError` when
+    the meter cannot be updated (an allowance the store cannot hold is not
+    enforced, so the caller refuses rather than spending unmetered)."""
+    from datetime import datetime, timezone
+
+    _require_workspace(workspace)
+    who = _clean_person(by, "by")
+
+    def take(used: int, _day: str) -> int | None:
+        return used + 1 if used < TEMPLATE_READINGS_PER_DAY else None
+
+    _used, new = _meter_step(workspace, take)
+    if new is None:
+        raise ReadingLimitReached(
+            f"all {TEMPLATE_READINGS_PER_DAY} of today's readings are used")
+    record = {"id": new_run_id(), "kind": TEMPLATE_READING_KIND, "user_id": workspace,
+              "generated_at": datetime.now(timezone.utc).isoformat(), "day": _utc_day(),
+              "by": who, "filename": filename, "source_kind": source_kind,
+              "status": "pending", "code": None, "usage": None}
+    try:
+        save_run(record)                   # history only; the meter already counted it
+    except Exception:  # noqa: BLE001
+        logger.warning("MR template reading %s: audit record not written", record["id"],
+                       exc_info=True)
+    return record
+
+
+def settle_template_reading(record: dict, *, status: str, code: str | None = None,
+                            usage: dict | None = None) -> None:
+    """Record how a reading ended — ``ok`` / ``failed`` (billed) / ``error`` — on its
+    audit doc. The meter is untouched: a billed reading stays counted. Best
+    effort."""
+    updated = {**record, "status": status, "code": code, "usage": usage}
+    try:
+        if not save_run(updated):
+            logger.warning("MR template reading %s could not be settled durably (%s)",
+                           record.get("id"), status)
+    except Exception:  # noqa: BLE001 - see the docstring
+        logger.warning("MR template reading %s could not be settled", record.get("id"),
+                       exc_info=True)
+
+
+def release_template_reading(record: dict) -> None:
+    """Nothing was billed: give the reading back — but only on the day it was
+    taken (a reading reserved before midnight must not lower the next day's
+    count). Best effort: a release that does not land over-counts, never under."""
+    workspace = record.get("user_id")
+
+    def give(used: int, day: str) -> int | None:
+        return used - 1 if used > 0 and day == record.get("day") else None
+
+    try:
+        _meter_step(workspace, give)
+    except Exception:  # noqa: BLE001 - see the docstring
+        logger.warning("MR template reading %s could not be given back", record.get("id"),
+                       exc_info=True)
+    try:
+        delete_run(record["id"])
+    except Exception:  # noqa: BLE001
+        logger.warning("MR template reading %s: audit record not removed", record.get("id"),
+                       exc_info=True)

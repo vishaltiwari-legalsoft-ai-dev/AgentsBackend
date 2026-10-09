@@ -484,6 +484,27 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("POST", "/api/mr/vendor-report"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("GET", "/api/mr/vendor-report/{run_id}/html"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("GET", "/api/mr/vendor-report/{run_id}/pdf"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    # 2026-10-09: team report templates for the vendor report. The template is
+    # the WORKSPACE's by owner decision (2026-10-08): any member may read a
+    # sample, check HTML, preview, save or switch versions, so there is no admin
+    # gate. Versions live in ``mr_runs`` under the workspace key; a version id
+    # from another workspace is a 404. Previews and the placeholder examples
+    # read the same vendor sweep the report does. Kill switch
+    # ``MR_REPORT_TEMPLATES`` (and ``MR_VENDOR_REPORT``), default off.
+    ("GET", "/api/mr/report-templates"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/mr/report-templates"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/mr/report-templates/extract"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/mr/report-templates/check-html"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/mr/report-templates/preview"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("POST", "/api/mr/report-templates/{version_id}/activate"): (WORKSPACE_SHARED,
+                                                                  INTERNAL_ONLY),
+    # A saved layout version's sections (or the built-in's), to arrange from by
+    # hand. One doc read under the workspace key; another workspace's id is 404.
+    ("GET", "/api/mr/report-templates/{version_id}/layout"): (WORKSPACE_SHARED,
+                                                              INTERNAL_ONLY),
+    # The documented starter file: generated from the placeholder vocabulary,
+    # identical for every caller, no workspace data in it.
+    ("GET", "/api/mr/report-templates/starter.html"): (SHARED_CATALOG, INTERNAL_ONLY),
     ("GET", "/api/mr/datasets"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("DELETE", "/api/mr/datasets/{dataset_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("POST", "/api/mr/ingest"): (WORKSPACE_SHARED, INTERNAL_ONLY),
@@ -634,7 +655,21 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
 #: of the reach: the figures are the vendor sweep every member can already read
 #: through ``GET /mr/snapshots*`` (counted above), and the run is stamped with the
 #: workspace key exactly like a board run. INTERNAL_ONLY, dark by default.
-WORKSPACE_SHARED_BASELINE = 80
+#: 80 → 86 on 2026-10-09: team report templates — the listing, save, activate,
+#: sample reading, HTML check and preview routes. A real widening, said plainly:
+#: by the owner's decision any member may change the template the whole team's
+#: vendor report renders through, so these are WORKSPACE_SHARED with no admin
+#: gate. Each version, and each day's sample-reading allowance, is keyed on the
+#: workspace; a version id from another workspace answers 404. The figures they
+#: preview are the vendor sweep already counted above. The starter download is
+#: SHARED_CATALOG, not counted here. INTERNAL_ONLY, dark by default
+#: (``MR_REPORT_TEMPLATES``).
+#: 86 → 87 on 2026-10-09: ``GET /mr/report-templates/{version_id}/layout`` — one
+#: saved layout version's sections, so "arrange by hand" can start from the active
+#: template. Same reach as the listing above (any member, this workspace's
+#: versions only; another workspace's id answers 404), split out so the listing
+#: stays a bodiless read.
+WORKSPACE_SHARED_BASELINE = 87
 
 #: The GEO editor surface, BY NAME. Not a count — a count would let a future
 #: route join the role while another left it and say nothing, and the thing

@@ -8,8 +8,10 @@ runs, owned by the authenticated user.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import io
+import json
 import logging
 import math
 import os
@@ -25,12 +27,13 @@ import httpx  # noqa: F401
 from fastapi import (
     APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.routing import APIRoute
 
 from app.security import get_current_user
 from app.services import pdf_renderer
 from app.services.run_tracking import (
-    CHANGE, CRON, JOB, Activity, ActivityTrail, silent,
+    CHANGE, CRON, JOB, OUTPUT, Activity, ActivityTrail, silent,
 )
 
 from dataclasses import asdict
@@ -2326,11 +2329,46 @@ def _pdf_unavailable_reason() -> str | None:
             "up — meanwhile, the full report opens as a web page.")
 
 
+def _coded(status: int, code: str, reason: str, act: Activity | None = None,
+           **extra) -> JSONResponse:
+    """An error the console can branch on: ``{code, reason}`` plus ``detail``
+    (the same words, for clients that read FastAPI's usual key). A route that
+    declared the trail skips its row: a refused request is not a unit of work."""
+    if act is not None:
+        act.skip(f"refused: {code}")
+    return JSONResponse(status_code=status,
+                        content={"code": code, "reason": reason, "detail": reason, **extra})
+
+
+def _templates_on() -> bool:
+    """Team templates need the vendor report itself to be on."""
+    from marketing_research_agent import report_templates as rt
+
+    return reports.vendor_report_enabled() and rt.enabled()
+
+
+def _template_line(ws: str) -> dict:
+    """The console's one-line "which template" answer for a workspace."""
+    from marketing_research_agent import report_templates as rt
+
+    blank = {"number": None, "set_by": None, "set_by_name": None, "set_at": None}
+    if not _templates_on():
+        return {"kind": "builtin", **blank}
+    try:
+        active = rt.summarize(runs.active_template_meta(ws))
+    except runs.RunStoreError:
+        # The month picker still works; the line says it does not know, rather
+        # than claiming the built-in.
+        logger.warning("mr periods: the template store could not be read", exc_info=True)
+        return {"kind": None, **blank}
+    return {k: active[k] for k in ("kind", "number", "set_by", "set_by_name", "set_at")}
+
+
 @router.get("/mr/vendor-report/periods")
 def vendor_report_periods(user=Depends(get_current_user)):
     """The month picker: months with a vendor sweep, newest first, plus whether
-    the feature is on and whether PDF export is configured. Off, it reads
-    nothing and lists nothing."""
+    the feature is on, whether PDF export is configured, and which template a
+    build will use. Off, it reads nothing and lists nothing."""
     from marketing_research_agent import vendor_report as vr
 
     enabled = reports.vendor_report_enabled()
@@ -2339,6 +2377,7 @@ def vendor_report_periods(user=Depends(get_current_user)):
         "pdf_available": not pdf_renderer.missing_config(),
         "pdf_unavailable_reason": _pdf_unavailable_reason(),
         "months": vr.periods() if enabled else [],
+        "template": _template_line(_ws(user)) if enabled else None,
     }
 
 
@@ -2348,8 +2387,7 @@ def _year_month_field(body: dict | None) -> str | None:
         return None
     if isinstance(value, str) and _YEAR_MONTH_RE.match(value.strip()):
         return value.strip()
-    raise HTTPException(
-        422, f"'{reports._echo_period(value)}' is not a month - year_month is 'YYYY-MM'.")
+    raise ValueError(f"'{reports._echo_period(value)}' is not a month - year_month is 'YYYY-MM'.")
 
 
 @router.post("/mr/vendor-report")
@@ -2361,25 +2399,43 @@ def vendor_report_build(body: dict | None = None, user=Depends(get_current_user)
     (``reused``).
 
     Body (all optional): ``{"year_month": "YYYY-MM", "template": "builtin"}``.
-    No ``year_month`` = the newest month with a sweep. ``template: "builtin"`` is
-    the explicit override and the ONLY way a build uses the built-in template
-    when the workspace has a different one active; there is no silent swap.
+    No ``year_month`` = the newest month with a sweep. Without ``template`` the
+    build uses the workspace's active template (when team templates are on);
+    ``template: "builtin"`` is the explicit override and the ONLY way a build
+    uses the built-in while the team has its own. There is no silent swap: a
+    team template that cannot render this report is a 409 ``template_failed``
+    with ``can_use_builtin``, and nothing is saved.
+
+    Errors carry ``{code, reason, detail}``: ``invalid_month``,
+    ``invalid_template``, ``empty_month`` (422) and ``template_failed`` (409).
     """
     from marketing_research_agent import vendor_report as vr
 
     if not reports.vendor_report_enabled():
         raise HTTPException(404, "Not Found")
-    year_month = _year_month_field(body)
+    try:
+        year_month = _year_month_field(body)
+    except ValueError as exc:
+        return _coded(422, "invalid_month", str(exc), act)
     try:
         run = vr.build(workspace_id=_ws(user), year_month=year_month,
-                       template=(body or {}).get("template"))
+                       template=(body or {}).get("template"), use_templates=_templates_on())
     except (vr.EmptyMonth, vr.TemplateRefused) as exc:
-        raise HTTPException(422, str(exc))
+        return _coded(422, exc.code, str(exc), act)
+    except vr.TemplateFailed as exc:
+        return _coded(409, exc.code, exc.reason, act, can_use_builtin=True,
+                      template=exc.template)
     s = run.get("structured") or {}
-    act.note(f"Built the vendor report for {s.get('month_label')} from the "
-             f"{run.get('sweep_date')} sweep ({(s.get('sweep') or {}).get('vendor_count')} "
-             "vendors)" + (" - served from the store" if run.get("reused") else ""),
-             action="report:vendor_report", run_id=str(run.get("id") or "") or None)
+    if run.get("reused"):
+        # The run already stored for exactly these inputs was handed back:
+        # nothing was built, so it is a read, and THE RULE records no read —
+        # a second row (and a Home "generate") would count one report twice.
+        act.skip("served the run already stored for identical inputs; nothing new was built")
+    else:
+        act.note(f"Built the vendor report for {s.get('month_label')} from the "
+                 f"{run.get('sweep_date')} sweep "
+                 f"({(s.get('sweep') or {}).get('vendor_count')} vendors)",
+                 action="report:vendor_report", run_id=str(run.get("id") or "") or None)
     rid = run.get("id")
     return {**run, "links": {"html": f"/api/mr/vendor-report/{rid}/html",
                              "pdf": f"/api/mr/vendor-report/{rid}/pdf"}}
@@ -2395,28 +2451,55 @@ def _vendor_run(run_id: str, user: dict) -> dict:
     return run
 
 
-def _vendor_document(run: dict) -> str:
-    """The stored run as one self-contained HTML document, or a 422 saying why
-    not. Imported lazily for the same reason as ``_board_document``: the
-    renderer carries the embedded font faces."""
+def _vendor_document(run: dict) -> str | JSONResponse:
+    """The stored run as one self-contained HTML document, rendered through the
+    template it was BUILT with (not whatever is active now); or a coded error
+    saying why not. A team template that is gone, switched off, or no longer
+    renders is a 409 ``template_failed`` offering the built-in — never a quiet
+    re-render in some other template. Imported lazily for the same reason as
+    ``_board_document``: the renderer carries the embedded font faces."""
+    from marketing_research_agent import report_templates as rt
     from marketing_research_agent import vendor_report_render as vrr
 
+    structured = run.get("structured") or {}
+    tpl = run.get("template") or {}
     try:
-        layout = vrr.layout_for_template(run.get("template"))
-        return vrr.render(run.get("structured") or {}, layout)
+        if not tpl.get("id"):
+            return vrr.render(structured)
+        label = vrr.template_label(tpl)
+        if not rt.enabled():
+            raise rt.TemplateRenderError(
+                f"This report was built with the {label}, and team templates are switched "
+                "off on this server. Rebuild it with the built-in template.")
+        version = runs.find_template_version(run.get("user_id"), tpl["id"])
+        if version is None:
+            raise rt.TemplateRenderError(
+                f"This report was built with the {label}, which is no longer kept. Rebuild "
+                "it with the current template or the built-in one.")
+        return rt.render_with_template(structured, version)
+    except rt.TemplateRenderError as exc:
+        return _coded(409, "template_failed", exc.reason, can_use_builtin=True,
+                      template={k: tpl.get(k) for k in ("kind", "number", "id")})
     except ValueError as exc:
-        raise HTTPException(422, f"{exc} - rebuild it at POST /api/mr/vendor-report")
+        return _coded(422, "unrenderable", f"{exc} - rebuild it at POST /api/mr/vendor-report")
     except (KeyError, TypeError, IndexError):
         logger.exception("mr vendor report %s: stored run could not be rendered",
                          run.get("id"))
-        raise HTTPException(
-            422, "this vendor run cannot be rendered by this service - rebuild it at "
-                 "POST /api/mr/vendor-report")
+        return _coded(422, "unrenderable",
+                      "this vendor run cannot be rendered by this service - rebuild it at "
+                      "POST /api/mr/vendor-report")
 
 
 def _vendor_stamp(run: dict) -> str:
     return (str(run.get("sweep_date") or run.get("generated_at") or "")[:10]
             or date.today().isoformat())
+
+
+#: Sent with every vendor document. A team's HTML template also carries this as
+#: its first <head> element; on the response it covers every document, the
+#: built-in included: no script, no fetch except inline styles and data: URLs.
+_VENDOR_DOCUMENT_CSP = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
+                        "font-src data:")
 
 
 @router.get("/mr/vendor-report/{run_id}/html")
@@ -2429,6 +2512,8 @@ def vendor_report_html(run_id: str, user=Depends(get_current_user)):
         raise HTTPException(404, "Not Found")
     run = _vendor_run(run_id, user)
     html = _vendor_document(run)
+    if isinstance(html, Response):
+        return html
     return Response(
         content=html,
         media_type="text/html; charset=utf-8",
@@ -2436,6 +2521,7 @@ def vendor_report_html(run_id: str, user=Depends(get_current_user)):
             "Content-Disposition":
                 f'inline; filename="mr-vendor-report-{_vendor_stamp(run)}.html"',
             "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": _VENDOR_DOCUMENT_CSP,
         },
     )
 
@@ -2451,6 +2537,9 @@ def vendor_report_pdf(run_id: str, user=Depends(get_current_user),
         raise HTTPException(404, "Not Found")
     run = _vendor_run(run_id, user)
     html = _vendor_document(run)
+    if isinstance(html, Response):
+        act.skip("the document could not be rendered; nothing was exported")
+        return html
     pdf, blocked = _render_pdf_via_service(
         html, run_id=run_id, html_hint=_VENDOR_HTML_HINT.replace("{run_id}", run_id))
     if blocked not in ("", "0"):
@@ -2461,6 +2550,561 @@ def vendor_report_pdf(run_id: str, user=Depends(get_current_user),
     response = _pdf_response(pdf, f"mr-vendor-report-{stamp}.pdf")
     response.headers["X-Blocked-Subresources"] = blocked
     return response
+
+
+# --------------------------------------------------------------------------- #
+# Team report templates (/api/mr/report-templates*)
+# --------------------------------------------------------------------------- #
+# Owner decisions (2026-10-08): the template is the WORKSPACE's; ANY member may
+# read a sample, check an HTML file, preview, save or switch versions — so these
+# are WORKSPACE_SHARED with no admin gate, deliberately. Everything sits behind
+# ``MR_REPORT_TEMPLATES`` (and the vendor report's own switch), default off,
+# checked INSIDE the handler after auth so an anonymous caller gets 401 either
+# way; the listing answers ``enabled: false`` instead of 404 so the console can
+# hide the panel without a failed click.
+#
+# Nothing a client sends is trusted: a save re-checks HTML with ``check_html``
+# and re-validates a layout with ``validate_layout`` (and renders it once
+# against real data when there is any). The uploaded original is never stored —
+# not here, not in GCS: a version keeps what it renders from, the filename and
+# a SHA-256 of the stored content.
+#
+# Reading a sample is one billed model call, metered per workspace per UTC day
+# (``runs.TEMPLATE_READINGS_PER_DAY``) in the shared store. A call that failed
+# AFTER the provider billed it still counts; one that never reached the
+# provider does not.
+
+#: ``TemplateExtractionError.code`` -> HTTP status. Ours to fix or the
+#: provider's is 503; the model answered unusably is 502; the upload itself is
+#: the problem is 422.
+_EXTRACT_STATUS = {
+    "no_key": 503, "offline": 503, "provider_error": 503, "timeout": 503,
+    "refused": 502, "truncated": 502, "invalid_output": 502,
+    "unreadable": 422, "encrypted": 422, "too_large": 422, "too_many_pages": 422,
+    "cost_ceiling": 422, "nothing_matched": 422,
+}
+
+_STARTER_FILENAME = "vendor-report-template-starter.html"
+
+#: Request-body ceilings, per route: the largest legitimate body plus framing.
+#: Refused on ``Content-Length`` before a byte is read, and again while the body
+#: streams in (a chunked upload declares no length), so an oversized body is
+#: never held — not in memory, not in the multipart spool on disk.
+_BODY_LIMITS = {
+    "extract": 10 * 1024 * 1024 + 256 * 1024,      # a 10 MB sample + multipart framing
+    "check-html": 512 * 1024 + 64 * 1024,          # a 512 KB template + framing
+    "preview": 256 * 1024,                         # a layout is a few KB of JSON
+    "save": 4 * 1024 * 1024,                       # 512 KB of HTML, JSON-escaped worst case
+    "activate": 16 * 1024,                         # no body at all
+}
+
+
+class _BodyTooLarge(HTTPException):
+    def __init__(self) -> None:
+        super().__init__(413, "request body too large")
+
+
+def _too_large(limit: int) -> JSONResponse:
+    size = (f"{limit // (1024 * 1024)} MB" if limit >= 1024 * 1024 else f"{limit // 1024} KB")
+    return _coded(413, "too_large", f"The request is larger than this action accepts ({size}).")
+
+
+def _capped_route(limit: int) -> type[APIRoute]:
+    """An ``APIRoute`` whose handler refuses a body over ``limit`` bytes — by its
+    declared length first, then by counting it as it streams (FastAPI reads a
+    form or JSON body before any dependency runs, so this is the earliest
+    place a route can say no). Kept across ``include_router``, which re-creates
+    routes with ``type(route)``."""
+
+    class _CappedBodyRoute(APIRoute):
+        body_limit = limit
+
+        def get_route_handler(self):
+            handler = super().get_route_handler()
+            cap = self.body_limit
+
+            async def capped(request: Request) -> Response:
+                declared = request.headers.get("content-length")
+                if declared is not None:
+                    try:
+                        if int(declared) > cap:
+                            return _too_large(cap)
+                    except ValueError:
+                        return _coded(400, "bad_request", "Content-Length is not a number.")
+                received = 0
+                receive = request.receive
+
+                async def counted():
+                    nonlocal received
+                    message = await receive()
+                    if message.get("type") == "http.request":
+                        received += len(message.get("body") or b"")
+                        if received > cap:
+                            raise _BodyTooLarge()
+                    return message
+
+                try:
+                    return await handler(Request(request.scope, counted))
+                except _BodyTooLarge:
+                    return _too_large(cap)
+
+            return capped
+
+    return _CappedBodyRoute
+
+
+def _post_capped(path: str, limit: int):
+    """``@router.post(path)`` with :func:`_capped_route`'s body ceiling."""
+    def register(fn):
+        router.add_api_route(path, fn, methods=["POST"],
+                             route_class_override=_capped_route(limit))
+        return fn
+    return register
+
+
+def _templates_gate() -> None:
+    if not _templates_on():
+        raise HTTPException(404, "Not Found")
+
+
+def _display_name(user: dict) -> str:
+    """The signed-in person's name for the template history, read from their
+    profile (one batched doc read, only on a save or a switch), or their email
+    when there is none. Cosmetic: a failed read never blocks the change."""
+    email = str(user.get("email") or user["id"])
+    try:
+        from app.services import firestore_repo
+
+        doc = firestore_repo.get_users_by_ids([str(user["id"])]).get(str(user["id"])) or {}
+        name = " ".join(str(doc.get("name") or "").split())
+    except Exception:  # noqa: BLE001 - see the docstring
+        logger.info("mr templates: no display name for %s; using the email", user.get("id"),
+                    exc_info=True)
+        name = ""
+    return name or email
+
+
+def _clean_filename(value) -> str | None:
+    """The upload's own name, for the version list only: last path component,
+    no control characters, capped. Never used to decide what the file is."""
+    if not isinstance(value, str):
+        return None
+    name = re.split(r"[\\/]", value)[-1]
+    name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip()[:160]
+    return name or None
+
+
+def _read_upload(file: UploadFile, cap: int) -> bytes | None:
+    """The upload's bytes, or None when it is larger than ``cap``. Reads at
+    most ``cap + 1`` bytes, so an oversized file is refused without being held."""
+    data = file.file.read(cap + 1)
+    return None if len(data) > cap else data
+
+
+def _template_limits() -> dict:
+    from marketing_research_agent import report_templates as rt
+    from marketing_research_agent import template_extract as tx
+
+    return {"readings_per_day": runs.TEMPLATE_READINGS_PER_DAY, "readings_reset": "00:00 UTC",
+            "pdf_max_bytes": rt.PDF_MAX_BYTES, "pdf_max_pages": tx.MAX_PDF_PAGES,
+            "image_max_bytes": rt.IMAGE_MAX_BYTES, "image_max_side": rt.IMAGE_MAX_SIDE,
+            "html_max_bytes": rt.HTML_MAX_BYTES}
+
+
+def _readings_left(ws: str) -> int:
+    return max(0, runs.TEMPLATE_READINGS_PER_DAY - runs.template_readings_today(ws))
+
+
+#: Why a preview is missing, for the console to act on without parsing words:
+#: ``no_data`` (nothing to render yet; saving is fine), ``store_unavailable`` (a
+#: transient read failure; saving is fine), ``template_failed`` (THIS template
+#: does not render or does not check; hold Save).
+PREVIEW_NO_DATA, PREVIEW_STORE_UNAVAILABLE, PREVIEW_TEMPLATE_FAILED = (
+    "no_data", "store_unavailable", "template_failed")
+
+
+def _no_preview(code: str, reason: str) -> dict:
+    return {"preview_html": None, "preview_unavailable_reason": reason,
+            "preview_unavailable_code": code}
+
+
+def _preview_source(ws: str) -> tuple[dict | None, dict | None]:
+    """The newest month's real report to preview against, or the
+    :func:`_no_preview` answer saying why there is none."""
+    from marketing_research_agent import vendor_report as vr
+
+    try:
+        report = vr.preview_report(workspace_id=ws)
+    except mr_snapshots.SnapshotStoreError:
+        logger.warning("mr template preview: the snapshot store could not be read",
+                       exc_info=True)
+        return None, _no_preview(PREVIEW_STORE_UNAVAILABLE, "The report's figures could not "
+                                 "be read just now, so there is no preview.")
+    if report is None:
+        return None, _no_preview(PREVIEW_NO_DATA, "There are no vendor figures yet, so there "
+                                 "is no month to preview. Pull the workbook first.")
+    return report, None
+
+
+def _preview(ws: str, version: dict) -> dict:
+    """``{preview_html, preview_unavailable_reason, preview_unavailable_code}``
+    for a candidate template, rendered with this workspace's newest real figures."""
+    from marketing_research_agent import report_templates as rt
+
+    report, missing = _preview_source(ws)
+    if report is None:
+        return missing
+    try:
+        return {"preview_html": rt.render_with_template(report, version),
+                "preview_unavailable_reason": None, "preview_unavailable_code": None}
+    except rt.TemplateRenderError as exc:
+        return _no_preview(PREVIEW_TEMPLATE_FAILED, exc.reason)
+
+
+def _upload_facts(data: bytes, filename: str | None, sniffed) -> dict:
+    return {"filename": filename, "kind": sniffed.kind, "size": sniffed.size,
+            "sha256": hashlib.sha256(data).hexdigest()}
+
+
+_CHECK_UNAVAILABLE = ("The template checker could not run just now, so the file was not "
+                      "checked and nothing was saved. Try again in a minute.")
+
+
+def _html_check_body(ws: str, data: bytes, upload: dict) -> dict | JSONResponse:
+    from marketing_research_agent import report_templates as rt
+
+    try:
+        result = rt.check_html(data)
+    except rt.TemplateCheckUnavailable:
+        logger.warning("mr template check unavailable", exc_info=True)
+        return _coded(503, "check_unavailable", _CHECK_UNAVAILABLE)
+    body = {**result.to_dict(), "source_kind": "html", "upload": upload}
+    if result.can_save:
+        body.update(_preview(ws, {"source_kind": "html", "html": result.sanitized_html}))
+    else:
+        body.update(_no_preview(PREVIEW_TEMPLATE_FAILED,
+                                "Fix the errors listed to see a preview."))
+    return body
+
+
+@router.get("/mr/report-templates")
+def report_templates_list(user=Depends(get_current_user)):
+    """The template panel: the active template, the saved versions (newest
+    first), the placeholder list with live example values from the newest
+    month's real report (null when there is none), today's remaining sample
+    readings and the upload limits. Off, ``enabled: false`` and nothing read."""
+    from marketing_research_agent import report_templates as rt
+
+    from marketing_research_agent import vendor_report_render as vrr
+
+    if not _templates_on():
+        return {"enabled": False, "active": None, "versions": [], "placeholders": [],
+                "examples_from": None, "readings_left_today": 0, "limits": None,
+                "default_layout": None}
+    ws = _ws(user)
+    listed = rt.listing(runs.list_template_versions(ws))
+    try:
+        from marketing_research_agent import vendor_report as vr
+        report = vr.preview_report(workspace_id=ws, with_previous=False)
+    except mr_snapshots.SnapshotStoreError:
+        logger.warning("mr templates: no examples - the snapshot store could not be read",
+                       exc_info=True)
+        report = None
+    placeholders = [{"token": p["placeholder"], "title": p["title"],
+                     "description": p["description"], "kind": p["kind"],
+                     "example": p["example"]}
+                    for p in rt.vocabulary(report)]
+    return {
+        "enabled": True,
+        **listed,
+        "placeholders": placeholders,
+        "examples_from": ({"year_month": report.get("year_month"),
+                           "label": report.get("month_label")} if report else None),
+        "readings_left_today": _readings_left(ws),
+        "limits": _template_limits(),
+        # The built-in's sections, to start "arrange by hand" from. A saved
+        # layout version's own sections: GET /mr/report-templates/{id}/layout.
+        "default_layout": vrr.layout_to_dict(vrr.DEFAULT_LAYOUT),
+    }
+
+
+@_post_capped("/mr/report-templates/extract", _BODY_LIMITS["extract"])
+def report_template_extract(file: UploadFile | None = File(None),
+                            user=Depends(get_current_user),
+                            act: Activity = trail.records(
+                                "template_extract", "Read a sample report for a template",
+                                unit=OUTPUT)):
+    """Read a sample report (PDF, PNG or JPEG) into a layout, with a preview in
+    this workspace's real figures. What the file IS comes from its bytes; an
+    HTML file is checked instead (the ``check-html`` answer, ``source_kind:
+    "html"``) and costs no reading. Nothing is saved.
+
+    200: ``{source_kind, upload, layout, unsupported, matched_count, notes,
+    preview_html, preview_unavailable_reason, readings_left_today}``.
+    Errors: ``{code, reason, detail, ...}`` — 422 ``invalid_file`` or an
+    extraction code for a bad upload, 429 ``rate_limited``, 503/502 for the AI
+    reader (``unsupported`` included when the sample had sections we cannot
+    fill)."""
+    from marketing_research_agent import report_templates as rt
+    from marketing_research_agent import template_extract as tx
+
+    _templates_gate()
+    if file is None:
+        return _coded(422, "invalid_file", "Attach the sample report as 'file'.", act)
+    ws = _ws(user)
+    filename = _clean_filename(file.filename)
+    data = _read_upload(file, rt.MAX_UPLOAD_BYTES)
+    if data is None:
+        return _coded(422, "invalid_file", "The file is over the 10 MB upload limit.", act)
+    try:
+        sniffed = rt.sniff_upload(data)
+    except rt.UploadRejected as exc:
+        return _coded(422, "invalid_file", exc.reason, act)
+    upload = _upload_facts(data, filename, sniffed)
+    if sniffed.kind == "html":
+        act.skip("an HTML upload is checked, not read by the model")
+        return _html_check_body(ws, data, upload)
+
+    source_kind = "pdf" if sniffed.kind == "pdf" else "image"
+    # One atomic check-and-take on the workspace's daily meter: a burst of
+    # simultaneous readings can never all take the last slot.
+    try:
+        reading = runs.reserve_template_reading(ws, by=user.get("email") or user["id"],
+                                                filename=filename, source_kind=source_kind)
+    except runs.ReadingLimitReached:
+        return _coded(429, "rate_limited",
+                      f"This workspace has used all {runs.TEMPLATE_READINGS_PER_DAY} sample "
+                      "readings for today. More are available from 00:00 UTC; meanwhile, "
+                      "HTML templates and arranging sections by hand need no reading.", act,
+                      readings_left_today=0)
+    try:
+        result = tx.extract_layout(data, sniffed.kind, filename=filename or "upload",
+                                   activity=act)
+    except tx.TemplateExtractionError as exc:
+        usage = exc.usage or {}
+        billed = bool(usage.get("calls") or usage.get("cost_usd"))
+        if billed:
+            runs.settle_template_reading(reading, status="failed", code=exc.code,
+                                         usage=dict(usage))
+            # Not on the trail: its row would count a "generate" on the Home
+            # dashboard for a reading that produced nothing. The spend is in
+            # the reading record and here.
+            logger.warning("mr template reading failed after billing: workspace=%s code=%s "
+                           "calls=%s cost_usd=%s", ws, exc.code, usage.get("calls"),
+                           usage.get("cost_usd"))
+        else:
+            runs.release_template_reading(reading)
+        extra = {"unsupported": exc.unsupported} if exc.unsupported else {}
+        return _coded(_EXTRACT_STATUS.get(exc.code, 502), exc.code, exc.reason, act,
+                      billed=billed, readings_left_today=_readings_left(ws), **extra)
+    except Exception:
+        runs.settle_template_reading(reading, status="error", code="internal")
+        raise
+    runs.settle_template_reading(reading, status="ok", usage=dict(result.get("usage") or {}))
+    return {
+        "source_kind": source_kind,
+        "upload": upload,
+        "layout": result["layout"],
+        "unsupported": result["unsupported"],
+        "matched_count": result["matched_count"],
+        "notes": result["notes"],
+        **_preview(ws, {"source_kind": source_kind, "spec": result["layout"]}),
+        "readings_left_today": _readings_left(ws),
+    }
+
+
+@_post_capped("/mr/report-templates/check-html", _BODY_LIMITS["check-html"])
+@silent("checks and previews an uploaded HTML template without saving anything or "
+        "calling a model - saving it is the recorded unit")
+def report_template_check_html(file: UploadFile | None = File(None),
+                               user=Depends(get_current_user)):
+    """Check an HTML template: errors with line numbers and suggestions, what
+    was removed, the placeholders used, ``can_save``, and — when it can be
+    saved — a preview in this workspace's real figures. Costs no reading.
+
+    200 (even with errors — it is a check): ``CheckResult.to_dict()`` +
+    ``{source_kind: "html", upload, preview_html, preview_unavailable_reason}``.
+    422 ``invalid_file`` / ``not_html`` for an upload that is not HTML."""
+    from marketing_research_agent import report_templates as rt
+
+    _templates_gate()
+    if file is None:
+        return _coded(422, "invalid_file", "Attach the HTML template as 'file'.")
+    ws = _ws(user)
+    filename = _clean_filename(file.filename)
+    data = _read_upload(file, rt.HTML_MAX_BYTES)
+    if data is None:
+        return _coded(422, "invalid_file", "The HTML file is over the 512 KB limit.")
+    try:
+        sniffed = rt.sniff_upload(data)
+    except rt.UploadRejected as exc:
+        return _coded(422, "invalid_file", exc.reason)
+    if sniffed.kind != "html":
+        return _coded(422, "not_html", f"This is a {sniffed.kind.upper()} file, not HTML. "
+                      "Upload it as a sample report instead.")
+    return _html_check_body(ws, data, _upload_facts(data, filename, sniffed))
+
+
+@_post_capped("/mr/report-templates/preview", _BODY_LIMITS["preview"])
+@silent("renders a layout arranged by hand for a look before saving - nothing is "
+        "saved and no model is called; saving it is the recorded unit")
+def report_template_preview(body: dict | None = None, user=Depends(get_current_user)):
+    """Preview a layout (``{"layout": {...}}``, the ``extract`` answer's shape)
+    in this workspace's real figures. 200 ``{preview_html,
+    preview_unavailable_reason}``; 422 ``invalid_layout`` with the reason."""
+    from marketing_research_agent import vendor_report_render as vrr
+
+    _templates_gate()
+    layout = (body or {}).get("layout")
+    try:
+        vrr.layout_from_dict(layout)
+    except ValueError as exc:
+        return _coded(422, "invalid_layout", str(exc))
+    return _preview(_ws(user), {"source_kind": "builder", "spec": layout})
+
+
+@_post_capped("/mr/report-templates", _BODY_LIMITS["save"])
+def report_template_save(body: dict | None = None, user=Depends(get_current_user),
+                         act: Activity = trail.records(
+                             "template_save", "Saved a report template", unit=CHANGE)):
+    """Save a template version for the whole workspace; it becomes active.
+
+    Body: ``{source_kind: "pdf"|"image"|"html"|"builder", filename?, layout?, html?}``
+    (``html`` for ``source_kind: "html"``, ``layout`` otherwise). The server
+    re-checks everything: HTML through ``check_html`` (the SANITIZED result is
+    what is stored), a layout through ``validate_layout`` and one render against
+    the newest real figures. 200 ``{version, active}``; 422
+    ``invalid_template`` / ``invalid_layout`` / ``template_invalid`` (with
+    ``errors``) / ``too_large``."""
+    from marketing_research_agent import report_templates as rt
+    from marketing_research_agent import vendor_report_render as vrr
+
+    _templates_gate()
+    ws = _ws(user)
+    body = body or {}
+    source_kind = body.get("source_kind")
+    if source_kind not in runs.TEMPLATE_SOURCE_KINDS:
+        return _coded(422, "invalid_template", "source_kind must be one of "
+                      + ", ".join(sorted(runs.TEMPLATE_SOURCE_KINDS)) + ".", act)
+    filename = _clean_filename(body.get("filename"))
+    spec, html_text = None, None
+    if source_kind == "html":
+        raw = body.get("html")
+        if not isinstance(raw, str) or body.get("layout") is not None:
+            return _coded(422, "invalid_template", "An HTML template is saved with 'html' "
+                          "(the file's text) and no 'layout'.", act)
+        try:
+            result = rt.check_html(raw.encode("utf-8"))
+        except rt.TemplateCheckUnavailable:
+            logger.warning("mr template check unavailable", exc_info=True)
+            return _coded(503, "check_unavailable", _CHECK_UNAVAILABLE, act)
+        if not result.can_save:
+            return _coded(422, "template_invalid", result.errors[0].message, act,
+                          errors=[e.to_dict() for e in result.errors])
+        html_text = result.sanitized_html
+        stored = html_text.encode("utf-8")
+    else:
+        if body.get("html") is not None:
+            return _coded(422, "invalid_template", "A layout template is saved with "
+                          "'layout' and no 'html'.", act)
+        try:
+            spec = vrr.layout_to_dict(vrr.layout_from_dict(body.get("layout")))
+        except ValueError as exc:
+            return _coded(422, "invalid_layout", str(exc), act)
+        stored = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    candidate = {"source_kind": source_kind, "spec": spec, "html": html_text}
+    report, _missing = _preview_source(ws)
+    if report is not None:
+        try:
+            rt.render_with_template(report, candidate)
+        except rt.TemplateRenderError as exc:
+            return _coded(422, "template_invalid", exc.reason, act)
+    email = user.get("email") or user["id"]
+    try:
+        record = runs.save_template_version(
+            ws, uploaded_by=email, uploaded_by_name=_display_name(user),
+            source_kind=source_kind, spec=spec, html=html_text,
+            sha256=hashlib.sha256(stored).hexdigest(), filename=filename)
+    except ValueError as exc:
+        return _coded(422, "too_large", str(exc), act)
+    summary = rt.summarize(record)
+    act.note(f"Saved report template version {summary['number']} ({summary['kind']}"
+             + (f", {filename}" if filename else "") + ")")
+    return {"version": summary, "active": summary}
+
+
+@_post_capped("/mr/report-templates/{version_id}/activate", _BODY_LIMITS["activate"])
+def report_template_activate(version_id: str, user=Depends(get_current_user),
+                             act: Activity = trail.records(
+                                 "template_activate", "Switched the report template",
+                                 unit=CHANGE)):
+    """Make a saved version (or ``builtin``) the workspace's active template —
+    one click, recorded with who did it. Activating what is already active
+    changes nothing. 200 ``{active}``; 404 ``not_found`` for an id this
+    workspace does not have (another workspace's id included)."""
+    from marketing_research_agent import report_templates as rt
+
+    _templates_gate()
+    ws = _ws(user)
+    current = rt.summarize(runs.active_template_meta(ws))
+    if current["id"] == version_id:
+        act.skip("already the active template; nothing changed")
+        return {"active": current}
+    try:
+        record = runs.revert_template(ws, version_id, set_by=user.get("email") or user["id"],
+                                      set_by_name=_display_name(user))
+    except LookupError:
+        return _coded(404, "not_found", "That template version is not in this workspace's "
+                      "history.", act)
+    summary = rt.summarize(record)
+    act.note("Switched the report template to "
+             + ("the built-in" if summary["kind"] == "builtin"
+                else f"version {summary['number']}"))
+    return {"active": summary}
+
+
+@router.get("/mr/report-templates/{version_id}/layout")
+def report_template_layout(version_id: str, user=Depends(get_current_user)):
+    """One version's section layout, to arrange from by hand: ``builtin`` gives
+    the built-in's. One doc read (the list stays bodiless). 200 ``{id, kind,
+    number, layout}``; 404 ``not_found`` for an id this workspace does not have
+    (another workspace's included); 422 ``not_a_layout`` for an HTML version."""
+    from marketing_research_agent import report_templates as rt
+    from marketing_research_agent import vendor_report_render as vrr
+
+    _templates_gate()
+    if version_id == runs.BUILTIN_TEMPLATE_ID:
+        return {"id": "builtin", "kind": "builtin", "number": None,
+                "layout": vrr.layout_to_dict(vrr.DEFAULT_LAYOUT)}
+    record = runs.find_template_content(_ws(user), version_id)
+    if record is None:
+        return _coded(404, "not_found", "That template version is not in this workspace's "
+                      "history.")
+    summary = rt.summarize(record)
+    if summary["kind"] != "layout":
+        return _coded(422, "not_a_layout", f"Version {summary['number']} is an HTML template; "
+                      "it has no section layout to arrange.")
+    try:
+        layout = vrr.layout_to_dict(vrr.layout_from_dict(record.get("spec")))
+    except ValueError as exc:
+        return _coded(422, "invalid_layout", str(exc))
+    return {"id": summary["id"], "kind": "layout", "number": summary["number"],
+            "layout": layout}
+
+
+@router.get("/mr/report-templates/starter.html")
+def report_template_starter(user=Depends(get_current_user)):
+    """A documented HTML starter that uses every placeholder, as a download.
+    The same for every workspace; it carries no workspace data."""
+    from marketing_research_agent import report_templates as rt
+
+    _templates_gate()
+    return Response(
+        content=rt.starter_html(),
+        media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{_STARTER_FILENAME}"',
+                 "X-Content-Type-Options": "nosniff"},
+    )
 
 
 @router.get("/mr/lead-analysis/pdf")

@@ -28,6 +28,7 @@ that module, not to a layout.
 from __future__ import annotations
 
 import html
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
@@ -254,8 +255,12 @@ def _header(ctx: _Ctx, spec: SectionSpec) -> str:
         f"<b>{_f(r['portfolio'].get(k), vr.METRICS[k][1])}</b></div>"
         for k in _opt(spec, "kpis"))
     thesis = _segments((r.get("notes") or {}).get("thesis"))
+    fallback = ""
+    if ((r.get("build") or {}).get("template") or {}).get("fallback"):
+        fallback = f'<p class="sub"><b>{_esc(FALLBACK_SENTENCE)}</b></p>'
     return ('<header class="cover"><div class="wrap">'
             f'<div class="eyebrow">{_esc(_opt(spec, "kicker"))}</div><h1>{heading}</h1>'
+            + fallback
             + (f'<p class="sub">{thesis}</p>' if thesis else "")
             + f'<div class="cover-meta">{kpis}</div></div></header>')
 
@@ -536,6 +541,37 @@ def _data_gaps(ctx: _Ctx, spec: SectionSpec) -> str:
             + "".join(blocks) + "</div></div></section>")
 
 
+#: Said in the header band and the footer of a report built with the built-in
+#: template because the workspace's own template could not be rendered.
+FALLBACK_SENTENCE = "Built with the built-in template because the team template failed."
+
+
+def template_label(template: Mapping[str, Any] | None) -> str:
+    """The plain words for which template a report was built with — the
+    footer's provenance line and the console's template line. ``template`` is a
+    run's template reference: ``{kind, number, id}`` (kind ``builtin``,
+    ``layout`` or ``html``), optionally carrying ``fallback`` or ``override_of``
+    on a built-in build, or ``{"kind": "preview"}`` for an unsaved preview."""
+    tpl = template or {}
+    kind = tpl.get("kind")
+    if kind == "preview":
+        return "a preview of an unsaved template"
+    if kind in ("layout", "html"):
+        number = tpl.get("number")
+        return f"team template, version {number}" if number else "team template"
+    fallback = tpl.get("fallback")
+    if fallback:
+        number = fallback.get("number")
+        return ("built-in, because the team template"
+                + (f" (version {number})" if number else "") + " failed")
+    override = tpl.get("override_of")
+    if override:
+        number = override.get("number")
+        return ("built-in, chosen instead of the team template"
+                + (f" (version {number})" if number else ""))
+    return "built-in"
+
+
 def _footer(ctx: _Ctx, spec: SectionSpec) -> str:
     r = ctx.report
     foot = _segments((r.get("notes") or {}).get("footer"))
@@ -543,10 +579,13 @@ def _footer(ctx: _Ctx, spec: SectionSpec) -> str:
     meta = ""
     if build:
         tpl = build.get("template") or {}
-        name = ("built-in" if tpl.get("kind") == "builtin"
-                else f"version {tpl.get('version')}")
-        meta = (f" Built {_esc(str(build.get('built_at') or '')[:16].replace('T', ' '))} UTC "
-                f"from the {_esc(build.get('sweep_date'))} pull. Template: {_esc(name)}.")
+        built_at = str(build.get("built_at") or "")[:16].replace("T", " ")
+        meta = (f" Built {_esc(built_at)} UTC from the {_esc(build.get('sweep_date'))} pull. "
+                f"Template: {_esc(template_label(tpl))}.")
+        fallback = tpl.get("fallback")
+        if fallback:
+            reason = str(fallback.get("reason") or "").strip()
+            meta += f" {_esc(FALLBACK_SENTENCE)}" + (f" ({_esc(reason)})" if reason else "")
     return f'<footer><div class="wrap">{foot}{meta}</div></footer>'
 
 
@@ -595,8 +634,21 @@ SECTION_REGISTRY: dict[str, SectionType] = {s.type: s for s in (
     SectionType("footer", "Footer", "band", False, (), {}, _footer),
 )}
 
-#: Options whose values must be metric keys the section accepts.
-_METRIC_OPTIONS = {"kpis", "tiles", "metrics", "highlight", "accent"}
+#: Options whose values must be metric keys the section accepts. Public: the
+#: template extractor builds its response schema from it.
+METRIC_OPTIONS = frozenset({"kpis", "tiles", "metrics", "highlight", "accent"})
+
+#: What a theme colour may be. Theme values are written verbatim into the
+#: stylesheet (``--ink:VALUE``) and into SVG ``fill="VALUE"``, and a layout can
+#: arrive from a client, so anything else is refused: no quotes, no ``<``, no
+#: ``;``, no ``url(``.
+COLOUR_RE = re.compile(
+    r"#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})"
+    r"|(?:rgba?|hsla?)\([0-9.,%\s/+-]{1,60}\)"
+    r"|[a-zA-Z]{3,24}")
+#: A font stack: family names, quotes, commas, spaces. Same reason as above.
+FONT_STACK_RE = re.compile(r"[A-Za-z0-9 ,'\"_.-]{1,240}")
+_TEXT_MAX = 200
 
 DEFAULT_THEME = Theme()
 
@@ -607,20 +659,46 @@ DEFAULT_LAYOUT = Layout(theme=DEFAULT_THEME, sections=tuple(SectionSpec(t) for t
 )))
 
 
+def _option_type_ok(default: Any, value: Any) -> bool:
+    """An option value has its default's type: what the section renderers
+    compare, iterate and print. Checked here so a bad value is a refusal at
+    validation, never a TypeError half-way through a render."""
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, int):
+        return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 10_000
+    if isinstance(default, str):
+        return isinstance(value, str) and len(value) <= _TEXT_MAX
+    if isinstance(default, (tuple, list)):
+        return (isinstance(value, (tuple, list)) and len(value) <= 50
+                and all(isinstance(v, str) for v in value))
+    return True
+
+
 def validate_layout(layout: Layout) -> None:
     """Refuse a layout the registry cannot honour — before anything renders."""
     if not layout.sections:
         raise ValueError("a layout needs at least one section")
+    if len(layout.sections) > 40:
+        raise ValueError("a layout has at most 40 sections")
     for spec in layout.sections:
         entry = SECTION_REGISTRY.get(spec.type)
         if entry is None:
             raise ValueError(f"unknown section type {spec.type!r} "
                              f"(known: {', '.join(sorted(SECTION_REGISTRY))})")
+        if spec.title is not None and (not isinstance(spec.title, str)
+                                       or len(spec.title) > _TEXT_MAX):
+            raise ValueError(f"section {spec.type!r} title must be text of at most "
+                             f"{_TEXT_MAX} characters")
         unknown = set(spec.options) - set(entry.options)
         if unknown:
             raise ValueError(f"section {spec.type!r} does not take option(s) "
                              f"{', '.join(sorted(unknown))}")
-        for name in _METRIC_OPTIONS & set(spec.options):
+        for name, value in spec.options.items():
+            if not _option_type_ok(entry.options[name], value):
+                raise ValueError(f"section {spec.type!r} option {name!r} has the wrong type "
+                                 f"(expected {type(entry.options[name]).__name__})")
+        for name in METRIC_OPTIONS & set(spec.options):
             value = spec.options[name]
             keys = [value] if isinstance(value, str) else list(value or ())
             bad = [k for k in keys if k not in entry.metrics]
@@ -631,21 +709,43 @@ def validate_layout(layout: Layout) -> None:
             bad = [c for c in spec.options["columns"] if c not in SCORECARD_COLUMNS]
             if bad:
                 raise ValueError(f"unknown scorecard column(s): {', '.join(bad)}")
-    for name in layout.theme.colors:
+    for name, value in layout.theme.colors.items():
         if name not in PALETTE:
             raise ValueError(f"unknown theme colour token {name!r}")
+        if not isinstance(value, str) or not COLOUR_RE.fullmatch(value):
+            raise ValueError(f"theme colour {name!r} must be a colour such as #14213A")
+    for name in ("serif", "sans", "mono"):
+        value = getattr(layout.theme, name)
+        if not isinstance(value, str) or not FONT_STACK_RE.fullmatch(value):
+            raise ValueError(f"theme font {name!r} must be a plain font list")
 
 
 def layout_from_dict(data: Mapping[str, Any]) -> Layout:
-    """A stored/JSON layout (Phase 2 templates) → a validated :class:`Layout`."""
+    """A stored/JSON layout (Phase 2 templates) → a validated :class:`Layout`.
+    Every refusal — a bad value or a wrong shape — is a ``ValueError`` with a
+    reason a person can act on."""
+    if not isinstance(data, Mapping):
+        raise ValueError("a layout must be an object with a 'sections' list")
     theme_in = data.get("theme") or {}
+    sections_in = data.get("sections") or []
+    if not isinstance(theme_in, Mapping) or not isinstance(theme_in.get("colors") or {},
+                                                           Mapping):
+        raise ValueError("a layout's 'theme' must be an object with a 'colors' object")
+    if not isinstance(sections_in, (list, tuple)):
+        raise ValueError("a layout's 'sections' must be a list")
     theme = Theme(colors={**PALETTE, **(theme_in.get("colors") or {})},
                   serif=theme_in.get("serif") or SERIF, sans=theme_in.get("sans") or SANS,
                   mono=theme_in.get("mono") or MONO)
-    sections = tuple(SectionSpec(type=str(s["type"]), title=s.get("title"),
-                                 options=dict(s.get("options") or {}))
-                     for s in data.get("sections") or [])
-    layout = Layout(theme=theme, sections=sections)
+    sections = []
+    for s in sections_in:
+        if not isinstance(s, Mapping) or not isinstance(s.get("type"), str):
+            raise ValueError("every section must be an object with a 'type'")
+        options = s.get("options") or {}
+        if not isinstance(options, Mapping):
+            raise ValueError(f"section {s['type']!r} options must be an object")
+        sections.append(SectionSpec(type=s["type"], title=s.get("title"),
+                                    options=dict(options)))
+    layout = Layout(theme=theme, sections=tuple(sections))
     validate_layout(layout)
     return layout
 
@@ -663,13 +763,6 @@ def layout_to_dict(layout: Layout) -> dict:
                                   for k, v in s.options.items()}}
                      for s in layout.sections],
     }
-
-
-def layout_for_template(template: Mapping[str, Any] | None) -> Layout:
-    """The layout a run's template record names. Phase 1: the built-in only."""
-    if not template or template.get("kind") == "builtin":
-        return DEFAULT_LAYOUT
-    raise ValueError("only the built-in template can be rendered by this server so far")
 
 
 def placeholder_vocabulary() -> dict:

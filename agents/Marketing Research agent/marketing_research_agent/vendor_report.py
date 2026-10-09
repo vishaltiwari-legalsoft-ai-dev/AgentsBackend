@@ -47,9 +47,9 @@ KIND = "vendor_report"
 
 MONEY, PCT, INT = "money", "pct", "int"
 
-#: The only template Phase 1 has. A request names it explicitly to force it
-#: (Phase 2 adds saved template versions; a build never falls back silently).
-BUILTIN_TEMPLATE = {"kind": "builtin"}
+#: The request's word for the built-in template: the explicit override, and the
+#: only way a build falls back to it (a build never falls back silently).
+BUILTIN = "builtin"
 
 # --- metric catalog ------------------------------------------------------------
 # One vocabulary for the JSON, the renderer's tiles and the template placeholders
@@ -1124,9 +1124,27 @@ def cache_key(*, sweep: Mapping, previous: Mapping | None, rollup: Mapping | Non
 class EmptyMonth(LookupError):
     """No vendor figures for the requested month. The message is user-facing."""
 
+    code = "empty_month"
+
 
 class TemplateRefused(ValueError):
     """The request named a template this build cannot use. User-facing."""
+
+    code = "invalid_template"
+
+
+class TemplateFailed(Exception):
+    """The workspace's active template could not render this report, so nothing
+    was saved. ``reason`` is user-facing; ``template`` is the version's
+    reference (``{kind, number, id}``). The caller offers the built-in — this
+    module never swaps it in silently."""
+
+    code = "template_failed"
+
+    def __init__(self, reason: str, template: dict) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.template = template
 
 
 def empty_month_message(year_month: str) -> str:
@@ -1134,64 +1152,110 @@ def empty_month_message(year_month: str) -> str:
             "Pull the workbook, then build again.")
 
 
-def resolve_template(requested: Any, active: Mapping | None) -> dict:
-    """Which template this build uses, or a refusal — never a silent swap.
-
-    ``requested`` is the request's ``template`` field: ``"builtin"`` forces the
-    built-in (the ONLY way a build falls back to it), ``None`` means "the
-    workspace's active template". ``active`` is ``runs.active_template()``; its
-    ``builtin`` flag (or no stored version at all) means the built-in default,
-    whose layout is ``vendor_report_render.DEFAULT_LAYOUT``. Phase 1 renders only
-    the built-in, so an active uploaded version is refused with the way out
-    named, rather than quietly rendered as something it is not."""
-    if requested == "builtin":
-        return dict(BUILTIN_TEMPLATE)
-    if requested is not None:
+def _requested_template(template: Any) -> None:
+    """``template`` is ``"builtin"`` (the explicit override, and the ONLY way a
+    build uses the built-in while the workspace has its own template active) or
+    absent (the workspace's active template). Anything else is refused."""
+    if template is not None and template != BUILTIN:
         raise TemplateRefused(
-            "template must be \"builtin\" or left out — saved template versions are not "
-            "selectable by id yet.")
-    if active is None or active.get("builtin", True):
-        return dict(BUILTIN_TEMPLATE)
-    raise TemplateRefused(
-        "This workspace's active template is an uploaded version, and this server can only "
-        "render the built-in template so far. Build with the built-in template "
-        "(template: \"builtin\") to continue.")
+            "template must be \"builtin\" or left out (left out = the workspace's active "
+            "template).")
 
 
-def build(*, workspace_id: str, year_month: str | None = None,
-          template: Any = None) -> dict:
-    """Read, compute, persist (or serve the stored run). Returns the run with
-    ``reused`` saying which happened. Raises :class:`EmptyMonth` /
-    :class:`TemplateRefused` with caller-safe messages; store failures surface as
-    ``snapshots.SnapshotStoreError`` / ``runs.RunStoreError`` (the app maps both
-    to 502)."""
-    from . import runs, snapshots
+def _inputs(workspace_id: str, year_month: str | None, *, with_previous: bool = True):
+    """The bounded reads a report is computed from, or :class:`EmptyMonth`."""
+    from . import snapshots
 
-    # The active template is read only when the request did not name one.
-    tpl = resolve_template(template, runs.active_template(workspace_id)
-                           if template is None else None)
     sweep = snapshots.vendor_sweep(year_month)
     if not sweep or not [d for d in (sweep.get("docs") or [])
                          if not _is_rollup(d) and not _is_non_media(d)]:
         ym = year_month or date.today().strftime("%Y-%m")
         raise EmptyMonth(empty_month_message(ym))
     ym = str(sweep["date"])[:7]
-    previous = snapshots.previous_month_sweep(ym)
+    previous = snapshots.previous_month_sweep(ym) if with_previous else None
     # The roll-up comes from the SAME bounded read as the vendor docs, or not at
     # all — there is deliberately no wider lookup behind it.
     rollup = _sweep_rollup(sweep)
     targets = goals.get_targets(workspace_id)
+    return sweep, previous, rollup, targets
+
+
+def preview_report(*, workspace_id: str, year_month: str | None = None,
+                   with_previous: bool = True) -> dict | None:
+    """This workspace's report for the newest (or the given) month, computed and
+    NOT stored: what a template preview and the placeholder examples render
+    from, so a team sees its own real figures in a template before saving it.
+    ``None`` when there are no vendor figures yet. Store failures surface as
+    ``snapshots.SnapshotStoreError``."""
+    try:
+        sweep, previous, rollup, targets = _inputs(workspace_id, year_month,
+                                                   with_previous=with_previous)
+    except EmptyMonth:
+        return None
+    report = compute(sweep, targets=targets, previous=previous, rollup=rollup)
+    report["build"] = {"built_at": datetime.now(timezone.utc).isoformat(),
+                       "sweep_date": sweep["date"], "template": {"kind": "preview"}}
+    return report
+
+
+def build(*, workspace_id: str, year_month: str | None = None,
+          template: Any = None, use_templates: bool = False) -> dict:
+    """Read, compute, render-check, persist (or serve the stored run). Returns the
+    run with ``reused`` saying which happened.
+
+    ``use_templates`` is the route's ``MR_REPORT_TEMPLATES`` switch. On, a build
+    with no ``template`` renders through the workspace's active template; the
+    run is saved only after that render succeeded, and a failure raises
+    :class:`TemplateFailed` with nothing saved. ``template="builtin"`` builds the
+    built-in instead — and when the workspace HAS a team template, the run says
+    so honestly: ``fallback`` (with the reason) when the team template fails on
+    this report, ``override_of`` when it would have worked and the built-in was
+    simply chosen.
+
+    The run's ``template`` is ``{kind, number, id}`` (``kind`` builtin / layout /
+    html). Raises :class:`EmptyMonth` / :class:`TemplateRefused` /
+    :class:`TemplateFailed` with caller-safe messages; store failures surface as
+    ``snapshots.SnapshotStoreError`` / ``runs.RunStoreError`` (the app maps both
+    to 502)."""
+    from . import runs
+    from .report_templates import TemplateRenderError, render_with_template, template_ref
+
+    _requested_template(template)
+    active = runs.active_template(workspace_id) if use_templates else None
+    team = active if active and not active.get("builtin", True) else None
+    version = team if template is None else None
+
+    sweep, previous, rollup, targets = _inputs(workspace_id, year_month)
+    structured = compute(sweep, targets=targets, previous=previous, rollup=rollup)
+    built_at = datetime.now(timezone.utc).isoformat()
+
+    tpl = template_ref(version)
+    if version is None and team is not None:
+        # The built-in was asked for while the team has its own template. Find
+        # out — never assume — whether that template fails on this report.
+        probe = {**structured, "build": {"built_at": built_at, "sweep_date": sweep["date"],
+                                         "template": template_ref(team)}}
+        ref = {"number": team.get("number"), "id": team.get("id")}
+        try:
+            render_with_template(probe, team)
+            tpl["override_of"] = ref
+        except TemplateRenderError as exc:
+            tpl["fallback"] = {**ref, "reason": exc.reason}
+
     key = cache_key(sweep=sweep, previous=previous, rollup=rollup, targets=targets,
                     template=tpl)
     for run in runs.list_runs(workspace_id, kind=KIND):
         if (run.get("structured") or {}).get("cache_key") == key:
             return {**run, "reused": True}
 
-    structured = compute(sweep, targets=targets, previous=previous, rollup=rollup)
-    built_at = datetime.now(timezone.utc).isoformat()
     structured["cache_key"] = key
     structured["build"] = {"built_at": built_at, "sweep_date": sweep["date"],
                            "template": tpl}
+    if version is not None:
+        try:
+            render_with_template(structured, version)
+        except TemplateRenderError as exc:
+            raise TemplateFailed(exc.reason, tpl) from exc
     run = {
         "id": runs.new_run_id(),
         "kind": KIND,
