@@ -20,14 +20,21 @@ THIN_WORDS = 300
 
 NO_REC_NOTE = "AI recommendations unavailable — showing rule-based advice"
 NOT_CRAWLED_FLAG = "not-crawled"
-NOT_CRAWLED_REC = "Not in the site crawl — re-run the site analysis to audit this page."
 
 #: ``rec_chip`` ids: a rule verdict that reads the same on every row it applies
 #: to, so the row carries a stable id the console renders as a chip instead of
-#: the same sentence repeated down the table. The row's ``word_count`` is there
-#: for a "thin" chip that wants to say how thin.
-HEALTHY_CHIP = "healthy"
+#: the same sentence repeated down the table. Every rule verdict is one; the
+#: only sentences left are the AI pass's page-specific advice. The row's
+#: ``word_count`` is there for a "thin" chip that wants to say how thin.
+#:
+#: ``not-crawled``: known to GA/Search Console but not in the site crawl —
+#: re-run the site analysis to audit it. ``meta-long``: the meta description
+#: runs past 160 characters and gets truncated.
+NOT_CRAWLED_CHIP = NOT_CRAWLED_FLAG
 THIN_CHIP = "thin-content"
+META_LONG_CHIP = "meta-long"
+HEALTHY_CHIP = "healthy"
+REC_CHIPS = (NOT_CRAWLED_CHIP, THIN_CHIP, META_LONG_CHIP, HEALTHY_CHIP)
 
 #: The rule sentence behind each flag — also the text AI advice is compared
 #: against: advice that only says this again, in other words, is dropped.
@@ -108,20 +115,20 @@ def _rule_rec(page: dict) -> tuple[str, str, str | None]:
     """Deterministic advice when AI is unavailable (or for pages outside the
     top-traffic slice) -> ``(recommendation, rec_source, rec_chip)``.
 
-    A verdict that would be the same sentence on every row it fits is a chip,
-    not a sentence: ``("", "flags", chip)``. Thin content is :data:`THIN_CHIP`,
-    a page with nothing flagged is :data:`HEALTHY_CHIP`, and a flag the audit
-    already groups (title, meta, H1, alt) is its own chip in ``flags``
-    (``rec_chip`` None). The precedence is the one the sentences had: thin
-    content outranks a long meta description, which still speaks.
+    Every rule verdict would be the same sentence on every row it fits, so each
+    is a chip: ``("", "flags", chip)`` with one of :data:`REC_CHIPS`, in the
+    precedence the sentences had — not crawled, thin content, long meta
+    description, then healthy when nothing is flagged. A flag the audit already
+    groups (title, meta, H1, alt) is its own chip in ``flags`` (``rec_chip``
+    None). Page-specific advice comes only from the AI pass, as a sentence.
     """
     flags = page.get("flags") or []
     if NOT_CRAWLED_FLAG in flags:
-        return NOT_CRAWLED_REC, "rule", None
+        return "", "flags", NOT_CRAWLED_CHIP
     if "thin" in flags:
         return "", "flags", THIN_CHIP
     if "meta-long" in flags:
-        return FLAG_TEXT["meta-long"], "rule", None
+        return "", "flags", META_LONG_CHIP
     if any(f in AUDIT_GROUPED_FLAGS for f in flags):
         return "", "flags", None
     return "", "flags", HEALTHY_CHIP
@@ -200,7 +207,7 @@ def _entry(merged: dict, path: str) -> dict:
         "views": 0, "sessions": 0, "engagement_rate": 0.0,
         "clicks": 0, "impressions": 0, "position": None,
         "best_query": None, "flags": [], "recommendation": "", "ai": False,
-        "rec_source": "rule", "rec_chip": None, "word_count": 0,
+        "rec_source": "flags", "rec_chip": None, "word_count": 0,
     })
 
 

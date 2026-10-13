@@ -104,7 +104,7 @@ def test_meta_long_only_gets_heuristic_rec():
     )
     page = doc["pages"][0]
     assert page["flags"] == ["meta-long"]
-    assert page["recommendation"] == "Tighten the meta description under 160 characters — long snippets get truncated."
+    assert (page["recommendation"], page["rec_chip"]) == ("", pages_mod.META_LONG_CHIP)
 
 
 def test_data_notes_merge_into_persisted_doc():
@@ -148,16 +148,19 @@ def test_audit_grouped_flags_are_chips_not_repeated_sentences():
 
 
 def test_rule_verdicts_that_repeat_down_the_table_are_chips_not_sentences():
-    """'Healthy — keep it fresh…' and 'Expand this page past 300 words' were the
-    same sentence on every row they fit. Each is now a stable chip id. A long
-    meta description is still a sentence, and thin content still outranks it."""
+    """'Healthy — keep it fresh…', 'Expand this page past 300 words', 'Tighten
+    the meta description…' and 'Not in the site crawl…' were each the same
+    sentence on every row they fit. Each is now a stable chip id, in the
+    precedence the sentences had; no rule row carries a sentence any more."""
     doc = pages_mod.build_page_intel(
         {"id": "b", "domain": "x.com"},
         corpus_pages=[_corpus_page(url=f"https://x.com/ok{i}") for i in range(3)]
         + [_corpus_page(url=f"https://x.com/thin{i}", word_count=90 + i) for i in range(3)]
-        + [_corpus_page(url="https://x.com/both", word_count=50, meta_description="d" * 200),
-           _corpus_page(url="https://x.com/long", meta_description="d" * 200)],
-        ga_pages=[], gsc_rows=[])
+        + [_corpus_page(url="https://x.com/both", word_count=50, meta_description="d" * 200)]
+        + [_corpus_page(url=f"https://x.com/long{i}", meta_description="d" * 200) for i in range(3)],
+        ga_pages=[{"path": f"/ga-only{i}", "views": 5, "sessions": 4, "engagement_rate": 0.3}
+                  for i in range(3)],
+        gsc_rows=[])
     by_path = {p["path"]: p for p in doc["pages"]}
     verdict = {path: (p["recommendation"], p["rec_source"], p["rec_chip"]) for path, p in by_path.items()}
 
@@ -165,9 +168,12 @@ def test_rule_verdicts_that_repeat_down_the_table_are_chips_not_sentences():
         assert verdict[f"/ok{i}"] == ("", "flags", "healthy")
         assert verdict[f"/thin{i}"] == ("", "flags", "thin-content")
         assert by_path[f"/thin{i}"]["word_count"] == 90 + i       # what the chip can say
+        assert verdict[f"/long{i}"] == ("", "flags", "meta-long")
+        assert verdict[f"/ga-only{i}"] == ("", "flags", "not-crawled")
     assert verdict["/both"] == ("", "flags", "thin-content")      # thin keeps its precedence
-    assert "meta-long" in by_path["/both"]["flags"]               # ...and meta-long is still a chip
-    assert verdict["/long"] == (pages_mod.FLAG_TEXT["meta-long"], "rule", None)
+    assert "meta-long" in by_path["/both"]["flags"]               # ...and meta-long is still a flag chip
+    assert not [p["path"] for p in doc["pages"] if p["recommendation"]]
+    assert {p["rec_chip"] for p in doc["pages"]} <= set(pages_mod.REC_CHIPS)
 
 
 def test_an_ai_row_carries_no_chip(monkeypatch):
@@ -389,7 +395,7 @@ def test_page_known_only_from_ga_is_flagged_not_crawled():
     )
     p = doc["pages"][0]
     assert p["flags"] == ["not-crawled"]
-    assert p["recommendation"] == "Not in the site crawl — re-run the site analysis to audit this page."
+    assert (p["recommendation"], p["rec_chip"]) == ("", pages_mod.NOT_CRAWLED_CHIP)   # not "healthy"
     # no crawled pages at all -> ai_candidates is empty -> the AI pass never ran;
     # ai must reflect that honestly rather than defaulting to True
     assert doc["ai"] is False

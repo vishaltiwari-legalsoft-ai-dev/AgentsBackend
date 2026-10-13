@@ -41,8 +41,9 @@ def test_overview_lists_default_brand_and_sources():
     assert body["brands"][0]["brand"]["id"] == "legalsoft"
     assert body["brands"][0]["last_run"] is None
     assert body["brands"][0]["gsc"] == {
-        "connected": False, "property": None, "connected_by": None, "connected_at": None,
-        "service_account_property": "sc-domain:legalsoft.com", "reading": False,
+        "connected": False, "mismatch": False, "property": None, "connected_by": None,
+        "connected_at": None, "service_account_property": "sc-domain:legalsoft.com",
+        "reading": False,
     }
 
 
@@ -322,7 +323,7 @@ OTHER = {"id": "u2", "email": "other@legalsoft.com", "is_admin": False, "is_crea
 TOKENS = {"refresh_token": "r1", "access_token": "a1",
           "scope": "https://www.googleapis.com/auth/webmasters.readonly"}
 LEGALSOFT_OWNED = [{"siteUrl": "sc-domain:legalsoft.com", "permissionLevel": "siteOwner"}]
-GSC_KEYS = {"connected", "property", "connected_by", "connected_at",
+GSC_KEYS = {"connected", "mismatch", "property", "connected_by", "connected_at",
             "service_account_property", "reading"}
 
 
@@ -422,7 +423,7 @@ def test_connect_round_trip_records_who_connected_and_seals_the_token(gsc):
     body = r.json()
     assert body["brand_id"] == "legalsoft"
     assert set(body["gsc"]) == GSC_KEYS
-    assert body["gsc"]["connected"] is True
+    assert body["gsc"]["connected"] is True and body["gsc"]["mismatch"] is False
     assert body["gsc"]["property"] == "sc-domain:legalsoft.com"
     assert body["gsc"]["connected_by"] == "t@legalsoft.com"
     assert body["gsc"]["connected_at"]
@@ -620,4 +621,27 @@ def test_a_geo_only_caller_gets_the_overview_without_any_search_console_block(gs
         assert "gsc" not in card and "gsc_connected" not in card
         assert card["brand"]["id"]                          # the rest of the card is intact
     assert "t@legalsoft.com" not in r.text and "connected_at" not in r.text
+
+
+@pytest.mark.parametrize(("grant", "why"), [
+    ({"brand_id": "legalsoft", "property": "sc-domain:oldsite.com"}, "domain edited after connect"),
+    ({"brand_id": "someone-else", "property": "sc-domain:legalsoft.com"}, "stored for another brand"),
+])
+def test_a_grant_for_a_different_site_is_never_shown_as_connected(gsc, grant, why):
+    """The run ignores a foreign grant, so nothing may call the brand Connected
+    on its strength: ``connected`` false, ``mismatch`` true, and the property
+    shown is the one to replace — on the card, the detail and the integration
+    flag alike."""
+    gsc.store["legalsoft"] = {**grant, "refresh_token_enc": "sealed",
+                              "connected_by": "t@legalsoft.com"}
+
+    overview = client.get("/api/seo-geo/overview").json()
+    card = overview["brands"][0]
+    assert (card["gsc"]["connected"], card["gsc"]["mismatch"]) == (False, True), why
+    assert card["gsc"]["property"] == grant["property"]
+    assert card["gsc_connected"] is False
+    assert overview["sources"]["gsc"] is False             # Integrations: not Connected
+
+    detail = client.get("/api/seo-geo/brands/legalsoft").json()["gsc"]
+    assert (detail["connected"], detail["mismatch"]) == (False, True)
 

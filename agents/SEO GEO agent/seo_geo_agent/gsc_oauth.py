@@ -97,6 +97,10 @@ PROPERTY_TAKEN = "gsc_property_taken"
 #: The run's degraded note when a stored grant may not be used for the brand —
 #: stored for another brand id, or for a site the brand's domain no longer is.
 FOREIGN_GRANT_NOTE = "Search Console connection is for a different site — reconnect it."
+#: The run's degraded note when Google refuses the stored grant's refresh token
+#: (``invalid_grant``): removed at myaccount.google.com, ended by a12's revoke
+#: on the same Google account (the client is shared), or expired.
+REVOKED_NOTE = "Search Console connection was removed at Google — reconnect it."
 
 _UNCONFIGURED_MESSAGE = (
     "Search Console connect isn't set up on this server yet — an admin needs to "
@@ -570,6 +574,16 @@ def connection(brand_id: str) -> dict | None:
     return connections([brand_id]).get(brand_id)
 
 
+def brand_connections(brands: list[dict]) -> dict[str, dict]:
+    """``{brand_id: public view + "mismatch"}`` for every brand with a stored
+    grant — one batched read. ``mismatch`` is :func:`foreign_grant` against the
+    brand as it is NOW, so a grant the run would ignore is never shown as
+    connected (``_gsc_view`` in the router)."""
+    by_id = {b["id"]: b for b in brands if b.get("id")}
+    return {bid: {**_public(doc), "mismatch": foreign_grant(by_id[bid], doc)}
+            for bid, doc in _grant_docs(list(by_id)).items()}
+
+
 def foreign_grant(brand: dict, grant: dict) -> bool:
     """A stored grant this brand must not read with: stored for a different
     brand id, or for a property that is not the brand's CURRENT domain under
@@ -580,6 +594,25 @@ def foreign_grant(brand: dict, grant: dict) -> bool:
     if stored_for and stored_for != brand.get("id"):
         return True
     return not property_matches(str(grant.get("property") or ""), str(brand.get("domain") or ""))
+
+
+def grant_revoked(exc: BaseException, *, brand_id: str) -> bool:
+    """Whether ``exc`` — or anything it wraps — is Google refusing the grant's
+    refresh token with ``invalid_grant``. ``sources.gsc_fetch`` wraps every
+    query failure, so the cause chain is walked. The raw error goes to the
+    server log; the run shows :data:`REVOKED_NOTE` instead of Google's text."""
+    from google.auth.exceptions import RefreshError
+
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, RefreshError) and "invalid_grant" in str(cur):
+            logger.warning("Search Console grant for brand %s refused at Google: %s",
+                           brand_id, str(cur)[:200])
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 def usable_grant(brand: dict) -> tuple[dict | None, str | None]:

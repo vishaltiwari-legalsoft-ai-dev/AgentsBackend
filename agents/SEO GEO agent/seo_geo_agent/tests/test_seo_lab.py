@@ -1078,6 +1078,60 @@ def test_run_brand_ignores_a_grant_for_a_different_site(gsc_connect, monkeypatch
     assert gsc_oauth.usable_grant(brand) == (None, gsc_oauth.FOREIGN_GRANT_NOTE)
 
 
+class _QueryFails:
+    """A Search Console client whose query raises ``error`` — the shape
+    ``googleapiclient`` gives ``sources.gsc_fetch``."""
+
+    def __init__(self, error: Exception):
+        self._error = error
+
+    def searchanalytics(self):
+        return self
+
+    def query(self, **kwargs):
+        return self
+
+    def execute(self):
+        raise self._error
+
+
+def test_a_grant_google_no_longer_honours_reads_plainly_not_in_googles_words(
+        gsc_connect, monkeypatch):
+    """Removed at myaccount.google.com, ended by a12's revoke on the same Google
+    account (the client is shared), or expired: Google answers the refresh with
+    ``invalid_grant``. The run — and the pages doc it feeds — says so in one
+    plain sentence; Google's tuple never reaches the console."""
+    from google.auth.exceptions import RefreshError
+
+    from seo_geo_agent import pages as pages_mod, state
+
+    brand = insights.list_brands()[0]
+    gsc_connect.store[brand["id"]] = {"brand_id": brand["id"], "refresh_token_enc": "sealed",
+                                      "property": "sc-domain:legalsoft.com"}
+    state.save(f"corpus-{brand['id']}", {"pages": [{
+        "url": "https://legalsoft.com/", "title": "Home", "word_count": 800,
+        "meta_description": "d", "h1_count": 1, "images_no_alt": 0}]})
+    dead = RefreshError("invalid_grant: Token has been expired or revoked.",
+                        {"error": "invalid_grant"})
+    monkeypatch.setattr(insights.gsc_oauth, "service", lambda bid: _QueryFails(dead))
+
+    run = insights.run_brand(brand, trigger="t")
+    assert gsc_oauth.REVOKED_NOTE in run["degraded"]
+    assert not [n for n in run["degraded"] if "invalid_grant" in n or "expired or revoked" in n]
+    assert gsc_oauth.REVOKED_NOTE in pages_mod.latest(brand["id"])["notes"]
+
+
+def test_any_other_search_console_failure_keeps_its_reason(gsc_connect, monkeypatch):
+    brand = insights.list_brands()[0]
+    gsc_connect.store[brand["id"]] = {"brand_id": brand["id"], "refresh_token_enc": "sealed",
+                                      "property": "sc-domain:legalsoft.com"}
+    monkeypatch.setattr(insights.gsc_oauth, "service",
+                        lambda bid: _QueryFails(RuntimeError("HTTP 403 user does not have access")))
+    run = insights.run_brand(brand, trigger="t")
+    assert gsc_oauth.REVOKED_NOTE not in run["degraded"]
+    assert any(n.startswith("Search Console: ") and "403" in n for n in run["degraded"])
+
+
 # --------------------------------- advisor ---------------------------------
 
 def test_advisor_context_survives_empty_state():

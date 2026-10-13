@@ -125,7 +125,7 @@ def overview(user=Depends(get_current_user)):
     data: for them both per-brand fields are left out, so the connecting staff
     member's email, ``connected_at`` and the property never reach them."""
     brands = insights.list_brands()
-    grants = seo_oauth.connections([b["id"] for b in brands])  # one batched read
+    grants = seo_oauth.brand_connections(brands)  # one batched read, mismatch judged
     cards = []
     for brand in brands:
         run = insights.latest_run(brand["id"])
@@ -244,7 +244,7 @@ def _plan_of_action(brand_id: str, run: dict | None) -> list[dict]:
 @router.get("/seo-geo/brands/{brand_id}")
 def brand_detail(brand_id: str, user=Depends(get_current_user)):
     brand = _brand_or_404(brand_id)
-    conn = seo_oauth.connection(brand_id)
+    conn = seo_oauth.brand_connections([brand]).get(brand_id)
     run = insights.latest_run(brand_id)
     return {
         "brand": brand,
@@ -540,14 +540,19 @@ def _gsc_view(brand: dict, grant: dict | None, run: dict | None) -> dict:
     the brand detail and the connect answer.
 
     ``connected`` / ``property`` / ``connected_by`` / ``connected_at`` describe
-    a stored OAuth grant. ``service_account_property`` is the property set on
-    the brand for the shared service account (``None`` when unset — the run
-    then tries ``sc-domain:<domain>``); whether that account can actually read
-    it is only known from a run, which is what ``reading`` says: the latest run
-    got Search Console rows."""
+    a stored OAuth grant. ``mismatch`` is true when that stored grant is for a
+    different brand or site (``gsc_oauth.foreign_grant``): the run ignores it,
+    so ``connected`` is false and the property shown is the one to replace.
+    ``service_account_property`` is the property set on the brand for the
+    shared service account (``None`` when unset — the run then tries
+    ``sc-domain:<domain>``); whether that account can actually read it is only
+    known from a run, which is what ``reading`` says: the latest run got
+    Search Console rows."""
     grant = grant or {}
+    mismatch = bool(grant.get("mismatch"))
     return {
-        "connected": bool(grant),
+        "connected": bool(grant) and not mismatch,
+        "mismatch": mismatch,
         "property": grant.get("property"),
         "connected_by": grant.get("connected_by"),
         "connected_at": grant.get("connected_at"),

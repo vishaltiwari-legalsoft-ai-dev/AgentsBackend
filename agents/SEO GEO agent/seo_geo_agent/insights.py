@@ -509,13 +509,16 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
     conn, foreign = gsc_oauth.usable_grant(brand)
     if foreign:
         degraded.append(foreign)
+    svc = None
     try:
         svc = gsc_oauth.service(brand["id"]) if conn else None
         prop = conn["property"] if conn else (brand.get("gsc_property") or f"sc-domain:{brand['domain']}")
         rows = gsc_fetch(prop, end - timedelta(days=28), end, service=svc)
         prev_rows = gsc_fetch(prop, end - timedelta(days=56), end - timedelta(days=29), service=svc)
     except CredentialMissing as exc:
-        degraded.append(f"Search Console: {exc}")
+        # A grant Google no longer honours says so plainly, not in Google's words.
+        revoked = svc is not None and gsc_oauth.grant_revoked(exc, brand_id=brand["id"])
+        degraded.append(gsc_oauth.REVOKED_NOTE if revoked else f"Search Console: {exc}")
 
     # Every to-do is built uncapped; merge_todos below makes the one cut to
     # MAX_TODOS and counts it. The summary and bullets keep their top-MAX_TODOS
@@ -558,7 +561,8 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
                     ga["property"], end - timedelta(days=28), end)
             # Forward whatever GA/GSC degradation this run already hit — a zeroed
             # metric in the pages doc must carry the reason, not read as real data.
-            page_notes = [n for n in degraded if n.startswith(("Search Console:", "Google Analytics:"))]
+            # ("Search Console" without the colon also carries the grant notes.)
+            page_notes = [n for n in degraded if n.startswith(("Search Console", "Google Analytics:"))]
             pages_mod.build_page_intel(brand, corpus["pages"], ga_pages, rows, data_notes=page_notes)
     except CredentialMissing as exc:
         degraded.append(f"Page analytics: {exc}")
