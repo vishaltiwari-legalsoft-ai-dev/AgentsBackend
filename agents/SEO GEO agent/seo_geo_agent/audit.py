@@ -105,6 +105,20 @@ _BLOG_ROOTS = frozenset({"blog", "blogs", "news", "articles", "article", "insigh
 _SERVICE_ROOTS = frozenset({"services", "service", "solutions", "practice-areas", "what-we-do",
                             "offerings"})
 _ABOUT_SEGS = frozenset({"about", "about-us", "team", "our-team", "company", "who-we-are"})
+#: Policy and legal pages — never a service offering, whatever their slug says
+#: ("/terms-of-service" contains "service").
+_POLICY_SEG = re.compile(
+    r"^(?:terms(?:-.*)?|tos|privacy(?:-.*)?|cookies?(?:-.*)?|disclaimers?|legal|legal-notices?|"
+    r"imprint|accessibility(?:-statement)?|gdpr|ccpa|dmca|eula)$", re.I)
+#: First path segments that are not a service offering even when the corpus
+#: summary calls the page one: pricing, the product/platform, careers, login,
+#: comparisons, proof pages, partner programmes, events, thank-you pages.
+_NOT_SERVICE_FIRST = re.compile(
+    r"^(?:pricing|prices?|plans?|platform|products?|features?|software|apps?|careers?|jobs?|"
+    r"hiring|join-us|work-with-us|log-?in|sign-?in|sign-?up|register|account|portal|dashboard|"
+    r"compare|comparisons?|vs|alternatives?|testimonials?|reviews?|case-stud(?:y|ies)|"
+    r"success-stories|faqs?|partners?|events?|news|press|podcasts?|webinars?|thank-?you|thanks|"
+    r"404|search|sitemap)(?:-|$)", re.I)
 
 
 def page_kind(url: str, hint: str | None = None) -> str:
@@ -114,6 +128,10 @@ def page_kind(url: str, hint: str | None = None) -> str:
     under ``/blog/`` is blog); ``hint`` — the corpus's per-page type — only
     fills in what the URL leaves open. A section index (``/blog``,
     ``/services``) is ``other``: it lists posts or services, it is not one.
+    Policy/legal pages, pricing, the platform/product, careers, login and the
+    other non-offering sections are ``other`` even when the summary says
+    "service": Service is only for a page that presents a service offering —
+    a service URL pattern, or the summary's type on a page none of those is.
     """
     if not (url or "").strip():  # a page that does not exist yet (a brief's planned article)
         return hint if hint in ("home", "service", "blog", "about", "contact") else "other"
@@ -124,12 +142,14 @@ def page_kind(url: str, hint: str | None = None) -> str:
     first = segs[0]
     if first in _BLOG_ROOTS:
         return "blog" if len(segs) > 1 else "other"
-    if first in _SERVICE_ROOTS:
-        return "service" if len(segs) > 1 else "other"
     if first.startswith("contact"):
         return "contact"
     if first in _ABOUT_SEGS or first.startswith("about"):
         return "about"
+    if any(_POLICY_SEG.match(s) for s in segs) or _NOT_SERVICE_FIRST.match(first):
+        return "other"
+    if first in _SERVICE_ROOTS:
+        return "service" if len(segs) > 1 else "other"
     if any(w in ("service", "services") for s in segs for w in re.split(r"[-_.]+", s)):
         return "service"
     if hint in ("service", "blog", "about", "contact"):
@@ -156,6 +176,10 @@ FAQ_RICH_RESULT_NOTE = (
     "and health sites, so for a business site the value is clean question-and-answer pairs "
     "that AI answers can lift — not a rich result."
 )
+#: Question headings that only count as a FAQ when there are at least this many
+#: real Q&A pairs — two CTA questions on a landing page are not one.
+FAQ_MIN_PAIRS = 3
+FAQ_REASON = "Visible question-and-answer pairs and no FAQPage markup."
 #: Type-level "how to fix", one per recommendable type, in report order.
 SCHEMA_FIX = {
     "Organization": "Add Organization JSON-LD to the home page: legal name, logo, contact point, "
@@ -188,13 +212,20 @@ def _fit_view(page, kind_hint: str | None = None) -> dict:
             return getattr(page, key, default)
     url = get("url") or ""
     types = get("schema_types")
+    pairs = get("faq_pairs")
+    total, linked = int(get("headings_total") or 0), int(get("headings_linked") or 0)
     return {
         "url": url,
         "kind": page_kind(url, kind_hint or get("type")),
         "types": None if types is None else {str(t) for t in types},
         "q": int(get("q_headings") or 0),
+        # None: crawled before Q&A pairs were counted — unknown, so no FAQPage.
+        "faq_pairs": None if pairs is None else int(pairs),
+        # Most headings are links out: a listing of posts/episodes, not a FAQ.
+        "listing": total > 0 and linked * 2 > total,
         "phone": bool(get("has_phone")),
         "address": bool(get("has_address")),
+        "address_text": str(get("address_text") or ""),
         "errors": list(get("schema_errors") or []),
     }
 
@@ -203,16 +234,20 @@ def schema_fit(page, site_types=None, kind_hint: str | None = None) -> list[dict
     """Schema types this page should carry, each with the reason it fits.
 
     Rule-based on what the crawl actually saw — never "add schema" by default:
-      * FAQPage — 2+ question-style headings and no FAQPage yet (low; see the note).
+      * FAQPage — FAQ_MIN_PAIRS+ real question-and-answer pairs (a question a
+        visitor would ask, not itself a link, followed by an answer block) on a
+        page that is not a listing, and no FAQPage yet (low; see the note).
       * BlogPosting — a blog post with no Article-family markup.
-      * Service — a service page with no Service/Product markup.
+      * Service — a service page (``page_kind``) with no Service/Product markup.
       * Organization / WebSite — home page only, and only if NO page on the site has it.
-      * LocalBusiness — home page only, address or phone on the page, none on the site.
+      * LocalBusiness — home page only, a postal street address on the page
+        (a phone number alone is not one), none on the site.
       * contact / about pages — nothing.
     ``site_types`` is every type seen site-wide; None = unknown, so the
     site-wide rules stay silent rather than guess. A page whose schema was never
     recorded, or whose JSON-LD fails to parse, gets nothing here (the parse
-    error is its own finding).
+    error is its own finding). Each rec carries the page's ``reason`` and,
+    where the type has one, the type-level ``note``.
     """
     view = _fit_view(page, kind_hint)
     if view["types"] is None or view["errors"] or view["kind"] in ("contact", "about"):
@@ -221,12 +256,12 @@ def schema_fit(page, site_types=None, kind_hint: str | None = None) -> list[dict
     site = None if site_types is None else {str(t) for t in site_types}
     recs: list[dict] = []
 
-    def rec(typ: str, reason: str) -> None:
-        recs.append({"type": typ, "severity": SCHEMA_SEVERITY[typ], "reason": reason})
+    def rec(typ: str, reason: str, **extra) -> None:
+        recs.append({"type": typ, "severity": SCHEMA_SEVERITY[typ], "reason": reason, **extra})
 
-    if view["q"] >= 2 and "FAQPage" not in types:
-        rec("FAQPage", f"{view['q']} question-style headings on the page and no FAQPage markup. "
-            + FAQ_RICH_RESULT_NOTE)
+    pairs = view["faq_pairs"]
+    if pairs is not None and pairs >= FAQ_MIN_PAIRS and not view["listing"] and "FAQPage" not in types:
+        rec("FAQPage", FAQ_REASON, note=FAQ_RICH_RESULT_NOTE, pairs=pairs)
     if view["kind"] == "blog" and not types & ARTICLE_TYPES:
         rec("BlogPosting", "A blog post with no Article/BlogPosting markup.")
     if view["kind"] == "service" and not (
@@ -237,11 +272,11 @@ def schema_fit(page, site_types=None, kind_hint: str | None = None) -> list[dict
             rec("Organization", "No page on the site carries Organization markup.")
         if "WebSite" not in site:
             rec("WebSite", "No page on the site carries WebSite markup.")
-        if (view["phone"] or view["address"]) and not site & LOCAL_TYPES:
-            shown = "an address" if view["address"] else "a phone number"
-            rec("LocalBusiness", f"The home page shows {shown} and no page carries "
-                "LocalBusiness markup — right only for a business customers visit or that "
-                "serves a defined area; otherwise Organization is the type.")
+        if view["address"] and not site & LOCAL_TYPES:
+            shown = f" ({view['address_text']})" if view["address_text"] else ""
+            rec("LocalBusiness", f"The home page shows a street address{shown} and no page "
+                "carries LocalBusiness markup — right only for a business customers visit or "
+                "that serves a defined area; otherwise Organization is the type.")
     return recs
 
 
@@ -445,16 +480,29 @@ def _schema_issues(pages: list[PageFacts], kind_hints: dict[str, str | None]) ->
         "LocalBusiness": lambda n: "Home page shows contact details but has no LocalBusiness schema",
         "Service": lambda n: f"{lack(n, 'service page')} Service schema",
         "BlogPosting": lambda n: f"{lack(n, 'blog post')} Article/BlogPosting schema",
-        "FAQPage": lambda n: f"{lack(n, 'page')} FAQPage schema despite 2+ question headings",
+        "FAQPage": lambda n: (f"{lack(n, 'page')} FAQPage schema despite {FAQ_MIN_PAIRS}+ "
+                              "question-and-answer pairs"),
     }
     for typ in SCHEMA_FIX:  # report order
         hits = by_type.get(typ)
         if not hits:
             continue
+        # The reason is said once, on the finding; a page's evidence line
+        # carries text only where its reason actually differs. The type's note
+        # (FAQ rich results since 2023) is already in the fix.
+        reasons = [r["reason"] for _, r in hits]
+        common = max(dict.fromkeys(reasons), key=reasons.count)
+        evidence = []
+        for u, r in hits[:PAGES_PER_ISSUE]:
+            line = {"page": u}
+            if r["reason"] != common:
+                line["reason"] = r["reason"]
+            if "pairs" in r:
+                line["pairs"] = r["pairs"]
+            evidence.append(line)
         out.append(_issue(
             headline[typ](len(hits)), SCHEMA_SEVERITY[typ], [u for u, _ in hits], SCHEMA_FIX[typ],
-            kind="schema-fit", schema_type=typ,
-            evidence=[{"page": u, "reason": r["reason"]} for u, r in hits[:PAGES_PER_ISSUE]]))
+            kind="schema-fit", schema_type=typ, reason=common, evidence=evidence))
     return out
 
 

@@ -9,8 +9,9 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import date, timedelta
+from urllib.parse import urlparse
 
-from . import competitors, gsc_oauth, pages as pages_mod, site_brain, state, topics
+from . import audit, competitors, gsc_oauth, pages as pages_mod, site_brain, state, topics
 from .sources import (
     CredentialMissing,
     QueryStat,
@@ -18,6 +19,7 @@ from .sources import (
     ga_fetch_overview,
     ga_fetch_pages,
     gsc_fetch,
+    plain_note,
 )
 
 # Aggregate organic CTR by position (rounded from public CTR studies). Position
@@ -278,6 +280,44 @@ def build_todos(brand_id: str, rows: list[QueryStat], prev_rows: list[QueryStat]
     return todos if cap is None else todos[:cap]
 
 
+#: Words in a "This week" strip label — a pointer to the Fix list, not a copy of it.
+LABEL_WORDS = 8
+_LABEL_FRAMES = {
+    "unranked": "New page: “{q}”",
+    "striking": "Refresh: “{q}”",
+    "rank_drop": "Recover: “{q}”",
+    "ctr_gap": "Snippet: “{q}”",
+}
+
+
+def short_label(text: str, words: int = LABEL_WORDS) -> str:
+    """``text`` cut to ``words`` words (an ellipsis says it was cut)."""
+    parts = str(text or "").split()
+    return " ".join(parts) if len(parts) <= words else " ".join(parts[:words]).rstrip(",;:—-") + "…"
+
+
+def todo_label(todo: dict) -> str:
+    """A to-do in at most :data:`LABEL_WORDS` words — what the strip shows
+    next to "See Fix list #n"."""
+    kind, query = todo.get("kind"), str(todo.get("query") or "").strip()
+    if kind in _LABEL_FRAMES and query:
+        frame = _LABEL_FRAMES[kind]
+        room = LABEL_WORDS - (len(frame.split()) - 1)
+        q = query.split()
+        quoted = " ".join(q) if len(q) <= room else " ".join(q[:room]) + "…"
+        return frame.format(q=quoted)
+    if kind == "decay":
+        return short_label(f"Refresh {urlparse(todo.get('page') or '').path or todo.get('page') or 'the page'}")
+    if kind == "site":
+        pages = todo.get("pages") or []
+        category = str(todo.get("category") or "site").replace("-", " ")
+        if todo.get("origin") == site_brain.PAGE_ADVICE:
+            return short_label(f"{category.capitalize()} on {len(pages)} pages")
+        path = urlparse(todo.get("page") or "").path or ""
+        return short_label(f"{category.capitalize()} fix{f': {path}' if path else ''}")
+    return short_label(todo.get("action") or "")
+
+
 def _summary(rows: list[QueryStat], prev_rows: list[QueryStat], todos: list[dict]) -> dict:
     clicks = sum(r.clicks for r in rows)
     impressions = sum(r.impressions for r in rows)
@@ -518,7 +558,7 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
     except CredentialMissing as exc:
         # A grant Google no longer honours says so plainly, not in Google's words.
         revoked = svc is not None and gsc_oauth.grant_revoked(exc, brand_id=brand["id"])
-        degraded.append(gsc_oauth.REVOKED_NOTE if revoked else f"Search Console: {exc}")
+        degraded.append(gsc_oauth.REVOKED_NOTE if revoked else plain_note(f"Search Console: {exc}"))
 
     # Every to-do is built uncapped; merge_todos below makes the one cut to
     # MAX_TODOS and counts it. The summary and bullets keep their top-MAX_TODOS
@@ -535,7 +575,7 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
             summary = _rank_summary(ranks_doc)
             bullets = _rank_bullets(summary, todos)
         except CredentialMissing as exc:
-            degraded.append(f"Rank tracking: {exc}")
+            degraded.append(plain_note(f"Rank tracking: {exc}"))
             todos, bullets = [], []
             summary = _summary([], [], [])
 
@@ -544,11 +584,15 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
     try:
         ga = _ga_section(brand, end)
     except CredentialMissing as exc:
-        degraded.append(f"Google Analytics: {exc}")
+        degraded.append(plain_note(f"Google Analytics: {exc}"))
     if ga:
         bullet = _ga_bullet(ga)
         if bullet:
             bullets.append(bullet)
+
+    # Site-review findings, as Fix-list items. Read before the page pass: page
+    # advice that a site to-do already covers is folded into it there.
+    site = site_brain.site_todos(brand["id"])
 
     # Page-level intelligence rides along too — never fatal to the run.
     corpus = {}
@@ -563,24 +607,30 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
             # metric in the pages doc must carry the reason, not read as real data.
             # ("Search Console" without the colon also carries the grant notes.)
             page_notes = [n for n in degraded if n.startswith(("Search Console", "Google Analytics:"))]
-            pages_mod.build_page_intel(brand, corpus["pages"], ga_pages, rows, data_notes=page_notes)
+            page_doc = pages_mod.build_page_intel(
+                brand, corpus["pages"], ga_pages, rows, data_notes=page_notes,
+                site_todos=site, audit_report=audit.latest_audit(brand["id"]))
+            site = site_brain.fold_page_advice(brand["id"], site, page_doc.get("fix_items"))
     except CredentialMissing as exc:
-        degraded.append(f"Page analytics: {exc}")
+        degraded.append(plain_note(f"Page analytics: {exc}"))
 
     # Site-review findings ride along in the fix list: reserved slots, and the cut
     # is counted — ``todos_not_shown`` is every search-data or site to-do this
     # run built that is not in ``todos``.
-    todos, todos_not_shown = site_brain.merge_todos(todos, site_brain.site_todos(brand["id"]), MAX_TODOS)
+    todos, todos_not_shown = site_brain.merge_todos(todos, site, MAX_TODOS)
 
     # One review read grounds both the seeds and the blog plan's gap/coverage check.
+    # A keyword already on the Fix list is that page's job, not a new post's.
     review = site_brain.latest_review(brand["id"])
     topic_list, topic_notes = topics.build_topics(
         site_brain.effective_seeds(brand, review=review), rows, prev_rows,
         corpus_pages=corpus.get("pages"),
         competitor_topics=_competitor_topic_pool(brand["id"]),
         site_review=review,
+        fix_queries=topics.fix_query_index(todos),
+        competitor_domains=_competitor_domains(brand),
     )
-    degraded.extend(topic_notes)
+    degraded.extend(plain_note(n) for n in topic_notes)
 
     run = {
         "brand_id": brand["id"],
@@ -603,6 +653,35 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
     return run
 
 
+def _competitor_domains(brand: dict) -> list[str]:
+    """Domains that rank against this brand: the tracked list plus the ones
+    rank snapshots keep seeing — whose brand names are not blog topics."""
+    ranks = state.load(f"ranks-{brand['id']}") or {}
+    out: list[str] = []
+    for d in list(brand.get("competitors") or []) + list(ranks.get("suggested_competitors") or []):
+        if isinstance(d, str) and d.strip() and d not in out:
+            out.append(d.strip().lower())
+    return out
+
+
+def refold_page_advice(brand_id: str, page_doc: dict, site: list[dict]) -> None:
+    """Bring the stored run's Fix list in line with a page pass rebuilt on its
+    own (``POST /pages/{id}/refresh``): the page rows just dropped advice as
+    "on the Fix list", so the Fix list must say it. Site to-dos get the
+    folded ``pages``; page-advice items are replaced. Nothing else moves."""
+    run = state.load(f"run-{brand_id}")
+    if not run:
+        return
+    folded = {t["id"]: t for t in site_brain.fold_page_advice(brand_id, site, page_doc.get("fix_items"))}
+    todos = [t for t in run.get("todos") or [] if t.get("origin") != site_brain.PAGE_ADVICE]
+    todos = [dict(t, pages=folded[t["id"]].get("pages", [])) if t.get("id") in folded else t
+             for t in todos]
+    shown = {t.get("id") for t in todos}
+    todos += [t for t in folded.values() if t.get("origin") == site_brain.PAGE_ADVICE and t["id"] not in shown]
+    run["todos"] = todos
+    state.save(f"run-{brand_id}", run)
+
+
 def latest_run(brand_id: str) -> dict | None:
     run = state.load(f"run-{brand_id}")
     if not run:
@@ -612,6 +691,8 @@ def latest_run(brand_id: str) -> dict | None:
     for todo in run.get("todos", []):
         if todo["id"] in overlay:
             todo["status"] = overlay[todo["id"]]
+    # A run stored before notes were made plain still carries raw exception text.
+    run["degraded"] = [plain_note(n, log=False) for n in run.get("degraded") or [] if isinstance(n, str)]
     return run
 
 

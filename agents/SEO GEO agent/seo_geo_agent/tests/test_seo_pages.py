@@ -311,6 +311,199 @@ def test_phone_and_address_detected():
     assert (plain.has_phone, plain.has_address) == (False, False)
 
 
+# ----------------------- legalsoft.com, as the crawler sees it -----------------------
+# Cut down from the live Webflow HTML fetched 2026-10-14 (the staging test's
+# ground truth). Every page shares the chrome: a nav that links every practice
+# area, a footer with the newsletter w-form, the click-to-call link and the
+# office address. /contact-us embeds HubSpot the v2 way: a src on
+# js.hsforms.net plus an inline ``hbspt.forms.create``.
+
+LS = "https://www.legalsoft.com"
+LS_NAV = ('<nav class="navbar w-nav"><a href="/" class="brand w-nav-brand">Legal Soft</a>'
+          '<a href="/virtual-staffing">Virtual Staffing</a><a href="/virtual-paralegal">Paralegals</a>'
+          '<a href="/practice-areas/personal-injury">Personal Injury</a>'
+          '<a href="/practice-areas/family">Family Law</a>'
+          '<a href="/practice-areas/bankruptcy">Bankruptcy</a>'
+          '<a href="/bookkeeper">Bookkeepers</a><a href="/pricing">Pricing</a>'
+          '<a href="https://app.legalsoft.com" class="button w-button">Login</a>'
+          '<a href="/contact-us" class="button w-button">Get Started</a></nav>')
+LS_FOOTER = ('<footer class="footer"><div class="form-block w-form">'
+             '<form id="wf-form-Newsletter-Sign-Up-Form" name="wf-form-Newsletter-Sign-Up-Form" '
+             'data-name="Newsletter Sign Up Form" method="get" class="main-form">'
+             '<input class="text-field w-input" name="Email" type="email">'
+             '<input type="submit" class="button w-button" value="Subscribe"></form>'
+             '<div class="success-message w-form-done"><div>Thank you!</div></div>'
+             '<div class="error-message w-form-fail"><div>Oops!</div></div></div>'
+             '<a href="tel:+1(424)341-4917" class="social-media-icon w-inline-block">'
+             '<div class="call-icon w-embed"><svg><title>Call</title></svg></div></a>'
+             '<div class="footer-address">21731 Ventura Blvd. Suite 100 Woodland Hills, CA 91364</div>'
+             '</footer>')
+LS_HUBSPOT_FORM = ('<div class="meeting_embed w-embed w-script"><div style="height: 25rem; width: 100%;"> '
+                   '<script charset="utf-8" type="text/javascript" src="//js.hsforms.net/forms/embed/v2.js">'
+                   '</script> <script>   hbspt.forms.create({     region: "na1",     portalId: "5728668",'
+                   '     formId: "9ece68fa-b2f0-42ca-92af-6ed528dd9562"   }); </script>  <style> .hbspt-form,'
+                   ' .hbspt-form form { width: 100% !important; } </style> </div></div>')
+LS_ANSWER = ("You can outsource a wide range of tasks to your virtual paralegal, just as you would with an "
+             "in-house team member in a remote setting. As a direct extension of your team, they work "
+             "under your supervision.")
+#: The real FAQ block (/virtual-paralegal): h3 questions, each followed by its answer.
+LS_FAQ = "".join(
+    f'<div class="faq-wrap main"><div class="faq-question-wrap"><h3 class="faq-q-text">{q}</h3>'
+    f'<div class="faq-plus-wrap"><div class="faq-plus"></div></div></div><div class="faq-answer-block">'
+    f'<p class="faq-answer-text">{LS_ANSWER}</p></div></div>'
+    for q in ("What tasks can I outsource to my virtual paralegal?",
+              "How do virtual paralegal services work?",
+              "Are my client data and legal documents secure? "))
+#: /blog: every post is a card — an <a> wrapping its question-titled <h2>.
+LS_BLOG_CARDS = "".join(
+    f'<a href="/blog/{slug}" class="blog-card w-inline-block"><img src="/c.png" alt="{title}">'
+    f'<div class="text-size-small">October 12, 2026</div><h2 class="text-size-medium">{title}</h2>'
+    f'<div class="author-name">Grace</div><p>{LS_ANSWER}</p></a>'
+    for slug, title in (
+        ("should-i-start-my-own-law-firm", "Should I Start My Own Law Firm or Keep Working for One?"),
+        ("virtual-vs-in-house", "Virtual vs. In-House Legal Assistant: Which Is Better for Law Firms?"),
+        ("how-many-hours-do-lawyers-work", "How Many Hours Do Lawyers Work?"),
+        ("side-hustles-for-lawyers", "What Are the Best Side Hustles for Lawyers?")))
+#: /testimonials: marketing hooks phrased as questions, each over a 29-38 word story.
+LS_TESTIMONIAL_HOOKS = "".join(
+    f'<div class="heading-texts-wrapper"><h2 class="heading-style-h2">{hook}</h2>'
+    f'<div class="text-size-big">{story}</div></div>'
+    f'<a href="#" class="yt-opener-btn w-inline-block w-lightbox">Watch</a>'
+    for hook, story in (
+        ('Growing in a <span class="text-color-gradient">crowded market?</span>',
+         "Joseph was in the same position, launching a personal injury practice in one of the most "
+         "competitive markets in the country. With Legal Soft, he got the support he needed to get "
+         "his firm up and running."),
+        ('<span class="text-color-gradient">Missing calls</span> from leads?',
+         "Emma was too. Every missed call was a missed lead walking out the door. With a dedicated "
+         "virtual intake team, she now answers every call consistently, with dependable coverage."),
+        ('<span class="text-color-gradient">Buried </span>in case work?',
+         "Justin needed support that understood personal injury. His Legal Soft virtual assistants "
+         "came in familiar with the field and stayed on top of the details that keep cases moving.")))
+#: /partners/referral-program: two CTA questions over a bullet list and a button.
+LS_REFERRAL_CTAS = ('<h2 class="heading-style-h2">Why Join the <br/><span>Referral Program?</span></h2>'
+                    '<ul><li>Simple, effortless referral process</li><li>Generous cash rewards</li></ul>'
+                    '<a href="https://share.hsforms.com/1iiTsXme5Q36XJfPlG75Zqg3es9o" class="button">Learn More</a>'
+                    '<h2 class="heading-style-h2">Ready to Start Earning?</h2>'
+                    '<a href="https://share.hsforms.com/1iiTsXme5Q36XJfPlG75Zqg3es9o" class="button">Refer Now</a>')
+
+
+def ls_page(path: str, body: str, title: str = "Legal Soft",
+            types=("WebSite", "Organization", "ContactPoint", "WebPage"), words: int | None = None) -> PageFacts:
+    """One legalsoft.com page with the shared chrome, parsed by the real parser.
+    ``words`` pins the word count a test's evidence quotes (the digest's "(920w)")."""
+    ld = ('<script type="application/ld+json">{"@context": "https://schema.org", "@graph": ['
+          + ", ".join(f'{{"@type": "{t}"}}' for t in types) + "]}</script>") if types else ""
+    facts = parse_page(LS + path, f'<html><head><title>{title}</title>{ld}</head><body>{LS_NAV}'
+                                  f'<main>{body}</main>{LS_FOOTER}</body></html>')
+    if words is not None:
+        facts.word_count = words
+    return facts
+
+
+def test_contact_us_facts_hold_the_hubspot_form_the_call_link_and_the_address():
+    """D1: the review said /contact-us has "no visible contact form, phone
+    number, or calendar link". The page has all of that but the calendar."""
+    facts = ls_page("/contact-us", '<h1>Contact Legal Soft</h1>' + LS_HUBSPOT_FORM)
+    assert facts.forms == ["hubspot", "newsletter"]   # the HubSpot embed is the contact form
+    assert facts.tel_links == ["tel:+1(424)341-4917"]
+    assert facts.booking_links == []
+    assert facts.has_address and facts.address_text == "21731 Ventura Blvd. Suite 100 Woodland Hills, CA 91364"
+
+
+@pytest.mark.parametrize(("markup", "kind"), [
+    ('<iframe src="https://form.typeform.com/to/abc"></iframe>', "typeform"),
+    ('<div data-tf-widget="abc123"></div>', "typeform"),
+    ('<div class="calendly-inline-widget" data-url="https://calendly.com/acme/intro"></div>', "calendly"),
+    ('<div class="meetings-iframe-container" data-src="https://meetings.hubspot.com/acme"></div>',
+     "hubspot-meetings"),
+    ('<iframe src="https://form.jotform.com/2123"></iframe>', "jotform"),
+    ('<div class="wpforms-container"><div class="wpforms-form"></div></div>', "wpforms"),
+    ('<div class="gform_wrapper"></div>', "gravity-forms"),
+    ('<script src="https://acme.formstack.com/forms/js.php/contact"></script>', "formstack"),
+    ('<iframe src="https://docs.google.com/forms/d/e/1FAIpQ/viewform?embedded=true"></iframe>', "google-forms"),
+    ('<script src="https://www.cognitoforms.com/f/seamless.js" data-key="k"></script>', "cognito"),
+    ('<div class="contact-block w-form"><div class="w-form-done">Thanks</div></div>', "form"),
+    ('<form action="/contact" method="post"><input name="name"></form>', "form"),
+    ('<form role="search"><input type="search" name="q"></form>', "search"),
+    ('<form action="/"><input type="text" name="s"></form>', "search"),
+])
+def test_form_embeds_and_form_kinds_are_recognised(markup, kind):
+    assert parse_page("https://x.com/a", f"<html><body>{markup}</body></html>").forms == [kind]
+
+
+def test_link_facts_are_same_site_paths_calls_mails_and_bookings():
+    facts = parse_page("https://www.legalsoft.com/virtual-paralegal", (
+        '<a href="/practice-areas/personal-injury/">PI</a><a href="practice-areas/family?x=1#top">Fam</a>'
+        '<a href="https://legalsoft.com/pricing">Pricing</a><a href="https://www.legalsoft.com/pricing/">P</a>'
+        '<a href="https://linkedin.com/company/legalsoft">In</a><a href="#faq">FAQ</a>'
+        '<a href="mailto:referrals@legalsoft.com">Mail</a><a href="tel:+1(424)341-4917">Call</a>'
+        '<a href="/book-a-meeting-legal-soft-sales">Book</a><a href="/bookkeeper">Bookkeepers</a>'
+        '<a href="https://calendly.com/legalsoft/intro">Calendly</a>'))
+    assert facts.link_paths == ["/practice-areas/personal-injury", "/practice-areas/family", "/pricing",
+                                "/book-a-meeting-legal-soft-sales", "/bookkeeper"]
+    assert facts.mailto_links == ["mailto:referrals@legalsoft.com"]
+    assert facts.tel_links == ["tel:+1(424)341-4917"]
+    assert facts.booking_links == ["https://www.legalsoft.com/book-a-meeting-legal-soft-sales",
+                                   "https://calendly.com/legalsoft/intro"]       # never /bookkeeper
+
+
+def test_only_real_question_and_answer_pairs_count_toward_faq():
+    """D2: /blog's question headings are post titles inside links; /testimonials'
+    and the partner pages' are marketing hooks. Only a question a visitor asks,
+    not a link, followed by a 25+ word answer, is a Q&A pair."""
+    faq = ls_page("/virtual-paralegal", "<h1>Virtual Paralegals</h1>" + LS_FAQ)
+    assert (faq.q_headings, faq.faq_pairs) == (3, 3)
+    blog = ls_page("/blog", "<h1>Law Firm Success Strategies</h1>" + LS_BLOG_CARDS)
+    assert blog.q_headings == 4 and blog.faq_pairs == 0
+    assert blog.headings_linked * 2 > blog.headings_total               # a listing
+    hooks = ls_page("/testimonials", "<h1>Client Success Stories</h1>" + LS_TESTIMONIAL_HOOKS)
+    assert hooks.q_headings == 3 and hooks.faq_pairs == 0
+    ctas = ls_page("/partners/referral-program", "<h1>Referral Program</h1>" + LS_REFERRAL_CTAS)
+    assert ctas.q_headings == 2 and ctas.faq_pairs == 0
+
+
+def test_a_phone_alone_is_not_a_street_address():
+    phone_only = parse_page("https://x.com/", "<html><body><p>Call (555) 123-4567</p>"
+                                              "<address>hello@x.com</address></body></html>")
+    assert phone_only.has_phone and not phone_only.has_address and phone_only.address_text == ""
+
+
+def test_corpus_entry_stores_the_facts_absence_claims_are_checked_against():
+    facts = ls_page("/contact-us", '<h1>Contact Legal Soft</h1>' + LS_HUBSPOT_FORM)
+    corpus = site_brain.build_corpus({"id": "b", "domain": "legalsoft.com"},
+                                     fetch=lambda url, client=None: facts,
+                                     sitemap=lambda domain, client=None: [LS + "/contact-us"])
+    entry = corpus["pages"][0]
+    assert entry["forms"] == ["hubspot", "newsletter"] and entry["tel_links"] == ["tel:+1(424)341-4917"]
+    assert "/practice-areas/family" in entry["link_paths"] and entry["booking_links"] == []
+    assert entry["address_text"].startswith("21731 Ventura Blvd.")
+    assert {"faq_pairs", "headings_total", "headings_linked", "mailto_links"} <= set(entry)
+
+
+def test_link_targets_fit_the_one_document_corpus_and_say_when_trimmed():
+    """The corpus is one Firestore document (1 MiB). Fifty pages each carrying
+    a 300-link mega-menu of long paths would not fit; the links share a budget,
+    and a trimmed page can no longer prove "it never links to X"."""
+    menu = "".join(f'<a href="/services/category-{i:03d}/a-rather-long-descriptive-service-slug">s</a>'
+                   for i in range(320))
+    pages = {f"https://x.com/p{i}": parse_page(f"https://x.com/p{i}",
+                                               f"<html><head><title>P{i}</title></head><body>{menu}</body></html>")
+             for i in range(50)}
+    assert all(f.link_paths_capped and len(f.link_paths) == 300 for f in pages.values())
+    corpus = site_brain.build_corpus({"id": "b", "domain": "x.com"}, fetch=lambda u, c=None: pages[u],
+                                     sitemap=lambda d: list(pages))
+    total = sum(len(p) + 3 for e in corpus["pages"] for p in e["link_paths"])
+    assert total <= site_brain.LINK_PATHS_BUDGET and all(e["link_paths_capped"] for e in corpus["pages"])
+    entry = corpus["pages"][0]
+    crawled = {"x.com/p0": entry}
+    issue = {"insight": "The page has no links to /about", "evidence": "https://x.com/p0"}
+    assert site_brain.absence_problem(issue, [entry], crawled)[0] == "unverifiable-absence"
+    linked = {"insight": "No links to /services/category-000/a-rather-long-descriptive-service-slug",
+              "evidence": "https://x.com/p0"}
+    assert site_brain.absence_problem(linked, [entry], crawled)[0] == "contradicted-by-page"
+
+
 def test_corpus_entry_stores_schema_question_and_image_fields():
     facts = parse_page("https://x.com/faq", (
         '<html><head><title>FAQ</title><script type="application/ld+json">{"@type": "FAQPage"}'
@@ -334,7 +527,7 @@ def test_corpus_entry_stores_schema_question_and_image_fields():
 def _ai_corpus():
     return [
         _corpus_page(url="https://x.com/pricing", title="P" * 70, schema_types=[], q_headings=0),
-        _corpus_page(url="https://x.com/help", title="Help", schema_types=[], q_headings=3),
+        _corpus_page(url="https://x.com/help", title="Help", schema_types=[], q_headings=3, faq_pairs=3),
         _corpus_page(url="https://x.com/team", title="Team", schema_types=[], q_headings=0),
     ]
 
@@ -382,6 +575,122 @@ def test_schema_advice_on_a_corpus_without_schema_facts_is_dropped(monkeypatch):
     doc = pages_mod.build_page_intel({"id": "b", "domain": "x.com"}, old, [], [])
     assert doc["pages"][0]["rec_source"] != "ai"
     assert doc["grounding"]["dropped"][0]["reason"] == "schema-not-fit"
+
+
+# ------------------- D3: categorised advice, one place per move -------------------
+# The AI lines below are staging's, word for word (2026-10-14 browser test).
+
+def _ai(monkeypatch, lines: dict[str, str]) -> None:
+    import json
+    monkeypatch.setattr(pages_mod, "llm_text", lambda s, p, **kw: json.dumps(
+        [{"path": path, "recommendation": rec} for path, rec in lines.items()]))
+
+
+STAGING_TITLE_LINES = {
+    "/virtual-paralegal": "Shorten the title tag to 'Virtual Paralegal Services for Law Firms | Legal Soft' "
+                          "to stay within 60-character limit.",
+    "/case-manager": "Reduce title tag length to 'Remote Legal Case Manager Services | Legal Soft' to prevent "
+                     "truncation in search results.",
+    "/remote-attorneys": "Condense title to 'Remote Attorneys for Law Firms | Legal Soft' to improve search "
+                         "result appearance.",
+}
+STAGING_LINK_LINES = {
+    "/careers": "Implement internal links from the homepage and about page to increase visibility and drive "
+                "traffic to this high-performing page.",
+    "/legal-assistant": "Build internal links from the homepage and virtual-staffing page to boost this "
+                        "service page's authority and traffic.",
+    "/intake-specialist-remote": "Create targeted blog content about intake processes that links to this page "
+                                 "to increase organic traffic.",
+}
+STAGING_CTA_LINES = {
+    "/": "Add clear call-to-action buttons above the fold to convert the 6,953 views into measurable clicks "
+         "and engagement.",
+    "/contact-us": "Place prominent contact form links on all service pages to convert the existing traffic "
+                   "into leads.",
+}
+
+
+def test_title_advice_on_a_row_whose_chip_says_title_too_long_is_dropped(monkeypatch):
+    """Seven rows on staging said "Shorten title to '…'" beside a "Title too
+    long" chip; the new title's words got past the similarity check. The line
+    is title advice on a title-flagged row — categorised, it is the chip again."""
+    _ai(monkeypatch, {**STAGING_TITLE_LINES,
+                      "/demand-writer": "Add sample demand letters and before/after examples to differentiate "
+                                        "content and improve time-on-page metrics."})
+    corpus = [_corpus_page(url=f"https://x.com{p}", title="T" * 66) for p in STAGING_TITLE_LINES]
+    corpus.append(_corpus_page(url="https://x.com/demand-writer", title="Virtual Demand Writers"))
+    doc = pages_mod.build_page_intel({"id": "b", "domain": "x.com"}, corpus, [], [])
+    by_path = {p["path"]: p for p in doc["pages"]}
+    for path in STAGING_TITLE_LINES:
+        assert by_path[path]["ai"] is False and "title-long" in by_path[path]["flags"]
+    reasons = {d["path"]: d["reason"] for d in doc["grounding"]["dropped"]}
+    assert reasons == {p: "repeats-flags" for p in STAGING_TITLE_LINES}
+    keep = by_path["/demand-writer"]                      # page-specific content advice stays
+    assert (keep["rec_source"], keep["rec_category"]) == ("ai", "content")
+
+
+def test_a_suggested_title_over_60_or_meta_over_160_characters_is_dropped(monkeypatch):
+    """/bookkeeper's suggested title was 61 characters — still too long."""
+    meta = "M" * 161
+    _ai(monkeypatch, {
+        "/bookkeeper": "Shorten title to 'Legal Bookkeeping Services | Virtual Bookkeepers | Legal Soft' "
+                       "to optimize for search display.",
+        "/pricing": f'Rewrite the meta description as "{meta}" to sell the click.',
+        "/team": "Lead the title with 'Legal VA team' so the query comes first.",
+    })
+    corpus = [_corpus_page(url=f"https://x.com{p}", title="Short title") for p in ("/bookkeeper", "/pricing", "/team")]
+    doc = pages_mod.build_page_intel({"id": "b", "domain": "x.com"}, corpus, [], [])
+    dropped = {d["path"]: d for d in doc["grounding"]["dropped"]}
+    assert dropped["/bookkeeper"]["reason"] == "suggestion-too-long"
+    assert dropped["/bookkeeper"]["detail"].startswith("the suggested title is 61 characters")
+    assert dropped["/pricing"]["reason"] == "suggestion-too-long"
+    team = next(p for p in doc["pages"] if p["path"] == "/team")   # 13 characters, no chip: kept
+    assert (team["rec_source"], team["rec_category"]) == ("ai", "title")
+
+
+def test_hygiene_advice_the_audit_already_owns_is_dropped_without_a_chip(monkeypatch):
+    _ai(monkeypatch, {"/team": "Give the page a unique title tag naming the paralegal team."})
+    report = {"issues": [{"issue": "Duplicate titles", "severity": "medium", "pages": ["https://x.com/team"],
+                          "fix": "f", "count": 1}]}
+    doc = pages_mod.build_page_intel({"id": "b", "domain": "x.com"},
+                                     [_corpus_page(url="https://x.com/team", title="Team")], [], [],
+                                     audit_report=report)
+    assert doc["pages"][0]["ai"] is False
+    assert doc["grounding"]["dropped"][0]["reason"] == "repeats-flags"
+    assert "technical audit" in doc["grounding"]["dropped"][0]["detail"]
+
+
+def test_internal_linking_on_three_rows_moves_to_one_fix_list_item(monkeypatch):
+    """Internal linking was on six rows plus Fix #6. Three or more rows giving
+    the same site-wide move collapse into ONE Fix-list item naming the pages."""
+    _ai(monkeypatch, {**STAGING_LINK_LINES, **STAGING_CTA_LINES})
+    paths = list(STAGING_LINK_LINES) + list(STAGING_CTA_LINES)
+    doc = pages_mod.build_page_intel(
+        {"id": "b", "domain": "x.com"},
+        [_corpus_page(url=f"https://x.com{p}", title="T") for p in paths],
+        [{"path": p, "views": 100 - i, "sessions": 1, "engagement_rate": 0.5} for i, p in enumerate(paths)], [])
+    by_path = {p["path"]: p for p in doc["pages"]}
+    assert all(by_path[p]["ai"] is False for p in STAGING_LINK_LINES)          # off the rows
+    assert doc["fix_items"] == [{"category": "internal-links", "paths": list(STAGING_LINK_LINES),
+                                 "todo_id": None}]
+    moved = [d for d in doc["grounding"]["dropped"] if d["reason"] == "moved-to-fix-list"]
+    assert sorted(d["path"] for d in moved) == sorted(STAGING_LINK_LINES)
+    # two CTA rows and no CTA to-do on the Fix list: they stay where they are
+    assert all(by_path[p]["rec_category"] == "cta" for p in STAGING_CTA_LINES)
+
+
+def test_cta_advice_joins_the_site_todo_that_already_says_it(monkeypatch):
+    _ai(monkeypatch, STAGING_CTA_LINES)
+    site = [{"id": "t5", "kind": "site", "category": "conversion", "page": "https://x.com/contact-us",
+             "action": "Embed a 3-field form above the fold, add a click-to-call number, and link to a Calendly",
+             "why": "Contact page dead-ends"}]
+    doc = pages_mod.build_page_intel(
+        {"id": "b", "domain": "x.com"},
+        [_corpus_page(url=f"https://x.com{p}", title="T") for p in STAGING_CTA_LINES], [], [], site_todos=site)
+    assert doc["fix_items"] == [{"category": "cta", "paths": ["/", "/contact-us"], "todo_id": "t5"}]
+    assert not [p for p in doc["pages"] if p["ai"]]
+    folded = site_brain.fold_page_advice("b", site, doc["fix_items"])
+    assert folded[0]["pages"] == ["/contact-us", "/"]          # its own page first, once
 
 
 def test_page_known_only_from_ga_is_flagged_not_crawled():

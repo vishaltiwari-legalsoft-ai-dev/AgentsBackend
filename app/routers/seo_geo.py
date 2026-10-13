@@ -90,7 +90,7 @@ def _rows_28d(brand: dict) -> tuple[list, list[str]]:
     try:
         return sources.gsc_fetch(prop, end - timedelta(days=28), end), []
     except CredentialMissing as exc:
-        return [], [f"Search Console: {exc}"]
+        return [], [sources.plain_note(f"Search Console: {exc}")]
 
 
 def _brand_or_404(brand_id: str) -> dict:
@@ -210,34 +210,46 @@ def _plan_of_action(brand_id: str, run: dict | None) -> list[dict]:
     The Fix list renders below this strip, so its #1 item is never repeated
     here (not even re-worded as a keyword move), and no two moves in the strip
     are the same move in different words.
+
+    A move that IS a Fix-list item is a reference, not a copy: it carries
+    ``ref_todo_id`` and ``ref_index`` (its 1-based Fix-list position) and a
+    ``label`` of at most eight words, and the console says "See Fix list #n"
+    instead of printing the item's action and why a second time. Moves from
+    other surfaces have ``ref_todo_id``/``ref_index`` None and a label too.
+    ``action``/``detail`` stay on every item for consoles that predate this.
     """
     todos = (run or {}).get("todos", [])
     shown_below = [todos[0]["action"]] if todos else []
     plan: list[dict] = []
 
-    def add(source: str, action: str, detail: str) -> bool:
+    def add(source: str, action: str, detail: str, label: str,
+            ref: dict | None = None, index: int | None = None) -> bool:
         taken = shown_below + [p["action"] for p in plan]
         if any(seo_audit.similar(action, other) for other in taken):
             return False
-        plan.append({"source": source, "action": action, "detail": detail})
+        plan.append({"source": source, "action": action, "detail": detail, "label": label,
+                     "ref_todo_id": ref["id"] if ref else None, "ref_index": index})
         return True
 
-    for todo in todos[1:]:
-        if todo.get("status") != "done" and add("fix list", todo["action"], todo["why"]):
+    for index, todo in enumerate(todos[1:], start=2):
+        if todo.get("status") != "done" and add("fix list", todo["action"], todo["why"],
+                                                insights.todo_label(todo), todo, index):
             break
     lab = seo_keywords.latest(brand_id) or {}
     for cluster in lab.get("clusters", []):
         if cluster.get("tier") == "high" and add(
-                "keywords", f"Go after “{cluster['name']}”", cluster.get("recommendation", "")):
+                "keywords", f"Go after “{cluster['name']}”", cluster.get("recommendation", ""),
+                insights.short_label(f"Go after “{cluster['name']}”")):
             break
     report = seo_audit.latest_audit(brand_id) or {}
     issue = next((i for i in report.get("issues", []) if i["severity"] == "high"), None)
     if issue:
-        add("audit", f"Fix: {issue['issue']}", issue["fix"])
+        add("audit", f"Fix: {issue['issue']}", issue["fix"], insights.short_label(f"Fix: {issue['issue']}"))
     else:
         failed = next((c for c in report.get("site_checks", []) if not c["ok"]), None)
         if failed:
-            add("audit", f"Fix: {failed['name']}", failed["fix"])
+            add("audit", f"Fix: {failed['name']}", failed["fix"],
+                insights.short_label(f"Fix: {failed['name']}"))
     return plan[:3]
 
 
@@ -251,7 +263,7 @@ def brand_detail(brand_id: str, user=Depends(get_current_user)):
         "run": run,
         "gsc": _gsc_view(brand, conn, run),
         "plan": _plan_of_action(brand_id, run),
-        "site_review": seo_site.latest_review(brand_id),
+        "site_review": seo_site.checked_review(brand_id),
     }
 
 
@@ -272,7 +284,7 @@ def run_site_review(brand_id: str, user=Depends(get_current_user),
 @router.get("/seo-geo/site-review/{brand_id}")
 def get_site_review(brand_id: str, user=Depends(get_current_user)):
     _brand_or_404(brand_id)
-    return {"review": seo_site.latest_review(brand_id)}
+    return {"review": seo_site.checked_review(brand_id)}
 
 
 # ------------------------- page intelligence -------------------------
@@ -299,8 +311,14 @@ def refresh_pages(brand_id: str, user=Depends(get_current_user),
             end = date.today()
             ga_pages = ga_fetch_pages(prop, end - timedelta(days=28), end)
         except CredentialMissing as exc:
-            notes.append(f"Google Analytics: {exc}")
-    intel = seo_pages.build_page_intel(brand, corpus["pages"], ga_pages, rows, data_notes=notes)
+            notes.append(sources.plain_note(f"Google Analytics: {exc}"))
+    # Page advice a site to-do already covers is folded into it, and the stored
+    # Fix list is brought in line — the rows must not point at an item that is
+    # not there.
+    site = seo_site.site_todos(brand_id)
+    intel = seo_pages.build_page_intel(brand, corpus["pages"], ga_pages, rows, data_notes=notes,
+                                       site_todos=site, audit_report=seo_audit.latest_audit(brand_id))
+    insights.refold_page_advice(brand_id, intel, site)
     act.note(f"Rebuilt page intelligence for {brand['domain']}")
     return intel
 
@@ -376,12 +394,12 @@ def track_competitors(brand_id: str, user=Depends(get_current_user),
     try:
         seo_competitors.rank_snapshot(brand)
     except CredentialMissing as exc:
-        degraded.append(str(exc))
+        degraded.append(sources.plain_note(f"Rank tracking: {exc}"))
     feed = {}
     try:
         feed = seo_competitors.sitemap_watch(brand)
     except CredentialMissing as exc:
-        degraded.append(f"Sitemap watch: {exc}")
+        degraded.append(sources.plain_note(f"Sitemap watch: {exc}"))
     return {"shifts": seo_competitors.rank_shifts(brand_id), "feed": feed, "degraded": degraded}
 
 

@@ -6,7 +6,7 @@ import re
 from datetime import date
 from urllib.parse import urlparse
 
-from . import audit, state
+from . import audit, sources, state
 from .sources import CredentialMissing, llm_text
 
 MAX_AI_PAGES = 25
@@ -66,6 +66,88 @@ FLAG_VOCAB = {f: audit.content_tokens(t) | _FLAG_SYNONYMS[f] for f, t in FLAG_TE
 #: page row they are chips — the same sentence on forty rows is noise.
 AUDIT_GROUPED_FLAGS = frozenset({"no-title", "title-long", "no-meta", "no-h1", "images-no-alt"})
 REWORD_SHARE = 0.6
+
+# ------------------------------ advice categories ------------------------------
+# Text similarity to the chip ("Shorten the title…" vs "title too long") missed
+# rewordings that carry a new title: the line was still about the title, on a
+# row whose chip already says the title is the problem. So every AI line is
+# CATEGORISED, and the category decides: hygiene the row or the audit owns is
+# dropped; a site-wide move (internal links, a clear next step) goes to ONE
+# place — the Fix list — instead of six rows.
+
+REC_CATEGORIES = ("title", "meta", "h1", "alt", "schema", "cta", "internal-links", "content", "other")
+HYGIENE_CATEGORIES = frozenset({"title", "meta", "h1", "alt", "schema"})
+#: Categories that are one site-wide move when several rows (or a site to-do) say them.
+COLLAPSE_CATEGORIES = ("internal-links", "cta")
+COLLAPSE_MIN_ROWS = 3
+_CATEGORY_RULES = (
+    ("title", re.compile(r"(?<!job )(?<!sub)\btitle(?: tags?)?s?\b", re.I)),
+    ("meta", re.compile(r"\bmeta(?: descriptions?| tags?)?\b|\bsnippets?\b", re.I)),
+    ("h1", re.compile(r"\bh1s?\b|\bmain heading\b", re.I)),
+    ("alt", re.compile(r"\balt(?:[- ]text| attributes?| tags?)\b|\bimage descriptions?\b", re.I)),
+    ("schema", audit._SCHEMA_MENTION),
+    ("cta", re.compile(r"\bcalls?[- ]to[- ]action\b|\bctas?\b|\bforms?\b|\bclick[- ]to[- ]call\b|"
+                       r"\bbook(?:ing)? (?:a |an )?(?:call|demo|meeting|consultation)\b|\bcalendly\b|"
+                       r"\bbuttons?\b|\bnext step\b|\bphone numbers?\b", re.I)),
+    ("internal-links", re.compile(r"\binternal(?:ly)? link|\bcross[- ]?link|\binterlink|"
+                                  r"\blinks? (?:to|from|pointing)\b|\blinking (?:to|from)\b", re.I)),
+    ("content", re.compile(r"\b(?:content|expand|sections?|faqs?|case stud(?:y|ies)|testimonials?|"
+                           r"videos?|screenshots?|examples?|descriptions?|trust signals?|publish|"
+                           r"articles?|blog|guides?|words?|copy|proof|reviews?|statistics|samples?|"
+                           r"demonstrations?)\b", re.I)),
+)
+#: The row chips that already say a hygiene category's problem.
+_CATEGORY_FLAGS = {"title": {"no-title", "title-long"}, "meta": {"no-meta", "meta-long"},
+                   "h1": {"no-h1"}, "alt": {"images-no-alt"}, "schema": set()}
+_SUGGESTION_MAX = {"title": TITLE_MAX, "meta": META_MAX}
+#: A quoted span: opens after a space / "(" / ":" and closes before a space or
+#: punctuation, so the apostrophe in "Legal Soft's" is not a closing quote.
+_QUOTED = re.compile(r"(?:(?<=\s)|^|(?<=[(:]))['‘“\"](.+?)['’”\"](?=[\s.,;:!?)]|$)")
+
+
+def rec_category(text: str) -> str:
+    """What one piece of advice is about — one of :data:`REC_CATEGORIES`."""
+    for name, rx in _CATEGORY_RULES:
+        if rx.search(text or ""):
+            return name
+    return "other"
+
+
+def suggested_text(rec: str) -> str | None:
+    """The new title / meta a line proposes: its last quoted span."""
+    spans = _QUOTED.findall(rec or "")
+    return spans[-1].strip() if spans else None
+
+
+def _audit_category(issue: dict) -> str | None:
+    """The hygiene category an audit finding owns, if any. Decorative alt
+    text is information, not a finding about the page."""
+    kind, name = issue.get("kind"), str(issue.get("issue") or "").lower()
+    if kind in ("schema-fit", "schema-error"):
+        return "schema"
+    if kind in ("template-alt", "page-alt"):
+        return "alt"
+    if kind in ("title-long", "title-template") or "title" in name:
+        return "title"
+    if "meta description" in name:
+        return "meta"
+    if "h1" in name:
+        return "h1"
+    return None
+
+
+def audit_owned(report: dict | None) -> dict[str, set[str]]:
+    """``{category: {path, …}}`` — the pages each hygiene category is already
+    an audit finding for."""
+    owned: dict[str, set[str]] = {}
+    for issue in (report or {}).get("issues") or []:
+        category = _audit_category(issue)
+        if not category:
+            continue
+        urls = list(issue.get("pages") or []) + [e.get("page") for e in issue.get("evidence") or []
+                                                  if isinstance(e, dict)]
+        owned.setdefault(category, set()).update(_path(u) for u in urls if isinstance(u, str) and u)
+    return owned
 
 
 def _path(url: str) -> str:
@@ -150,32 +232,82 @@ def rewords_flags(recommendation: str, flags: list[str]) -> bool:
 
 
 def _ground_recs(recs: dict[str, str], rows: dict[str, dict], corpus_by_path: dict[str, dict],
-                 site_types) -> tuple[dict[str, str], dict]:
+                 site_types, owned: dict[str, set[str]] | None = None) -> tuple[dict[str, str], dict]:
     """Keep AI advice that says something the page row does not already say.
 
-    Dropped (and recorded): advice for a path that was not sent, advice that
-    re-words the page's flags, and schema advice that does not fit the page
-    (``audit.schema_claim_problem``).
+    Dropped (and recorded): advice for a path that was not sent; a proposed
+    title over 60 characters or meta over 160 (``suggestion-too-long``); a
+    hygiene line (title / meta / H1 / alt / schema) when the row's chip or
+    the audit (``owned``, from :func:`audit_owned`) already reports it, or
+    that re-words the flags (``repeats-flags``); and schema advice that does
+    not fit the page (``audit.schema_claim_problem``). Each kept line's
+    category rides in ``grounding["categories"]``.
     """
+    owned = owned or {}
     kept: dict[str, str] = {}
+    categories: dict[str, str] = {}
     dropped: list[dict] = []
+
+    def drop(path: str, reason: str, rec: str, detail: str) -> None:
+        dropped.append({"path": path, "reason": reason, "recommendation": rec[:200], "detail": detail[:200]})
+
     for path, rec in recs.items():
         row = rows.get(path)
         if row is None or path not in corpus_by_path:
-            dropped.append({"path": path, "reason": "unknown-page", "recommendation": rec[:200],
-                            "detail": "not one of the crawled pages sent for advice"})
+            drop(path, "unknown-page", rec, "not one of the crawled pages sent for advice")
             continue
-        if rewords_flags(rec, row.get("flags") or []):
-            dropped.append({"path": path, "reason": "repeats-flags", "recommendation": rec[:200],
-                            "detail": f"restates {', '.join(row['flags'])}"})
+        flags = row.get("flags") or []
+        category = rec_category(rec)
+        limit = _SUGGESTION_MAX.get(category)
+        proposed = suggested_text(rec) if limit else None
+        if proposed and len(proposed) > limit:
+            drop(path, "suggestion-too-long", rec,
+                 f"the suggested {category} is {len(proposed)} characters — over the {limit} limit")
+            continue
+        if category in HYGIENE_CATEGORIES:
+            chip = sorted(set(flags) & _CATEGORY_FLAGS[category])
+            if chip or path in owned.get(category, set()):
+                drop(path, "repeats-flags", rec,
+                     f"{category} advice — " + (f"the row already shows {', '.join(chip)}" if chip
+                                               else "the technical audit already reports it"))
+                continue
+        if rewords_flags(rec, flags):
+            drop(path, "repeats-flags", rec, f"restates {', '.join(flags)}")
             continue
         problem = audit.schema_claim_problem(rec, corpus_by_path[path], site_types)
         if problem:
-            dropped.append({"path": path, "reason": "schema-not-fit", "recommendation": rec[:200],
-                            "detail": problem[:200]})
+            drop(path, "schema-not-fit", rec, problem)
             continue
         kept[path] = rec
-    return kept, {"kept": len(kept), "dropped": dropped}
+        categories[path] = category
+    return kept, {"kept": len(kept), "dropped": dropped, "categories": categories}
+
+
+def _collapse(kept: dict[str, str], categories: dict[str, str], order: list[str],
+              site_todos: list[dict] | None, dropped: list[dict]) -> list[dict]:
+    """Site-wide advice in ONE place -> ``fix_items``; the rows stop saying it.
+
+    For each of :data:`COLLAPSE_CATEGORIES`: when :data:`COLLAPSE_MIN_ROWS`+
+    rows give it, or a site to-do on the Fix list is already that move, the
+    rows' lines are dropped (``moved-to-fix-list``) and one fix item names the
+    affected paths and the site to-do (``todo_id``, None = a new item)."""
+    held: dict[str, dict] = {}
+    for todo in site_todos or []:
+        category = rec_category(f"{todo.get('action', '')} {todo.get('why', '')}")
+        if category in COLLAPSE_CATEGORIES:
+            held.setdefault(category, todo)
+    items: list[dict] = []
+    for category in COLLAPSE_CATEGORIES:
+        paths = [p for p in order if p in kept and categories.get(p) == category]
+        todo = held.get(category)
+        if not paths or (len(paths) < COLLAPSE_MIN_ROWS and todo is None):
+            continue
+        where = f"Fix-list item “{todo['action'][:80]}”" if todo else "one Fix-list item"
+        for p in paths:
+            dropped.append({"path": p, "reason": "moved-to-fix-list", "recommendation": kept.pop(p)[:200],
+                            "detail": f"{category} advice on {len(paths)} pages — listed once, as the {where}"[:200]})
+        items.append({"category": category, "paths": paths, "todo_id": todo["id"] if todo else None})
+    return items
 
 
 def _ai_recs(pages: list[dict]) -> dict[str, str]:
@@ -207,12 +339,13 @@ def _entry(merged: dict, path: str) -> dict:
         "views": 0, "sessions": 0, "engagement_rate": 0.0,
         "clicks": 0, "impressions": 0, "position": None,
         "best_query": None, "flags": [], "recommendation": "", "ai": False,
-        "rec_source": "flags", "rec_chip": None, "word_count": 0,
+        "rec_source": "flags", "rec_chip": None, "rec_category": None, "word_count": 0,
     })
 
 
 def build_page_intel(brand: dict, corpus_pages: list[dict], ga_pages: list[dict], gsc_rows: list,
-                      data_notes: list[str] | None = None) -> dict:
+                      data_notes: list[str] | None = None, *, site_todos: list[dict] | None = None,
+                      audit_report: dict | None = None) -> dict:
     """Merge GA + Search Console + on-page health into one per-page table, keyed
     by URL path. A page appears if it's in ANY source; missing-source fields
     default to 0/None. Adds one best-effort AI recommendation pass (top-traffic
@@ -265,6 +398,8 @@ def build_page_intel(brand: dict, corpus_pages: list[dict], ga_pages: list[dict]
     notes: list[str] = list(data_notes or [])
     ai_used = False
     recs: dict[str, str] = {}
+    categories: dict[str, str] = {}
+    fix_items: list[dict] = []
     grounding: dict = {"kept": 0, "dropped": []}
     if ai_candidates:
         try:
@@ -278,20 +413,33 @@ def build_page_intel(brand: dict, corpus_pages: list[dict], ga_pages: list[dict]
             known = all("schema_types" in cp for cp in corpus_pages)
             site_types = ({t for cp in corpus_pages for t in cp.get("schema_types") or []}
                           if corpus_pages and known else None)
-            recs, grounding = _ground_recs(raw_recs, merged, corpus_by_path, site_types)
+            recs, grounding = _ground_recs(raw_recs, merged, corpus_by_path, site_types,
+                                           audit_owned(audit_report))
+            categories = grounding.pop("categories")
+            fix_items = _collapse(recs, categories, [p["path"] for p in merged_list], site_todos,
+                                  grounding["dropped"])
+            grounding["kept"] = len(recs)
 
     for p in merged_list:
         p["ai"] = p["path"] in recs
         if p["ai"]:
             p["recommendation"], p["rec_source"], p["rec_chip"] = recs[p["path"]], "ai", None
+            p["rec_category"] = categories.get(p["path"])
         else:
             p["recommendation"], p["rec_source"], p["rec_chip"] = _rule_rec(p)
+            p["rec_category"] = None
 
     doc = {"brand_id": brand["id"], "at": date.today().isoformat(),
-           "ai": ai_used, "notes": notes, "grounding": grounding, "pages": merged_list}
+           "ai": ai_used, "notes": notes, "grounding": grounding, "pages": merged_list,
+           "fix_items": fix_items}
     state.save(f"pages-{brand['id']}", doc)
     return doc
 
 
 def latest(brand_id: str) -> dict | None:
-    return state.load(f"pages-{brand_id}")
+    doc = state.load(f"pages-{brand_id}")
+    if doc:
+        # A doc stored before notes were made plain still carries raw exception text.
+        doc["notes"] = [sources.plain_note(n, log=False) for n in doc.get("notes") or []
+                        if isinstance(n, str)]
+    return doc

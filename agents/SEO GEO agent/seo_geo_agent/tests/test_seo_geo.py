@@ -521,10 +521,20 @@ def test_topics_without_serper_still_built_from_gsc():
     assert all(t["difficulty"] is None for t in ranked)
 
 
-def test_question_angle_detection():
-    assert topics._angle("how to hire a paralegal") == "FAQ answer"
-    assert topics._angle("virtual assistant cost per hour") == "pricing guide"
-    assert topics._angle("clio vs mycase") == "comparison"
+@pytest.mark.parametrize(("keyword", "angle"), [
+    # buyer intent (commercial / transactional): a page that sells or compares
+    ("law firm intake services", "service page"),            # was "how-to guide" on staging
+    ("outsourced legal billing", "service page"),
+    ("virtual paralegal cost", "pricing explainer"),
+    ("legal virtual assistant reviews and ratings", "comparison"),
+    ("clio vs mycase", "comparison"),
+    # informational: a guide, or a FAQ answer for a question that is not "how to"
+    ("remote legal secretary", "how-to guide"),
+    ("how to onboard a remote paralegal", "how-to guide"),
+    ("what does a legal virtual assistant do", "FAQ answer"),
+])
+def test_the_angle_comes_from_the_search_intent(keyword, angle):
+    assert topics._angle(keyword, keywords.intent_of(keyword)) == angle
 
 
 # ------------------------- blog plan: intent + gaps + cannibalization -------------------------
@@ -548,8 +558,10 @@ def test_every_topic_has_intent():
 
 
 def test_cannibalizing_candidate_marked_avoided_and_sorted_last():
-    brand = {"id": "b", "domain": "x.com",
-             "seeds": ["legal virtual assistant cost", "paralegal staffing help"]}
+    """Only a candidate the user did NOT type is avoided — a suggested seed here."""
+    brand = {"id": "b", "domain": "x.com", "seeds": ["paralegal staffing help"],
+             "seed_entries": [{"text": "paralegal staffing help", "source": "seed"},
+                              {"text": "legal virtual assistant cost", "source": "suggested seed"}]}
     rows = [
         row(query="legal virtual assistant cost", impressions=900, position=3.0),
         row(query="paralegal staffing help", impressions=500, position=3.0),
@@ -818,6 +830,140 @@ def test_site_gap_candidates_carry_their_source():
     assert {t["keyword"] for t in gaps} == {"legal intake checklist", "law firm pricing comparisons"}
     assert all(t["from_seed"] is None for t in gaps)
     assert topics.NO_REVIEW_NOTE not in notes and topics.EMPTY_REVIEW_NOTE not in notes
+
+
+# --------------- D4/D5: the blog plan defers to the Fix list, seeds stay live ---------------
+
+#: Staging's Fix list #1-#4 (rank mode): the keywords those page moves target.
+STAGING_FIX = [
+    {"id": "d550b5585f0f", "kind": "striking", "query": "law firm intake services", "position": 10},
+    {"id": "912fbf2195ee", "kind": "unranked", "query": "virtual paralegal services", "position": 0},
+    {"id": "fbe67c81dbe3", "kind": "unranked", "query": "remote legal secretary", "position": 0},
+    {"id": "41c6f7740285", "kind": "unranked", "query": "personal injury case management", "position": 0},
+    {"id": "6ffdb5858bd2", "kind": "site", "query": "", "position": 0},
+]
+
+
+def test_fix_list_keywords_are_not_offered_again_as_blog_topics():
+    """Staging's blog plan re-offered four Fix-list keywords as posts. A
+    non-seed topic that IS one is dropped; a typed seed stays (hard
+    requirement) and says the page move comes first."""
+    brand = {"id": "b", "domain": "legalsoft.com", "seeds": [],
+             "seed_entries": [{"text": "law firm intake services", "source": "seed"},
+                              {"text": "personal injury case management", "source": "seed"},
+                              {"text": "virtual paralegal services", "source": "suggested seed"}]}
+    review = {"missing_topics": ["remote legal secretary", "virtual paralegal qualifications"],
+              "covered_topics": []}
+    ranked, _ = topics.build_topics(brand, [], [], search=None, site_review=review,
+                                    fix_queries=topics.fix_query_index(STAGING_FIX))
+    by_kw = {t["keyword"]: t for t in ranked}
+    assert "virtual paralegal services" not in by_kw and "remote legal secretary" not in by_kw
+    assert "virtual paralegal qualifications" in by_kw and by_kw["virtual paralegal qualifications"]["also_in_fix"] is None
+    intake = by_kw["law firm intake services"]
+    assert (intake["source"], intake["avoided"], intake["also_in_fix"]) == ("seed", False, 1)
+    assert intake["why"] == ("You listed this as a seed keyword · Also on your Fix list as #1 — that page "
+                             "update comes first.")
+    assert by_kw["personal injury case management"]["also_in_fix"] == 4
+
+
+def test_a_typed_seed_never_goes_to_avoided():
+    """'legal virtual assistant' — we rank #1 with /pricing — was in Avoided:
+    the user's stated input dropped from the plan. It stays live, with a note."""
+    serp = {"organic": [{"link": "https://www.legalsoft.com/pricing", "title": "Pricing", "position": 1}]
+            + [{"link": f"https://big{i}.com/x", "title": "t", "position": i + 2} for i in range(9)],
+            "related": [], "paa": [], "aio_present": False}
+    corpus = [{"url": "https://www.legalsoft.com/pricing", "title": "Legal Virtual Assistant Pricing",
+               "target_query": "legal virtual assistant pricing"},
+              {"url": "https://www.legalsoft.com/virtual-paralegal", "title": "Virtual Paralegal Services",
+               "target_query": "virtual paralegal services"}]
+    brand = {"id": "b", "domain": "legalsoft.com",
+             "seeds": ["legal virtual assistant", "virtual paralegal services"]}
+    ranked, _ = topics.build_topics(brand, [], [], search=lambda q: serp if "assistant" in q else STRONG_SERP,
+                                    corpus_pages=corpus)
+    by_kw = {t["keyword"]: t for t in ranked}
+    lva, vps = by_kw["legal virtual assistant"], by_kw["virtual paralegal services"]
+    assert lva["avoided"] is False and vps["avoided"] is False and lva["avoided_reason"] is None
+    assert lva["why"] == ("You listed this as a seed keyword · You already rank #1 with /pricing — refresh "
+                          "that page rather than writing a new post.")
+    assert lva["refresh_url"] == "https://www.legalsoft.com/pricing"
+    assert vps["why"].endswith("Your page /virtual-paralegal already targets this — refresh it rather than "
+                               "writing a new post.")
+
+
+def test_difficulty_counts_our_own_page_in_the_top_ten():
+    """Blog #9 said 'top 10 is all strong sites' while we ranked #10 ourselves."""
+    serp = {"organic": [{"link": f"https://big{i}.com/x", "title": "t", "position": i + 1} for i in range(9)]
+            + [{"link": "https://www.legalsoft.com/intake-specialist-remote", "title": "Us", "position": 10}],
+            "related": [], "paa": [], "aio_present": False}
+    assert topics._difficulty(serp, "legalsoft.com") == (
+        "hard", ["we rank #10 with /intake-specialist-remote", "the rest of the top 10 is strong sites"])
+    assert topics._difficulty(STRONG_SERP, "legalsoft.com") == ("hard", ["top 10 is all strong sites"])
+
+
+def test_company_names_are_not_blog_topics():
+    """'On demand Paralegal Services LLC' came from Google suggestions."""
+    def search(q):
+        return {**STRONG_SERP, "related": ["On demand Paralegal Services LLC", "Smith & Associates paralegal",
+                                           "zirtual paralegal reviews", "virtual paralegal services cost",
+                                           "paralegal certification requirements"]}
+
+    brand = {"id": "b", "domain": "legalsoft.com", "seeds": ["virtual paralegal services"]}
+    ranked, _ = topics.build_topics(
+        brand, [], [], search=search, max_checks=0,
+        competitor_domains=["zirtual.com", "virtualparalegalservices.com", "paralegal.com"])
+    kws = {t["keyword"] for t in ranked}
+    assert "On demand Paralegal Services LLC" not in kws and "Smith & Associates paralegal" not in kws
+    assert "zirtual paralegal reviews" not in kws                    # a ranking competitor's brand
+    # an exact-match domain or a generic word that a competitor owns is not a brand
+    assert {"virtual paralegal services cost", "paralegal certification requirements"} <= kws
+
+
+def test_impact_is_the_topics_own_numbers_or_nothing():
+    """'Builds topical authority — compounds into rankings for the whole
+    cluster.' was on eight of ten topics."""
+    rows = [row(query="legal intake checklist", impressions=900, position=15.0)]
+    brand = {"id": "b", "domain": "x.com", "seeds": ["legal intake checklist", "remote legal secretary",
+                                                    "virtual staffing contract terms"]}
+    ranked, _ = topics.build_topics(brand, rows, [], search=None)
+    by_kw = {t["keyword"]: t for t in ranked}
+    assert by_kw["legal intake checklist"]["impact"] == (
+        "Could bring ~99 clicks a month for “legal intake checklist” once it ranks on page one.")
+    assert by_kw["remote legal secretary"]["impact"] == "" == by_kw["virtual staffing contract terms"]["impact"]
+    lines = [t["impact"] for t in ranked if t["impact"]]
+    assert len(lines) == len(set(lines))
+
+
+def test_a_run_lists_each_move_once(monkeypatch):
+    """One run, end to end: internal-link advice on three page rows becomes ONE
+    Fix-list item naming the pages, and the typed seeds that ARE Fix-list
+    keywords stay in the blog plan pointing at their Fix-list position."""
+    import json
+
+    from seo_geo_agent import pages as pages_mod
+
+    brand = insights.list_brands()[0]   # legalsoft: seeds "legal virtual assistant", "law firm answering service"
+    monkeypatch.setattr(insights.competitors, "rank_snapshot", lambda b: {"snapshots": [{"at": "2026-10-14",
+        "ranks": {"legal virtual assistant": {"position": 6, "top": ["comp.com"]},
+                  "law firm answering service": {"position": None, "top": ["comp.com"]}}}]})
+    paths = ["/careers", "/legal-assistant", "/intake-specialist-remote"]
+    state.save("corpus-legalsoft", {"brand_id": "legalsoft", "pages": [
+        {"url": f"https://legalsoft.com{p}", "title": "T", "word_count": 800, "meta_description": "d",
+         "h1_count": 1, "images_no_alt": 0} for p in paths]})
+    monkeypatch.setattr(pages_mod, "llm_text", lambda s, p, **kw: json.dumps(
+        [{"path": p, "recommendation": f"Build internal links from the homepage to {p}."} for p in paths]))
+
+    run = insights.run_brand(brand, trigger="t", today=date(2026, 10, 14))
+    assert [t["kind"] for t in run["todos"]] == ["striking", "unranked", "site"]
+    advice = run["todos"][2]
+    assert (advice["origin"], advice["category"], advice["pages"]) == ("page-advice", "internal-links", paths)
+    assert not [p for p in pages_mod.latest("legalsoft")["pages"] if p["ai"]]   # off the rows
+    by_kw = {t["keyword"]: t for t in run["topics"]}
+    assert by_kw["legal virtual assistant"]["also_in_fix"] == 1
+    assert by_kw["law firm answering service"]["also_in_fix"] == 2
+    # statuses stick to the item, like any to-do
+    insights.set_todo_status("legalsoft", advice["id"], "assigned")
+    again = insights.run_brand(brand, trigger="t", today=date(2026, 10, 14))
+    assert next(t for t in again["todos"] if t["id"] == advice["id"])["status"] == "assigned"
 
 
 def test_covered_topics_are_dropped_but_never_a_typed_seed(monkeypatch):

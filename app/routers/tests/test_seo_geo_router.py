@@ -198,6 +198,96 @@ def test_this_week_strip_skips_fix_list_first_even_when_it_is_the_only_todo():
     assert client.get("/api/seo-geo/brands/legalsoft").json()["plan"] == []
 
 
+def test_this_week_strip_items_point_at_the_fix_list_instead_of_copying_it():
+    """Staging's strip copied Fix #2's action and why word for word. A strip
+    item that IS a Fix-list item now carries its id, its 1-based position and a
+    label of at most eight words; the console renders "See Fix list #n"."""
+    from seo_geo_agent import state as seo_state
+
+    unranked = {"id": "912fbf2195ee", "kind": "unranked", "page": "", "query": "virtual paralegal services",
+                "action": "Create or strengthen a page targeting 'virtual paralegal services'",
+                "why": "Not in the top 10 — currently owned by virtualparalegalservices.com, agilelegal.com",
+                "est_monthly_clicks": None, "position": 0, "impressions": None, "status": "todo"}
+    seo_state.save("run-legalsoft", {
+        "brand_id": "legalsoft", "at": "2026-10-14", "trigger": "t", "degraded": [], "summary": {},
+        "insights": [], "topics": [], "ga": None, "todos": [
+            {**unranked, "id": "d550b5585f0f", "kind": "striking", "query": "law firm intake services",
+             "action": "Refresh the page targeting 'law firm intake services'", "position": 10},
+            unranked]})
+    seo_state.save("keywords-legalsoft", {"clusters": [
+        {"name": "law firm answering service pricing for small and solo firms", "tier": "high",
+         "recommendation": "a new page"}]})
+    seo_state.save("audit-legalsoft", {"issues": [
+        {"issue": "Broken or unreachable pages", "severity": "high", "fix": "Redirect them"}], "site_checks": []})
+
+    plan = client.get("/api/seo-geo/brands/legalsoft").json()["plan"]
+    fix, kw, audit_item = plan
+    assert (fix["ref_todo_id"], fix["ref_index"]) == ("912fbf2195ee", 2)
+    assert fix["label"] == "New page: “virtual paralegal services”"
+    assert (fix["action"], fix["detail"]) == (unranked["action"], unranked["why"])   # kept for older consoles
+    assert (kw["ref_todo_id"], kw["ref_index"], audit_item["ref_todo_id"]) == (None, None, None)
+    assert kw["label"] == "Go after “law firm answering service pricing for…"
+    assert audit_item["label"] == "Fix: Broken or unreachable pages"
+    assert all(len(p["label"].split()) <= 8 for p in plan)
+
+
+def test_brand_detail_rechecks_the_stored_review_and_says_failures_plainly():
+    """D1 + D9 on the payload staging served: Fix #5's false "no form" claim
+    and a raw ``<HttpError 403 …>`` in run.degraded."""
+    from seo_geo_agent import state as seo_state
+
+    seo_state.save("sitereview-legalsoft", {"brand_id": "legalsoft", "issues": [{
+        "insight": "Contact page has no visible contact form, phone number, or calendar link",
+        "evidence": "https://www.legalsoft.com/contact-us (920w) — 'Lacks visible contact form'",
+        "action": "Embed a form", "priority": "high", "category": "conversion",
+        "url": "https://www.legalsoft.com/contact-us"}], "grounding": {"kept": 1, "dropped": []}})
+    seo_state.save("corpus-legalsoft", {"pages": [{"url": "https://www.legalsoft.com/contact-us",
+                                                   "title": "Contact", "word_count": 920}]})
+    seo_state.save("run-legalsoft", {
+        "brand_id": "legalsoft", "at": "2026-10-14", "trigger": "t", "summary": {}, "insights": [],
+        "topics": [], "ga": None, "todos": [], "degraded": [
+            "Search Console: Search Console rejected sc-domain:legalsoft.com: <HttpError 403 when "
+            "requesting https://searchconsole.googleapis.com/webmasters/v3/sites/x returned \"User does "
+            "not have sufficient permission for site 'sc-domain:legalsoft.com'.\">"]})
+
+    body = client.get("/api/seo-geo/brands/legalsoft").json()
+    review = body["site_review"]
+    assert review["issues"] == []
+    assert review["grounding"]["dropped"][0]["reason"] == "unverifiable-absence"
+    assert body["run"]["degraded"] == [
+        "Search Console: no permission for property 'sc-domain:legalsoft.com' — the account this server "
+        "reads with hasn't been given access."]
+    overview = client.get("/api/seo-geo/overview").json()
+    assert "HttpError" not in str(overview["brands"][0]["last_run"]["degraded"])
+
+
+def test_pages_refresh_moves_site_wide_advice_onto_the_stored_fix_list(monkeypatch):
+    import json
+
+    from seo_geo_agent import pages as seo_pages, state as seo_state
+
+    paths = ["/careers", "/legal-assistant", "/intake-specialist-remote"]
+    seo_state.save("corpus-legalsoft", {"brand_id": "legalsoft", "pages": [
+        {"url": f"https://legalsoft.com{p}", "title": "T", "word_count": 800, "meta_description": "d",
+         "h1_count": 1, "images_no_alt": 0} for p in paths]})
+    seo_state.save("run-legalsoft", {"brand_id": "legalsoft", "at": "2026-10-14", "trigger": "t",
+                                     "degraded": [], "summary": {}, "insights": [], "topics": [], "ga": None,
+                                     "todos": [_todo("t1", "Refresh the page targeting 'x'")]})
+    monkeypatch.setattr(seo_pages, "llm_text", lambda s, p, **kw: json.dumps(
+        [{"path": p, "recommendation": f"Build internal links from the homepage to {p}."} for p in paths]))
+
+    body = client.post("/api/seo-geo/pages/legalsoft/refresh").json()
+    assert not [p for p in body["pages"] if p["ai"]]
+    assert [d["reason"] for d in body["grounding"]["dropped"]] == ["moved-to-fix-list"] * 3
+    todos = client.get("/api/seo-geo/brands/legalsoft").json()["run"]["todos"]
+    assert [t["id"] for t in todos][:1] == ["t1"]
+    advice = todos[1]
+    assert (advice["kind"], advice["origin"], advice["pages"]) == ("site", "page-advice", paths)
+    # a second refresh replaces the item, never stacks a copy
+    client.post("/api/seo-geo/pages/legalsoft/refresh")
+    assert len(client.get("/api/seo-geo/brands/legalsoft").json()["run"]["todos"]) == 2
+
+
 def test_pages_endpoints():
     assert client.get("/api/seo-geo/pages/legalsoft").json()["pages"] is None
     r = client.post("/api/seo-geo/pages/legalsoft/refresh")

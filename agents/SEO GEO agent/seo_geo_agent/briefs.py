@@ -63,17 +63,21 @@ def _brief_schema(deep: dict) -> tuple[list[str], str]:
 
     The ranking pages' own patterns first (types on 2+ of them). When they show
     none, the only rule-backed suggestion is FAQPage, and only when the brief
-    carries 2+ questions the article will answer. No hard-coded default.
+    carries enough questions the article will answer to be a FAQ by the same
+    rule a crawled page meets (``audit.FAQ_MIN_PAIRS`` Q&A pairs). No
+    hard-coded default.
     """
     seen = list(deep.get("schema_seen") or [])[:4]
     if seen:
         return seen, f"Seen on the ranking pages: {_prevalence(deep, seen)}."
-    planned = {"url": "", "type": "other", "schema_types": [],  # the article, not yet written
-               "q_headings": len(deep.get("questions") or [])}
+    answered = len(deep.get("questions") or [])
+    # The article, not yet written: every question the brief answers is a Q&A pair.
+    planned = {"url": "", "type": "other", "schema_types": [], "q_headings": answered,
+               "faq_pairs": answered}
     faq = next((r for r in audit.schema_fit(planned) if r["type"] == "FAQPage"), None)
     if faq:
         return ["FAQPage"], (f"No schema seen on ranking pages. The brief answers "
-                             f"{planned['q_headings']} questions, so FAQPage fits. "
+                             f"{answered} questions, so FAQPage fits. "
                              + audit.FAQ_RICH_RESULT_NOTE)
     return [], "No schema seen on ranking pages."
 
@@ -96,7 +100,8 @@ def build_brief(brand: dict, keyword: str, rows: list[QueryStat], search=None, f
             for o in raw.get("outline", []) if isinstance(o, dict) and o.get("heading")
         ] or _fallback_outline(keyword, deep)
     except CredentialMissing as exc:
-        notes.append(f"LLM outline skipped ({exc}) — structural outline from SERP data")
+        notes.append(f"LLM outline skipped ({sources.plain_reason(exc, log=True).rstrip('.')}) "
+                     "— structural outline from SERP data")
         outline = _fallback_outline(keyword, deep)
 
     schema_recommended, schema_note = _brief_schema(deep)

@@ -60,7 +60,7 @@ def expand_keywords(brand: dict, rows: list[QueryStat], search=None) -> tuple[li
                 for kw in serp["related"] + serp["paa"]:
                     add(kw)
             except CredentialMissing as exc:
-                notes.append(f"Serper: {exc}")
+                notes.append(sources.plain_note(f"Serper: {exc}"))
                 search = None
                 break
     else:
@@ -78,7 +78,7 @@ def expand_keywords(brand: dict, rows: list[QueryStat], search=None) -> tuple[li
                 if isinstance(kw, str):
                     add(kw)
     except CredentialMissing as exc:
-        notes.append(f"LLM expansion skipped: {exc}")
+        notes.append(sources.plain_note(f"LLM expansion skipped: {exc}"))
 
     for r in rows:
         if r.impressions >= 20:
@@ -132,7 +132,8 @@ def cluster_keywords(brand: dict, keywords: list[str]) -> tuple[list[dict], list
             return clusters[:MAX_CLUSTERS], notes
         notes.append("LLM returned no usable clusters — heuristic grouping used")
     except CredentialMissing as exc:
-        notes.append(f"LLM clustering skipped ({exc}) — heuristic grouping used")
+        notes.append(f"LLM clustering skipped ({sources.plain_reason(exc, log=True).rstrip('.')}) "
+                     "— heuristic grouping used")
     return _heuristic_clusters(keywords)[:MAX_CLUSTERS], notes
 
 
@@ -231,7 +232,7 @@ def run_keyword_lab(
 ) -> dict:
     """Full pass: expand -> cluster -> score -> persist. Returns the stored doc."""
     keywords, notes = expand_keywords(brand, rows, search=search)
-    notes = list(extra_notes or []) + notes
+    notes = [sources.plain_note(n) for n in list(extra_notes or []) + notes]
     clusters, cluster_notes = cluster_keywords(brand, keywords)
     notes.extend(cluster_notes)
     ranks: dict[str, float] = {}
@@ -257,4 +258,9 @@ def run_keyword_lab(
 
 
 def latest(brand_id: str) -> dict | None:
-    return state.load(f"keywords-{brand_id}")
+    doc = state.load(f"keywords-{brand_id}")
+    if doc:
+        # A lab stored before notes were made plain still carries raw exception text.
+        doc["degraded"] = [sources.plain_note(n, log=False) for n in doc.get("degraded") or []
+                           if isinstance(n, str)]
+    return doc
