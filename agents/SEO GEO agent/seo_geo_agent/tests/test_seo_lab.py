@@ -194,15 +194,17 @@ def test_build_brief_offline_falls_back_to_serp_outline():
 
 def test_update_plan_flags_missing_sections():
     rows = [row("legal virtual assistant", page="https://x.com/page", impressions=900)]
+    # Article on BOTH outranking pages: a SERP pattern needs 2+ pages, not one site's CMS.
     pages = {
         "https://comp.com/p1": facts("https://comp.com/p1", h2=["Pricing and costs breakdown"], schema=["Article"], words=2000),
-        "https://reddit.com/r/law": facts("https://reddit.com/r/law", h2=["Pricing and costs breakdown"], words=2000),
+        "https://reddit.com/r/law": facts("https://reddit.com/r/law", h2=["Pricing and costs breakdown"], schema=["Article"], words=2000),
         "https://x.com/page": facts("https://x.com/page", h2=["Why choose us"], words=600),
     }
     plan = briefs.update_plan(BRAND, "https://x.com/page", rows,
                               search=lambda q: serp_with(3), fetch=lambda u: pages[u])
     assert any("Pricing and costs" in s for s in plan["suggestions"])
-    assert any("structured data" in s.lower() for s in plan["suggestions"])
+    assert any("structured data" in s.lower() and "Article (2 of 2 top pages)" in s
+               for s in plan["suggestions"])
     assert any("Deepen" in s for s in plan["suggestions"])
 
 
@@ -212,6 +214,60 @@ def test_update_plan_needs_page_data():
         raise AssertionError("expected ValueError")
     except ValueError:
         pass
+
+
+def _deep(schema_seen=(), questions=(), prevalence=None, analyzed=5):
+    return {"schema_seen": list(schema_seen), "questions": list(questions),
+            "schema_prevalence": prevalence or [{"type": t, "pages": 2} for t in schema_seen],
+            "pages_analyzed": analyzed}
+
+
+def test_brief_schema_has_no_hardcoded_fallback():
+    recommended, note = briefs._brief_schema(_deep(questions=["How much does it cost?"]))
+    assert recommended == [] and note == "No schema seen on ranking pages."
+    recommended, note = briefs._brief_schema(_deep(questions=["How much?", "Is it worth it?"]))
+    assert recommended == ["FAQPage"]
+    assert note.startswith("No schema seen on ranking pages.") and "2023" in note
+    recommended, note = briefs._brief_schema(_deep(["Article"], prevalence=[{"type": "Article", "pages": 3}]))
+    assert recommended == ["Article"] and note == "Seen on the ranking pages: Article (3 of 5 top pages)."
+
+
+def test_build_brief_offline_recommends_no_schema_without_evidence():
+    pages = {u: facts(u, h2=["Pricing and costs"], words=1000)
+             for u in ("https://comp.com/p1", "https://reddit.com/r/law", "https://x.com/page")}
+    brief = briefs.build_brief(BRAND, "legal virtual assistant", [],
+                               search=lambda q: serp_with(None), fetch=lambda u: pages[u])
+    assert brief["schema_recommended"] == []   # used to be ["Article", "FAQPage"] by default
+    assert brief["schema_note"] == "No schema seen on ranking pages."
+
+
+def test_schema_seen_is_ranked_by_prevalence_without_boilerplate():
+    serp = {"organic": [{"link": f"https://c{i}.com/p", "title": "t", "position": i + 1} for i in range(4)],
+            "related": [], "paa": [], "aio_present": False}
+    pages = {
+        "https://c0.com/p": facts("https://c0.com/p", schema=["WebPage", "BreadcrumbList", "FAQPage", "Article"]),
+        "https://c1.com/p": facts("https://c1.com/p", schema=["Organization", "WebSite", "Article", "Service"]),
+        "https://c2.com/p": facts("https://c2.com/p", schema=["Article", "FAQPage", "ImageObject"]),
+        "https://c3.com/p": facts("https://c3.com/p", schema=["Organization", "WebSite"]),
+    }
+    deep = competitors.serp_deep_dive(BRAND, "q", search=lambda q: serp, fetch=lambda u: pages[u])
+    assert deep["schema_seen"] == ["Article", "FAQPage"]   # Service: only one page
+    assert deep["schema_prevalence"] == [{"type": "Article", "pages": 3}, {"type": "FAQPage", "pages": 2}]
+
+
+def test_update_plan_subtracts_schema_we_already_have():
+    rows = [row("legal virtual assistant", page="https://x.com/page", impressions=900)]
+    pages = {
+        "https://comp.com/p1": facts("https://comp.com/p1", schema=["Article", "Service", "FAQPage"]),
+        "https://reddit.com/r/law": facts("https://reddit.com/r/law", schema=["Article", "Service", "FAQPage"]),
+        "https://x.com/page": facts("https://x.com/page", schema=["BlogPosting"]),
+    }
+    plan = briefs.update_plan(BRAND, "https://x.com/page", rows,
+                              search=lambda q: serp_with(3), fetch=lambda u: pages[u])
+    schema_lines = [s for s in plan["suggestions"] if "structured data" in s]
+    # Article: we have BlogPosting. FAQPage: our page shows no questions. Service: missing.
+    assert schema_lines == ["Add structured data the outranking pages carry and ours doesn't: "
+                            "Service (2 of 2 top pages)."]
 
 
 # --------------------------------- audit ---------------------------------
@@ -243,6 +299,152 @@ def test_site_checks_flag_missing_foundations():
     assert checks["Sitemap.xml"]["ok"] is False and checks["Sitemap.xml"]["fix"]
     assert checks["Robots.txt"]["ok"] is False
     assert checks["HTTP → HTTPS redirect"]["ok"] is False
+
+
+ROBOTS_OK = {"status": 200, "text": "User-agent: *\nSitemap: https://x.com/sitemap.xml",
+             "final_url": "https://x.com/"}
+
+
+def _audit(site: dict) -> dict:
+    return audit.site_audit(BRAND, fetch=lambda u: site[u], sitemap=lambda d: list(site.keys()),
+                            get_text=lambda u: ROBOTS_OK)
+
+
+def _by_kind(report: dict) -> dict:
+    return {i.get("kind") or i["issue"]: i for i in report["issues"]}
+
+
+def test_template_image_without_alt_is_one_finding_not_one_per_page():
+    logo = "https://x.com/logo.png"
+    site = {}
+    for i, path in enumerate(["", "a", "b", "c"]):
+        f = facts(f"https://x.com/{path}", title=f"Page {i}", schema=["Organization", "WebSite"])
+        f.images_no_alt, f.images_no_alt_srcs = 1, [logo]
+        site[f.url] = f
+    own = site["https://x.com/c"]
+    own.images_no_alt, own.images_no_alt_srcs = 2, [logo, "https://x.com/c-chart.png"]
+    issues = _by_kind(_audit(site))
+    template = issues["template-alt"]
+    assert template["issue"] == "Template image(s) without alt text — fix once in the header/footer"
+    assert template["srcs"] == [logo] and template["count"] == 4
+    page_alt = issues["page-alt"]          # only the page with an image of its own
+    assert page_alt["pages"] == ["https://x.com/c"]
+    assert page_alt["examples"] == [{"page": "https://x.com/c", "srcs": ["https://x.com/c-chart.png"]}]
+
+
+def test_decorative_alt_is_reported_separately_and_not_scored():
+    site = {"https://x.com/": facts("https://x.com/", schema=["Organization", "WebSite"]),
+            "https://x.com/a": facts("https://x.com/a", schema=["Organization"])}
+    clean = _audit(site)["health_score"]
+    site["https://x.com/a"].images_decorative = 5
+    report = _audit(site)
+    deco = _by_kind(report)["decorative-alt"]
+    assert deco["severity"] == "low" and deco["informational"] is True and deco["images"] == 5
+    assert "missing" not in deco["issue"].lower()
+    assert "page-alt" not in _by_kind(report) and "template-alt" not in _by_kind(report)
+    assert report["health_score"] == clean   # decorative is not a defect
+
+
+def test_title_template_suffix_is_one_finding():
+    suffix = " | Acme Legal Virtual Assistants for Law Firms"   # 46 characters
+    own_long = "Outsourced paralegal and legal assistant services for small law firms"  # 70
+    site = {
+        "https://x.com/": facts("https://x.com/", title="Home page for legal teams" + suffix,
+                                schema=["Organization", "WebSite"]),
+        "https://x.com/a": facts("https://x.com/a", title="Paralegal services" + suffix),
+        "https://x.com/b": facts("https://x.com/b", title=own_long + suffix),
+        "https://x.com/c": facts("https://x.com/c", title="Short"),
+    }
+    issues = _by_kind(_audit(site))
+    tmpl = issues["title-template"]
+    assert tmpl["issue"] == f"Title template adds {len(suffix)} characters"
+    assert tmpl["suffix"] == suffix.strip() and tmpl["count"] == 3
+    assert issues["title-long"]["pages"] == ["https://x.com/b"]   # still long without the suffix
+
+
+def test_long_titles_without_a_shared_suffix_stay_per_page():
+    site = {
+        "https://x.com/": facts("https://x.com/", title="H" * 70, schema=["Organization", "WebSite"]),
+        "https://x.com/a": facts("https://x.com/a", title="A" * 70),
+    }
+    issues = _by_kind(_audit(site))
+    assert "title-template" not in issues
+    assert issues["title-long"]["count"] == 2
+
+
+def _fit(url, types=(), q=0, kind=None, phone=False, address=False, site=None, errors=()):
+    page = {"url": url, "schema_types": list(types), "q_headings": q, "has_phone": phone,
+            "has_address": address, "schema_errors": list(errors)}
+    if kind:
+        page["type"] = kind
+    return [r["type"] for r in audit.schema_fit(page, site_types=site)]
+
+
+@pytest.mark.parametrize(("case", "got", "expected"), [
+    ("faq: 2 question headings", lambda: _fit("https://x.com/help", q=2, site=set()), ["FAQPage"]),
+    ("faq: 1 question heading", lambda: _fit("https://x.com/help", q=1, site=set()), []),
+    ("faq: already marked up", lambda: _fit("https://x.com/help", ["FAQPage"], q=4, site=set()), []),
+    ("blog post", lambda: _fit("https://x.com/blog/how-to-hire", site=set()), ["BlogPosting"]),
+    ("blog post with Article", lambda: _fit("https://x.com/blog/x", ["Article"], site=set()), []),
+    ("blog index is not a post", lambda: _fit("https://x.com/blog", site=set()), []),
+    ("service page", lambda: _fit("https://x.com/services/paralegal", site=set()), ["Service"]),
+    ("service page via corpus type", lambda: _fit("https://x.com/intake", kind="service", site=set()), ["Service"]),
+    ("service page with Service", lambda: _fit("https://x.com/services/p", ["Service"], site=set()), []),
+    ("home, bare site", lambda: _fit("https://x.com/", site=set()), ["Organization", "WebSite"]),
+    ("home, Organization elsewhere", lambda: _fit("https://x.com/", site={"Organization", "WebSite"}), []),
+    ("home, LegalService counts as org", lambda: _fit("https://x.com/", site={"LegalService", "WebSite"}), []),
+    ("home, site schema unknown", lambda: _fit("https://x.com/", site=None), []),
+    ("home with phone", lambda: _fit("https://x.com/", phone=True, site={"Organization", "WebSite"}), ["LocalBusiness"]),
+    ("non-home with address", lambda: _fit("https://x.com/pricing", address=True, site=set()), []),
+    ("contact page, even with questions", lambda: _fit("https://x.com/contact-us", q=5, phone=True, site=set()), []),
+    ("about page", lambda: _fit("https://x.com/about", q=3, site=set()), []),
+    ("broken JSON-LD: the parse error owns it", lambda: _fit("https://x.com/services/p", errors=["x"], site=set()), []),
+])
+def test_schema_fit_matrix(case, got, expected):
+    assert got() == expected, case
+
+
+def test_schema_fit_unknown_schema_recommends_nothing():
+    """A corpus entry crawled before schema was stored has no schema_types key."""
+    assert audit.schema_fit({"url": "https://x.com/services/p", "q_headings": 5}) == []
+
+
+def test_faq_fit_explains_the_2023_rich_result_change():
+    rec = audit.schema_fit({"url": "https://x.com/help", "schema_types": [], "q_headings": 3})[0]
+    assert rec["type"] == "FAQPage" and rec["severity"] == "low"
+    assert "2023" in rec["reason"] and "AI answers" in rec["reason"]
+
+
+def test_audit_schema_findings_are_grouped_per_type_with_evidence():
+    site = {
+        "https://x.com/": facts("https://x.com/"),
+        "https://x.com/services/paralegal": facts("https://x.com/services/paralegal"),
+        "https://x.com/services/intake": facts("https://x.com/services/intake"),
+        "https://x.com/contact": facts("https://x.com/contact"),
+        "https://x.com/blog/post": facts("https://x.com/blog/post", schema=["BlogPosting"]),
+    }
+    report = _audit(site)
+    schema = {i["schema_type"]: i for i in report["issues"] if i.get("kind") == "schema-fit"}
+    assert set(schema) == {"Organization", "WebSite", "Service"}
+    svc = schema["Service"]
+    assert svc["issue"] == "2 service pages lack Service schema"
+    assert svc["pages"] == ["https://x.com/services/paralegal", "https://x.com/services/intake"]
+    assert [e["page"] for e in svc["evidence"]] == svc["pages"]
+    assert schema["Organization"]["pages"] == ["https://x.com/"]
+    assert not any("No structured data" in i["issue"] for i in report["issues"])
+    assert not any("https://x.com/contact" in i["pages"] for i in schema.values())
+
+
+def test_audit_reports_jsonld_that_does_not_parse():
+    broken = facts("https://x.com/services/p", schema=["WebSite"])
+    broken.schema_errors = ["JSON-LD block 1: Expecting value: line 1 column 1 (char 0)"]
+    site = {"https://x.com/": facts("https://x.com/", schema=["Organization", "WebSite"]),
+            "https://x.com/services/p": broken}
+    issues = _by_kind(_audit(site))
+    err = issues["schema-error"]
+    assert err["severity"] == "medium" and err["pages"] == ["https://x.com/services/p"]
+    assert err["examples"][0]["error"].startswith("JSON-LD block 1")
+    assert "schema-fit" not in issues   # no "add Service" on top of a broken block
 
 
 # -------------------------------- site brain --------------------------------
@@ -296,10 +498,20 @@ def test_corpus_cache_skips_unchanged_pages(monkeypatch):
     assert first >= 1 and calls["n"] == first  # second run: all pages cached
 
 
+#: The crawl REVIEW_JSON's evidence points at — a finding is only kept when the
+#: page it cites was actually crawled.
+REVIEW_CORPUS = {"brand_id": "b", "page_count": 2, "degraded": [], "pages": [
+    {"url": "https://x.com/", "title": "Acme Legal — Home", "type": "home", "word_count": 900,
+     "summary": "Virtual assistants for law firms.", "schema_types": ["Organization", "WebSite"],
+     "q_headings": 0},
+    {"url": "https://x.com/pricing", "title": "Pricing", "type": "other", "word_count": 180,
+     "summary": "Plans start small and scale with your firm.", "schema_types": [], "q_headings": 3},
+]}
+
+
 def test_expert_review_todos_and_seeds(monkeypatch):
     monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: REVIEW_JSON)
-    corpus = {"brand_id": "b", "page_count": 2, "pages": [], "degraded": []}
-    review = site_brain.expert_review(BRAND, corpus)
+    review = site_brain.expert_review(BRAND, REVIEW_CORPUS)
     assert review["positioning"].startswith("Virtual assistants")
     assert review["scorecard"]["intent"]["grade"] == 5      # clamped into 1-5
     assert review["scorecard"]["content_depth"]["grade"] == 2
@@ -318,9 +530,80 @@ def test_expert_review_todos_and_seeds(monkeypatch):
 def test_run_brand_merges_site_todos(monkeypatch):
     monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: REVIEW_JSON)
     brand = insights.list_brands()[0]
-    site_brain.expert_review(brand, {"brand_id": brand["id"], "page_count": 1, "pages": [], "degraded": []})
+    site_brain.expert_review(brand, {**REVIEW_CORPUS, "brand_id": brand["id"]})
     run = insights.run_brand(brand, trigger="t")
     assert any(t["kind"] == "site" for t in run["todos"])
+    assert run["todos_not_shown"] == 0
+
+
+def _issue(insight, evidence, action="Do the specific thing", priority="medium", category="content"):
+    return {"insight": insight, "evidence": evidence, "action": action,
+            "priority": priority, "category": category}
+
+
+UNGROUNDED_JSON = {**REVIEW_JSON, "issues": [
+    _issue("Pricing page never states turnaround", "https://x.com/pricing (180w) — no FAQ",
+           action="Add a 5-question FAQ and a 48-hour turnaround promise", priority="high"),
+    _issue("Pricing page lacks plan comparisons", "https://x.com/pricing", priority="low"),
+    _issue("Case studies page is empty", "https://x.com/case-studies"),
+    _issue("Thin services", "the service pages"),
+    _issue("Pricing gets 4,000 visits but converts 2% of them", "https://x.com/pricing",
+           category="conversion"),
+    _issue("Homepage title is too long and gets truncated", "https://x.com/", category="intent"),
+    _issue("No Organization schema on the homepage", "https://x.com/", category="ai-search"),
+    _issue("Home page buyers can't find FAQ answers — add FAQPage schema", "https://x.com/",
+           category="ai-search"),
+    _issue("Pricing questions are unanswered in a quotable form", "https://x.com/pricing",
+           action="Wrap the 3 pricing questions in FAQPage JSON-LD", category="ai-search"),
+    "not an object",
+]}
+
+
+def test_expert_review_drops_ungrounded_issues(monkeypatch):
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: UNGROUNDED_JSON)
+    review = site_brain.expert_review(BRAND, REVIEW_CORPUS)
+    kept = [(i["insight"], i["url"]) for i in review["issues"]]
+    assert kept == [
+        ("Pricing page never states turnaround", "https://x.com/pricing"),   # 180 is in the data
+        ("Pricing questions are unanswered in a quotable form", "https://x.com/pricing"),  # FAQ fits: 3 q's
+    ]
+    reasons = {d["insight"]: d["reason"] for d in review["grounding"]["dropped"]}
+    assert reasons["Pricing page lacks plan comparisons"] == "duplicate"         # same content + URL, lower
+    assert reasons["Case studies page is empty"] == "no-evidence-url"           # never crawled
+    assert reasons["Thin services"] == "no-evidence-url"                        # cites no page
+    assert reasons["Pricing gets 4,000 visits but converts 2% of them"] == "invented-number"
+    assert reasons["Homepage title is too long and gets truncated"] == "audit-owned"
+    assert reasons["No Organization schema on the homepage"] == "audit-owned"
+    assert reasons["Home page buyers can't find FAQ answers — add FAQPage schema"] == "schema-not-fit"
+    assert reasons["not an object"] == "malformed"
+    assert review["grounding"]["kept"] == 2
+    assert site_brain.latest_review("b")["grounding"] == review["grounding"]   # persisted with the review
+
+
+def test_invented_number_detail_names_the_number(monkeypatch):
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: {
+        **REVIEW_JSON, "issues": [_issue("Pricing page has 12 broken links", "https://x.com/pricing")]})
+    review = site_brain.expert_review(BRAND, REVIEW_CORPUS)
+    assert review["issues"] == []
+    assert review["grounding"]["dropped"][0]["detail"].startswith("12 not in the data")
+
+
+@pytest.mark.parametrize("answer", [["a", "list"], "a string", 42, None])
+def test_expert_review_wrong_shape_is_an_honest_failure(monkeypatch, answer):
+    """A list answer used to hit raw.get(...) -> AttributeError -> unexplained 500."""
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: answer)
+    with pytest.raises(CredentialMissing, match="not the review object"):
+        site_brain.expert_review(BRAND, REVIEW_CORPUS)
+    assert site_brain.latest_review("b") is None   # nothing canned was saved
+
+
+def test_expert_review_tolerates_malformed_sub_fields(monkeypatch):
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: {
+        "scorecard": ["not", "a", "dict"], "issues": "nope", "strengths": "one string",
+        "suggested_seeds": None})
+    review = site_brain.expert_review(BRAND, REVIEW_CORPUS)
+    assert review["scorecard"] == {} and review["issues"] == [] and review["strengths"] == []
+    assert review["grounding"] == {"kept": 0, "dropped": []}
 
 
 # ----------------------------- GSC OAuth connect -----------------------------

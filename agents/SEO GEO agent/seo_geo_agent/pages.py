@@ -6,7 +6,7 @@ import re
 from datetime import date
 from urllib.parse import urlparse
 
-from . import state
+from . import audit, state
 from .sources import CredentialMissing, llm_text
 
 MAX_AI_PAGES = 25
@@ -21,21 +21,60 @@ THIN_WORDS = 300
 NO_REC_NOTE = "AI recommendations unavailable — showing rule-based advice"
 NOT_CRAWLED_FLAG = "not-crawled"
 NOT_CRAWLED_REC = "Not in the site crawl — re-run the site analysis to audit this page."
+HEALTHY_REC = "Healthy — keep it fresh and add internal links to weaker pages."
+
+#: The rule sentence behind each flag — also the text AI advice is compared
+#: against: advice that only says this again, in other words, is dropped.
+FLAG_TEXT = {
+    "no-title": "Write a title tag targeting its main query.",
+    "no-meta": "Add a meta description — the snippet is unsold.",
+    "thin": "Expand this page past 300 words; it can't rank as-is.",
+    "title-long": "Shorten the title under 60 characters.",
+    "no-h1": "Add an H1 matching the target query.",
+    "images-no-alt": "Add alt text to images.",
+    "meta-long": "Tighten the meta description under 160 characters — long snippets get truncated.",
+}
+_FLAG_SYNONYMS = {
+    "no-title": {"title", "tag", "missing", "keyword", "main"},
+    "title-long": {"title", "tag", "shorten", "shorter", "trim", "long", "length", "character",
+                   "truncate", "truncated", "front-load", "keyword", "cut", "reduce", "concise"},
+    "no-meta": {"meta", "description", "snippet", "missing", "compelling", "click", "ctr", "pitch",
+                "tag", "sell"},
+    "meta-long": {"meta", "description", "tighten", "shorten", "shorter", "trim", "long", "length",
+                  "character", "snippet", "truncate", "concise"},
+    "thin": {"expand", "thin", "word", "content", "length", "longer", "depth", "deepen", "rank",
+             "flesh", "substantive", "copy"},
+    "no-h1": {"h1", "heading", "missing", "match", "main", "tag", "clear"},
+    "images-no-alt": {"alt", "text", "image", "describe", "descriptive", "attribute", "missing",
+                      "tag", "accessibility"},
+}
+FLAG_VOCAB = {f: audit.content_tokens(t) | _FLAG_SYNONYMS[f] for f, t in FLAG_TEXT.items()}
+#: Flags the technical audit already reports as ONE grouped site finding. On a
+#: page row they are chips — the same sentence on forty rows is noise.
+AUDIT_GROUPED_FLAGS = frozenset({"no-title", "title-long", "no-meta", "no-h1", "images-no-alt"})
+REWORD_SHARE = 0.6
 
 
 def _path(url: str) -> str:
     return (urlparse(url).path or "/") if "//" in url else (url or "/")
 
 
-def _flags(entry: dict) -> list[str]:
+def _flags(entry: dict, template_srcs: set[str] = frozenset()) -> list[str]:
     """On-page health flags from a corpus entry — every key read with a default
-    so older cached entries (missing meta_description/h1_count/images_no_alt) don't crash."""
+    so older cached entries (missing meta_description/h1_count/images_no_alt) don't crash.
+
+    ``images-no-alt`` means an image of THIS page's own: a header/footer image
+    missing alt on most pages is one template finding in the audit, not a chip
+    on every row. Entries crawled before srcs were stored fall back to the count."""
     flags: list[str] = []
     title = (entry.get("title") or "").strip()
     meta = (entry.get("meta_description") or "").strip()
     word_count = entry.get("word_count") or 0
     h1_count = entry.get("h1_count", 0) or 0
-    images_no_alt = entry.get("images_no_alt", 0) or 0
+    count = entry.get("images_no_alt", 0) or 0
+    srcs = entry.get("images_no_alt_srcs")
+    images_no_alt = (bool(count) if srcs is None
+                     else audit.has_page_specific_missing_alt(count, srcs, template_srcs))
 
     if not title:
         flags.append("no-title")
@@ -59,27 +98,66 @@ def _flags(entry: dict) -> list[str]:
     return flags
 
 
-def _heuristic_rec(page: dict) -> str:
-    """Deterministic, honest recommendation when AI is unavailable (or for pages
-    outside the top-traffic slice the AI call covers)."""
+def _rule_rec(page: dict) -> tuple[str, str]:
+    """Deterministic advice when AI is unavailable (or for pages outside the
+    top-traffic slice) -> ``(recommendation, rec_source)``.
+
+    A flag the audit already groups (title, meta, H1, alt) stays a chip and
+    gets no sentence: ``("", "flags")``. Only page-specific rules speak.
+    """
     flags = page.get("flags") or []
     if NOT_CRAWLED_FLAG in flags:
-        return NOT_CRAWLED_REC
-    if "no-title" in flags:
-        return "Write a title tag targeting its main query."
-    if "no-meta" in flags:
-        return "Add a meta description — the snippet is unsold."
-    if "thin" in flags:
-        return "Expand this page past 300 words; it can't rank as-is."
-    if "title-long" in flags:
-        return "Shorten the title under 60 characters."
-    if "no-h1" in flags:
-        return "Add an H1 matching the target query."
-    if "images-no-alt" in flags:
-        return "Add alt text to images."
-    if "meta-long" in flags:
-        return "Tighten the meta description under 160 characters — long snippets get truncated."
-    return "Healthy — keep it fresh and add internal links to weaker pages."
+        return NOT_CRAWLED_REC, "rule"
+    for flag in ("thin", "meta-long"):
+        if flag in flags:
+            return FLAG_TEXT[flag], "rule"
+    if any(f in AUDIT_GROUPED_FLAGS for f in flags):
+        return "", "flags"
+    return HEALTHY_REC, "rule"
+
+
+def rewords_flags(recommendation: str, flags: list[str]) -> bool:
+    """True when AI advice only restates the page's own flag chips.
+
+    Deterministic: the share of the advice's content words that the flags'
+    rule text (plus its synonyms) already accounts for. "Shorten the title to
+    under 60 characters" on a ``title-long`` page is the chip again; "Lead the
+    title with 'legal VA pricing'" names something the chip does not."""
+    vocab: set[str] = set()
+    for f in flags:
+        vocab |= FLAG_VOCAB.get(f, set())
+    if not vocab:
+        return False
+    return audit.coverage(audit.content_tokens(recommendation), vocab) >= REWORD_SHARE
+
+
+def _ground_recs(recs: dict[str, str], rows: dict[str, dict], corpus_by_path: dict[str, dict],
+                 site_types) -> tuple[dict[str, str], dict]:
+    """Keep AI advice that says something the page row does not already say.
+
+    Dropped (and recorded): advice for a path that was not sent, advice that
+    re-words the page's flags, and schema advice that does not fit the page
+    (``audit.schema_claim_problem``).
+    """
+    kept: dict[str, str] = {}
+    dropped: list[dict] = []
+    for path, rec in recs.items():
+        row = rows.get(path)
+        if row is None or path not in corpus_by_path:
+            dropped.append({"path": path, "reason": "unknown-page", "recommendation": rec[:200],
+                            "detail": "not one of the crawled pages sent for advice"})
+            continue
+        if rewords_flags(rec, row.get("flags") or []):
+            dropped.append({"path": path, "reason": "repeats-flags", "recommendation": rec[:200],
+                            "detail": f"restates {', '.join(row['flags'])}"})
+            continue
+        problem = audit.schema_claim_problem(rec, corpus_by_path[path], site_types)
+        if problem:
+            dropped.append({"path": path, "reason": "schema-not-fit", "recommendation": rec[:200],
+                            "detail": problem[:200]})
+            continue
+        kept[path] = rec
+    return kept, {"kept": len(kept), "dropped": dropped}
 
 
 def _ai_recs(pages: list[dict]) -> dict[str, str]:
@@ -111,7 +189,7 @@ def _entry(merged: dict, path: str) -> dict:
         "views": 0, "sessions": 0, "engagement_rate": 0.0,
         "clicks": 0, "impressions": 0, "position": None,
         "best_query": None, "flags": [], "recommendation": "", "ai": False,
-        "word_count": 0,
+        "rec_source": "rule", "word_count": 0,
     })
 
 
@@ -128,15 +206,18 @@ def build_page_intel(brand: dict, corpus_pages: list[dict], ga_pages: list[dict]
     a zeroed-out metric always shows the reason it's zero, not just a number."""
     merged: dict[str, dict] = {}
     crawled: set[str] = set()
+    corpus_by_path: dict[str, dict] = {}
+    template = set(audit.template_srcs([cp.get("images_no_alt_srcs") or [] for cp in corpus_pages]))
 
     for cp in corpus_pages:
         path = _path(cp.get("url", "") or "")
         crawled.add(path)
+        corpus_by_path[path] = cp
         e = _entry(merged, path)
         e["url"] = cp.get("url")
         e["title"] = cp.get("title") or None
         e["word_count"] = cp.get("word_count", 0) or 0
-        e["flags"] = _flags(cp)
+        e["flags"] = _flags(cp, template)
 
     for gp in ga_pages:
         path = _path(gp.get("path", "") or "/")
@@ -166,19 +247,30 @@ def build_page_intel(brand: dict, corpus_pages: list[dict], ga_pages: list[dict]
     notes: list[str] = list(data_notes or [])
     ai_used = False
     recs: dict[str, str] = {}
+    grounding: dict = {"kept": 0, "dropped": []}
     if ai_candidates:
         try:
-            recs = _ai_recs(ai_candidates)
+            raw_recs = _ai_recs(ai_candidates)
             ai_used = True
         except (CredentialMissing, ValueError):  # degrade to heuristics, never crash the run
             notes.append(NO_REC_NOTE)
+        else:
+            # Schema state is "unknown" for corpora crawled before it was stored —
+            # the site-wide schema rules then stay silent instead of guessing.
+            known = all("schema_types" in cp for cp in corpus_pages)
+            site_types = ({t for cp in corpus_pages for t in cp.get("schema_types") or []}
+                          if corpus_pages and known else None)
+            recs, grounding = _ground_recs(raw_recs, merged, corpus_by_path, site_types)
 
     for p in merged_list:
         p["ai"] = p["path"] in recs
-        p["recommendation"] = recs.get(p["path"]) or _heuristic_rec(p)
+        if p["ai"]:
+            p["recommendation"], p["rec_source"] = recs[p["path"]], "ai"
+        else:
+            p["recommendation"], p["rec_source"] = _rule_rec(p)
 
     doc = {"brand_id": brand["id"], "at": date.today().isoformat(),
-           "ai": ai_used, "notes": notes, "pages": merged_list}
+           "ai": ai_used, "notes": notes, "grounding": grounding, "pages": merged_list}
     state.save(f"pages-{brand['id']}", doc)
     return doc
 

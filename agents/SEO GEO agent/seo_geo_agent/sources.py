@@ -14,7 +14,7 @@ import socket
 from dataclasses import dataclass, field
 from datetime import date
 from html.parser import HTMLParser
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -335,6 +335,19 @@ def domain_of(url: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def norm_url(url: str) -> str:
+    """One spelling per page: ``host/path`` — no scheme, ``www.``, query,
+    fragment or trailing slash. Used wherever two mentions of a page must
+    compare equal (evidence citations, stable to-do ids, template grouping)."""
+    raw = (url or "").strip()
+    if "//" not in raw:
+        raw = "//" + raw
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    path = parsed.path.rstrip("/") or "/"
+    return f"{host}{path}"
+
+
 # ------------------------------- LLM adapter -------------------------------
 
 def llm_text(system: str, prompt: str, *, agent_id: str | None = None) -> str:
@@ -375,6 +388,86 @@ def llm_json(system: str, prompt: str, *, agent_id: str | None = None):
 
 # ------------------------------ page fetcher ------------------------------
 
+#: Offending image srcs kept per page — enough to name a template image or
+#: point at the page's own culprits, never a dump of every asset.
+MAX_ALT_SRCS = 20
+MAX_SCHEMA_ERRORS = 5
+
+_WH_WORDS = frozenset({"what", "how", "why", "when", "who", "which"})
+_AUX_WORDS = frozenset({"can", "do", "does", "is", "are"})
+# A wh-word only opens a question when an auxiliary or quantifier follows it:
+# "How much does it cost" is one, "How it works" / "What we do" are section
+# labels. Same for a leading auxiliary: "Is it worth it" vs "Do more with less".
+_AFTER_WH = frozenset({"is", "are", "was", "were", "do", "does", "did", "can", "could",
+                       "should", "would", "will", "much", "many", "long", "often", "if"})
+_AFTER_AUX = frozenset({"i", "you", "we", "it", "they", "my", "your", "our", "a", "an", "the",
+                        "this", "that", "these", "those", "there", "he", "she", "someone",
+                        "anyone"})
+
+
+def is_question_heading(text: str) -> bool:
+    """True for a heading written as a question — the FAQ-fit signal."""
+    t = " ".join((text or "").split())
+    if not t:
+        return False
+    if t.endswith("?"):
+        return True
+    words = re.findall(r"[a-z']+", t.lower())
+    if len(words) < 3:
+        return False
+    if words[0] in _WH_WORDS:
+        return words[1] in _AFTER_WH
+    if words[0] in _AUX_WORDS:
+        return words[1] in _AFTER_AUX
+    return False
+
+
+def schema_local_name(raw: str) -> str:
+    """``https://schema.org/Article`` / ``schema:Article`` / ``Article`` -> ``Article``."""
+    name = str(raw or "").strip()
+    for sep in ("/", "#", ":"):
+        name = name.rsplit(sep, 1)[-1]
+    return name
+
+
+def jsonld_types(node) -> list[str]:
+    """Every ``@type`` in a parsed JSON-LD value — nested objects, arrays and
+    ``@graph`` included (a FAQPage under a WebPage's ``mainEntity`` is still a
+    FAQPage on the page). Order of first appearance, no duplicates."""
+    out: list[str] = []
+
+    def walk(n) -> None:
+        if isinstance(n, list):
+            for item in n:
+                walk(item)
+        elif isinstance(n, dict):
+            t = n.get("@type")
+            for typ in t if isinstance(t, list) else [t]:
+                name = schema_local_name(typ) if isinstance(typ, str) else ""
+                if name and name not in out:
+                    out.append(name)
+            for key, value in n.items():
+                if key != "@type" and isinstance(value, (dict, list)):
+                    walk(value)
+
+    walk(node)
+    return out
+
+
+_PHONE_RE = re.compile(
+    r"(?<!\d)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}(?!\d)"   # NANP
+    r"|(?<![\w+])\+\d{1,3}[\s.-]?\(?\d{1,4}\)?(?:[\s.-]?\d{2,4}){2,4}(?!\d)"  # international
+)
+_ADDRESS_RE = re.compile(
+    r"\b\d{1,6}\s+(?:[A-Z][\w.'-]*\s+){1,4}"
+    r"(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Court|Ct|"
+    r"Place|Pl|Parkway|Pkwy|Highway|Hwy|Suite|Ste)\b\.?"
+)
+
+_HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
+_KEPT_HEADINGS = ("h1", "h2", "h3")
+
+
 @dataclass
 class PageFacts:
     url: str
@@ -386,8 +479,15 @@ class PageFacts:
     h2: list[str] = field(default_factory=list)
     h3: list[str] = field(default_factory=list)
     schema_types: list[str] = field(default_factory=list)
+    schema_errors: list[str] = field(default_factory=list)  # JSON-LD blocks that failed to parse
     internal_links: list[str] = field(default_factory=list)
-    images_no_alt: int = 0
+    images_total: int = 0           # images counted for alt (noscript/presentational skipped)
+    images_no_alt: int = 0          # no alt ATTRIBUTE at all — the real defect
+    images_decorative: int = 0      # alt="" — declared decorative, not "missing"
+    images_no_alt_srcs: list[str] = field(default_factory=list)  # capped, de-duplicated
+    q_headings: int = 0             # question-style headings, h1-h6
+    has_phone: bool = False
+    has_address: bool = False
     word_count: int = 0
     text: str = ""  # body text, capped — feeds the site-brain content analysis
 
@@ -397,61 +497,217 @@ class PageFacts:
 
 
 class _PageParser(HTMLParser):
+    """On-page facts, collected per ELEMENT.
+
+    Text arrives in chunks — ``<h1>Legal<br>Virtual Assistants</h1>`` is two
+    ``handle_data`` calls, a ``<span>`` inside is more — so a heading is
+    buffered from its start tag to its end tag and recorded once. Recording
+    per chunk is how one Webflow ``<h1>`` used to count as three.
+    """
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.facts_title: list[str] = []
         self.meta_description = ""
         self.canonical = ""
         self.headings: dict[str, list[str]] = {"h1": [], "h2": [], "h3": []}
+        self.q_headings = 0
         self.schema_raw: list[str] = []
+        self.schema_types: list[str] = []   # microdata itemtype + RDFa typeof
         self.links: list[str] = []
+        self.images_total = 0
         self.images_no_alt = 0
+        self.images_decorative = 0
+        self.no_alt_srcs: list[str] = []
+        self.has_phone = False
+        self.has_address = False
         self.words = 0
         self.text_parts: list[str] = []
         self._text_len = 0
-        self._stack: list[str] = []
+        self._skip: str | None = None        # inside <script>/<style>
         self._in_schema = False
+        self._svg_depth = 0
+        self._noscript_depth = 0
+        self._title_state = "before"         # before -> open -> done
+        self._heading: str | None = None
+        self._heading_buf: list[str] = []
 
+    # -- helpers --------------------------------------------------------
+    def _close_heading(self) -> None:
+        tag, self._heading = self._heading, None
+        text = " ".join(" ".join(self._heading_buf).split())[:300]
+        self._heading_buf = []
+        if not tag or not text:
+            return
+        if tag in self.headings:
+            self.headings[tag].append(text)
+        if is_question_heading(text):
+            self.q_headings += 1
+
+    def _add_types(self, raw: str | None) -> None:
+        for token in (raw or "").split():
+            name = schema_local_name(token)
+            if name and name not in self.schema_types:
+                self.schema_types.append(name)
+
+    def _image(self, a: dict) -> None:
+        if self._noscript_depth:
+            return  # the no-JS duplicate of an image already counted (or a tracking pixel)
+        if (a.get("role") or "").strip().lower() in ("presentation", "none"):
+            return
+        if (a.get("aria-hidden") or "").strip().lower() == "true":
+            return
+        self.images_total += 1
+        if "alt" not in a:
+            self.images_no_alt += 1
+            src = (a.get("src") or a.get("data-src") or "").strip()
+            if src.startswith("data:"):
+                src = "(inline data: image)"
+            if src and src not in self.no_alt_srcs and len(self.no_alt_srcs) < MAX_ALT_SRCS:
+                self.no_alt_srcs.append(src[:500])
+        elif not (a.get("alt") or "").strip():
+            self.images_decorative += 1
+
+    # -- HTMLParser hooks -----------------------------------------------
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
-        if tag in ("title", "h1", "h2", "h3"):
-            self._stack.append(tag)
+        if a.get("itemtype"):
+            self._add_types(a.get("itemtype"))
+        if a.get("typeof"):
+            self._add_types(a.get("typeof"))
+        if tag == "svg":
+            self._svg_depth += 1
+        elif tag == "noscript":
+            self._noscript_depth += 1
+        elif tag == "title":
+            if not self._svg_depth and self._title_state == "before":
+                self._title_state = "open"
+        elif tag in _HEADING_TAGS:
+            self._close_heading()  # an unclosed heading ends where the next begins
+            self._heading = tag
         elif tag in ("script", "style"):
-            self._in_schema = tag == "script" and a.get("type", "") == "application/ld+json"
+            kind = (a.get("type") or "").split(";")[0].strip().lower()
+            self._in_schema = tag == "script" and kind == "application/ld+json"
             if self._in_schema:
                 self.schema_raw.append("")
-            self._stack.append("skip")
-        elif tag == "meta" and a.get("name", "").lower() == "description":
-            self.meta_description = a.get("content", "")
+            self._skip = tag
+        elif tag == "meta" and (a.get("name") or "").lower() == "description":
+            self.meta_description = a.get("content") or ""
         elif tag == "link" and a.get("rel", "") == "canonical":
-            self.canonical = a.get("href", "")
+            self.canonical = a.get("href") or ""
         elif tag == "a" and a.get("href"):
             self.links.append(a["href"])
-        elif tag == "img" and not (a.get("alt") or "").strip():
-            self.images_no_alt += 1
+            if a["href"].strip().lower().startswith("tel:"):
+                self.has_phone = True
+        elif tag == "address":
+            self.has_address = True
+        elif tag == "img":
+            self._image(a)
 
     def handle_endtag(self, tag):
-        if self._stack and (tag in ("title", "h1", "h2", "h3", "script", "style")):
-            self._stack.pop()
+        if tag == "svg":
+            self._svg_depth = max(0, self._svg_depth - 1)
+        elif tag == "noscript":
+            self._noscript_depth = max(0, self._noscript_depth - 1)
+        elif tag == "title":
+            if self._title_state == "open":
+                self._title_state = "done"
+        elif tag in _HEADING_TAGS:
+            if self._heading:
+                self._close_heading()
+        elif tag in ("script", "style") and self._skip == tag:
+            self._skip = None
             self._in_schema = False
 
     def handle_data(self, data):
-        top = self._stack[-1] if self._stack else ""
+        if self._skip:
+            if self._in_schema:
+                self.schema_raw[-1] += data
+            return
+        if self._svg_depth:
+            return  # an icon's <title>/<desc> is not page text, a title, or a heading
         text = " ".join(data.split())
         if not text:
             return
-        if top == "title":
+        if self._title_state == "open":
             self.facts_title.append(text)
-        elif top in ("h1", "h2", "h3"):
-            self.headings[top].append(text)
-        elif top == "skip":
-            if self._in_schema:
-                self.schema_raw[-1] += data
-        else:
-            self.words += len(text.split())
-            if self._text_len < 6000:
-                self.text_parts.append(text)
-                self._text_len += len(text) + 1
+            return
+        if self._heading:
+            self._heading_buf.append(text)
+            return
+        if self._noscript_depth:
+            return
+        self.words += len(text.split())
+        if not self.has_phone and _PHONE_RE.search(text):
+            self.has_phone = True
+        if not self.has_address and _ADDRESS_RE.search(text):
+            self.has_address = True
+        if self._text_len < 6000:
+            self.text_parts.append(text)
+            self._text_len += len(text) + 1
+
+    def close(self):
+        super().close()
+        self._close_heading()
+
+
+def _apply_parsed(facts: PageFacts, parser: _PageParser) -> PageFacts:
+    """Copy what ``_PageParser`` collected onto ``facts`` — JSON-LD parsed here.
+
+    A JSON-LD block that does not parse is recorded in ``schema_errors``, never
+    skipped: Google ignores it too, so "you have schema" would be a false
+    comfort and "you have none" a false alarm.
+    """
+    facts.title = " ".join(parser.facts_title)[:300]
+    facts.meta_description = parser.meta_description[:500]
+    facts.canonical = parser.canonical
+    facts.h1, facts.h2, facts.h3 = parser.headings["h1"], parser.headings["h2"], parser.headings["h3"]
+    facts.q_headings = parser.q_headings
+    facts.internal_links = parser.links[:400]
+    facts.images_total = parser.images_total
+    facts.images_no_alt = parser.images_no_alt
+    facts.images_decorative = parser.images_decorative
+    facts.images_no_alt_srcs = list(parser.no_alt_srcs)
+    facts.has_phone, facts.has_address = parser.has_phone, parser.has_address
+    facts.word_count = parser.words
+    facts.text = " ".join(parser.text_parts)[:6000]
+    types: list[str] = list(parser.schema_types)
+    for i, raw in enumerate(parser.schema_raw, start=1):
+        body = raw.strip()
+        if not body:
+            continue  # an empty block claims nothing
+        try:
+            node = json.loads(body)
+        except ValueError as exc:
+            if len(facts.schema_errors) < MAX_SCHEMA_ERRORS:
+                facts.schema_errors.append(f"JSON-LD block {i}: {exc}"[:200])
+            continue
+        for typ in jsonld_types(node):
+            if typ not in types:
+                types.append(typ)
+    facts.schema_types = types
+    return facts
+
+
+def parse_page(url: str, html_text: str, status: int = 200) -> PageFacts:
+    """Parse one HTML document into ``PageFacts`` — no network."""
+    facts = PageFacts(url=url, status=status)
+    parser = _PageParser()
+    try:
+        parser.feed(html_text)
+    except Exception:  # noqa: BLE001 — real-world HTML; keep what parsed
+        pass
+    try:
+        parser.close()
+    except Exception:  # noqa: BLE001
+        parser._close_heading()
+    _apply_parsed(facts, parser)
+    # Resolve srcs so the same header logo reads the same on every page.
+    facts.images_no_alt_srcs = [
+        s if s.startswith("(") else urljoin(url, s).split("#", 1)[0]
+        for s in facts.images_no_alt_srcs
+    ]
+    return facts
 
 
 # --- Outbound fetch safety -------------------------------------------------
@@ -541,31 +797,7 @@ def fetch_page(url: str, client: httpx.Client | None = None) -> PageFacts:
         facts.status = resp.status_code
         if resp.status_code != 200 or len(resp.content) > 2_000_000:
             return facts
-        parser = _PageParser()
-        try:
-            parser.feed(resp.text)
-        except Exception:  # noqa: BLE001 — real-world HTML; keep what parsed
-            pass
-        facts.title = " ".join(parser.facts_title)[:300]
-        facts.meta_description = parser.meta_description[:500]
-        facts.canonical = parser.canonical
-        facts.h1, facts.h2, facts.h3 = parser.headings["h1"], parser.headings["h2"], parser.headings["h3"]
-        facts.internal_links = parser.links[:400]
-        facts.images_no_alt = parser.images_no_alt
-        facts.word_count = parser.words
-        facts.text = " ".join(parser.text_parts)[:6000]
-        for raw in parser.schema_raw:
-            try:
-                node = json.loads(raw)
-                nodes = node if isinstance(node, list) else node.get("@graph", [node])
-                for n in nodes:
-                    t = n.get("@type") if isinstance(n, dict) else None
-                    for typ in t if isinstance(t, list) else [t]:
-                        if typ:
-                            facts.schema_types.append(str(typ))
-            except Exception:  # noqa: BLE001
-                continue
-        return facts
+        return parse_page(url, resp.text, status=resp.status_code)
     except httpx.HTTPError:
         return facts  # status stays 0 -> "unreachable"
     finally:
