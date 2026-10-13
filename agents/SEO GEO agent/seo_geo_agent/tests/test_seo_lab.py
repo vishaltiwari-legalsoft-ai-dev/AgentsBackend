@@ -833,6 +833,45 @@ def test_match_property_prefers_domain_property():
     assert gsc_oauth.match_property("other.com", sites) is None  # unverified doesn't count
 
 
+@pytest.mark.parametrize("lookalike", [
+    "https://legalsoft.com.attacker.net/",
+    "sc-domain:notlegalsoft.com",
+    "https://attacker.net/legalsoft.com/",
+    "https://legalsoft.com.au/",
+    "https://legalsoft.com/blog/",             # a section, not the site
+    "https://legalsoft.com:8443/",
+    "https://evil@legalsoft.com/",
+    "ftp://legalsoft.com/",
+    "https://legalsoft.com/?x=1",
+    "sc-domain:legalsoft.com.attacker.net",
+])
+def test_match_property_never_binds_a_lookalike(lookalike):
+    """Any member can press Connect, so the account's lookalike property must
+    not become the brand's numbers. These used to match by prefix/substring."""
+    sites = [{"siteUrl": lookalike, "permissionLevel": "siteOwner"}]
+    assert gsc_oauth.match_property("legalsoft.com", sites) is None
+    assert not gsc_oauth.property_matches(lookalike, "legalsoft.com")
+
+
+@pytest.mark.parametrize("exact", [
+    "sc-domain:legalsoft.com", "https://legalsoft.com/", "https://www.legalsoft.com/",
+    "http://legalsoft.com/", "http://www.legalsoft.com", "https://LegalSoft.com/",
+])
+def test_match_property_still_takes_the_brands_own_site(exact):
+    sites = [{"siteUrl": exact, "permissionLevel": "siteFullUser"}]
+    assert gsc_oauth.match_property("legalsoft.com", sites) == exact
+    assert gsc_oauth.property_matches(exact, "www.legalsoft.com")   # a www-typed domain too
+
+
+def test_match_property_prefers_domain_then_https_then_the_bare_host():
+    site = lambda url: {"siteUrl": url, "permissionLevel": "siteOwner"}  # noqa: E731
+    pool = [site("http://legalsoft.com/"), site("https://www.legalsoft.com/"),
+            site("https://legalsoft.com/"), site("https://legalsoft.com.attacker.net/")]
+    assert gsc_oauth.match_property("legalsoft.com", pool) == "https://legalsoft.com/"
+    assert gsc_oauth.match_property(
+        "legalsoft.com", pool + [site("sc-domain:legalsoft.com")]) == "sc-domain:legalsoft.com"
+
+
 def _verified(brand_id="b", user_id="user-a"):
     return gsc_oauth.read_state(gsc_oauth.make_state(brand_id, user_id), user_id=user_id)
 
@@ -874,6 +913,27 @@ def test_complete_says_plainly_when_the_account_cannot_see_the_site(gsc_connect,
         "account that does, or ask the site owner to add it."
     )
     assert gsc_connect.store == {}
+
+
+def test_complete_refuses_a_property_another_brand_already_reads(gsc_connect, monkeypatch):
+    """The GA rule for Search Console: one property's numbers belong to one
+    brand. A second brand on the same domain is refused, not double-counted."""
+    insights.create_brand({"id": "twin", "name": "Twin Legal", "domain": "x.com", "enabled": True})
+    gsc_connect.store["twin"] = {"brand_id": "twin", "property": "sc-domain:x.com",
+                                 "refresh_token_enc": "t"}
+    monkeypatch.setattr(gsc_oauth, "_exchange", lambda code: dict(TOKENS))
+    monkeypatch.setattr(gsc_oauth, "_sites", lambda tok: OWNED)
+    with _refused(gsc_oauth.PROPERTY_TAKEN) as info:
+        gsc_oauth.complete(_verified(), BRAND, code="c", connected_by="a@b.com", user_id="user-a")
+    assert info.value.message == (
+        "sc-domain:x.com is already connected to Twin Legal — one Search Console "
+        "property can feed only one brand. Disconnect it there first."
+    )
+    assert set(gsc_connect.store) == {"twin"}          # nothing stored for BRAND
+    # once the other brand lets go, the same connect goes through
+    gsc_oauth.disconnect("twin")
+    view = gsc_oauth.complete(_verified(), BRAND, code="c", connected_by="a@b.com", user_id="user-a")
+    assert view["property"] == "sc-domain:x.com"
 
 
 def test_complete_refuses_a_grant_without_search_console_read(gsc_connect, monkeypatch):
@@ -970,12 +1030,12 @@ def test_a_sealed_token_this_server_cannot_open_degrades_the_run_honestly(gsc_co
         gsc_oauth._open_token({"refresh_token_enc": other})
 
 
-def test_run_brand_uses_connected_property(monkeypatch):
+def test_run_brand_uses_connected_property(gsc_connect, monkeypatch):
     brand = insights.list_brands()[0]
     seen = {}
+    gsc_connect.store[brand["id"]] = {"brand_id": brand["id"], "refresh_token_enc": "sealed",
+                                      "property": "https://www.legalsoft.com/"}
     monkeypatch.setattr(insights.gsc_oauth, "service", lambda bid: object())
-    monkeypatch.setattr(insights.gsc_oauth, "connection",
-                        lambda bid: {"property": "sc-domain:custom.com"})
 
     def fake_fetch(prop, s, e, service=None):
         seen["prop"], seen["svc"] = prop, service
@@ -983,8 +1043,39 @@ def test_run_brand_uses_connected_property(monkeypatch):
 
     monkeypatch.setattr(insights, "gsc_fetch", fake_fetch)
     run = insights.run_brand(brand, trigger="t")
-    assert seen["prop"] == "sc-domain:custom.com" and seen["svc"] is not None
+    assert seen["prop"] == "https://www.legalsoft.com/" and seen["svc"] is not None
     assert run["summary"]["mode"] == "search-console"
+    assert gsc_oauth.FOREIGN_GRANT_NOTE not in run["degraded"]
+
+
+@pytest.mark.parametrize(("grant", "why"), [
+    ({"brand_id": "legalsoft", "property": "sc-domain:oldsite.com"}, "domain edited after connect"),
+    ({"brand_id": "someone-else", "property": "sc-domain:legalsoft.com"}, "stored for another brand"),
+    ({"property": "https://legalsoft.com.au/"}, "legacy grant for a lookalike"),
+])
+def test_run_brand_ignores_a_grant_for_a_different_site(gsc_connect, monkeypatch, grant, why):
+    """A slug recreated for another domain, or a domain edited after the
+    connect: the stored grant reads somebody else's site. The run ignores it,
+    falls back to the shared service account on the brand's own domain, and
+    says why."""
+    brand = insights.list_brands()[0]
+    gsc_connect.store[brand["id"]] = {**grant, "refresh_token_enc": "sealed"}
+
+    def no_grant_client(bid):
+        raise AssertionError(f"the grant's client was built ({why})")
+
+    seen = {}
+
+    def fake_fetch(prop, s, e, service=None):
+        seen["prop"], seen["svc"] = prop, service
+        return [row("legal virtual assistant")]
+
+    monkeypatch.setattr(insights.gsc_oauth, "service", no_grant_client)
+    monkeypatch.setattr(insights, "gsc_fetch", fake_fetch)
+    run = insights.run_brand(brand, trigger="t")
+    assert seen == {"prop": "sc-domain:legalsoft.com", "svc": None}
+    assert gsc_oauth.FOREIGN_GRANT_NOTE in run["degraded"]
+    assert gsc_oauth.usable_grant(brand) == (None, gsc_oauth.FOREIGN_GRANT_NOTE)
 
 
 # --------------------------------- advisor ---------------------------------

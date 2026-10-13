@@ -43,16 +43,19 @@ import binascii
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 
 from . import state
 from .sources import GOOGLE_API_TIMEOUT_SECONDS, CredentialMissing
+
+logger = logging.getLogger("agentos.seo_geo.gsc_oauth")
 
 SCOPE = "https://www.googleapis.com/auth/webmasters.readonly"
 AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -89,6 +92,11 @@ SCOPE_NOT_GRANTED = "gsc_scope_not_granted"
 EXCHANGE_FAILED = "gsc_exchange_failed"
 GOOGLE_UNAVAILABLE = "gsc_google_unavailable"
 NO_PROPERTY = "gsc_no_property"
+PROPERTY_TAKEN = "gsc_property_taken"
+
+#: The run's degraded note when a stored grant may not be used for the brand —
+#: stored for another brand id, or for a site the brand's domain no longer is.
+FOREIGN_GRANT_NOTE = "Search Console connection is for a different site — reconnect it."
 
 _UNCONFIGURED_MESSAGE = (
     "Search Console connect isn't set up on this server yet — an admin needs to "
@@ -360,17 +368,73 @@ def _sites(access_token: str) -> list[dict]:
     )
 
 
+def _bare(domain: str) -> str:
+    return (domain or "").strip().lower().removeprefix("www.").rstrip(".")
+
+
+def property_matches(prop: str, domain: str) -> bool:
+    """Whether Search Console property ``prop`` IS the brand's site ``domain``.
+
+    Exact, never a substring or prefix: ``sc-domain:{domain}``, or a URL-prefix
+    property ``http(s)://{domain}/`` / ``http(s)://www.{domain}/`` — scheme http
+    or https, host exactly the domain or its www host, path "/" or empty, and
+    nothing else in the URL (no port, credentials, query or fragment). So
+    ``https://legalsoft.com.attacker.net/``, ``sc-domain:notlegalsoft.com``,
+    ``https://attacker.net/legalsoft.com/`` and ``https://legalsoft.com.au/``
+    are NOT legalsoft.com — any member can press Connect, so a lookalike the
+    account happens to own must not become the brand's numbers."""
+    domain = _bare(domain)
+    prop = (prop or "").strip()
+    if not domain or not prop:
+        return False
+    if prop.lower().startswith("sc-domain:"):
+        return prop[len("sc-domain:"):].strip().lower() == domain
+    try:
+        parts = urlsplit(prop)
+        host = parts.hostname
+    except ValueError:
+        return False
+    return (
+        parts.scheme.lower() in ("http", "https")
+        and host in (domain, f"www.{domain}")
+        and parts.netloc.lower() == host          # no port, no user:pass@
+        and parts.path in ("", "/")
+        and not parts.query and not parts.fragment
+    )
+
+
 def match_property(domain: str, sites: list[dict]) -> str | None:
-    """Pick the account's property for this brand: domain property first."""
+    """Pick the account's property for this brand: the domain property, else
+    an exact URL-prefix one (https before http, bare host before www). Only a
+    property :func:`property_matches` accepts is ever returned."""
     verified = [s["siteUrl"] for s in sites
                 if s.get("siteUrl") and s.get("permissionLevel") != "siteUnverifiedUser"]
-    if f"sc-domain:{domain}" in verified:
-        return f"sc-domain:{domain}"
-    for prefix in (f"https://{domain}", f"https://www.{domain}", f"http://{domain}"):
-        for site in verified:
-            if site.startswith(prefix):
-                return site
-    return next((s for s in verified if domain in s), None)
+    matching = [s for s in verified if property_matches(s, domain)]
+    bare = _bare(domain)
+
+    def rank(site: str) -> tuple[int, int, int]:
+        if site.lower().startswith("sc-domain:"):
+            return (0, 0, 0)
+        parts = urlsplit(site)
+        return (1, parts.scheme.lower() != "https", parts.hostname != bare)
+
+    return min(matching, key=rank, default=None)
+
+
+def _held_by_another_brand(brand_id: str, prop: str) -> dict | None:
+    """The other registered brand whose stored grant already reads ``prop``.
+
+    The GA rule in ``insights._ga_section``, for Search Console: one property's
+    numbers belong to one brand, so a second brand connecting the same property
+    is refused rather than reporting the first brand's traffic as its own.
+    One batched read of the other brands' grants."""
+    from . import insights  # the registry; imported here because insights imports this module
+
+    others = {b["id"]: b for b in insights.list_brands() if b.get("id") and b["id"] != brand_id}
+    for other_id, grant in _grant_docs(list(others)).items():
+        if str(grant.get("property") or "").strip().lower() == prop.strip().lower():
+            return others[other_id]
+    return None
 
 
 def _utcnow() -> str:
@@ -405,6 +469,14 @@ def complete(verified: ConnectState, brand: dict, *, code: str,
             NO_PROPERTY,
             f"This Google account has no Search Console access to {brand['domain']} — "
             "sign in with an account that does, or ask the site owner to add it.",
+        )
+    holder = _held_by_another_brand(brand["id"], prop)
+    if holder:
+        raise ConnectRefused(
+            PROPERTY_TAKEN,
+            f"{prop} is already connected to {holder.get('name') or holder['id']} — one "
+            "Search Console property can feed only one brand. Disconnect it there first.",
+            log_detail=f"brand {brand['id']} asked for {prop}, held by brand {holder['id']}",
         )
     grant = {
         "property": prop,
@@ -496,6 +568,33 @@ def connections(brand_ids: list[str]) -> dict[str, dict]:
 def connection(brand_id: str) -> dict | None:
     """``{"property", "connected_by", "connected_at"}`` or ``None``."""
     return connections([brand_id]).get(brand_id)
+
+
+def foreign_grant(brand: dict, grant: dict) -> bool:
+    """A stored grant this brand must not read with: stored for a different
+    brand id, or for a property that is not the brand's CURRENT domain under
+    :func:`property_matches` — a slug deleted and recreated for another site,
+    or a domain edited after the connect. A grant with no stored ``brand_id``
+    (legacy) is judged on its property alone."""
+    stored_for = grant.get("brand_id")
+    if stored_for and stored_for != brand.get("id"):
+        return True
+    return not property_matches(str(grant.get("property") or ""), str(brand.get("domain") or ""))
+
+
+def usable_grant(brand: dict) -> tuple[dict | None, str | None]:
+    """``(public view, None)`` when the brand has a grant it may read with,
+    ``(None, None)`` when it has none, and ``(None, FOREIGN_GRANT_NOTE)`` when
+    its stored grant is :func:`foreign_grant` — the run then ignores it, falls
+    back to the shared service account, and says so. One grant read."""
+    grant = _grant_docs([brand["id"]]).get(brand["id"])
+    if not grant:
+        return None, None
+    if foreign_grant(brand, grant):
+        logger.warning("Search Console grant for brand %s ignored: property %s is not %s",
+                       brand["id"], grant.get("property"), brand.get("domain"))
+        return None, FOREIGN_GRANT_NOTE
+    return _public(grant), None
 
 
 def disconnect(brand_id: str) -> None:

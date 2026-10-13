@@ -1186,6 +1186,24 @@ def test_a_geo_only_caller_completes_the_whole_geo_journey(
     )
 
 
+def test_the_seo_overview_a_geo_only_account_reaches_carries_no_search_console_block(
+    scoped_app,
+) -> None:
+    """``GET /api/seo-geo/overview`` is EXTERNAL_OK only because the console
+    shell reads it; GEO uses none of its Search Console data. So the per-brand
+    ``gsc`` block — who connected it, when, which property — is left out for a
+    GEO-only principal, end to end through the real token and the scope wall,
+    while a member still gets it."""
+    geo = scoped_app.get("/api/seo-geo/overview", headers=_headers(_GEO_ONLY))
+    assert geo.status_code == 200, geo.text
+    assert geo.json()["brands"], "the overview must still list the brands"
+    assert all("gsc" not in c and "gsc_connected" not in c for c in geo.json()["brands"])
+
+    member = scoped_app.get("/api/seo-geo/overview", headers=_headers(_MEMBER))
+    assert member.status_code == 200, member.text
+    assert all("gsc" in c for c in member.json()["brands"])
+
+
 @pytest.mark.parametrize("email", [_MEMBER, _ADMIN, _CREATOR])
 @pytest.mark.parametrize(("method", "path"), sorted(ROUTE_LEDGER))
 def test_the_scope_wall_refuses_nobody_who_is_not_geo_only(

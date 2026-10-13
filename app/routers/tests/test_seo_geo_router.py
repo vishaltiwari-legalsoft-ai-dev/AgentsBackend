@@ -583,3 +583,41 @@ def test_a_grant_still_shows_connected_when_its_run_failed_to_read(gsc, monkeypa
     assert body["brands"][0]["gsc"]["reading"] is False
     assert body["sources"]["gsc"] is True   # a grant exists
 
+
+def test_connecting_a_property_another_brand_reads_is_a_coded_409(gsc, as_creator):
+    as_creator()
+    assert client.post("/api/seo-geo/brands", json={"name": "Twin", "domain": "legalsoft.com"}
+                       ).status_code == 200
+    gsc.store["twin"] = {"brand_id": "twin", "property": "sc-domain:legalsoft.com",
+                         "refresh_token_enc": "t"}
+    r = client.post("/api/seo-geo/oauth/complete", json={"code": "c", "state": _start_state()})
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == {
+        "code": "gsc_property_taken",
+        "message": "sc-domain:legalsoft.com is already connected to Twin — one Search "
+                   "Console property can feed only one brand. Disconnect it there first.",
+    }
+    assert "legalsoft" not in gsc.store
+
+
+GEO_ONLY = {"id": "g1", "email": "contractor@aivirtual.com", "is_admin": False,
+            "is_creator": False, "is_geo_only": True}
+
+
+def test_a_geo_only_caller_gets_the_overview_without_any_search_console_block(gsc, as_caller):
+    """GEO-only contractors reach this route (the console shell reads it) but
+    use no Search Console data, so a staff member's connect — their email, when,
+    and the property — never reaches them."""
+    r = client.post("/api/seo-geo/oauth/complete", json={"code": "c", "state": _start_state()})
+    assert r.status_code == 200, r.text
+    staff = client.get("/api/seo-geo/overview").json()
+    assert staff["brands"][0]["gsc"]["connected_by"] == "t@legalsoft.com"
+
+    as_caller(GEO_ONLY)
+    r = client.get("/api/seo-geo/overview")
+    assert r.status_code == 200
+    for card in r.json()["brands"]:
+        assert "gsc" not in card and "gsc_connected" not in card
+        assert card["brand"]["id"]                          # the rest of the card is intact
+    assert "t@legalsoft.com" not in r.text and "connected_at" not in r.text
+

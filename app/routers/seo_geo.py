@@ -118,7 +118,12 @@ def overview(user=Depends(get_current_user)):
     when some brand really has Search Console behind it (a stored grant, or a
     latest run that read Search Console rows); ``sources.gsc_connect`` says
     whether the Connect button can work on this server. Per brand, ``gsc`` is
-    :func:`_gsc_view`; ``gsc_connected`` stays for consoles that predate it."""
+    :func:`_gsc_view`; ``gsc_connected`` stays for consoles that predate it.
+
+    GEO-only accounts (outside contractors) reach this route through the scope
+    wall because the console shell reads it, but GEO uses no Search Console
+    data: for them both per-brand fields are left out, so the connecting staff
+    member's email, ``connected_at`` and the property never reach them."""
     brands = insights.list_brands()
     grants = seo_oauth.connections([b["id"] for b in brands])  # one batched read
     cards = []
@@ -139,7 +144,7 @@ def overview(user=Depends(get_current_user)):
                 "topic_count": len(run["topics"]),
             },
         })
-    return {
+    body = {
         "sources": {
             "gsc": any(c["gsc"]["connected"] or c["gsc"]["reading"] for c in cards),
             "gsc_connect": seo_oauth.connect_ready(),
@@ -147,6 +152,11 @@ def overview(user=Depends(get_current_user)):
         },
         "brands": cards,
     }
+    if user.get("is_geo_only"):
+        for card in cards:
+            card.pop("gsc", None)
+            card.pop("gsc_connected", None)
+    return body
 
 
 @router.post("/seo-geo/brands")
@@ -505,6 +515,7 @@ _GSC_STATUS = {
     seo_oauth.STATE_OTHER_USER: 400,
     seo_oauth.SCOPE_NOT_GRANTED: 422,
     seo_oauth.NO_PROPERTY: 422,
+    seo_oauth.PROPERTY_TAKEN: 409,
     seo_oauth.EXCHANGE_FAILED: 502,
     seo_oauth.GOOGLE_UNAVAILABLE: 502,
 }

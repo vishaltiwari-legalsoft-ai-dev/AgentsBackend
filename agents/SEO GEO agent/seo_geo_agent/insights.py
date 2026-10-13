@@ -503,10 +503,14 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
     degraded: list[str] = []
     rows: list[QueryStat] = []
     prev_rows: list[QueryStat] = []
+    # A brand's own OAuth grant wins; the shared service account is the fallback,
+    # and the only path when the stored grant is for a different site (a slug
+    # recreated for another domain, or a domain edited after the connect).
+    conn, foreign = gsc_oauth.usable_grant(brand)
+    if foreign:
+        degraded.append(foreign)
     try:
-        # A customer's own OAuth grant wins; the shared service account is the fallback.
-        svc = gsc_oauth.service(brand["id"])
-        conn = gsc_oauth.connection(brand["id"]) if svc else None
+        svc = gsc_oauth.service(brand["id"]) if conn else None
         prop = conn["property"] if conn else (brand.get("gsc_property") or f"sc-domain:{brand['domain']}")
         rows = gsc_fetch(prop, end - timedelta(days=28), end, service=svc)
         prev_rows = gsc_fetch(prop, end - timedelta(days=56), end - timedelta(days=29), service=svc)
