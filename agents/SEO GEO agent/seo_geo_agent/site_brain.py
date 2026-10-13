@@ -68,6 +68,42 @@ def _summarize_batch(batch: list) -> list[dict]:
     ]
 
 
+#: Corpus keys an absence claim ("no form", "no links to /x") is checked
+#: against, and the schema-fit facts that came with them. An entry without
+#: ``forms`` was crawled before they existed: such claims are unverifiable.
+CLAIM_FACT_KEYS = ("forms", "tel_links", "mailto_links", "booking_links", "link_paths",
+                   "link_paths_capped", "faq_pairs", "headings_total", "headings_linked",
+                   "address_text")
+#: The corpus is ONE Firestore document (1 MiB). Link targets are the only
+#: per-page list that can grow large (a 300-link mega-menu on every page), so
+#: they share a fixed budget; a page trimmed to fit is marked capped.
+LINK_PATHS_BUDGET = 350_000
+
+
+def page_claim_facts(facts) -> dict:
+    """The corpus-entry slice of ``PageFacts`` that grounding checks claims against."""
+    return {k: (list(getattr(facts, k)) if isinstance(getattr(facts, k), list) else getattr(facts, k))
+            for k in CLAIM_FACT_KEYS}
+
+
+def _fit_link_budget(pages: list[dict], budget: int = LINK_PATHS_BUDGET) -> None:
+    """Trim every page's ``link_paths`` to an equal share of ``budget``
+    characters when the corpus would exceed it, marking trimmed pages capped."""
+    size = sum(len(p) + 3 for e in pages for p in e.get("link_paths") or [])
+    if size <= budget or not pages:
+        return
+    share = budget // len(pages)
+    for entry in pages:
+        kept, used = [], 0
+        for path in entry.get("link_paths") or []:
+            used += len(path) + 3
+            if used > share:
+                entry["link_paths_capped"] = True
+                break
+            kept.append(path)
+        entry["link_paths"] = kept
+
+
 def build_corpus(brand: dict, fetch=fetch_page, sitemap=fetch_sitemap, max_pages: int = MAX_PAGES) -> dict:
     """Crawl the site into a cached, summarised corpus. Only changed pages hit the LLM."""
     domain = brand["domain"]
@@ -98,7 +134,8 @@ def build_corpus(brand: dict, fetch=fetch_page, sitemap=fetch_sitemap, max_pages
                      "schema_types": list(facts.schema_types),
                      "schema_errors": list(facts.schema_errors),
                      "q_headings": facts.q_headings,
-                     "has_phone": facts.has_phone, "has_address": facts.has_address}
+                     "has_phone": facts.has_phone, "has_address": facts.has_address,
+                     **page_claim_facts(facts)}
             if cached and cached.get("hash") == h and cached.get("summary"):
                 entry.update({k: cached[k] for k in ("summary", "type", "topics", "target_query", "cta")
                               if k in cached})
@@ -118,7 +155,7 @@ def build_corpus(brand: dict, fetch=fetch_page, sitemap=fetch_sitemap, max_pages
                 summaries[facts.url] = summary
         except CredentialMissing as exc:
             if not notes:
-                notes.append(f"Content summaries degraded (no AI): {exc}")
+                notes.append(sources.plain_note(f"Content summaries degraded (no AI): {exc}"))
             for facts in batch:
                 summaries[facts.url] = _fallback_summary(facts)
     for entry in pages:
@@ -126,6 +163,7 @@ def build_corpus(brand: dict, fetch=fetch_page, sitemap=fetch_sitemap, max_pages
         if facts is not None:
             entry.update(summaries[facts.url])
 
+    _fit_link_budget(pages)
     corpus = {
         "brand_id": brand["id"],
         "at": date.today().isoformat(),
@@ -240,6 +278,239 @@ def _cited_pages(text: str, crawled: dict[str, dict]) -> list[dict]:
     return out
 
 
+# ------------------------------ digest artifacts ------------------------------
+# The expert model reads a digest line per page — "(920w)", "[no clear CTA]" —
+# and echoes those markers, and "in the provided text", back into its prose.
+# None of that means anything to the person reading the review.
+
+_DIGEST_ARTIFACTS = (
+    re.compile(r"\s*\(\s*\d[\d,]*\s*w(?:ords?)?\s*\)", re.I),
+    re.compile(r"\s*\[\s*no clear CTA\s*\]", re.I),
+    re.compile(r"\s*\b(?:in|from|within) (?:the )?(?:provided|supplied|given) "
+               r"(?:text|content|digest|summar(?:y|ies)|excerpts?|notes)\b", re.I),
+    re.compile(r"\s*\b(?:in|from) the (?:site |page )?digest\b", re.I),
+)
+
+
+def clean_review_text(text) -> str:
+    """``text`` without the digest's markers: word counts, ``[no clear CTA]``,
+    "in the provided text", "in the digest"."""
+    out = str(text or "")
+    for rx in _DIGEST_ARTIFACTS:
+        out = rx.sub("", out)
+    out = re.sub(r"\(\s*\)|\[\s*\]", "", out)
+    out = re.sub(r"\s+([,.;:!?)'’\]])", r"\1", out)
+    return re.sub(r"\s{2,}", " ", out).strip()
+
+
+# ------------------------------- absence claims -------------------------------
+# "The contact page has no form", "no links to /practice-areas/family". The
+# model judges from a text digest that never showed it forms, phone links or
+# the link graph, so an absence it reports is a guess. Each one is checked
+# against what the crawl recorded for the cited page: the page contradicts it
+# (dropped, ``contradicted-by-page``), the page confirms it (kept), or the
+# crawl has no fact to check it with (dropped, ``unverifiable-absence``) —
+# an absence claim nobody can check is never kept.
+
+_ABSENCE_CUE = re.compile(
+    r"\b(?:no|not|never|lacks?|lacking|missing|without|absent|zero|none|"
+    r"doesn['’]t|does not|don['’]t|do not|isn['’]t|is not|aren['’]t|are not|"
+    r"has no|have no|fails? to|omits?|omitted)\b", re.I)
+_CLAUSE_BREAK = re.compile(r"[.;!?]\s|\s[—–]\s|\s-\s|\bbut\b|\bhowever\b|\bwhereas\b|\bwhile\b", re.I)
+_PATH_RE = re.compile(r"(?<![\w.:/])/[a-z0-9][a-z0-9_\-/]*", re.I)
+_DIGEST_PROVENANCE = re.compile(
+    r"\b(?:in|from|within) (?:the )?(?:provided|supplied|given) (?:text|content|digest|"
+    r"summar(?:y|ies)|excerpts?)\b|\b(?:in|from) the digest\b|"
+    r"\bcontent(?: of [\w ]{1,40})? not visible\b|\bnot visible in (?:the )?(?:text|digest|summar)", re.I)
+#: The thing a clause says is missing.
+_CLAIM_OBJECTS = (
+    ("form", re.compile(r"\bforms?\b", re.I)),
+    ("phone", re.compile(r"\b(?:phone(?: numbers?)?|telephone|click[- ]to[- ]call|call (?:buttons?|links?))\b|"
+                         r"\btel:", re.I)),
+    ("booking", re.compile(r"\b(?:calendars?|calendly|booking|book(?:ing)? (?:a )?(?:call|meeting|demo|"
+                           r"consultation)|schedul(?:er|ing)|appointments?)\b", re.I)),
+    ("contact", re.compile(r"\bcontact (?:info(?:rmation)?|details?|options?|methods?|points?)\b|"
+                           r"\bways? to (?:contact|reach)\b|\be-?mail(?: address(?:es)?)?\b", re.I)),
+    ("cta", re.compile(r"\b(?:ctas?|calls?[- ]to[- ]action|next[- ]steps?|conversion paths?)\b", re.I)),
+    ("link", re.compile(r"\b(?:cross[- ]?|inter)?link(?:s|ed|ing)?\b", re.I)),
+)
+#: "calendar link", "form links": the link IS the other object, not a claim
+#: about the page's links.
+_LINK_QUALIFIERS = frozenset({"calendar", "calendly", "booking", "call", "form", "forms", "contact",
+                              "phone", "email", "e-mail", "social", "scheduling", "demo"})
+_TARGET_FILLER = frozenset({
+    "the", "a", "an", "to", "from", "your", "their", "its", "our", "other", "related", "relevant",
+    "key", "top", "any", "these", "those", "more", "all", "main", "important", "core", "each",
+    "every", "specific", "individual", "page", "pages", "content", "section", "sections", "site",
+    "website", "internal", "this", "that", "them", "it", "etc", "and", "or", "of", "for", "on",
+    "in", "with", "back", "corresponding", "appropriate", "reciprocal", "outbound", "inbound",
+    "external", "clear", "visible", "direct", "obvious", "useful", "helpful", "working",
+})
+_HOME_WORDS = frozenset({"home", "homepage"})
+_CONTACT_SEG = re.compile(r"^(?:contact|get-in-touch|talk-to|book|schedule|get-started|"
+                          r"request-a|consult)", re.I)
+
+
+def _path_of(url: str) -> str:
+    return "/" + sources.norm_url(url).partition("/")[2].rstrip("/") if url else "/"
+
+
+def _contact_forms(page: dict) -> list[str]:
+    return [f for f in page.get("forms") or [] if f not in sources.NON_CONTACT_FORMS]
+
+
+def _booking(page: dict) -> list[str]:
+    return list(page.get("booking_links") or []) + [
+        f for f in page.get("forms") or [] if f in sources.BOOKING_EMBEDS]
+
+
+def _stem(word: str) -> str:
+    w = word.lower().strip("'’-")
+    if w.endswith("ies") and len(w) > 4:
+        return w[:-3]
+    if w.endswith("s") and not w.endswith("ss") and len(w) > 3:
+        return w[:-1]
+    return w
+
+
+def _link_target(after: str, before: str = "") -> tuple[str, list[str] | str | None]:
+    """What a "no links … X" clause is about -> ``(direction, target)``.
+
+    ``direction`` is "out" (links TO something) or "in" (linked FROM
+    somewhere). ``target`` is a list of paths, a slug to look for in paths,
+    "" for "any link at all", or None when nothing checkable was named.
+    ``before`` is the word in front of "link": in "no case-study link" it
+    names the target."""
+    paths = [p.rstrip("/.,") for p in _PATH_RE.findall(after)]
+    words = re.findall(r"[a-z][a-z'’\-]*", after.lower())
+    direction = "in" if (words[:1] == ["from"] or "pointing" in words[:3]) else "out"
+    if paths:
+        return direction, paths
+    if (direction == "out" and words[:1] not in (["to"], ["into"]) and before
+            and before not in _TARGET_FILLER and not _ABSENCE_CUE.fullmatch(before)):
+        return direction, _stem(before)
+    content = [w for w in words if w not in _TARGET_FILLER and w not in ("pointing", "linking")]
+    if direction == "in":
+        if not content or set(content[:2]) & {"anywhere", "anything"}:
+            return direction, ""
+        if content[0] in _HOME_WORDS:
+            return direction, ["/"]
+        return direction, None
+    if not words or words[0] not in ("to", "into", "toward", "towards"):
+        return direction, ""          # "has no internal links": links to anything
+    if not content:
+        return direction, None
+    return direction, "-".join(_stem(w) for w in content[:3])
+
+
+def _claims(text: str) -> list[tuple[str, str, str]]:
+    """Every ``(object, rest of clause, word before it)`` that ``text`` says is absent."""
+    clean = _URL_RE.sub(" ", text or "")
+    out: list[tuple[str, str, str]] = []
+    for clause in _CLAUSE_BREAK.split(clean):
+        cue = _ABSENCE_CUE.search(clause or "")
+        if not cue:
+            continue
+        rest = clause[cue.end():]
+        for name, rx in _CLAIM_OBJECTS:
+            for m in rx.finditer(rest):
+                before = (re.findall(r"[a-z][a-z\-]*", rest[: m.start()].lower())[-1:] or [""])[0]
+                if name == "link" and before in _LINK_QUALIFIERS:
+                    continue
+                out.append((name, rest[m.end():], before))
+                break
+    return out
+
+
+def _check_claim(name: str, after: str, before: str, page: dict,
+                 crawled: dict[str, dict]) -> tuple[str, str]:
+    """One absence claim against one crawled page -> ``(verdict, detail)``,
+    verdict "contradicted" / "verified" / "unverifiable"."""
+    url = page.get("url") or ""
+    phone = list(page.get("tel_links") or []) or (["a phone number"] if page.get("has_phone") else [])
+    if name == "phone":
+        if phone:
+            return "contradicted", f"{url} shows {phone[0]}"
+        return ("verified", "") if "has_phone" in page else ("unverifiable", "")
+    if "forms" not in page:
+        return "unverifiable", f"{url} was crawled before forms, links and booking were recorded"
+    forms, booking = _contact_forms(page), _booking(page)
+    mail = list(page.get("mailto_links") or [])
+    if name == "form":
+        return (("contradicted", f"{url} has a form ({', '.join(forms)})") if forms
+                else ("verified", ""))
+    if name == "booking":
+        return (("contradicted", f"{url} has a booking link ({booking[0]})") if booking
+                else ("verified", ""))
+    if name == "contact":
+        found = ([f"a form ({', '.join(forms)})"] if forms else []) + phone[:1] + mail[:1] + booking[:1]
+        return (("contradicted", f"{url} shows {', '.join(found)}") if found else ("verified", ""))
+    if name == "cta":
+        contact_paths = [p for p in page.get("link_paths") or []
+                         if _CONTACT_SEG.match(p.strip("/").split("/")[0] or "")]
+        found = ([f"a form ({', '.join(forms)})"] if forms else []) + booking[:1] + phone[:1] \
+            + [f"a link to {p}" for p in contact_paths[:1]]
+        return (("contradicted", f"{url} has {', '.join(found)}") if found else ("verified", ""))
+    # links
+    direction, target = _link_target(after, before)
+    if target is None:
+        return "unverifiable", "names no page the links should point to"
+    own = _path_of(url)
+    if direction == "in":
+        sources_pages = [p for p in crawled.values() if p is not page]
+        if isinstance(target, list):
+            sources_pages = [p for p in sources_pages if _path_of(p.get("url") or "") in target]
+        if not sources_pages or any("link_paths" not in p for p in sources_pages):
+            return "unverifiable", "the linking pages' links were not recorded"
+        hit = next((p for p in sources_pages if own in (p.get("link_paths") or [])), None)
+        if hit:
+            return "contradicted", f"{hit.get('url')} links to {own}"
+        if any(p.get("link_paths_capped") for p in sources_pages):
+            return "unverifiable", "not every link on the linking pages was recorded"
+        return "verified", ""
+    paths = [p for p in page.get("link_paths") or [] if p != own]
+    capped = bool(page.get("link_paths_capped"))
+    if target == "":
+        if paths:
+            return "contradicted", f"{url} links to {paths[0]}"
+        return ("unverifiable", "") if capped else ("verified", "")
+    if isinstance(target, list):
+        named = [t.lower() for t in target]
+        hit = next((p for p in paths for t in named if p.lower() == t or p.lower().endswith(t)), None)
+    else:
+        hit = next((p for p in paths if target in p.lower()), None)
+    if hit:
+        return "contradicted", f"{url} links to {hit}"
+    return ("unverifiable", "") if capped else ("verified", "")
+
+
+def absence_problem(issue: dict, cited: list[dict], crawled: dict[str, dict]) -> tuple[str, str] | None:
+    """``(reason, detail)`` when the issue says the cited page lacks something
+    and the crawl contradicts that — or has no fact to check it — else None."""
+    claims: list[tuple[str, str, str]] = []
+    for field in ("insight", "evidence"):
+        claims += _claims(str(issue.get(field) or ""))
+    text = f"{issue.get('insight', '')} {issue.get('evidence', '')}"
+    if not claims:
+        if _DIGEST_PROVENANCE.search(_URL_RE.sub(" ", text)):
+            return ("unverifiable-absence",
+                    "says something is absent from the page digest — the digest is not the page")
+        return None
+    if not cited:
+        return "unverifiable-absence", "no crawled page to check the claim against"
+    unverifiable = ""
+    for name, after, before in claims:
+        for page in cited:
+            verdict, detail = _check_claim(name, after, before, page, crawled)
+            if verdict == "contradicted":
+                return "contradicted-by-page", detail
+            if verdict == "unverifiable" and not unverifiable:
+                unverifiable = detail or f"{page.get('url')} has no {name} fact to check against"
+    if unverifiable:
+        return "unverifiable-absence", unverifiable
+    return None
+
+
 def ground_issues(raw_issues, corpus: dict, client_line: str = "") -> tuple[list[dict], dict]:
     """Validate the model's issues against the crawl -> ``(kept, grounding)``.
 
@@ -248,8 +519,11 @@ def ground_issues(raw_issues, corpus: dict, client_line: str = "") -> tuple[list
     number in the insight and evidence must appear in the input the model was
     given for the cited page(s) — the action may carry recommendation numbers;
     a mention of schema / JSON-LD / rich results must fit the cited page per
-    ``audit.schema_fit``; and per category + page only the highest-priority
-    issue survives. ``grounding`` = ``{kept, dropped: [{reason, insight, detail}]}``.
+    ``audit.schema_fit``; a claim that the page lacks a form, phone, contact
+    route, booking link, CTA or a link must survive :func:`absence_problem`;
+    and per category + page only the highest-priority issue survives. Kept
+    text is stripped of digest markers (:func:`clean_review_text`).
+    ``grounding`` = ``{kept, dropped: [{reason, insight, detail}]}``.
     """
     pages = corpus.get("pages") or []
     crawled = {sources.norm_url(p.get("url") or ""): p for p in pages if p.get("url")}
@@ -260,7 +534,8 @@ def ground_issues(raw_issues, corpus: dict, client_line: str = "") -> tuple[list
     dropped: list[dict] = []
 
     def drop(reason: str, insight: str, detail: str) -> None:
-        dropped.append({"reason": reason, "insight": insight[:200], "detail": detail[:200]})
+        dropped.append({"reason": reason, "insight": clean_review_text(insight)[:200],
+                        "detail": detail[:200]})
 
     candidates: list[dict] = []
     for i in raw_issues if isinstance(raw_issues, list) else []:
@@ -299,7 +574,13 @@ def ground_issues(raw_issues, corpus: dict, client_line: str = "") -> tuple[list
         if problem:
             drop("schema-not-fit", insight, problem)
             continue
+        absent = absence_problem(issue, cited, crawled)
+        if absent:
+            drop(absent[0], insight, absent[1])
+            continue
         issue["url"] = cited[0]["url"]
+        for key in ("insight", "evidence", "action"):
+            issue[key] = clean_review_text(issue[key])
         candidates.append(issue)
 
     best: dict[tuple[str, str], dict] = {}
@@ -358,15 +639,15 @@ def expert_review(brand: dict, corpus: dict) -> dict:
                 grade = max(1, min(5, int(cell["grade"])))
             except (TypeError, ValueError):
                 continue
-            scorecard[key] = {"grade": grade, "note": str(cell.get("note", ""))[:200]}
+            scorecard[key] = {"grade": grade, "note": clean_review_text(cell.get("note", ""))[:200]}
 
     review = {
         "brand_id": brand["id"],
         "at": date.today().isoformat(),
         "page_count": corpus["page_count"],
-        "positioning": str(raw.get("positioning", ""))[:300],
+        "positioning": clean_review_text(raw.get("positioning", ""))[:300],
         "scorecard": scorecard,
-        "strengths": [str(s)[:200] for s in _as_list(raw.get("strengths"))[:4]],
+        "strengths": [clean_review_text(s)[:200] for s in _as_list(raw.get("strengths"))[:4]],
         "issues": issues,
         "grounding": grounding,
         "suggested_seeds": [str(s)[:80] for s in _as_list(raw.get("suggested_seeds"))[:12]],
@@ -391,6 +672,58 @@ def analyze(brand: dict, fetch=fetch_page, sitemap=fetch_sitemap) -> dict:
 
 def latest_review(brand_id: str) -> dict | None:
     return state.load(f"sitereview-{brand_id}")
+
+
+def recheck_review(review: dict, corpus: dict) -> dict:
+    """``review`` as it may be shown today, against today's crawl.
+
+    A review stored before a check existed (or before the crawl recorded the
+    facts it needs) still holds findings that check would drop. Its text is
+    stripped of digest markers, and every issue is held to
+    :func:`absence_problem` again: one the crawl contradicts, or cannot check,
+    moves to ``grounding.dropped`` with that reason — never silently. Pure: the
+    stored review is not rewritten."""
+    out = dict(review)
+    pages = corpus.get("pages") or []
+    crawled = {sources.norm_url(p.get("url") or ""): p for p in pages if p.get("url")}
+    grounding = dict(out.get("grounding") or {})
+    dropped = list(grounding.get("dropped") or [])
+    kept: list[dict] = []
+    for issue in out.get("issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        issue = dict(issue, **{k: clean_review_text(issue.get(k, "")) for k in ("insight", "evidence", "action")})
+        url = _issue_url(issue)
+        cited = [crawled[sources.norm_url(url)]] if url and sources.norm_url(url) in crawled else []
+        cited += [p for p in _cited_pages(str(issue.get("evidence", "")), crawled) if p not in cited]
+        problem = absence_problem(issue, cited, crawled)
+        if problem:
+            dropped.append({"reason": problem[0], "insight": issue["insight"][:200],
+                            "detail": problem[1][:200]})
+            continue
+        kept.append(issue)
+    if out.get("grounding") is not None or len(kept) != len(out.get("issues") or []):
+        out["grounding"] = {**grounding, "kept": len(kept), "dropped": dropped}
+    out["issues"] = kept
+    if "positioning" in out:
+        out["positioning"] = clean_review_text(out["positioning"])
+    if isinstance(out.get("strengths"), list):
+        out["strengths"] = [clean_review_text(s) for s in out["strengths"]]
+    if isinstance(out.get("scorecard"), dict):
+        out["scorecard"] = {k: (dict(v, note=clean_review_text(v.get("note", ""))) if isinstance(v, dict) else v)
+                            for k, v in out["scorecard"].items()}
+    out["degraded"] = [sources.plain_note(n, log=False) for n in out.get("degraded") or []
+                       if isinstance(n, str)]
+    return out
+
+
+def checked_review(brand_id: str) -> dict | None:
+    """The latest review, rechecked against the latest crawl
+    (:func:`recheck_review`) — what the console and the Fix list show."""
+    review = latest_review(brand_id)
+    if not review:
+        return review
+    return recheck_review(review, state.load(f"corpus-{brand_id}") or {})
 
 
 def _todo_id(brand_id: str, category: str, url: str) -> str:
@@ -446,7 +779,7 @@ def site_todos(brand_id: str) -> list[dict]:
     evidence sentence. A status recorded under the previous wording-based id is
     carried over rather than lost.
     """
-    review = latest_review(brand_id) or {}
+    review = checked_review(brand_id) or {}
     overlay = _status_overlay(brand_id)
     todos: list[dict] = []
     seen: set[str] = set()
@@ -502,6 +835,59 @@ def merge_todos(search_todos: list[dict], site: list[dict], cap: int) -> tuple[l
         head += search_todos[len(head): len(head) + room]
     shown = head + tail
     return shown, len(search_todos) + len(site) - len(shown)
+
+
+#: ``origin`` of a Fix-list item made from the page pass's advice (it is a
+#: ``kind: "site"`` item, so a console that predates it draws it as a site fix).
+PAGE_ADVICE = "page-advice"
+PAGE_ADVICE_ACTION = {
+    "internal-links": "Add internal links to these pages from related pages on your site",
+    "cta": "Give each of these pages one clear next step — a form, a booking link or a call button",
+}
+PAGE_ADVICE_LABEL = {"internal-links": "internal linking", "cta": "a clear next step"}
+
+
+def fold_page_advice(brand_id: str, site: list[dict], fix_items) -> list[dict]:
+    """Site to-dos with the page pass's collapsed advice in ONE place.
+
+    ``fix_items`` (from ``pages.build_page_intel``) are advice categories the
+    page rows no longer repeat. Each lands on the site to-do it names
+    (``todo_id``) as that item's ``pages`` — its own page first — or, when no
+    site to-do covers it, as one new ``kind: "site"`` item with
+    ``origin: "page-advice"``. Ids are stable per category, so a status set on
+    the item survives the next run.
+    """
+    out = [dict(t) for t in site]
+    by_id = {t["id"]: t for t in out}
+    overlay = _status_overlay(brand_id)
+    for item in fix_items or []:
+        category, paths = item.get("category"), list(item.get("paths") or [])
+        if not paths or category not in PAGE_ADVICE_ACTION:
+            continue
+        held = by_id.get(item.get("todo_id"))
+        if held is not None:
+            own = [_path_of(held["page"])] if held.get("page") else []
+            held["pages"] = list(dict.fromkeys(own + paths))
+            continue
+        tid = hashlib.sha1(f"{brand_id}|site|{PAGE_ADVICE}|{category}".encode()).hexdigest()[:12]
+        shown = ", ".join(paths[:5]) + (f" and {len(paths) - 5} more" if len(paths) > 5 else "")
+        out.append({
+            "id": tid,
+            "kind": "site",
+            "origin": PAGE_ADVICE,
+            "category": category,
+            "page": "",
+            "pages": paths,
+            "query": "",
+            "action": PAGE_ADVICE_ACTION[category],
+            "why": (f"The page review suggested {PAGE_ADVICE_LABEL[category]} on {len(paths)} pages "
+                    f"({shown}) — one site-wide move, listed once here instead of on each page."),
+            "est_monthly_clicks": None,
+            "position": 0,
+            "impressions": None,
+            "status": overlay.get(tid) or "todo",
+        })
+    return out
 
 
 _LOAD_REVIEW = object()

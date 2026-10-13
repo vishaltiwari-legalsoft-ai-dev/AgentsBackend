@@ -9,6 +9,7 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import re
 
 from datetime import date, timedelta
 
@@ -90,7 +91,51 @@ def _rows_28d(brand: dict) -> tuple[list, list[str]]:
     try:
         return sources.gsc_fetch(prop, end - timedelta(days=28), end), []
     except CredentialMissing as exc:
-        return [], [f"Search Console: {exc}"]
+        return [], [sources.plain_note(f"Search Console: {exc}")]
+
+
+# ------------------------- coded 503s for the live routes -------------------------
+# Every SEO route that needs a live service (the AI model, live Google results,
+# a crawl) used to answer ``detail=str(exc)``: the CredentialMissing text, which
+# wraps whatever the provider raised — an ``<HttpError …>`` repr, an OpenRouter
+# error dict, an env var name. The reply is now the OAuth routes' shape,
+# ``{"code", "message"}``: a stable code the console can key on and one plain
+# sentence. The raw text goes to the log at WARNING, never into a response.
+
+SEO_OFFLINE = "seo_offline"                        # this server runs without live services
+SEO_AI_BAD_ANSWER = "seo_ai_bad_answer"            # the model answered, in a shape we can't use
+SEO_SEARCH_UNCONFIGURED = "seo_search_unconfigured"  # no live Google results set up here
+SEO_NEEDS_REFRESH = "seo_needs_refresh"            # a precondition: run a data refresh first
+SEO_AI_UNAVAILABLE = "seo_ai_unavailable"          # the AI model could not be reached
+SEO_UNAVAILABLE = "seo_unavailable"                # anything else a live service refused
+
+#: First match wins — a wrapped failure carries the words of every layer.
+_SEO_FAILURES = (
+    (SEO_AI_BAD_ANSWER, re.compile(r"not the review object|wrong shape", re.I),
+     "The AI model's answer couldn't be used, so nothing was saved — run {what} again."),
+    (SEO_OFFLINE, re.compile(r"offline mode", re.I),
+     "This server runs without live services, so {what} can't run here."),
+    (SEO_SEARCH_UNCONFIGURED, re.compile(r"serper key missing|serper_api_key", re.I),
+     "Live Google results aren't set up on this server, so {what} can't run."),
+    (SEO_NEEDS_REFRESH, re.compile(r"run a data refresh first", re.I),
+     "Run a data refresh first — {what} can't be built without the latest rank snapshots."),
+    (SEO_AI_UNAVAILABLE, re.compile(r"llm unavailable|needs the ai model", re.I),
+     "The AI model isn't available right now, so {what} couldn't run — try again shortly."),
+)
+_SEO_FAILURE_FALLBACK = "{what} couldn't run right now — try again shortly."
+
+
+def _seo_unavailable(exc: Exception, what: str) -> HTTPException:
+    """A 503 a live SEO route answers: ``{"code", "message"}``, raw text logged."""
+    raw = str(exc)
+    code, message = SEO_UNAVAILABLE, _SEO_FAILURE_FALLBACK
+    for kind, pattern, sentence in _SEO_FAILURES:
+        if pattern.search(raw):
+            code, message = kind, sentence
+            break
+    text = message.format(what=what)
+    logger.warning("SEO %s unavailable (%s): %s", what, code, raw[:2000])
+    return HTTPException(status_code=503, detail={"code": code, "message": text[0].upper() + text[1:]})
 
 
 def _brand_or_404(brand_id: str) -> dict:
@@ -210,34 +255,46 @@ def _plan_of_action(brand_id: str, run: dict | None) -> list[dict]:
     The Fix list renders below this strip, so its #1 item is never repeated
     here (not even re-worded as a keyword move), and no two moves in the strip
     are the same move in different words.
+
+    A move that IS a Fix-list item is a reference, not a copy: it carries
+    ``ref_todo_id`` and ``ref_index`` (its 1-based Fix-list position) and a
+    ``label`` of at most eight words, and the console says "See Fix list #n"
+    instead of printing the item's action and why a second time. Moves from
+    other surfaces have ``ref_todo_id``/``ref_index`` None and a label too.
+    ``action``/``detail`` stay on every item for consoles that predate this.
     """
     todos = (run or {}).get("todos", [])
     shown_below = [todos[0]["action"]] if todos else []
     plan: list[dict] = []
 
-    def add(source: str, action: str, detail: str) -> bool:
+    def add(source: str, action: str, detail: str, label: str,
+            ref: dict | None = None, index: int | None = None) -> bool:
         taken = shown_below + [p["action"] for p in plan]
         if any(seo_audit.similar(action, other) for other in taken):
             return False
-        plan.append({"source": source, "action": action, "detail": detail})
+        plan.append({"source": source, "action": action, "detail": detail, "label": label,
+                     "ref_todo_id": ref["id"] if ref else None, "ref_index": index})
         return True
 
-    for todo in todos[1:]:
-        if todo.get("status") != "done" and add("fix list", todo["action"], todo["why"]):
+    for index, todo in enumerate(todos[1:], start=2):
+        if todo.get("status") != "done" and add("fix list", todo["action"], todo["why"],
+                                                insights.todo_label(todo), todo, index):
             break
     lab = seo_keywords.latest(brand_id) or {}
     for cluster in lab.get("clusters", []):
         if cluster.get("tier") == "high" and add(
-                "keywords", f"Go after “{cluster['name']}”", cluster.get("recommendation", "")):
+                "keywords", f"Go after “{cluster['name']}”", cluster.get("recommendation", ""),
+                insights.short_label(f"Go after “{cluster['name']}”")):
             break
     report = seo_audit.latest_audit(brand_id) or {}
     issue = next((i for i in report.get("issues", []) if i["severity"] == "high"), None)
     if issue:
-        add("audit", f"Fix: {issue['issue']}", issue["fix"])
+        add("audit", f"Fix: {issue['issue']}", issue["fix"], insights.short_label(f"Fix: {issue['issue']}"))
     else:
         failed = next((c for c in report.get("site_checks", []) if not c["ok"]), None)
         if failed:
-            add("audit", f"Fix: {failed['name']}", failed["fix"])
+            add("audit", f"Fix: {failed['name']}", failed["fix"],
+                insights.short_label(f"Fix: {failed['name']}"))
     return plan[:3]
 
 
@@ -251,7 +308,7 @@ def brand_detail(brand_id: str, user=Depends(get_current_user)):
         "run": run,
         "gsc": _gsc_view(brand, conn, run),
         "plan": _plan_of_action(brand_id, run),
-        "site_review": seo_site.latest_review(brand_id),
+        "site_review": seo_site.checked_review(brand_id),
     }
 
 
@@ -264,7 +321,7 @@ def run_site_review(brand_id: str, user=Depends(get_current_user),
     try:
         review = seo_site.analyze(brand)
     except CredentialMissing as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise _seo_unavailable(exc, "the site review") from exc
     act.note(f"Expert site review of {brand['domain']}")
     return review
 
@@ -272,7 +329,7 @@ def run_site_review(brand_id: str, user=Depends(get_current_user),
 @router.get("/seo-geo/site-review/{brand_id}")
 def get_site_review(brand_id: str, user=Depends(get_current_user)):
     _brand_or_404(brand_id)
-    return {"review": seo_site.latest_review(brand_id)}
+    return {"review": seo_site.checked_review(brand_id)}
 
 
 # ------------------------- page intelligence -------------------------
@@ -299,8 +356,14 @@ def refresh_pages(brand_id: str, user=Depends(get_current_user),
             end = date.today()
             ga_pages = ga_fetch_pages(prop, end - timedelta(days=28), end)
         except CredentialMissing as exc:
-            notes.append(f"Google Analytics: {exc}")
-    intel = seo_pages.build_page_intel(brand, corpus["pages"], ga_pages, rows, data_notes=notes)
+            notes.append(sources.plain_note(f"Google Analytics: {exc}"))
+    # Page advice a site to-do already covers is folded into it, and the stored
+    # Fix list is brought in line — the rows must not point at an item that is
+    # not there.
+    site = seo_site.site_todos(brand_id)
+    intel = seo_pages.build_page_intel(brand, corpus["pages"], ga_pages, rows, data_notes=notes,
+                                       site_todos=site, audit_report=seo_audit.latest_audit(brand_id))
+    insights.refold_page_advice(brand_id, intel, site)
     act.note(f"Rebuilt page intelligence for {brand['domain']}")
     return intel
 
@@ -376,12 +439,12 @@ def track_competitors(brand_id: str, user=Depends(get_current_user),
     try:
         seo_competitors.rank_snapshot(brand)
     except CredentialMissing as exc:
-        degraded.append(str(exc))
+        degraded.append(sources.plain_note(f"Rank tracking: {exc}"))
     feed = {}
     try:
         feed = seo_competitors.sitemap_watch(brand)
     except CredentialMissing as exc:
-        degraded.append(f"Sitemap watch: {exc}")
+        degraded.append(sources.plain_note(f"Sitemap watch: {exc}"))
     return {"shifts": seo_competitors.rank_shifts(brand_id), "feed": feed, "degraded": degraded}
 
 
@@ -394,7 +457,7 @@ def serp_xray(brand_id: str, payload: QueryIn, user=Depends(get_current_user),
     try:
         result = seo_competitors.serp_deep_dive(brand, payload.query.strip())
     except CredentialMissing as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise _seo_unavailable(exc, "the SERP X-ray") from exc
     act.note(f"SERP X-ray: “{payload.query.strip()}”")
     return result
 
@@ -415,7 +478,7 @@ def refresh_competitor_profiles(brand_id: str, user=Depends(get_current_user),
     try:
         profiles = seo_competitors.build_profiles(brand)
     except CredentialMissing as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise _seo_unavailable(exc, "the competitor profiles") from exc
     return profiles
 
 
@@ -436,7 +499,7 @@ def build_brief(brand_id: str, payload: KeywordIn, user=Depends(get_current_user
     try:
         brief = seo_briefs.build_brief(brand, payload.keyword.strip(), rows)
     except CredentialMissing as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise _seo_unavailable(exc, "the content brief") from exc
     act.note(f"Content brief for “{payload.keyword.strip()}”")
     return brief
 
@@ -450,7 +513,7 @@ def build_update_plan(brand_id: str, payload: PageIn, user=Depends(get_current_u
     try:
         plan = seo_briefs.update_plan(brand, payload.page.strip(), rows)
     except CredentialMissing as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise _seo_unavailable(exc, "the update plan") from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     act.note(f"Update plan for {payload.page.strip()}")
@@ -467,7 +530,7 @@ def run_audit(brand_id: str, user=Depends(get_current_user),
     try:
         report = seo_audit.site_audit(brand)
     except CredentialMissing as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise _seo_unavailable(exc, "the site audit") from exc
     act.note(f"Technical site audit of {brand['domain']}")
     return report
 
@@ -631,7 +694,7 @@ def ask_expert(brand_id: str, payload: AskIn, user=Depends(get_current_user),
     try:
         answer = seo_advisor.ask(brand, question)
     except CredentialMissing as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise _seo_unavailable(exc, "the SEO strategist") from exc
     act.note(f"Asked: {question}")
     return answer
 

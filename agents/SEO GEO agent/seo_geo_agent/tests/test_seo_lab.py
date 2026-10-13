@@ -112,7 +112,7 @@ def test_topics_include_new_ideas_with_priority(monkeypatch):
     idea = next(t for t in ranked if t["source"] == "new idea")
     assert idea["keyword"] == "paralegal outsourcing checklist"
     assert idea["priority"] in ("high", "medium", "low")
-    assert idea["impact"]
+    assert idea["impact"] == ""   # nothing measured about it: no impact line, not boilerplate
 
 
 def test_run_keyword_lab_persists_and_lists_gaps():
@@ -225,7 +225,10 @@ def _deep(schema_seen=(), questions=(), prevalence=None, analyzed=5):
 def test_brief_schema_has_no_hardcoded_fallback():
     recommended, note = briefs._brief_schema(_deep(questions=["How much does it cost?"]))
     assert recommended == [] and note == "No schema seen on ranking pages."
-    recommended, note = briefs._brief_schema(_deep(questions=["How much?", "Is it worth it?"]))
+    # two answered questions are not a FAQ — the same 3-pair rule a crawled page meets
+    assert briefs._brief_schema(_deep(questions=["How much?", "Is it worth it?"]))[0] == []
+    recommended, note = briefs._brief_schema(
+        _deep(questions=["How much?", "Is it worth it?", "Can I cancel?"]))
     assert recommended == ["FAQPage"]
     assert note.startswith("No schema seen on ranking pages.") and "2023" in note
     recommended, note = briefs._brief_schema(_deep(["Article"], prevalence=[{"type": "Article", "pages": 3}]))
@@ -372,18 +375,26 @@ def test_long_titles_without_a_shared_suffix_stay_per_page():
     assert issues["title-long"]["count"] == 2
 
 
-def _fit(url, types=(), q=0, kind=None, phone=False, address=False, site=None, errors=()):
+def _fit(url, types=(), q=0, kind=None, phone=False, address=False, site=None, errors=(),
+         pairs=None, headings=0, linked=0):
     page = {"url": url, "schema_types": list(types), "q_headings": q, "has_phone": phone,
-            "has_address": address, "schema_errors": list(errors)}
+            "has_address": address, "schema_errors": list(errors),
+            "headings_total": headings, "headings_linked": linked}
+    if pairs is not None:
+        page["faq_pairs"] = pairs
     if kind:
         page["type"] = kind
     return [r["type"] for r in audit.schema_fit(page, site_types=site)]
 
 
 @pytest.mark.parametrize(("case", "got", "expected"), [
-    ("faq: 2 question headings", lambda: _fit("https://x.com/help", q=2, site=set()), ["FAQPage"]),
-    ("faq: 1 question heading", lambda: _fit("https://x.com/help", q=1, site=set()), []),
-    ("faq: already marked up", lambda: _fit("https://x.com/help", ["FAQPage"], q=4, site=set()), []),
+    ("faq: 3 Q&A pairs", lambda: _fit("https://x.com/help", q=3, pairs=3, site=set()), ["FAQPage"]),
+    ("faq: 2 Q&A pairs", lambda: _fit("https://x.com/help", q=2, pairs=2, site=set()), []),
+    ("faq: question headings but no answers", lambda: _fit("https://x.com/help", q=5, pairs=0, site=set()), []),
+    ("faq: pairs never counted (old crawl)", lambda: _fit("https://x.com/help", q=5, site=set()), []),
+    ("faq: a listing whose headings link out",
+     lambda: _fit("https://x.com/help", q=12, pairs=3, headings=30, linked=28, site=set()), []),
+    ("faq: already marked up", lambda: _fit("https://x.com/help", ["FAQPage"], q=4, pairs=4, site=set()), []),
     ("blog post", lambda: _fit("https://x.com/blog/how-to-hire", site=set()), ["BlogPosting"]),
     ("blog post with Article", lambda: _fit("https://x.com/blog/x", ["Article"], site=set()), []),
     ("blog index is not a post", lambda: _fit("https://x.com/blog", site=set()), []),
@@ -394,10 +405,27 @@ def _fit(url, types=(), q=0, kind=None, phone=False, address=False, site=None, e
     ("home, Organization elsewhere", lambda: _fit("https://x.com/", site={"Organization", "WebSite"}), []),
     ("home, LegalService counts as org", lambda: _fit("https://x.com/", site={"LegalService", "WebSite"}), []),
     ("home, site schema unknown", lambda: _fit("https://x.com/", site=None), []),
-    ("home with phone", lambda: _fit("https://x.com/", phone=True, site={"Organization", "WebSite"}), ["LocalBusiness"]),
+    ("home with a phone only: no LocalBusiness",
+     lambda: _fit("https://x.com/", phone=True, site={"Organization", "WebSite"}), []),
+    ("home with a street address",
+     lambda: _fit("https://x.com/", address=True, site={"Organization", "WebSite"}), ["LocalBusiness"]),
     ("non-home with address", lambda: _fit("https://x.com/pricing", address=True, site=set()), []),
-    ("contact page, even with questions", lambda: _fit("https://x.com/contact-us", q=5, phone=True, site=set()), []),
-    ("about page", lambda: _fit("https://x.com/about", q=3, site=set()), []),
+    ("contact page, even with questions",
+     lambda: _fit("https://x.com/contact-us", q=5, pairs=5, phone=True, site=set()), []),
+    ("about page", lambda: _fit("https://x.com/about", q=3, pairs=3, site=set()), []),
+    # Service only where a service is on offer — never policy, pricing, the platform …
+    ("terms of service is not a service page",
+     lambda: _fit("https://x.com/terms-of-service", kind="service", site=set()), []),
+    ("pricing is not, whatever the summary says", lambda: _fit("https://x.com/pricing", kind="service", site=set()), []),
+    ("platform is not", lambda: _fit("https://x.com/platform", kind="service", site=set()), []),
+    ("privacy policy is not", lambda: _fit("https://x.com/privacy-policy", kind="service", site=set()), []),
+    ("careers / login / blog index are not",
+     lambda: _fit("https://x.com/careers", kind="service", site=set())
+     + _fit("https://x.com/login", kind="service", site=set())
+     + _fit("https://x.com/blog", kind="service", site=set()), []),
+    ("a role page the summary calls a service still is",
+     lambda: _fit("https://x.com/legal-assistant", kind="service", site=set()), ["Service"]),
+    ("a practice-area page still is", lambda: _fit("https://x.com/practice-areas/family", site=set()), ["Service"]),
     ("broken JSON-LD: the parse error owns it", lambda: _fit("https://x.com/services/p", errors=["x"], site=set()), []),
 ])
 def test_schema_fit_matrix(case, got, expected):
@@ -410,9 +438,11 @@ def test_schema_fit_unknown_schema_recommends_nothing():
 
 
 def test_faq_fit_explains_the_2023_rich_result_change():
-    rec = audit.schema_fit({"url": "https://x.com/help", "schema_types": [], "q_headings": 3})[0]
+    rec = audit.schema_fit({"url": "https://x.com/help", "schema_types": [], "q_headings": 3,
+                            "faq_pairs": 3})[0]
     assert rec["type"] == "FAQPage" and rec["severity"] == "low"
-    assert "2023" in rec["reason"] and "AI answers" in rec["reason"]
+    assert "2023" in rec["note"] and "AI answers" in rec["note"]   # the type's note, said once
+    assert "2023" not in rec["reason"] and rec["pairs"] == 3
 
 
 def test_audit_schema_findings_are_grouped_per_type_with_evidence():
@@ -433,6 +463,62 @@ def test_audit_schema_findings_are_grouped_per_type_with_evidence():
     assert schema["Organization"]["pages"] == ["https://x.com/"]
     assert not any("No structured data" in i["issue"] for i in report["issues"])
     assert not any("https://x.com/contact" in i["pages"] for i in schema.values())
+
+
+def test_audit_on_legalsoft_suggests_schema_only_where_the_page_fits_it(monkeypatch):
+    """D2 on staging: FAQPage on /blog, /podcasts-style listings, /testimonials
+    and the partner pages; Service on /terms-of-service, /pricing, /platform;
+    one sentence repeated fifteen times in the evidence. Built from the real
+    page shapes, parsed by the real parser."""
+    from seo_geo_agent.tests.test_seo_pages import (LS, LS_BLOG_CARDS, LS_FAQ, LS_REFERRAL_CTAS,
+                                                     LS_TESTIMONIAL_HOOKS, ls_page)
+
+    practice = [f"/practice-areas/{p}" for p in ("family", "bankruptcy", "criminal", "immigration",
+                                                 "mass-tort", "compensation", "estate-planning")]
+    pages = {
+        "/": ls_page("/", "<h1>Virtual Staff Built for Law Firms</h1>"),
+        "/blog": ls_page("/blog", "<h1>Legal Insights</h1>" + LS_BLOG_CARDS),
+        "/testimonials": ls_page("/testimonials", "<h1>Client Success Stories</h1>" + LS_TESTIMONIAL_HOOKS),
+        "/partners/referral-program": ls_page("/partners/referral-program", "<h1>Refer</h1>" + LS_REFERRAL_CTAS),
+        "/virtual-paralegal": ls_page("/virtual-paralegal", "<h1>Virtual Paralegals</h1>" + LS_FAQ),
+        "/case-manager": ls_page("/case-manager", "<h1>Case Managers</h1>" + LS_FAQ,
+                                 types=("WebSite", "Organization", "FAQPage")),
+        "/terms-of-service": ls_page("/terms-of-service", "<h1>Terms of Service</h1><p>These terms…</p>"),
+        "/pricing": ls_page("/pricing", "<h1>Our Pricing</h1>"),
+        "/platform": ls_page("/platform", "<h1>Legal Soft Platform</h1>"),
+        **{p: ls_page(p, "<h1>Practice area</h1>") for p in practice},
+    }
+    site = {LS + p: f for p, f in pages.items()}
+    # the corpus summary called these "service" — the URL now outranks that
+    site_brain.state.save("corpus-b", {"pages": [{"url": LS + p, "type": "service"} for p in pages]})
+    issues = {i.get("schema_type") or i.get("kind"): i for i in audit.site_audit(
+        {**BRAND, "domain": "legalsoft.com"}, fetch=lambda u: site[u], sitemap=lambda d: list(site),
+        get_text=lambda u: ROBOTS_OK)["issues"]}
+
+    faq = issues["FAQPage"]
+    assert faq["pages"] == [LS + "/virtual-paralegal"]      # real Q&A, no FAQPage yet
+    assert faq["issue"] == "1 page lacks FAQPage schema despite 3+ question-and-answer pairs"
+    assert faq["evidence"] == [{"page": LS + "/virtual-paralegal", "pairs": 3}]
+    assert faq["fix"].count("2023") == 1 and "2023" not in faq["reason"]   # the note, once
+
+    svc = issues["Service"]
+    assert svc["pages"] == [LS + p for p in ["/virtual-paralegal", "/case-manager"] + practice]
+    assert svc["reason"] == "A service page with no Service markup."       # said once
+    assert all(set(e) == {"page"} for e in svc["evidence"])                # URLs, no repeated sentence
+
+    local = issues["LocalBusiness"]          # the footer really shows a street address
+    assert local["evidence"] == [{"page": LS + "/"}]
+    assert "21731 Ventura Blvd. Suite 100 Woodland Hills, CA 91364" in local["reason"]
+
+
+def test_a_phone_number_alone_never_suggests_localbusiness():
+    from seo_geo_agent.sources import parse_page
+
+    home = parse_page("https://x.com/", '<html><head><title>Acme</title><script type="application/ld+json">'
+                      '{"@type": "Organization"}</script></head><body><h1>Acme</h1>'
+                      '<a href="tel:+15551234567">Call (555) 123-4567</a></body></html>')
+    report = _audit({"https://x.com/": home})
+    assert not [i for i in report["issues"] if i.get("schema_type") == "LocalBusiness"]
 
 
 def test_audit_reports_jsonld_that_does_not_parse():
@@ -505,7 +591,8 @@ REVIEW_CORPUS = {"brand_id": "b", "page_count": 2, "degraded": [], "pages": [
      "summary": "Virtual assistants for law firms.", "schema_types": ["Organization", "WebSite"],
      "q_headings": 0},
     {"url": "https://x.com/pricing", "title": "Pricing", "type": "other", "word_count": 180,
-     "summary": "Plans start small and scale with your firm.", "schema_types": [], "q_headings": 3},
+     "summary": "Plans start small and scale with your firm.", "schema_types": [], "q_headings": 3,
+     "faq_pairs": 3},
 ]}
 
 
@@ -586,6 +673,140 @@ def test_invented_number_detail_names_the_number(monkeypatch):
     review = site_brain.expert_review(BRAND, REVIEW_CORPUS)
     assert review["issues"] == []
     assert review["grounding"]["dropped"][0]["detail"].startswith("12 not in the data")
+
+
+# ------------------- D1: absence claims are checked against the page -------------------
+# Staging's Fix #5 and Fix #6, word for word. legalsoft.com's /contact-us embeds a
+# HubSpot form and has a tel: link; /virtual-paralegal links to every practice area.
+
+FIX_5 = {"insight": "Contact page has no visible contact form, phone number, or calendar link — traffic "
+                    "dead-ends with no conversion path",
+         "evidence": "https://www.legalsoft.com/contact-us (920w) — 'Lacks visible contact form or direct "
+                     "contact information in provided text'",
+         "action": "Embed a 3-field form (name/firm/role needed) above the fold, add a click-to-call number, "
+                   "and link to a Calendly for discovery calls",
+         "priority": "high", "category": "conversion"}
+FIX_6 = {"insight": "Role pages (paralegal, attorney, bookkeeper, etc.) don't cross-link to relevant "
+                    "practice-area pages — missed internal linking and user flow",
+         "evidence": "https://www.legalsoft.com/virtual-paralegal (2083w) mentions 'all practice areas' but "
+                     "no links to /practice-areas/personal-injury, /family, etc.",
+         "action": "Add a 'Popular for these practice areas' section to each role page with 4–6 links to "
+                   "top practice pages, and reciprocal 'Recommended roles' links on practice pages",
+         "priority": "medium", "category": "architecture"}
+LS_BRAND = {"id": "legalsoft", "name": "Legal Soft", "domain": "legalsoft.com", "seeds": []}
+
+
+def _ls_corpus(monkeypatch=None) -> dict:
+    """legalsoft.com crawled by the real parser into a corpus (no AI summaries)."""
+    from seo_geo_agent.tests.test_seo_pages import LS, LS_FAQ, LS_HUBSPOT_FORM, ls_page
+
+    site = {
+        LS + "/": ls_page("/", "<h1>Virtual Staff Built for Law Firms</h1><p>Hire vetted staff.</p>"),
+        LS + "/contact-us": ls_page("/contact-us", "<h1>Contact Legal Soft</h1>" + LS_HUBSPOT_FORM, words=920),
+        LS + "/virtual-paralegal": ls_page("/virtual-paralegal", "<h1>Virtual Paralegals</h1>" + LS_FAQ,
+                                           types=("WebSite", "Organization", "FAQPage"), words=2083),
+    }
+    return site_brain.build_corpus(LS_BRAND, fetch=lambda u, c=None: site[u], sitemap=lambda d: list(site))
+
+
+def test_absence_claims_the_page_contradicts_are_dropped(monkeypatch):
+    corpus = _ls_corpus()
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: {**REVIEW_JSON, "issues": [FIX_5, FIX_6]})
+    review = site_brain.expert_review(LS_BRAND, corpus)
+    assert review["issues"] == []
+    dropped = {d["insight"][:20]: d for d in review["grounding"]["dropped"]}
+    five, six = dropped["Contact page has no "], dropped["Role pages (paralega"]
+    assert five["reason"] == six["reason"] == "contradicted-by-page"
+    assert five["detail"] == "https://www.legalsoft.com/contact-us has a form (hubspot)"
+    assert six["detail"] == ("https://www.legalsoft.com/virtual-paralegal links to "
+                             "/practice-areas/personal-injury")
+    assert site_brain.site_todos("legalsoft") == []          # never reaches the Fix list
+
+
+@pytest.mark.parametrize(("insight", "url", "verdict"), [
+    ("The paralegal page isn't linked from the homepage", "/virtual-paralegal", "contradicted-by-page"),
+    ("The paralegal page has no internal links at all", "/virtual-paralegal", "contradicted-by-page"),
+    ("The contact page offers no email or other contact details", "/contact-us", "contradicted-by-page"),
+    ("The contact page has no clear CTA", "/contact-us", "contradicted-by-page"),
+    ("The contact page omits a phone number", "/contact-us", "contradicted-by-page"),
+    ("The contact page has no booking link for discovery calls", "/contact-us", None),   # true: kept
+    ("The paralegal page has no links to /case-studies", "/virtual-paralegal", None),      # true: kept
+    ("The paralegal page doesn't link to the relevant pages", "/virtual-paralegal", "unverifiable-absence"),
+])
+def test_each_kind_of_absence_claim_is_checked_against_the_crawl(insight, url, verdict):
+    corpus = _ls_corpus()
+    crawled = {site_brain.sources.norm_url(p["url"]): p for p in corpus["pages"]}
+    page = crawled["legalsoft.com" + url]
+    got = site_brain.absence_problem({"insight": insight, "evidence": page["url"]}, [page], crawled)
+    assert (got[0] if got else None) == verdict
+
+
+def test_absence_claims_on_a_crawl_without_the_facts_are_unverifiable(monkeypatch):
+    """A corpus crawled before forms/links were recorded cannot check "no form":
+    such a claim is never kept."""
+    old = {"brand_id": "legalsoft", "page_count": 2, "degraded": [], "pages": [
+        {"url": "https://www.legalsoft.com/contact-us", "title": "Contact", "word_count": 920,
+         "type": "contact", "schema_types": []},
+        {"url": "https://www.legalsoft.com/virtual-paralegal", "title": "Paralegals", "word_count": 2083,
+         "type": "service", "schema_types": []}]}
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: {**REVIEW_JSON, "issues": [FIX_5, FIX_6]})
+    review = site_brain.expert_review(LS_BRAND, old)
+    assert review["issues"] == []
+    assert {d["reason"] for d in review["grounding"]["dropped"]} == {"unverifiable-absence"}
+
+
+def test_an_absence_the_page_confirms_is_kept_and_its_digest_markers_are_stripped(monkeypatch):
+    from seo_geo_agent.sources import parse_page
+
+    intake = parse_page("https://x.com/intake", "<html><head><title>Intake</title></head><body><h1>Intake"
+                        "</h1><p>We answer calls for law firms.</p><a href='/pricing'>Pricing</a></body></html>")
+    intake.word_count = 180
+    corpus = site_brain.build_corpus(BRAND, fetch=lambda u, c=None: intake, sitemap=lambda d: [intake.url])
+    issue = _issue("The intake page has no contact form and no links to /case-studies [no clear CTA]",
+                   "https://x.com/intake (180w) — no form or case-study link in the provided text",
+                   action="Add a contact form and link /case-studies from the intake page",
+                   category="conversion")
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: {
+        **REVIEW_JSON, "issues": [issue],
+        "strengths": ["Clear pricing (920w) in the digest"],
+        "scorecard": {"conversion": {"grade": 2, "note": "Home [no clear CTA] in provided text"}}})
+    review = site_brain.expert_review(BRAND, corpus)
+    kept = review["issues"][0]
+    assert kept["insight"] == "The intake page has no contact form and no links to /case-studies"
+    assert kept["evidence"] == "https://x.com/intake — no form or case-study link"
+    assert review["strengths"] == ["Clear pricing"]
+    assert review["scorecard"]["conversion"]["note"] == "Home"
+
+
+def test_an_absence_the_digest_alone_supports_is_unverifiable(monkeypatch):
+    corpus = _ls_corpus()
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: {**REVIEW_JSON, "issues": [
+        _issue("The FAQ page answers nothing buyers ask",
+               "https://www.legalsoft.com/virtual-paralegal — 'Content of actual FAQs not visible'")]})
+    review = site_brain.expert_review(LS_BRAND, corpus)
+    assert review["issues"] == []
+    assert review["grounding"]["dropped"][0]["reason"] == "unverifiable-absence"
+
+
+def test_a_review_stored_before_the_check_is_rechecked_for_the_fix_list(monkeypatch):
+    """Staging's review was stored with Fix #5/#6 in it. The Fix list and the
+    console read it through the same check, against the latest crawl."""
+    site_brain.state.save("sitereview-legalsoft", {
+        "brand_id": "legalsoft", "issues": [
+            {**FIX_5, "url": "https://www.legalsoft.com/contact-us"},
+            {**FIX_6, "url": "https://www.legalsoft.com/virtual-paralegal"},
+            {**_issue("No case studies on the paralegal page (2083w)",
+                      "https://www.legalsoft.com/virtual-paralegal (2083w) — none shown"),
+             "url": "https://www.legalsoft.com/virtual-paralegal"}],
+        "grounding": {"kept": 3, "dropped": []}})
+    _ls_corpus()                                                   # today's crawl, with the facts
+    todos = site_brain.site_todos("legalsoft")
+    assert [t["category"] for t in todos] == ["content"]
+    assert "(2083w)" not in todos[0]["why"]
+    checked = site_brain.checked_review("legalsoft")
+    assert [d["reason"] for d in checked["grounding"]["dropped"]] == ["contradicted-by-page"] * 2
+    assert checked["grounding"]["kept"] == 1
+    assert len(site_brain.latest_review("legalsoft")["issues"]) == 3   # the stored doc is not rewritten
 
 
 @pytest.mark.parametrize("answer", [["a", "list"], "a string", 42, None])
@@ -1121,15 +1342,51 @@ def test_a_grant_google_no_longer_honours_reads_plainly_not_in_googles_words(
     assert gsc_oauth.REVOKED_NOTE in pages_mod.latest(brand["id"])["notes"]
 
 
-def test_any_other_search_console_failure_keeps_its_reason(gsc_connect, monkeypatch):
+#: What staging's ``run.degraded`` carried, word for word up to the repr.
+HTTPERROR_403 = (
+    "<HttpError 403 when requesting https://searchconsole.googleapis.com/webmasters/v3/sites/"
+    "sc-domain%3Alegalsoft.com/searchAnalytics/query?alt=json returned \"User does not have "
+    "sufficient permission for site 'sc-domain:legalsoft.com'. See also: "
+    "https://support.google.com/webmasters/answer/2451999.\". Details: \"[{'message': \"User "
+    "does not have sufficient permission for site 'sc-domain:legalsoft.com'.\", 'domain': "
+    "'global', 'reason': 'forbidden'}]\">")
+
+
+def test_any_other_search_console_failure_is_a_plain_sentence_and_the_raw_goes_to_the_log(
+        gsc_connect, monkeypatch, caplog):
+    """D9: staging's run.degraded carried Google's ``<HttpError 403 …>`` repr in
+    the API payload. The note keeps its cause — no permission, for which
+    property — as a sentence; the raw text is in the server log only."""
+    from app.services import issues as issues_svc
+
     brand = insights.list_brands()[0]
     gsc_connect.store[brand["id"]] = {"brand_id": brand["id"], "refresh_token_enc": "sealed",
                                       "property": "sc-domain:legalsoft.com"}
     monkeypatch.setattr(insights.gsc_oauth, "service",
-                        lambda bid: _QueryFails(RuntimeError("HTTP 403 user does not have access")))
-    run = insights.run_brand(brand, trigger="t")
+                        lambda bid: _QueryFails(RuntimeError(HTTPERROR_403)))
+    with caplog.at_level("WARNING", logger="agentos.seo_geo.sources"):
+        run = insights.run_brand(brand, trigger="t")
+    note = next(n for n in run["degraded"] if n.startswith("Search Console"))
+    assert note == ("Search Console: no permission for property 'sc-domain:legalsoft.com' — the "
+                    "account this server reads with hasn't been given access.")
+    assert not [n for n in run["degraded"] if "<" in n or "http" in n.lower() or "HttpError" in n]
     assert gsc_oauth.REVOKED_NOTE not in run["degraded"]
-    assert any(n.startswith("Search Console: ") and "403" in n for n in run["degraded"])
+    assert "HttpError 403" in caplog.text                     # the raw detail: log only
+    # the Issues rail still files it as "no access" for that property
+    code, title, _ = issues_svc.humanize_google_error(*issues_svc.split_degraded(note))
+    assert code == "gsc_no_access" and "sc-domain:legalsoft.com" in title
+
+
+def test_a_run_stored_with_raw_notes_reads_back_plain():
+    """A run saved before D9 still holds the repr; the read path cleans it."""
+    from seo_geo_agent import state
+
+    state.save("run-legalsoft", {"brand_id": "legalsoft", "todos": [], "degraded": [
+        f"Search Console: Search Console rejected sc-domain:legalsoft.com: {HTTPERROR_403}",
+        "Serper key missing — topics built from Search Console data only"]})
+    degraded = insights.latest_run("legalsoft")["degraded"]
+    assert degraded[0].startswith("Search Console: no permission for property 'sc-domain:legalsoft.com'")
+    assert degraded[1] == "Serper key missing — topics built from Search Console data only"
 
 
 # --------------------------------- advisor ---------------------------------

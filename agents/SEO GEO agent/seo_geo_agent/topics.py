@@ -6,6 +6,9 @@ ranking only needs relative numbers, and the dashboard labels them estimates.
 """
 from __future__ import annotations
 
+import re
+from urllib.parse import urlparse
+
 from . import sources
 from .sources import CredentialMissing, QueryStat
 
@@ -110,32 +113,63 @@ def _trend(candidate: str, rows: list[QueryStat], prev_rows: list[QueryStat]) ->
     return "flat"
 
 
-def _impact(angle: str) -> str:
-    """How this topic grows footfall — the reader's 'why bother' in one line."""
-    return {
-        "pricing guide": "Catches buyers comparing costs — bottom-funnel traffic that converts.",
-        "comparison": "Wins people choosing between options — high-intent visits.",
-        "FAQ answer": "Answers real questions — steady search traffic plus AI-answer citations.",
-        "how-to guide": "Builds topical authority — compounds into rankings for the whole cluster.",
-    }[angle]
+def _impact(keyword: str, volume: int) -> str:
+    """What this topic is worth, in its own numbers — or "" when there are none.
+
+    A sentence per angle ("Builds topical authority…") read the same on eight
+    topics of ten: it said nothing about any of them. Only a measured volume
+    says something specific."""
+    clicks = round(volume * 0.11) if volume else 0
+    if clicks < 1:
+        return ""
+    return f"Could bring ~{clicks:,} clicks a month for “{keyword}” once it ranks on page one."
 
 
-def _angle(candidate: str) -> str:
+_COMPARE_WORDS = re.compile(r"\b(?:best|compare|comparison|alternatives?|reviews?|ratings?|top)\b", re.I)
+_PRICE_WORDS = re.compile(r"\b(?:costs?|prices?|pricing|rates?|salary|salaries|fees?|quotes?)\b", re.I)
+_BUYER_INTENTS = ("commercial", "transactional", "local")
+
+
+def _angle(candidate: str, intent: str) -> str:
+    """The piece to write, from the search intent: a buyer query gets a service
+    page, a comparison or a pricing explainer; an informational one gets a
+    how-to guide, or a FAQ answer when it is a question other than "how to"."""
     lower = candidate.lower()
-    if lower.startswith(QUESTION_STARTS) or lower.endswith("?"):
+    if intent in _BUYER_INTENTS:
+        if " vs " in f" {lower} " or _COMPARE_WORDS.search(lower):
+            return "comparison"
+        if _PRICE_WORDS.search(lower):
+            return "pricing explainer"
+        return "service page"
+    if (lower.startswith(QUESTION_STARTS) or lower.endswith("?")) and not lower.startswith("how to "):
         return "FAQ answer"
-    if " vs " in f" {lower} " or "best " in lower:
-        return "comparison"
-    if any(w in lower for w in ("cost", "price", "pricing", "salary", "rates")):
-        return "pricing guide"
     return "how-to guide"
 
 
+def _own_result(serp: dict, own_domain: str) -> tuple[int, str] | None:
+    """``(position, url)`` of our own best result in a SERP's top 10, or None."""
+    own = (own_domain or "").lower()
+    for i, r in enumerate(serp.get("organic") or []):
+        host = sources.domain_of(r.get("link") or "")
+        if own and (host == own or host.endswith("." + own)):
+            return int(r.get("position") or i + 1), r.get("link") or ""
+    return None
+
+
+def _url_path(url: str) -> str:
+    return urlparse(url).path or "/"
+
+
 def _difficulty(serp: dict, own_domain: str) -> tuple[str, list[str]]:
-    evidence = []
-    weak = [r["link"] for r in serp["organic"] if any(w in r["link"].lower() for w in WEAK_DOMAINS)]
-    if any(own_domain in r["link"] for r in serp["organic"][:3]):
-        return "hard", ["we already rank top-3 — write only if refreshing"]
+    """How hard the top 10 is to break into — counting OUR result as ours: a
+    page of ours at #10 is neither a strong rival nor a reason to write anew."""
+    own = _own_result(serp, own_domain)
+    if own and own[0] <= 3:
+        return "hard", [f"we already rank #{own[0]} with {_url_path(own[1])} — refresh that page "
+                        "rather than writing a new post"]
+    others = [r for r in serp["organic"] if not own or r.get("link") != own[1]]
+    weak = [r["link"] for r in others if any(w in r["link"].lower() for w in WEAK_DOMAINS)]
+    evidence = [f"we rank #{own[0]} with {_url_path(own[1])}"] if own else []
     if weak:
         evidence.append(f"{len(weak)} weak result(s) in the top 10 (forums/UGC)")
     if serp.get("aio_present"):
@@ -144,7 +178,54 @@ def _difficulty(serp: dict, own_domain: str) -> tuple[str, list[str]]:
         return "easy win", evidence
     if len(weak) >= 1:
         return "medium", evidence
-    return "hard", evidence or ["top 10 is all strong sites"]
+    if own:
+        evidence.append("the rest of the top 10 is strong sites")
+    elif not evidence:
+        evidence.append("top 10 is all strong sites")
+    return "hard", evidence
+
+
+# A company in Google's suggestions ("On demand Paralegal Services LLC") is a
+# brand to look up, not a topic to write about.
+_COMPANY_SUFFIX = re.compile(
+    r"(?:,?\s+(?:llc|l\.l\.c\.?|inc\.?|incorporated|ltd\.?|limited|corp\.?|corporation|co\.|pllc|"
+    r"llp|lp)|\s+and\s+associates)\s*$|\s&\s+associates\b", re.I)
+
+
+def _brand_labels(competitor_domains, seed_texts: list[str], own_domain: str) -> set[str]:
+    """Competitors' brand names (the first label of their domain), minus any
+    word our own seeds use — "paralegal.com" must not make "paralegal" a brand."""
+    vocab = {w for s in seed_texts for w in re.findall(r"[a-z0-9]+", s.lower())}
+    vocab.add(sources.domain_of(own_domain or "").split(".")[0])
+    labels: set[str] = set()
+    for d in competitor_domains or []:
+        label = sources.domain_of(str(d)).split(".")[0]
+        if len(label) >= 4 and label not in vocab:
+            labels.add(label)
+    return labels
+
+
+def is_company_name(text: str, brand_labels: set[str] | frozenset = frozenset()) -> bool:
+    """A company or brand name, not a topic: a legal-entity suffix, or a word
+    that is a ranking competitor's brand."""
+    if _COMPANY_SUFFIX.search(" ".join((text or "").split())):
+        return True
+    return bool(brand_labels) and bool(set(re.findall(r"[a-z0-9]+", text.lower())) & brand_labels)
+
+
+def fix_query_index(todos: list[dict]) -> dict[frozenset, int]:
+    """``{keyword tokens: 1-based Fix-list position}`` for every to-do that
+    targets a search query — what the blog plan must not offer a second time."""
+    out: dict[frozenset, int] = {}
+    for i, todo in enumerate(todos or [], start=1):
+        query = str(todo.get("query") or "")
+        key = frozenset(_tokens(query))
+        if key and query != "(overall)":
+            out.setdefault(key, i)
+    return out
+
+
+FIX_LIST_WHY = "Also on your Fix list as #{n} — that page update comes first."
 
 
 def _provenance(source: str, from_seed: str | None, seed_is_users: bool) -> str:
@@ -222,13 +303,17 @@ def build_topics(
     corpus_pages: list[dict] | None = None,
     competitor_topics: list[str] | None = None,
     site_review: dict | None = None,
+    fix_queries: dict[frozenset, int] | None = None,
+    competitor_domains: list[str] | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Return (ranked topics, degradation notes) for one brand.
 
     Seeds: `brand["seed_entries"]` (from `site_brain.effective_seeds`) separates
-    the user's typed seeds — hard requirements: every one is a candidate and keeps
-    at least one live topic — from the site review's suggested seeds, which get
-    no protection. A plain brand's `seeds` are all treated as typed.
+    the user's typed seeds — hard requirements: every one is a candidate, keeps
+    at least one live topic and is NEVER avoided — from the site review's
+    suggested seeds, which get no protection. A plain brand's `seeds` are all
+    treated as typed. A typed seed that overlaps one of our pages stays live with
+    a note to refresh that page (``refresh_url``).
 
     `site_review` (the latest `sitereview-{id}` doc) adds its `missing_topics` as
     "site gap" candidates and uses its `covered_topics` to drop candidates the site
@@ -238,7 +323,12 @@ def build_topics(
     `corpus_pages` (our own crawled/summarised pages) grounds the anti-cannibalization
     check; `competitor_topics` (flattened hot-topics + recent-post topics from
     competitor profiles) seeds gap candidates tagged source="competitor-content".
-    All optional, offline data.
+
+    `fix_queries` (:func:`fix_query_index` of the run's Fix list): a non-seed
+    candidate that IS a Fix-list keyword is not offered again as a post; a typed
+    seed that is one stays, with ``also_in_fix`` = its Fix-list position.
+    `competitor_domains`: their brand names, and any legal-entity suffix (LLC,
+    Inc, …), mark a candidate as a company, not a topic. All optional, offline data.
     """
     from . import keywords  # lazy: keywords.py imports from this module at load time
 
@@ -264,6 +354,9 @@ def build_topics(
     candidates: dict[str, tuple[str, str]] = {}  # normalized -> (display, source)
     order: dict[str, int] = {}                   # normalized -> insertion index (stable tie-break)
     parent: dict[str, str] = {}                  # normalized -> normalized seed it was expanded from
+    fix_queries = fix_queries or {}
+    typed, suggested = _seed_lists(brand)
+    brand_labels = _brand_labels(competitor_domains, typed + suggested, brand.get("domain", ""))
 
     def add(cand: str, source: str, from_key: str | None = None) -> str | None:
         """Add one candidate; return its key when it is (now or already) in the pool."""
@@ -279,13 +372,16 @@ def build_topics(
             cand_tokens = _tokens(text)
             if any(_token_overlap(cand_tokens, c) for c in covered):
                 return None     # the site review says the site already covers this
+            if is_company_name(" ".join(cand.split()), brand_labels):
+                return None     # a company to look up, not a topic to write
+            if frozenset(cand_tokens) in fix_queries:
+                return None     # already a page move on the Fix list
         candidates[key] = (text, source)
         order[key] = len(order)
         if from_key:
             parent[key] = from_key
         return key
 
-    typed, suggested = _seed_lists(brand)
     user_seed_keys = list(dict.fromkeys(k for k in (add(s, SRC_SEED) for s in typed) if k))
     for gap in site_gaps:
         add(gap, SRC_SITE_GAP)
@@ -299,7 +395,7 @@ def build_topics(
         try:
             serp = search(candidates[key][0])
         except CredentialMissing as exc:
-            notes.append(f"Serper: {exc}")
+            notes.append(sources.plain_note(f"Serper: {exc}"))
             search = None
             break
         seed_serps[key] = serp
@@ -325,7 +421,7 @@ def build_topics(
                 if isinstance(idea, str):
                     add(idea, SRC_IDEA)
     except CredentialMissing as exc:
-        notes.append(f"New-topic ideation skipped: {exc}")
+        notes.append(sources.plain_note(f"New-topic ideation skipped: {exc}"))
 
     # Competitor gaps: topics rivals cover that we don't yet — from Task 5's
     # competitor-profiles doc (hot_topics + recent-post topics, flattened by the caller).
@@ -358,7 +454,7 @@ def build_topics(
                 serp = search(display)
                 checks += 1
             except CredentialMissing as exc:
-                notes.append(f"Serper: {exc}")
+                notes.append(sources.plain_note(f"Serper: {exc}"))
                 search = None
         if serp:
             difficulty, evidence = _difficulty(serp, brand["domain"])
@@ -367,28 +463,59 @@ def build_topics(
             + 0.35 * TREND_SCORE[trend]
             + 0.25 * (volume / max_volume if max_volume else 0.3)
         )
-        angle = _angle(display)
+        intent = keywords.intent_of(display)
+        angle = _angle(display, intent)
         avoided_url = _cannibalized_by(display, corpus_pages)
         seed_key = parent.get(key)
         from_seed = candidates[seed_key][0] if seed_key else None
-        keyed.append((key, {
+        why = _why(source, from_seed, seed_key in user_set, volume, trend, difficulty, evidence)
+        topic = {
             "keyword": display,
             "source": source,
             "from_seed": from_seed,
-            "impact": _impact(angle),
+            "impact": _impact(display, volume),
             "angle": angle,
-            "intent": keywords.intent_of(display),
+            "intent": intent,
             "volume_est": volume or None,
             "volume_label": _volume_label(volume, source),
             "trend": trend,
             "difficulty": difficulty,
             "est_monthly_clicks": round(volume * 0.11) if volume else None,
-            "why": _why(source, from_seed, seed_key in user_set, volume, trend, difficulty, evidence),
+            "why": why,
             "score": round(score, 3),
             "avoided": bool(avoided_url),
             "avoided_reason": f"overlaps {avoided_url}" if avoided_url else None,
-        }))
+            "also_in_fix": None,
+            "refresh_url": None,
+        }
+        if source == SRC_SEED:
+            # The user's own words are a hard requirement: never avoided. Where
+            # the Fix list or an existing page already owns the keyword, the
+            # topic stays live and says which page move comes first.
+            lead = _provenance(source, None, True)
+            fix_at = fix_queries.get(frozenset(_tokens(display)))
+            own = _own_result(serp, brand["domain"]) if serp else None
+            if fix_at:
+                topic["also_in_fix"] = fix_at
+                topic["why"] = f"{lead} · {FIX_LIST_WHY.format(n=fix_at)}"
+            elif avoided_url:
+                if own:
+                    note = (f"You already rank #{own[0]} with {_url_path(own[1])} — refresh that page "
+                            "rather than writing a new post.")
+                else:
+                    note = (f"Your page {_url_path(avoided_url)} already targets this — refresh it "
+                            "rather than writing a new post.")
+                topic["refresh_url"] = own[1] if own else avoided_url
+                topic["why"] = f"{lead} · {note}"
+            topic["avoided"], topic["avoided_reason"] = False, None
+        keyed.append((key, topic))
     topics = [t for _, t in keyed]
+    # An impact line is the topic's own numbers; one that reads the same on two
+    # topics is not specific to either.
+    lines = [t["impact"] for t in topics if t["impact"]]
+    for t in topics:
+        if t["impact"] and lines.count(t["impact"]) > 1:
+            t["impact"] = ""
 
     # Competitor-content candidates are a gap signal, not a mandate — never let
     # one outrank what the brand asked for (its seeds) or what its own site review

@@ -311,7 +311,7 @@ def build_profiles(brand: dict, search=None, fetch=None, fetch_sitemap=None) -> 
             feed = sitemap_watch({**brand, "competitors": top5}, fetch_sitemap=fetch_sitemap,
                                   state_key=f"profile-sitemaps-{brand['id']}")
         except CredentialMissing as exc:
-            notes.append(f"Sitemap watch: {exc}")
+            notes.append(sources.plain_note(f"Sitemap watch: {exc}"))
 
     profiles = []
     for domain in top5:
@@ -324,7 +324,7 @@ def build_profiles(brand: dict, search=None, fetch=None, fetch_sitemap=None) -> 
             try:
                 facts = fetch(url)
             except CredentialMissing as exc:
-                notes.append(f"Page fetch {url}: {exc}")
+                notes.append(f"Page fetch {url}: {sources.plain_reason(exc, log=True)}")
                 break
             if facts.status != 200 or not (facts.title or facts.text):
                 continue
@@ -346,7 +346,7 @@ def build_profiles(brand: dict, search=None, fetch=None, fetch_sitemap=None) -> 
                         clicks = round(volume * insights.ctr_at(position))
                         basis = "lab volume × CTR curve"
                 except CredentialMissing as exc:
-                    notes.append(f"Serper {domain}: {exc}")
+                    notes.append(sources.plain_note(f"Serper {domain}: {exc}"))
                     search = None
             recent_posts.append({
                 "url": url, "title": title, "topic": topic,

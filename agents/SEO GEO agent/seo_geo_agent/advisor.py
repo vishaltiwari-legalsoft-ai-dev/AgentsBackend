@@ -18,6 +18,8 @@ def _context(brand: dict) -> str:
     report = audit.latest_audit(brand["id"]) or {}
     ranks = state.load(f"ranks-{brand['id']}") or {}
     sitemaps = state.load(f"sitemaps-{brand['id']}") or {}
+    # Rechecked against the crawl: a finding the page contradicts is not context.
+    review = site_brain.checked_review(brand["id"]) or {}
 
     ctx = {
         "brand": {"name": brand["name"], "domain": brand["domain"], "seeds": brand.get("seeds", []),
@@ -58,7 +60,7 @@ def _context(brand: dict) -> str:
         },
         "existing_briefs": [b["keyword"] for b in briefs.list_briefs(brand["id"])],
         "site_review": {
-            k: (site_brain.latest_review(brand["id"]) or {}).get(k)
+            k: review.get(k)
             for k in ("at", "positioning", "scorecard", "strengths", "issues", "covered_topics", "missing_topics")
         },
     }
