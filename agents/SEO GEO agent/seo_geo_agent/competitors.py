@@ -118,6 +118,38 @@ def sitemap_watch(brand: dict, fetch_sitemap=None, state_key: str | None = None)
     return feed
 
 
+#: Types nearly every CMS emits, or that only exist as parts of another type
+#: (a BreadcrumbList's ListItem, a FAQPage's Question). "The top pages carry
+#: WebPage" is not a recommendation.
+SCHEMA_BOILERPLATE = frozenset({
+    "WebSite", "WebPage", "BreadcrumbList", "ImageObject", "Organization",
+    "AboutPage", "ContactPage", "CollectionPage", "ItemPage", "SearchResultsPage", "ProfilePage",
+    "ListItem", "ItemList", "SearchAction", "ReadAction", "Action", "EntryPoint",
+    "PropertyValueSpecification", "PostalAddress", "ContactPoint", "GeoCoordinates", "Place",
+    "OpeningHoursSpecification", "Person", "Rating", "AggregateRating", "Offer", "AggregateOffer",
+    "PriceSpecification", "UnitPriceSpecification", "MonetaryAmount", "QuantitativeValue",
+    "Question", "Answer", "HowToStep", "HowToSection", "HowToSupply", "HowToTool",
+    "SiteNavigationElement", "WPHeader", "WPFooter", "WPSideBar", "WebPageElement",
+    "SpeakableSpecification", "Thing", "Brand", "Audience", "Country", "State", "City",
+    "AdministrativeArea", "DefinedTerm", "Language", "VideoObject",
+})
+MIN_SCHEMA_PAGES = 2
+
+
+def schema_prevalence(pages: list) -> list[dict]:
+    """``[{type, pages}]`` for schema types on at least MIN_SCHEMA_PAGES of the
+    ranking pages, most widespread first — boilerplate excluded. One page with
+    an Article tag is that site's CMS; two or more is a pattern of the SERP."""
+    counts: dict[str, int] = {}
+    for p in pages:
+        for t in set(p.schema_types):
+            if t and t not in SCHEMA_BOILERPLATE:
+                counts[t] = counts.get(t, 0) + 1
+    return [{"type": t, "pages": n}
+            for t, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            if n >= MIN_SCHEMA_PAGES]
+
+
 def serp_deep_dive(brand: dict, query: str, search=None, fetch=fetch_page) -> dict:
     """Reverse-engineer the top of the SERP for one query: who ranks, what
     structure and questions their pages share, which entities keep appearing."""
@@ -158,6 +190,9 @@ def serp_deep_dive(brand: dict, query: str, search=None, fetch=fetch_page) -> di
 
     questions = list(dict.fromkeys(serp["paa"] + [q for p in pages for q in p.questions]))[:12]
     word_counts = [p.word_count for p in pages if p.word_count]
+    # Our own page is not evidence of what the SERP rewards.
+    their_pages = [p for p in pages if brand["domain"] not in _domain(p.url)]
+    prevalence = schema_prevalence(their_pages)
     return {
         "query": query,
         "at": date.today().isoformat(),
@@ -168,7 +203,9 @@ def serp_deep_dive(brand: dict, query: str, search=None, fetch=fetch_page) -> di
         "questions": questions,
         "entities": entities,
         "target_word_count": round(sum(word_counts) / len(word_counts)) if word_counts else None,
-        "schema_seen": sorted({t for p in pages for t in p.schema_types}),
+        "schema_seen": [s["type"] for s in prevalence],
+        "schema_prevalence": prevalence,
+        "schema_pages": len(their_pages),   # the denominator behind schema_prevalence
         "aio_present": serp["aio_present"],
         "pages_analyzed": len(pages),
     }

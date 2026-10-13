@@ -137,6 +137,67 @@ def test_site_review_endpoints_offline():
     assert detail["plan"] == [] and detail["site_review"] is None
 
 
+def test_site_review_with_a_wrong_shape_answer_is_503_not_500(monkeypatch):
+    """A model answer that is a JSON list used to hit ``raw.get`` -> AttributeError
+    -> an unexplained 500. It is a failed review: an honest 503 with the reason."""
+    from seo_geo_agent import site_brain
+
+    monkeypatch.setattr(site_brain, "build_corpus",
+                        lambda brand, fetch=None, sitemap=None: {"brand_id": brand["id"], "page_count": 0,
+                                                                 "pages": [], "degraded": []})
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: ["not", "an", "object"])
+    r = client.post("/api/seo-geo/site-review/legalsoft")
+    assert r.status_code == 503
+    assert "not the review object" in r.json()["detail"]
+    assert client.get("/api/seo-geo/site-review/legalsoft").json()["review"] is None
+
+
+def _todo(tid, action, why="w", status="todo"):
+    return {"id": tid, "kind": "striking", "page": "https://legalsoft.com/p", "query": "q",
+            "action": action, "why": why, "est_monthly_clicks": 10, "position": 8,
+            "impressions": 100, "status": status}
+
+
+def test_this_week_strip_never_repeats_fix_list_first():
+    """The strip sits right above the Fix list. Its first move used to be the Fix
+    list's #1, so the same action showed twice, one under the other."""
+    from seo_geo_agent import state as seo_state
+
+    first = "Refresh the content and add internal links for 'legal virtual assistant'"
+    seo_state.save("run-legalsoft", {
+        "brand_id": "legalsoft", "at": "2026-10-14", "trigger": "t", "degraded": [], "summary": {},
+        "insights": [], "topics": [], "ga": None, "todos": [
+            _todo("t1", first),
+            _todo("t2", "Refresh the content and add internal links for “legal virtual assistant”"),
+            _todo("t3", "Rewrite the title and meta description targeting 'paralegal services'"),
+        ]})
+    seo_state.save("keywords-legalsoft", {"clusters": [
+        {"name": "legal virtual assistant", "tier": "high", "recommendation": "same move as #1"},
+        {"name": "law firm answering service", "tier": "high", "recommendation": "a new page"},
+    ]})
+    seo_state.save("audit-legalsoft", {"issues": [
+        {"issue": "Broken or unreachable pages", "severity": "high", "fix": "Redirect them"}],
+        "site_checks": []})
+
+    plan = client.get("/api/seo-geo/brands/legalsoft").json()["plan"]
+    actions = [p["action"] for p in plan]
+    assert actions == [
+        "Rewrite the title and meta description targeting 'paralegal services'",  # #2 restates #1
+        "Go after “law firm answering service”",                                  # cluster 1 restates #1
+        "Fix: Broken or unreachable pages",
+    ]
+    assert first not in actions
+
+
+def test_this_week_strip_skips_fix_list_first_even_when_it_is_the_only_todo():
+    from seo_geo_agent import state as seo_state
+
+    seo_state.save("run-legalsoft", {
+        "brand_id": "legalsoft", "at": "2026-10-14", "trigger": "t", "degraded": [], "summary": {},
+        "insights": [], "topics": [], "ga": None, "todos": [_todo("t1", "Fix the pricing page")]})
+    assert client.get("/api/seo-geo/brands/legalsoft").json()["plan"] == []
+
+
 def test_pages_endpoints():
     assert client.get("/api/seo-geo/pages/legalsoft").json()["pages"] is None
     r = client.post("/api/seo-geo/pages/legalsoft/refresh")

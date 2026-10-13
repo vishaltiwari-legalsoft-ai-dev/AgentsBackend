@@ -185,24 +185,39 @@ def run_brand(brand_id: str, user=Depends(get_current_user),
 
 
 def _plan_of_action(brand_id: str, run: dict | None) -> list[dict]:
-    """Top 3 next moves across every surface — the 'what do I do' strip."""
+    """Top 3 next moves across every surface — the 'what do I do' strip.
+
+    The Fix list renders below this strip, so its #1 item is never repeated
+    here (not even re-worded as a keyword move), and no two moves in the strip
+    are the same move in different words.
+    """
+    todos = (run or {}).get("todos", [])
+    shown_below = [todos[0]["action"]] if todos else []
     plan: list[dict] = []
-    todo = next((t for t in (run or {}).get("todos", []) if t.get("status") != "done"), None)
-    if todo:
-        plan.append({"source": "fix list", "action": todo["action"], "detail": todo["why"]})
+
+    def add(source: str, action: str, detail: str) -> bool:
+        taken = shown_below + [p["action"] for p in plan]
+        if any(seo_audit.similar(action, other) for other in taken):
+            return False
+        plan.append({"source": source, "action": action, "detail": detail})
+        return True
+
+    for todo in todos[1:]:
+        if todo.get("status") != "done" and add("fix list", todo["action"], todo["why"]):
+            break
     lab = seo_keywords.latest(brand_id) or {}
-    cluster = next((c for c in lab.get("clusters", []) if c.get("tier") == "high"), None)
-    if cluster:
-        plan.append({"source": "keywords", "action": f"Go after “{cluster['name']}”",
-                     "detail": cluster.get("recommendation", "")})
+    for cluster in lab.get("clusters", []):
+        if cluster.get("tier") == "high" and add(
+                "keywords", f"Go after “{cluster['name']}”", cluster.get("recommendation", "")):
+            break
     report = seo_audit.latest_audit(brand_id) or {}
     issue = next((i for i in report.get("issues", []) if i["severity"] == "high"), None)
     if issue:
-        plan.append({"source": "audit", "action": f"Fix: {issue['issue']}", "detail": issue["fix"]})
+        add("audit", f"Fix: {issue['issue']}", issue["fix"])
     else:
         failed = next((c for c in report.get("site_checks", []) if not c["ok"]), None)
         if failed:
-            plan.append({"source": "audit", "action": f"Fix: {failed['name']}", "detail": failed["fix"]})
+            add("audit", f"Fix: {failed['name']}", failed["fix"])
     return plan[:3]
 
 

@@ -541,8 +541,8 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
     except CredentialMissing as exc:
         degraded.append(f"Page analytics: {exc}")
 
-    # Site-review findings ride along in the fix list (stable ids keep status).
-    todos = (todos + site_brain.site_todos(brand["id"]))[:MAX_TODOS]
+    # Site-review findings ride along in the fix list: reserved slots, and the cut is counted.
+    todos, todos_not_shown = site_brain.merge_todos(todos, site_brain.site_todos(brand["id"]), MAX_TODOS)
 
     topic_list, topic_notes = topics.build_topics(
         site_brain.effective_seeds(brand), rows, prev_rows,
@@ -561,6 +561,7 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
         "todos": todos,
         "topics": topic_list,
         "ga": ga,
+        "todos_not_shown": todos_not_shown,
     }
     state.save(f"run-{brand['id']}", run)
     return run

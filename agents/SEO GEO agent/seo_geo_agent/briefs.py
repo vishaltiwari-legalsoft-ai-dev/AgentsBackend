@@ -7,7 +7,7 @@ from __future__ import annotations
 import hashlib
 from datetime import date
 
-from . import competitors, keywords as kw_lab, sources, state
+from . import audit, competitors, keywords as kw_lab, sources, state
 from .sources import CredentialMissing, QueryStat, fetch_page
 from .topics import _tokens
 
@@ -50,6 +50,34 @@ def _fallback_outline(keyword: str, deep: dict) -> list[dict]:
     return outline
 
 
+def _prevalence(deep: dict, types: list[str]) -> str:
+    """``Article (3 of 5 top pages), Service (2 of 5 top pages)`` — the evidence."""
+    n_of = {s["type"]: s["pages"] for s in deep.get("schema_prevalence") or []}
+    total = deep.get("schema_pages") or deep.get("pages_analyzed") or 0
+    return ", ".join(f"{t} ({n_of[t]} of {total} top pages)" if t in n_of and total else t
+                     for t in types)
+
+
+def _brief_schema(deep: dict) -> tuple[list[str], str]:
+    """What the brief's page should be marked up with — evidence or nothing.
+
+    The ranking pages' own patterns first (types on 2+ of them). When they show
+    none, the only rule-backed suggestion is FAQPage, and only when the brief
+    carries 2+ questions the article will answer. No hard-coded default.
+    """
+    seen = list(deep.get("schema_seen") or [])[:4]
+    if seen:
+        return seen, f"Seen on the ranking pages: {_prevalence(deep, seen)}."
+    planned = {"url": "", "type": "other", "schema_types": [],  # the article, not yet written
+               "q_headings": len(deep.get("questions") or [])}
+    faq = next((r for r in audit.schema_fit(planned) if r["type"] == "FAQPage"), None)
+    if faq:
+        return ["FAQPage"], (f"No schema seen on ranking pages. The brief answers "
+                             f"{planned['q_headings']} questions, so FAQPage fits. "
+                             + audit.FAQ_RICH_RESULT_NOTE)
+    return [], "No schema seen on ranking pages."
+
+
 def build_brief(brand: dict, keyword: str, rows: list[QueryStat], search=None, fetch=fetch_page) -> dict:
     """SERP-grounded brief: outline, target keywords, entities, length, links."""
     deep = competitors.serp_deep_dive(brand, keyword, search=search, fetch=fetch)
@@ -71,6 +99,7 @@ def build_brief(brand: dict, keyword: str, rows: list[QueryStat], search=None, f
         notes.append(f"LLM outline skipped ({exc}) — structural outline from SERP data")
         outline = _fallback_outline(keyword, deep)
 
+    schema_recommended, schema_note = _brief_schema(deep)
     brief = {
         "id": _brief_id(brand["id"], keyword),
         "keyword": keyword,
@@ -81,7 +110,8 @@ def build_brief(brand: dict, keyword: str, rows: list[QueryStat], search=None, f
         "questions": deep["questions"],
         "entities": deep["entities"],
         "target_word_count": deep["target_word_count"] or 1200,
-        "schema_recommended": deep["schema_seen"][:4] or ["Article", "FAQPage"],
+        "schema_recommended": schema_recommended,
+        "schema_note": schema_note,
         "internal_links": _internal_links(rows, keyword),
         "who_ranks": deep["who_ranks"][:5],
         "our_position": deep["our_position"],
@@ -96,6 +126,27 @@ def build_brief(brand: dict, keyword: str, rows: list[QueryStat], search=None, f
 
 def list_briefs(brand_id: str) -> list[dict]:
     return (state.load(f"briefs-{brand_id}") or {}).get("briefs", [])
+
+
+def _missing_schema(deep: dict, ours) -> list[str]:
+    """The SERP's schema patterns our page does not already carry (an Article-
+    family type counts for Article; any Organization-family type for those).
+    FAQPage additionally has to fit OUR page — 2+ question headings — because
+    markup for Q&A the page does not show is exactly the advice not to give."""
+    have = set(ours.schema_types)
+    our_fit = {r["type"] for r in audit.schema_fit(ours)}
+    out = []
+    for typ in deep.get("schema_seen") or []:
+        if typ in have:
+            continue
+        if typ in audit.ARTICLE_TYPES and have & audit.ARTICLE_TYPES:
+            continue
+        if typ in audit.ORG_TYPES and have & audit.ORG_TYPES:
+            continue
+        if typ == "FAQPage" and "FAQPage" not in our_fit:
+            continue
+        out.append(typ)
+    return out[:3]
 
 
 def update_plan(brand: dict, page_url: str, rows: list[QueryStat], search=None, fetch=fetch_page) -> dict:
@@ -121,8 +172,10 @@ def update_plan(brand: dict, page_url: str, rows: list[QueryStat], search=None, 
         suggestions.append(f"Add a section on “{theme}” — the pages outranking us cover it, ours doesn't.")
     for q in missing(deep["questions"])[:4]:
         suggestions.append(f"Answer “{q}” directly on the page.")
-    if deep["schema_seen"] and not ours.schema_types:
-        suggestions.append(f"Add structured data ({', '.join(deep['schema_seen'][:3])}) — top pages carry it.")
+    missing_schema = _missing_schema(deep, ours)
+    if missing_schema:
+        suggestions.append(f"Add structured data the outranking pages carry and ours doesn't: "
+                           f"{_prevalence(deep, missing_schema)}.")
     if deep["target_word_count"] and ours.word_count and ours.word_count < 0.6 * deep["target_word_count"]:
         suggestions.append(
             f"Deepen the page: ours is ~{ours.word_count} words, the top pages average ~{deep['target_word_count']}."

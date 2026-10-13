@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from seo_geo_agent import insights, keywords, state, topics
+from seo_geo_agent import insights, keywords, site_brain, state, topics
 from seo_geo_agent.sources import QueryStat
 
 
@@ -294,6 +294,103 @@ def test_build_rank_todos_orders_drops_first():
     assert todos[0]["est_monthly_clicks"] is None  # honest: no impression data
     unranked = next(t for t in todos if t["kind"] == "unranked")
     assert "comp.com" in unranked["why"]
+
+
+# ------------------------------ site-review to-dos ------------------------------
+
+SITE_CORPUS = {"brand_id": "legalsoft", "page_count": 2, "degraded": [], "pages": [
+    {"url": "https://legalsoft.com/", "title": "Home", "type": "home", "word_count": 900,
+     "summary": "Virtual assistants for law firms.", "schema_types": ["Organization", "WebSite"]},
+    {"url": "https://legalsoft.com/pricing", "title": "Pricing", "type": "other", "word_count": 180,
+     "summary": "Plans and rates.", "schema_types": []},
+]}
+
+
+def _review(monkeypatch, issues: list[dict]) -> dict:
+    payload = {"positioning": "p", "scorecard": {}, "strengths": [], "issues": issues,
+               "suggested_seeds": [], "covered_topics": [], "missing_topics": []}
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: payload)
+    return site_brain.expert_review(insights.list_brands()[0], SITE_CORPUS)
+
+
+def _site_issue(insight, url="https://legalsoft.com/pricing", category="trust", priority="high"):
+    return {"insight": insight, "evidence": f"{url} — no reviews shown",
+            "action": "Add client reviews", "priority": priority, "category": category}
+
+
+def test_site_todo_ids_survive_a_reworded_rerun(monkeypatch):
+    """The model words the same finding differently every run; the id is the
+    category + the page, so the Fix-list row is the same row."""
+    _review(monkeypatch, [_site_issue("No testimonials on the pricing page")])
+    first = site_brain.site_todos("legalsoft")
+    _review(monkeypatch, [_site_issue("Pricing lacks social proof from real clients")])
+    second = site_brain.site_todos("legalsoft")
+    assert [t["id"] for t in first] == [t["id"] for t in second]
+    assert second[0]["page"] == "https://legalsoft.com/pricing"     # the URL, not the evidence sentence
+    assert second[0]["category"] == "trust"
+    _review(monkeypatch, [_site_issue("Pricing lacks social proof", category="conversion")])
+    assert site_brain.site_todos("legalsoft")[0]["id"] != first[0]["id"]   # a different finding
+
+
+def test_site_todo_status_carries_over_a_reworded_rerun(monkeypatch):
+    brand = insights.list_brands()[0]
+    _review(monkeypatch, [_site_issue("No testimonials on the pricing page")])
+    run = insights.run_brand(brand, trigger="test")
+    tid = next(t["id"] for t in run["todos"] if t["kind"] == "site")
+    insights.set_todo_status(brand["id"], tid, "done")
+
+    _review(monkeypatch, [_site_issue("Pricing lacks social proof from real clients")])
+    insights.run_brand(brand, trigger="test")
+    site = [t for t in insights.latest_run(brand["id"])["todos"] if t["kind"] == "site"]
+    assert [(t["id"], t["status"]) for t in site] == [(tid, "done")]
+
+
+def test_status_set_under_the_old_wording_id_is_carried(monkeypatch):
+    """Statuses saved before ids were keyed by page live under the wording-based
+    id. A review stored then (no url field) and the re-run after it both keep them."""
+    legacy_issue = {"insight": "No testimonials on the pricing page",
+                    "evidence": "https://legalsoft.com/pricing (180w) — none",
+                    "action": "Add client reviews", "priority": "high", "category": "trust"}
+    state.save("sitereview-legalsoft", {"brand_id": "legalsoft", "issues": [legacy_issue]})
+    legacy_id = site_brain._legacy_todo_id("legalsoft", legacy_issue)
+    insights.set_todo_status("legalsoft", legacy_id, "assigned")
+
+    todo = site_brain.site_todos("legalsoft")[0]
+    assert todo["page"] == "https://legalsoft.com/pricing"
+    assert todo["id"] == site_brain._todo_id("legalsoft", "trust", "https://legalsoft.com/pricing")
+    assert todo["status"] == "assigned"
+
+    _review(monkeypatch, [_site_issue("Pricing lacks social proof")])     # reworded re-run
+    assert site_brain.site_todos("legalsoft")[0]["status"] == "assigned"
+
+
+def test_merge_todos_reserves_site_slots_and_counts_the_cut():
+    search = [{"id": f"s{i}"} for i in range(25)]
+    site = [{"id": f"w{i}"} for i in range(8)]
+    shown, not_shown = site_brain.merge_todos(search, site, 25)
+    assert len(shown) == 25 and not_shown == 8
+    assert [t["id"] for t in shown[-site_brain.SITE_TODO_SLOTS:]] == [f"w{i}" for i in range(5)]
+    # room either side leaves goes to the other
+    shown, not_shown = site_brain.merge_todos(search[:3], site, 25)
+    assert len(shown) == 11 and not_shown == 0
+    shown, not_shown = site_brain.merge_todos(search, site[:2], 25)
+    assert [t["id"] for t in shown][-2:] == ["w0", "w1"] and not_shown == 2
+
+
+def test_site_todos_are_never_cut_silently_by_max_todos(monkeypatch):
+    """Search-data to-dos fill all 25 slots on their own; site findings used to be
+    appended after them and sliced off without a trace."""
+    brand = insights.list_brands()[0]
+    rows = [row(query=f"legal assistant topic {i}", page=f"https://legalsoft.com/p{i}",
+                impressions=2000, position=8.0) for i in range(30)]
+    monkeypatch.setattr(insights, "gsc_fetch", lambda prop, s, e, service=None: rows)
+    _review(monkeypatch, [_site_issue("No testimonials on the pricing page"),
+                          _site_issue("Home page never says who it serves",
+                                      url="https://legalsoft.com/", category="intent")])
+    run = insights.run_brand(brand, trigger="test")
+    assert len(run["todos"]) == insights.MAX_TODOS
+    assert sum(t["kind"] == "site" for t in run["todos"]) == 2
+    assert run["todos_not_shown"] == 2   # two search to-dos made room, and it is counted
 
 
 def test_run_brand_rank_mode_without_gsc(monkeypatch):
