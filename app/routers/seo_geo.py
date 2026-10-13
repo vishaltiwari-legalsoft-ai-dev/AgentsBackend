@@ -7,16 +7,13 @@ Creator edits the brand registry; the cron entry is gated by ``x-cron-key``
 from __future__ import annotations
 
 import hmac
-import html
 import logging
 import os
-import secrets
 
 from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.security import get_current_user, require_creator
 from app.services.run_tracking import CHANGE, CRON, JOB, Activity, ActivityTrail
@@ -117,13 +114,22 @@ def _headline(run: dict | None, review: dict | None) -> str | None:
 
 @router.get("/seo-geo/overview")
 def overview(user=Depends(get_current_user)):
+    """The brand cards plus the integration flags. ``sources.gsc`` is true only
+    when some brand really has Search Console behind it (a stored grant, or a
+    latest run that read Search Console rows); ``sources.gsc_connect`` says
+    whether the Connect button can work on this server. Per brand, ``gsc`` is
+    :func:`_gsc_view`; ``gsc_connected`` stays for consoles that predate it."""
+    brands = insights.list_brands()
+    grants = seo_oauth.connections([b["id"] for b in brands])  # one batched read
     cards = []
-    for brand in insights.list_brands():
+    for brand in brands:
         run = insights.latest_run(brand["id"])
         review = seo_site.latest_review(brand["id"])
+        gsc = _gsc_view(brand, grants.get(brand["id"]), run)
         cards.append({
             "brand": brand,
-            "gsc_connected": bool(seo_oauth.connection(brand["id"])),
+            "gsc_connected": gsc["connected"],
+            "gsc": gsc,
             "headline": _headline(run, review),
             "last_run": run and {
                 "at": run["at"],
@@ -134,7 +140,11 @@ def overview(user=Depends(get_current_user)):
             },
         })
     return {
-        "sources": {"gsc": sources.gsc_available(), "serp": sources.serper_available()},
+        "sources": {
+            "gsc": any(c["gsc"]["connected"] or c["gsc"]["reading"] for c in cards),
+            "gsc_connect": seo_oauth.connect_ready(),
+            "serp": sources.serper_available(),
+        },
         "brands": cards,
     }
 
@@ -214,7 +224,7 @@ def brand_detail(brand_id: str, user=Depends(get_current_user)):
     return {
         "brand": brand,
         "run": run,
-        "gsc": {"connected": bool(conn), "property": (conn or {}).get("property")},
+        "gsc": _gsc_view(brand, conn, run),
         "plan": _plan_of_action(brand_id, run),
         "site_review": seo_site.latest_review(brand_id),
     }
@@ -459,76 +469,99 @@ def draft_score(brand_id: str, payload: DraftIn, user=Depends(get_current_user),
 
 
 # --------------------- Search Console connect (OAuth) ---------------------
+#
+# Google returns the browser to the CONSOLE (``<APP_PUBLIC_URL>/oauth/google``),
+# which posts ``{code, state}`` here with the member's own bearer — the a12
+# Inbox pattern. There is no public callback route. Any signed-in member may
+# connect a brand (owner decision, 2026-10-14); disconnect stays Creator-only.
+#
+# Error contract: ``detail`` is ``{"code", "message"}`` — a stable code the
+# console keys on and one plain sentence. What the server lacks (env var names)
+# goes to the log as a WARNING, never into a response.
 
-def _oauth_redirect(request: Request) -> str:
-    base = os.environ.get("SEO_OAUTH_REDIRECT_BASE", "") or str(request.base_url).rstrip("/")
-    if "localhost" not in base and base.startswith("http://"):
-        base = "https://" + base.removeprefix("http://")  # Cloud Run sits behind TLS proxy
-    return f"{base}/api/seo-geo/oauth/callback"
+#: ``ConnectRefused.code`` -> HTTP status. Ours to fix is 503; a stale or
+#: foreign connect link is 400; the member's Google account said no (or has no
+#: access to the site) is 422; Google itself failed or refused the code is 502.
+_GSC_STATUS = {
+    seo_oauth.UNCONFIGURED: 503,
+    seo_oauth.OFFLINE: 503,
+    seo_oauth.STATE_INVALID: 400,
+    seo_oauth.STATE_EXPIRED: 400,
+    seo_oauth.STATE_OTHER_USER: 400,
+    seo_oauth.SCOPE_NOT_GRANTED: 422,
+    seo_oauth.NO_PROPERTY: 422,
+    seo_oauth.EXCHANGE_FAILED: 502,
+    seo_oauth.GOOGLE_UNAVAILABLE: 502,
+}
 
 
-def _close_page(title: str, body: str, status: int = 200, *, strong: str = "") -> HTMLResponse:
-    """The OAuth landing page — the ONE place this backend serves HTML.
+class OAuthCompleteIn(BaseModel):
+    code: str = Field(min_length=1, max_length=2048)
+    state: str = Field(min_length=1, max_length=2048)
 
-    Every caller value is attacker-reachable (``?error=`` comes straight off the
-    query string), so ``title``, ``body`` and ``strong`` are all escaped: markup
-    never comes from a value. ``body`` may carry one ``{strong}`` marker, which
-    is where the escaped ``strong`` text is emphasised — the tag is wrapped
-    around already-escaped text, so the value itself can never carry markup.
 
-    The CSP grants a fresh per-response nonce to the two inline blocks this
-    function authors and nothing else: injected script has no nonce, so
-    ``default-src 'none'`` still applies to it. Never a constant nonce — a
-    predictable one is the same as ``unsafe-inline``.
-    """
-    nonce = secrets.token_urlsafe(16)
-    safe_body = html.escape(body)
-    if strong:
-        safe_body = safe_body.replace("{strong}", f"<b>{html.escape(strong)}</b>")
-    return HTMLResponse(
-        f"<html><head><style nonce=\"{nonce}\">"
-        "body{font-family:sans-serif;max-width:480px;margin:80px auto;text-align:center}"
-        f"</style></head><body><h2>{html.escape(title)}</h2>"
-        f"<p>{safe_body}</p><p>You can close this tab.</p>"
-        f"<script nonce=\"{nonce}\">setTimeout(()=>window.close(),4000)</script>"
-        "</body></html>",
-        status_code=status,
-        headers={
-            "Content-Security-Policy": (
-                f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'"
-            ),
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
+def _gsc_refused(exc: seo_oauth.ConnectRefused) -> HTTPException:
+    status = _GSC_STATUS.get(exc.code, 502)
+    if status >= 500:
+        logger.warning("Search Console connect refused (%s): %s", exc.code, exc.log_detail or exc.message)
+    else:
+        logger.info("Search Console connect refused (%s): %s", exc.code, exc.log_detail or exc.message)
+    return HTTPException(status_code=status, detail={"code": exc.code, "message": exc.message})
+
+
+def _gsc_view(brand: dict, grant: dict | None, run: dict | None) -> dict:
+    """One brand's Search Console truth, the same shape on the overview card,
+    the brand detail and the connect answer.
+
+    ``connected`` / ``property`` / ``connected_by`` / ``connected_at`` describe
+    a stored OAuth grant. ``service_account_property`` is the property set on
+    the brand for the shared service account (``None`` when unset — the run
+    then tries ``sc-domain:<domain>``); whether that account can actually read
+    it is only known from a run, which is what ``reading`` says: the latest run
+    got Search Console rows."""
+    grant = grant or {}
+    summary = (run or {}).get("summary") or {}
+    return {
+        "connected": bool(grant),
+        "property": grant.get("property"),
+        "connected_by": grant.get("connected_by"),
+        "connected_at": grant.get("connected_at"),
+        "service_account_property": brand.get("gsc_property") or None,
+        "reading": summary.get("mode") == "search-console",
+    }
 
 
 @router.get("/seo-geo/oauth/start/{brand_id}")
-def oauth_start(brand_id: str, request: Request, user=Depends(get_current_user)):
+def oauth_start(brand_id: str, user=Depends(get_current_user)):
+    """The Google consent URL for this brand, bound to the caller. Refused
+    with 503 before anyone is sent to Google if the connection could not be
+    finished or stored here."""
     _brand_or_404(brand_id)
     try:
-        return {"url": seo_oauth.auth_url(brand_id, _oauth_redirect(request))}
-    except CredentialMissing as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"url": seo_oauth.auth_url(brand_id, user_id=str(user["id"]))}
+    except seo_oauth.ConnectRefused as exc:
+        raise _gsc_refused(exc) from exc
 
 
-@router.get("/seo-geo/oauth/callback")
-def oauth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
-    """Google redirects the customer's browser here — gated by the signed state."""
-    if error:
-        return _close_page("Not connected", f"Google returned: {error}", status=400)
+@router.post("/seo-geo/oauth/complete")
+def oauth_complete(payload: OAuthCompleteIn, user=Depends(get_current_user),
+                   act: Activity = trail.records("gsc_connect",
+                                                 "Connected Search Console", unit=CHANGE)):
+    """The console posts Google's ``{code, state}`` here. The state names the
+    brand and must have been issued to this same caller; the answer is the
+    brand's ``gsc`` view — never a token."""
     try:
-        brand = _brand_or_404(seo_oauth.read_state(state))
-        result = seo_oauth.complete(brand, code, _oauth_redirect(request))
-        return _close_page(
-            "Search Console connected ✓",
-            f"{brand['name']} is now reading data from {{strong}}. "
-            "Go back to the dashboard and hit Refresh data.",
-            strong=result["property"],
-        )
-    except ValueError as exc:
-        return _close_page("Not connected", str(exc), status=400)
-    except CredentialMissing as exc:
-        return _close_page("Not connected", str(exc), status=503)
+        verified = seo_oauth.read_state(payload.state, user_id=str(user["id"]))
+        brand = _brand_or_404(verified.brand_id)
+        _for(act, brand)
+        grant = seo_oauth.complete(verified, brand, code=payload.code,
+                                   connected_by=str(user.get("email") or ""),
+                                   user_id=str(user["id"]))
+    except seo_oauth.ConnectRefused as exc:
+        raise _gsc_refused(exc) from exc
+    act.note(f"Search Console connected for {brand['id']} — reading {grant['property']}")
+    return {"brand_id": brand["id"],
+            "gsc": _gsc_view(brand, grant, insights.latest_run(brand["id"]))}
 
 
 @router.post("/seo-geo/oauth/disconnect/{brand_id}")

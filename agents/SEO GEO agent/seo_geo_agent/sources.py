@@ -72,10 +72,6 @@ class QueryStat:
     position: float
 
 
-def gsc_available() -> bool:
-    return state.use_cloud()
-
-
 # ------------------------- Google Analytics (GA4) -------------------------
 
 # Metric order is load-bearing: parsing reads metricValues by this position.

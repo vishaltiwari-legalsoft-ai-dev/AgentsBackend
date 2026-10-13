@@ -96,3 +96,31 @@ def test_auth_failure_still_degrades_rather_than_crashing(monkeypatch):
     with pytest.raises(sources.CredentialMissing) as excinfo:
         sources._gsc_service()
     assert "no ADC here" in str(excinfo.value)
+
+
+# ----------------- the brand's own Search Console grant -----------------
+
+def test_a_connected_brands_client_carries_a_timeout_and_its_own_token(gsc_connect):
+    """``gsc_oauth.service`` was the one Google client built with
+    ``credentials=`` and no transport — the token refresh and every Search
+    Console query on a connected brand could hang a worker thread. It now
+    rides a timed ``http=``, opened from the SEALED grant."""
+    from seo_geo_agent import gsc_oauth
+
+    sealed = gsc_connect.fernet.encrypt(b"r1").decode()
+    gsc_connect.store["b"] = {"property": "sc-domain:x.com", "refresh_token_enc": sealed}
+
+    svc = gsc_oauth.service("b")
+    assert svc._http.http.timeout == sources.GOOGLE_API_TIMEOUT_SECONDS
+    assert svc._http.credentials.refresh_token == "r1"
+    assert svc._http.credentials.scopes == [gsc_oauth.SCOPE]
+    assert gsc_oauth.service("no-grant") is None  # the run falls back to the service account
+
+
+def test_a_legacy_plaintext_grant_still_builds_a_bounded_client(gsc_connect):
+    from seo_geo_agent import gsc_oauth
+
+    gsc_connect.store["b"] = {"property": "sc-domain:x.com", "refresh_token": "old", "legacy": True}
+    svc = gsc_oauth.service("b")
+    assert svc._http.http.timeout == sources.GOOGLE_API_TIMEOUT_SECONDS
+    assert svc._http.credentials.refresh_token == "old"
