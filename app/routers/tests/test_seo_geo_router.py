@@ -148,8 +148,68 @@ def test_site_review_with_a_wrong_shape_answer_is_503_not_500(monkeypatch):
     monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: ["not", "an", "object"])
     r = client.post("/api/seo-geo/site-review/legalsoft")
     assert r.status_code == 503
-    assert "not the review object" in r.json()["detail"]
+    assert r.json()["detail"] == {
+        "code": "seo_ai_bad_answer",
+        "message": "The AI model's answer couldn't be used, so nothing was saved — run the site review again."}
     assert client.get("/api/seo-geo/site-review/legalsoft").json()["review"] is None
+
+
+#: What a provider failure looks like inside a CredentialMissing: an OpenRouter
+#: error dict, a Google ``HttpError`` repr, an env var name.
+RAW_FAILURES = {
+    "seo_ai_unavailable": "LLM unavailable: Error code: 401 - {'error': {'message': 'User not found.', 'code': 401}}",
+    "seo_search_unconfigured": "SEO_SERPER_API_KEY not set",
+    "seo_needs_refresh": "Run a data refresh first — competitor discovery needs rank snapshots",
+    "seo_unavailable": "Google Analytics rejected properties/123: <HttpError 403 when requesting "
+                       "https://analyticsdata.googleapis.com/v1beta/properties/123:runReport returned "
+                       "\"User does not have sufficient permissions\">",
+}
+#: (route, body, the agent module and function behind it) — every SEO route that answers 503.
+LIVE_ROUTES = [
+    ("/api/seo-geo/site-review/legalsoft", None, "site_brain", "analyze"),
+    ("/api/seo-geo/serp/legalsoft", {"query": "virtual paralegal"}, "competitors", "serp_deep_dive"),
+    ("/api/seo-geo/competitors/legalsoft/profiles/refresh", None, "competitors", "build_profiles"),
+    ("/api/seo-geo/briefs/legalsoft", {"keyword": "virtual paralegal"}, "briefs", "build_brief"),
+    ("/api/seo-geo/update-plan/legalsoft", {"page": "https://legalsoft.com/x"}, "briefs", "update_plan"),
+    ("/api/seo-geo/audit/legalsoft/run", None, "audit", "site_audit"),
+    ("/api/seo-geo/ask/legalsoft", {"question": "what next?"}, "advisor", "ask"),
+]
+
+
+@pytest.mark.parametrize(("route", "body", "module", "func"), LIVE_ROUTES)
+@pytest.mark.parametrize("code", sorted(RAW_FAILURES))
+def test_a_live_route_that_fails_answers_a_code_and_a_sentence_never_the_exception(
+        monkeypatch, caplog, route, body, module, func, code):
+    """These routes answered ``detail=str(exc)``: provider reprs, error dicts and
+    env var names reached the console. Now the OAuth routes' shape — a stable
+    code and one plain sentence — and the raw text is in the log only."""
+    import importlib
+
+    from seo_geo_agent.sources import CredentialMissing
+
+    raw = RAW_FAILURES[code]
+
+    def fail(*args, **kwargs):
+        raise CredentialMissing(raw)
+
+    monkeypatch.setattr(importlib.import_module(f"seo_geo_agent.{module}"), func, fail)
+    with caplog.at_level("WARNING", logger="agentos.seo_geo"):
+        r = client.post(route, json=body) if body is not None else client.post(route)
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert set(detail) == {"code", "message"} and detail["code"] == code
+    for leak in ("HttpError", "googleapis", "Error code", "User not found", "SEO_SERPER_API_KEY",
+                 "{'error'", "properties/123", "competitor discovery"):
+        assert leak not in r.text
+    assert raw[:40] in caplog.text                       # the raw detail: server log only
+
+
+def test_offline_live_routes_say_so_in_a_coded_sentence():
+    r = client.post("/api/seo-geo/audit/legalsoft/run")
+    assert r.status_code == 503
+    assert r.json()["detail"] == {"code": "seo_offline",
+                                  "message": "This server runs without live services, so the site audit "
+                                             "can't run here."}
 
 
 def _todo(tid, action, why="w", status="todo"):
