@@ -504,13 +504,42 @@ def merge_todos(search_todos: list[dict], site: list[dict], cap: int) -> tuple[l
     return shown, len(search_todos) + len(site) - len(shown)
 
 
-def effective_seeds(brand: dict) -> dict:
-    """Brand copy whose seeds fall back to the site review's suggestions."""
-    if [s for s in brand.get("seeds", []) if s.strip()]:
-        return brand
-    suggested = (latest_review(brand["id"]) or {}).get("suggested_seeds", [])
-    if not suggested:
-        return brand
+_LOAD_REVIEW = object()
+
+
+def effective_seeds(brand: dict, review: dict | None | object = _LOAD_REVIEW) -> dict:
+    """Brand copy carrying every seed the agent should start from.
+
+    `seed_entries` (read by the blog plan): the user's typed seeds, tagged
+    source "seed" — hard requirements — followed by the site review's
+    `suggested_seeds`, tagged source "suggested seed" and given no protection.
+    Deduped case-insensitively; a typed seed always wins over a suggestion.
+
+    `seeds` keeps its earlier meaning for rank tracking and the keyword lab: the
+    typed seeds, or the review's suggestions only when none were typed. Merging
+    there would silently change which keywords those spend Serper calls and
+    model prompts on.
+
+    Pass `review` when the caller already loaded it (None = no review exists).
+    """
+    if review is _LOAD_REVIEW:
+        review = latest_review(brand["id"])
+    raw_suggested = (review or {}).get("suggested_seeds") or []
+
+    seen: set[str] = set()
+    entries: list[dict] = []
+    for source, values in (("seed", brand.get("seeds") or []), ("suggested seed", raw_suggested)):
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                continue
+            key = " ".join(value.split()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({"text": value.strip(), "source": source})
+
     out = dict(brand)
-    out["seeds"] = suggested[:10]
+    out["seed_entries"] = entries
+    if not any(e["source"] == "seed" for e in entries) and raw_suggested:
+        out["seeds"] = raw_suggested[:10]
     return out
