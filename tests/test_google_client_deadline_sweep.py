@@ -84,20 +84,17 @@ def untimed_client_sites() -> dict[str, list[int]]:
 
 
 # --------------------------------------------------------------------------- #
-# Known, reported, NOT fixed here — this file is test code only.
-#
-# seo_geo_agent/gsc_oauth.py:service() builds a Search Console client with
-# `credentials=` and no transport, so it carries no socket deadline. It is
-# reached from a live request path (insights.py:337 → the SEO Lab panel and the
-# SEO cron), which is the same exposure W2-C closed on the other six clients.
-# Owner: senior-python-backend.
+# Known gaps. Empty since 2026-10-14, when seo_geo_agent/gsc_oauth.py:service()
+# — the last client built with `credentials=` and no transport — moved onto a
+# timed `http=` (pinned behaviourally in
+# seo_geo_agent/tests/test_google_client_timeouts.py).
 #
 # This is an equality ratchet, deliberately: a NEW unbounded client fails
-# `test_no_new_unbounded_google_client_is_added`, and *fixing* gsc_oauth fails
-# `test_the_known_gap_is_still_the_only_one`, which is the signal to delete this
-# entry. Neither direction can pass silently.
+# `test_no_new_unbounded_google_client_is_added`, and *fixing* a listed one
+# fails `test_the_known_gap_is_still_the_only_one`, which is the signal to
+# delete its entry. Neither direction can pass silently.
 # --------------------------------------------------------------------------- #
-KNOWN_UNBOUNDED = {"agents/SEO GEO agent/seo_geo_agent/gsc_oauth.py"}
+KNOWN_UNBOUNDED: set[str] = set()
 
 
 def test_the_sweep_finds_the_google_clients_at_all():
@@ -155,8 +152,8 @@ def test_no_new_unbounded_google_client_is_added():
 
 
 def test_the_known_gap_is_still_the_only_one():
-    """Fails the moment gsc_oauth is fixed — delete the KNOWN_UNBOUNDED entry
-    then. A ratchet that never releases is just a permanent exemption."""
+    """Fails the moment a listed gap is fixed — delete its KNOWN_UNBOUNDED
+    entry then. A ratchet that never releases is just a permanent exemption."""
     assert set(untimed_client_sites()) == KNOWN_UNBOUNDED, (
         "KNOWN_UNBOUNDED is stale — update it to match reality: "
         f"{sorted(untimed_client_sites())}"
@@ -180,6 +177,11 @@ _DEADLINES = [
     ("marketing_research_agent.sources.sheets_source", "AUTH_TIMEOUT_SECONDS"),
     ("marketing_research_agent.sources.sheets_source", "EXPORT_TIMEOUT_SECONDS"),
     ("seo_geo_agent.sources", "GOOGLE_API_TIMEOUT_SECONDS"),
+    # The brand's own Search Console grant: the API client (same constant,
+    # imported), the code exchange and the property listing.
+    ("seo_geo_agent.gsc_oauth", "GOOGLE_API_TIMEOUT_SECONDS"),
+    ("seo_geo_agent.gsc_oauth", "EXCHANGE_TIMEOUT_SECONDS"),
+    ("seo_geo_agent.gsc_oauth", "SITES_TIMEOUT_SECONDS"),
     ("app.services.google_http", "AUTH_TIMEOUT_SECONDS"),
     ("inbox_triage_agent.gmail_client", "GMAIL_TIMEOUT_SECONDS"),
     ("inbox_triage_agent.sheet_writer", "SHEETS_TIMEOUT_SECONDS"),

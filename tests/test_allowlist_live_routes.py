@@ -43,10 +43,11 @@ _PUBLIC_PATHS = {
     "/",                     # service banner: name + doc links, no data
     "/api/health",           # Cloud Run liveness — must answer without a token
     "/api/auth/google",      # the sign-in door itself
-    # OAuth redirects: the provider drives the *browser* here, so there is no
-    # Authorization header to read. Both are gated on a signed `state` instead
-    # (seo_oauth.read_state / canva state), which is the standard substitute.
-    "/api/seo-geo/oauth/callback",
+    # OAuth redirect: the provider drives the *browser* here, so there is no
+    # Authorization header to read. Gated on a signed canva `state` instead,
+    # which is the standard substitute. (The Search Console callback that sat
+    # here was removed on 2026-10-14: Google now returns to the console, which
+    # posts the code to the authenticated POST /api/seo-geo/oauth/complete.)
     "/api/canva/callback",
     "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc",
 }

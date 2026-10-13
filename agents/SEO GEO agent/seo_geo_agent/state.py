@@ -39,8 +39,9 @@ def _load_local_env() -> None:
     try:
         for line in env_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
-            # GOOGLE_CLIENT_* feeds the per-brand Search Console OAuth connect.
-            if line.startswith(("SEO_", "GOOGLE_CLIENT_")) and "=" in line:
+            # The Search Console connect reads its OAuth client from the app
+            # settings (``gsc_oauth``), which pydantic loads from .env itself.
+            if line.startswith("SEO_") and "=" in line:
                 key, _, value = line.partition("=")
                 os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
     except OSError:

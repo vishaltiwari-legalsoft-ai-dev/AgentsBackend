@@ -1,4 +1,6 @@
 """Tests for the researcher layer: keyword lab, competitors, briefs, audit, advisor."""
+from contextlib import contextmanager
+
 import pytest
 
 from seo_geo_agent import (advisor, audit, briefs, competitors, gsc_oauth, insights, keywords,
@@ -322,25 +324,128 @@ def test_run_brand_merges_site_todos(monkeypatch):
 
 
 # ----------------------------- GSC OAuth connect -----------------------------
+#
+# The a12 Inbox pattern: Google returns to the console, which posts the code to
+# an authenticated route. ``gsc_connect`` (conftest) configures the client,
+# turns on only this module's online switch and swaps in an in-memory store.
 
-def _oauth_env(monkeypatch):
-    monkeypatch.setenv("GOOGLE_CLIENT_ID", "cid")
-    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "sec")
-
-
-def test_oauth_state_roundtrip_and_tamper(monkeypatch):
-    _oauth_env(monkeypatch)
-    token = gsc_oauth.make_state("berry")
-    assert gsc_oauth.read_state(token) == "berry"
-    with pytest.raises(ValueError):
-        gsc_oauth.read_state(token[:-2] + "xx")
+TOKENS = {"refresh_token": "r1", "access_token": "a1", "scope": gsc_oauth.SCOPE}
+OWNED = [{"siteUrl": "sc-domain:x.com", "permissionLevel": "siteOwner"}]
 
 
-def test_oauth_needs_config(monkeypatch):
-    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
-    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
-    with pytest.raises(CredentialMissing):
-        gsc_oauth.auth_url("b", "http://cb")
+@contextmanager
+def _refused(code: str):
+    """``pytest.raises`` for one refusal code."""
+    with pytest.raises(gsc_oauth.ConnectRefused) as info:
+        yield info
+    assert info.value.code == code, (info.value.code, info.value.message)
+
+
+class _Resp:
+    def __init__(self, status: int, body=None, text: str = ""):
+        self.status_code, self._body, self.text = status, body, text or str(body or "")
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("no JSON")
+        return self._body
+
+
+def test_state_binds_purpose_brand_and_member(gsc_connect):
+    token = gsc_oauth.make_state("berry", "user-a")
+    assert token.startswith("gsc.")  # how /oauth/google tells it from an Inbox state
+    assert gsc_oauth.read_state(token, user_id="user-a") == gsc_oauth.ConnectState("berry", "user-a")
+
+
+def test_a_tampered_state_is_refused(gsc_connect):
+    import base64
+    import json
+
+    token = gsc_oauth.make_state("berry", "user-a")
+    with _refused(gsc_oauth.STATE_INVALID):
+        gsc_oauth.read_state(token[:-2] + "00", user_id="user-a")
+    # a different brand in the body, old signature kept
+    body, sig = token.removeprefix("gsc.").split(".")
+    claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    claims["b"] = "someone-elses-brand"
+    forged = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    with _refused(gsc_oauth.STATE_INVALID):
+        gsc_oauth.read_state(f"gsc.{forged}.{sig}", user_id="user-a")
+
+
+def test_an_expired_state_is_refused(gsc_connect):
+    token = gsc_oauth.make_state("berry", "user-a", now=1_000_000)
+    assert gsc_oauth.read_state(token, user_id="user-a", now=1_000_000 + 600)
+    with _refused(gsc_oauth.STATE_EXPIRED):
+        gsc_oauth.read_state(token, user_id="user-a", now=1_000_000 + 601)
+
+
+def test_another_members_state_is_refused(gsc_connect):
+    token = gsc_oauth.make_state("berry", "user-a")
+    with _refused(gsc_oauth.STATE_OTHER_USER):
+        gsc_oauth.read_state(token, user_id="user-b")
+
+
+@pytest.mark.parametrize("junk", [
+    "",
+    "0f3c9a.1700000000.ab12cd34ef56ab78.0123456789abcdef0123456789abcdef",  # a12-shaped
+    "inbox.eyJ9.0123",                       # another purpose
+    "gsc.",                                  # prefix only
+    "gsc.a.b.c",                             # too many parts
+    "gsc.éü.☃",               # non-ASCII must refuse, not 500
+])
+def test_a_state_that_is_not_ours_is_refused_not_crashed(gsc_connect, junk):
+    with _refused(gsc_oauth.STATE_INVALID):
+        gsc_oauth.read_state(junk, user_id="user-a")
+
+
+def test_a_state_signed_with_another_secret_is_refused(gsc_connect, monkeypatch):
+    from app.config import settings
+
+    token = gsc_oauth.make_state("berry", "user-a")
+    monkeypatch.setattr(settings, "inbox_google_client_secret", "rotated", raising=False)
+    with _refused(gsc_oauth.STATE_INVALID):
+        gsc_oauth.read_state(token, user_id="user-a")
+
+
+def test_unconfigured_is_one_plain_sentence_and_the_names_go_to_the_log(gsc_connect, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "inbox_google_client_secret", "", raising=False)
+    monkeypatch.setattr(settings, "inbox_token_key", "not-a-fernet-key", raising=False)
+    assert gsc_oauth.connect_ready() is False
+    assert gsc_oauth.missing_config() == [
+        "INBOX_GOOGLE_CLIENT_SECRET", "INBOX_TOKEN_KEY (missing or not a Fernet key)",
+    ]
+    with _refused(gsc_oauth.UNCONFIGURED) as info:
+        gsc_oauth.auth_url("b", user_id="user-a")
+    assert "an admin needs to finish the Google setup" in info.value.message
+    for leak in ("INBOX_", "GOOGLE_CLIENT", "SECRET", "TOKEN_KEY"):
+        assert leak not in info.value.message
+    assert "INBOX_GOOGLE_CLIENT_SECRET" in info.value.log_detail
+
+
+def test_offline_refuses_before_anyone_is_sent_to_google(gsc_connect, monkeypatch):
+    monkeypatch.setattr(gsc_oauth, "_online", lambda: False)
+    assert gsc_oauth.connect_ready() is False
+    with _refused(gsc_oauth.OFFLINE):
+        gsc_oauth.auth_url("b", user_id="user-a")
+    assert gsc_oauth.connection("b") is None  # and no grant is read offline
+
+
+def test_auth_url_returns_to_the_console_and_asks_for_read_only(gsc_connect):
+    from urllib.parse import parse_qs, urlparse
+
+    url = gsc_oauth.auth_url("berry", user_id="user-a")
+    q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+    assert url.startswith(gsc_oauth.AUTH_ENDPOINT)
+    assert q["redirect_uri"] == "https://console.example/oauth/google"
+    assert q["scope"] == "https://www.googleapis.com/auth/webmasters.readonly"
+    assert q["access_type"] == "offline" and "consent" in q["prompt"]
+    assert q["client_id"] == "cid"
+    # never folds in what the shared client was granted for a12's Gmail
+    assert "include_granted_scopes" not in q
+    assert gsc_oauth.read_state(q["state"], user_id="user-a").brand_id == "berry"
 
 
 def test_match_property_prefers_domain_property():
@@ -353,25 +458,141 @@ def test_match_property_prefers_domain_property():
     assert gsc_oauth.match_property("other.com", sites) is None  # unverified doesn't count
 
 
-def test_oauth_complete_stores_connection(monkeypatch):
-    _oauth_env(monkeypatch)
-    monkeypatch.setattr(gsc_oauth, "_exchange",
-                        lambda code, uri: {"refresh_token": "r1", "access_token": "a1"})
-    monkeypatch.setattr(gsc_oauth, "_sites",
-                        lambda tok: [{"siteUrl": "sc-domain:x.com", "permissionLevel": "siteOwner"}])
-    assert gsc_oauth.complete(BRAND, "code", "http://cb")["property"] == "sc-domain:x.com"
-    assert gsc_oauth.connection("b")["refresh_token"] == "r1"
+def _verified(brand_id="b", user_id="user-a"):
+    return gsc_oauth.read_state(gsc_oauth.make_state(brand_id, user_id), user_id=user_id)
+
+
+def test_complete_stores_the_token_sealed_with_who_connected_it(gsc_connect, monkeypatch):
+    import json
+
+    monkeypatch.setattr(gsc_oauth, "_exchange", lambda code: dict(TOKENS))
+    monkeypatch.setattr(gsc_oauth, "_sites", lambda tok: OWNED)
+    view = gsc_oauth.complete(_verified(), BRAND, code="c",
+                              connected_by="Her@LegalSoft.com", user_id="user-a")
+
+    assert view["property"] == "sc-domain:x.com"
+    assert view["connected_by"] == "her@legalsoft.com"
+    assert view["connected_at"].endswith("+00:00")
+    assert set(view) == {"property", "connected_by", "connected_at"}  # never a token
+
+    doc = gsc_connect.store["b"]
+    assert "refresh_token" not in doc and "r1" not in json.dumps(doc)
+    assert gsc_connect.fernet.decrypt(doc["refresh_token_enc"].encode()).decode() == "r1"
+    assert doc["connected_by_user_id"] == "user-a"
+
+    assert gsc_oauth.connection("b") == view
+    assert gsc_oauth.connections(["b", "nobody"]) == {"b": view}
     gsc_oauth.disconnect("b")
     assert gsc_oauth.connection("b") is None
 
 
-def test_oauth_complete_rejects_wrong_account(monkeypatch):
-    _oauth_env(monkeypatch)
+def test_complete_says_plainly_when_the_account_cannot_see_the_site(gsc_connect, monkeypatch):
+    monkeypatch.setattr(gsc_oauth, "_exchange", lambda code: dict(TOKENS))
+    monkeypatch.setattr(gsc_oauth, "_sites", lambda tok: [
+        {"siteUrl": "sc-domain:x.com", "permissionLevel": "siteUnverifiedUser"},
+        {"siteUrl": "sc-domain:elsewhere.com", "permissionLevel": "siteOwner"},
+    ])
+    with _refused(gsc_oauth.NO_PROPERTY) as info:
+        gsc_oauth.complete(_verified(), BRAND, code="c", connected_by="a@b.com", user_id="user-a")
+    assert info.value.message == (
+        "This Google account has no Search Console access to x.com — sign in with an "
+        "account that does, or ask the site owner to add it."
+    )
+    assert gsc_connect.store == {}
+
+
+def test_complete_refuses_a_grant_without_search_console_read(gsc_connect, monkeypatch):
     monkeypatch.setattr(gsc_oauth, "_exchange",
-                        lambda code, uri: {"refresh_token": "r1", "access_token": "a1"})
-    monkeypatch.setattr(gsc_oauth, "_sites", lambda tok: [])
-    with pytest.raises(ValueError):
-        gsc_oauth.complete(BRAND, "code", "http://cb")
+                        lambda code: {**TOKENS, "scope": "openid email"})
+    with _refused(gsc_oauth.SCOPE_NOT_GRANTED):
+        gsc_oauth.complete(_verified(), BRAND, code="c", connected_by="a@b.com", user_id="user-a")
+    monkeypatch.setattr(gsc_oauth, "_exchange",
+                        lambda code: {k: v for k, v in TOKENS.items() if k != "refresh_token"})
+    with _refused(gsc_oauth.EXCHANGE_FAILED):
+        gsc_oauth.complete(_verified(), BRAND, code="c", connected_by="a@b.com", user_id="user-a")
+    assert gsc_connect.store == {}
+
+
+def test_complete_only_finishes_what_the_state_was_issued_for(gsc_connect):
+    with pytest.raises(RuntimeError):
+        gsc_oauth.complete(_verified(brand_id="other"), BRAND, code="c",
+                           connected_by="a@b.com", user_id="user-a")
+
+
+def test_the_code_exchange_is_bounded_and_never_retried(gsc_connect, monkeypatch):
+    import httpx
+
+    calls = []
+
+    def post(url, data=None, timeout=None):
+        calls.append(timeout)
+        return _Resp(500, text="backend error")
+
+    monkeypatch.setattr(httpx, "post", post)
+    with _refused(gsc_oauth.GOOGLE_UNAVAILABLE):
+        gsc_oauth._exchange("c")
+    assert calls == [gsc_oauth.EXCHANGE_TIMEOUT_SECONDS]  # a code is single-use
+
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp(400, text='{"error":"invalid_grant"}'))
+    with _refused(gsc_oauth.EXCHANGE_FAILED) as info:
+        gsc_oauth._exchange("c")
+    assert "invalid_grant" in info.value.log_detail and "invalid_grant" not in info.value.message
+
+    def unreachable(*a, **k):
+        raise httpx.ConnectTimeout("slow")
+
+    monkeypatch.setattr(httpx, "post", unreachable)
+    with _refused(gsc_oauth.GOOGLE_UNAVAILABLE):
+        gsc_oauth._exchange("c")
+
+
+def test_the_site_list_retries_once_then_answers_honestly(gsc_connect, monkeypatch):
+    import httpx
+
+    answers = [_Resp(503, text="busy"), _Resp(200, {"siteEntry": OWNED})]
+    seen = []
+
+    def get(url, headers=None, timeout=None):
+        seen.append(timeout)
+        return answers.pop(0)
+
+    monkeypatch.setattr(httpx, "get", get)
+    assert gsc_oauth._sites("a1") == OWNED
+    assert seen == [gsc_oauth.SITES_TIMEOUT_SECONDS] * 2
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp(503, text="busy"))
+    with _refused(gsc_oauth.GOOGLE_UNAVAILABLE):
+        gsc_oauth._sites("a1")
+
+
+def test_a_disabled_search_console_api_reads_as_server_setup(gsc_connect, monkeypatch):
+    """The client lives in a12's GCP project; if the Search Console API is not
+    enabled there, Google answers 403 SERVICE_DISABLED. That is ours to fix."""
+    import httpx
+
+    body = '{"error":{"status":"PERMISSION_DENIED","details":[{"reason":"SERVICE_DISABLED"}]}}'
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp(403, text=body))
+    with _refused(gsc_oauth.UNCONFIGURED) as info:
+        gsc_oauth._sites("a1")
+    assert "not enabled" in info.value.log_detail and "INBOX_" not in info.value.message
+
+
+def test_a_legacy_plaintext_grant_is_still_read(gsc_connect):
+    gsc_connect.store["b"] = {"refresh_token": "old", "property": "sc-domain:x.com",
+                              "connected_at": 1_700_000_000, "legacy": True}
+    assert gsc_oauth.connection("b") == {
+        "property": "sc-domain:x.com", "connected_by": None,
+        "connected_at": "2023-11-14T22:13:20+00:00",
+    }
+    assert gsc_oauth._open_token(gsc_connect.store["b"]) == "old"
+
+
+def test_a_sealed_token_this_server_cannot_open_degrades_the_run_honestly(gsc_connect):
+    from cryptography.fernet import Fernet
+
+    other = Fernet(Fernet.generate_key()).encrypt(b"r1").decode()
+    with pytest.raises(CredentialMissing, match="connect it again"):
+        gsc_oauth._open_token({"refresh_token_enc": other})
 
 
 def test_run_brand_uses_connected_property(monkeypatch):
@@ -426,3 +647,84 @@ def test_draft_score_uses_brief_questions():
     names = {c["name"]: c["ok"] for c in scored["checks"]}
     assert names["Questions covered"] is True
     assert names["Entities covered"] is True
+
+
+# --------------- the grant store itself (firestore_repo, faked _db) ---------------
+
+class _FakeDb:
+    """Just enough Firestore for the three grant accessors: document refs,
+    ``get_all`` and a write batch. Records the timeout every call carried."""
+
+    class _Ref:
+        def __init__(self, db, collection, doc_id):
+            self._db, self.id = db, doc_id
+            self.parent = type("Parent", (), {"id": collection})()
+
+        @property
+        def key(self):
+            return (self.parent.id, self.id)
+
+    class _Snap:
+        def __init__(self, ref, data):
+            self.reference, self.id, self._data = ref, ref.id, data
+            self.exists = data is not None
+
+        def to_dict(self):
+            return dict(self._data or {})
+
+    class _Batch:
+        def __init__(self, db):
+            self._db, self._ops = db, []
+
+        def set(self, ref, data):
+            self._ops.append(("set", ref.key, dict(data)))
+
+        def delete(self, ref):
+            self._ops.append(("delete", ref.key, None))
+
+        def commit(self, timeout=None):
+            self._db.timeouts.append(timeout)
+            for op, key, data in self._ops:
+                if op == "set":
+                    self._db.docs[key] = data
+                else:
+                    self._db.docs.pop(key, None)
+
+    def __init__(self):
+        self.docs: dict[tuple[str, str], dict] = {}
+        self.timeouts: list = []
+
+    def collection(self, name):
+        db = self
+        return type("Col", (), {"document": lambda _self, doc_id: _FakeDb._Ref(db, name, doc_id)})()
+
+    def get_all(self, refs, timeout=None):
+        self.timeouts.append(timeout)
+        return [self._Snap(ref, self.docs.get(ref.key)) for ref in refs]
+
+    def batch(self):
+        return self._Batch(self)
+
+
+def test_the_grant_store_prefers_the_current_grant_and_retires_the_plaintext_one(monkeypatch):
+    from app.services import firestore_repo
+
+    db = _FakeDb()
+    monkeypatch.setattr(firestore_repo, "_db", lambda: db)
+    db.docs[("seo_geo", "gsc-auth-old")] = {"refresh_token": "plain", "property": "sc-domain:o.com"}
+    db.docs[("seo_geo", "gsc-auth-both")] = {"refresh_token": "plain", "property": "legacy"}
+    db.docs[("seo_gsc_grants", "both")] = {"refresh_token_enc": "sealed", "property": "current"}
+
+    grants = firestore_repo.get_gsc_grants(["old", "both", "none", "old"])
+    assert set(grants) == {"old", "both"}
+    assert grants["old"]["legacy"] is True and grants["old"]["refresh_token"] == "plain"
+    assert grants["both"]["property"] == "current" and "legacy" not in grants["both"]
+    assert firestore_repo.get_gsc_grants([]) == {}
+
+    firestore_repo.save_gsc_grant("old", {"refresh_token_enc": "sealed", "property": "sc-domain:o.com"})
+    assert ("seo_geo", "gsc-auth-old") not in db.docs  # the plaintext copy is gone
+    assert db.docs[("seo_gsc_grants", "old")]["brand_id"] == "old"
+
+    firestore_repo.delete_gsc_grant("both")
+    assert ("seo_gsc_grants", "both") not in db.docs and ("seo_geo", "gsc-auth-both") not in db.docs
+    assert db.timeouts and all(t == firestore_repo._GSC_GRANTS_TIMEOUT_S for t in db.timeouts)
