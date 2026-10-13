@@ -99,10 +99,11 @@ def create_brand(brand: dict) -> dict:
 
     Separate from :func:`upsert_brand` because self-serve creation must never
     silently overwrite a brand somebody else already set up — same slug, same
-    ``geo-config-*`` and ``gsc-auth-*`` documents underneath it, a year of
-    measurement now attached to a different name. The existence check runs
-    INSIDE the transaction, so two people typing the same brand name at once end
-    with one brand and one honest 409, not with a coin toss.
+    ``geo-config-*`` documents and ``seo_gsc_grants/{id}`` Search Console grant
+    underneath it, a year of measurement now attached to a different name. The
+    existence check runs INSIDE the transaction, so two people typing the same
+    brand name at once end with one brand and one honest 409, not with a coin
+    toss.
     """
 
     def change(doc: dict) -> tuple[dict, dict]:
@@ -135,18 +136,24 @@ def set_brand_enabled(brand_id: str, enabled: bool) -> dict:
 
 
 def delete_brand(brand_id: str) -> list[dict]:
-    """HARD delete: drop the registry entry and this brand's SEO run + to-dos.
+    """HARD delete: the brand's Search Console grant, its registry entry, and
+    its SEO run + to-dos.
 
-    It leaves every other ``…-{brand_id}`` document behind — including
-    ``gsc-auth-{brand_id}``, which holds a live Google Search Console refresh
-    token. That is why it stays Creator-only and why the self-serve path is
-    :func:`set_brand_enabled` instead.
+    The grant (``seo_gsc_grants/{brand_id}``, a sealed live refresh token) goes
+    FIRST: if that write fails the brand is still listed and the delete can be
+    retried, so a token is never left behind a brand nothing can reach any more.
+    Like a disconnect it is not revoked at Google — see ``gsc_oauth``.
+
+    Every other ``…-{brand_id}`` document (GEO measurements, prompt universes,
+    the site crawl and review) stays behind. That is why this is Creator-only
+    and why the self-serve path is :func:`set_brand_enabled` instead.
     """
 
     def change(doc: dict) -> tuple[dict, list[dict]]:
         brands = [b for b in _brands_of(doc) if b["id"] != brand_id]
         return {"brands": brands}, brands
 
+    gsc_oauth.disconnect(brand_id)
     brands = state.mutate(BRANDS_DOC, change)
     state.delete(f"run-{brand_id}")
     state.delete(f"todos-{brand_id}")
@@ -211,7 +218,13 @@ def _todo(brand_id: str, kind: str, row: QueryStat, action: str, why: str, gain:
     }
 
 
-def build_todos(brand_id: str, rows: list[QueryStat], prev_rows: list[QueryStat]) -> list[dict]:
+def build_todos(brand_id: str, rows: list[QueryStat], prev_rows: list[QueryStat],
+                *, cap: int | None = MAX_TODOS) -> list[dict]:
+    """Search-data to-dos, biggest estimated gain first, at most ``cap``.
+
+    ``cap=None`` returns every one: :func:`run_brand` makes the single cut in
+    ``site_brain.merge_todos`` so whatever does not fit is counted in
+    ``todos_not_shown`` rather than trimmed here without a trace."""
     todos: list[dict] = []
     for r in rows:
         if r.impressions < MIN_IMPRESSIONS:
@@ -262,7 +275,7 @@ def build_todos(brand_id: str, rows: list[QueryStat], prev_rows: list[QueryStat]
             ))
 
     todos.sort(key=lambda t: t["est_monthly_clicks"], reverse=True)
-    return todos[:MAX_TODOS]
+    return todos if cap is None else todos[:cap]
 
 
 def _summary(rows: list[QueryStat], prev_rows: list[QueryStat], todos: list[dict]) -> dict:
@@ -300,8 +313,10 @@ def _rank_todo(brand_id: str, kind: str, kw: str, position, action: str, why: st
     }
 
 
-def build_rank_todos(brand_id: str, ranks_doc: dict) -> list[dict]:
-    """Fix list from live rank snapshots: drops first, then near-page-1, then gaps."""
+def build_rank_todos(brand_id: str, ranks_doc: dict, *, cap: int | None = MAX_TODOS) -> list[dict]:
+    """Fix list from live rank snapshots: drops first, then near-page-1, then gaps.
+
+    At most ``cap``; ``cap=None`` returns every one, as :func:`build_todos`."""
     snaps = ranks_doc.get("snapshots", [])
     if not snaps:
         return []
@@ -336,7 +351,7 @@ def build_rank_todos(brand_id: str, ranks_doc: dict) -> list[dict]:
     todos.sort(key=lambda t: (t["_priority"], t["position"] or 99))
     for t in todos:
         del t["_priority"]
-    return todos[:MAX_TODOS]
+    return todos if cap is None else todos[:cap]
 
 
 def _rank_summary(ranks_doc: dict) -> dict:
@@ -488,25 +503,35 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
     degraded: list[str] = []
     rows: list[QueryStat] = []
     prev_rows: list[QueryStat] = []
+    # A brand's own OAuth grant wins; the shared service account is the fallback,
+    # and the only path when the stored grant is for a different site (a slug
+    # recreated for another domain, or a domain edited after the connect).
+    conn, foreign = gsc_oauth.usable_grant(brand)
+    if foreign:
+        degraded.append(foreign)
+    svc = None
     try:
-        # A customer's own OAuth grant wins; the shared service account is the fallback.
-        svc = gsc_oauth.service(brand["id"])
-        conn = gsc_oauth.connection(brand["id"]) if svc else None
+        svc = gsc_oauth.service(brand["id"]) if conn else None
         prop = conn["property"] if conn else (brand.get("gsc_property") or f"sc-domain:{brand['domain']}")
         rows = gsc_fetch(prop, end - timedelta(days=28), end, service=svc)
         prev_rows = gsc_fetch(prop, end - timedelta(days=56), end - timedelta(days=29), service=svc)
     except CredentialMissing as exc:
-        degraded.append(f"Search Console: {exc}")
+        # A grant Google no longer honours says so plainly, not in Google's words.
+        revoked = svc is not None and gsc_oauth.grant_revoked(exc, brand_id=brand["id"])
+        degraded.append(gsc_oauth.REVOKED_NOTE if revoked else f"Search Console: {exc}")
 
+    # Every to-do is built uncapped; merge_todos below makes the one cut to
+    # MAX_TODOS and counts it. The summary and bullets keep their top-MAX_TODOS
+    # basis, so the numbers they show do not move with this.
     if rows:
-        todos = build_todos(brand["id"], rows, prev_rows)
-        summary = _summary(rows, prev_rows, todos)
-        bullets = _insight_bullets(summary, todos)
+        todos = build_todos(brand["id"], rows, prev_rows, cap=None)
+        summary = _summary(rows, prev_rows, todos[:MAX_TODOS])
+        bullets = _insight_bullets(summary, todos[:MAX_TODOS])
     else:
         # No Search Console access: run on live rank snapshots instead (Serper).
         try:
             ranks_doc = competitors.rank_snapshot(brand)
-            todos = build_rank_todos(brand["id"], ranks_doc)
+            todos = build_rank_todos(brand["id"], ranks_doc, cap=None)
             summary = _rank_summary(ranks_doc)
             bullets = _rank_bullets(summary, todos)
         except CredentialMissing as exc:
@@ -536,18 +561,24 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
                     ga["property"], end - timedelta(days=28), end)
             # Forward whatever GA/GSC degradation this run already hit — a zeroed
             # metric in the pages doc must carry the reason, not read as real data.
-            page_notes = [n for n in degraded if n.startswith(("Search Console:", "Google Analytics:"))]
+            # ("Search Console" without the colon also carries the grant notes.)
+            page_notes = [n for n in degraded if n.startswith(("Search Console", "Google Analytics:"))]
             pages_mod.build_page_intel(brand, corpus["pages"], ga_pages, rows, data_notes=page_notes)
     except CredentialMissing as exc:
         degraded.append(f"Page analytics: {exc}")
 
-    # Site-review findings ride along in the fix list (stable ids keep status).
-    todos = (todos + site_brain.site_todos(brand["id"]))[:MAX_TODOS]
+    # Site-review findings ride along in the fix list: reserved slots, and the cut
+    # is counted — ``todos_not_shown`` is every search-data or site to-do this
+    # run built that is not in ``todos``.
+    todos, todos_not_shown = site_brain.merge_todos(todos, site_brain.site_todos(brand["id"]), MAX_TODOS)
 
+    # One review read grounds both the seeds and the blog plan's gap/coverage check.
+    review = site_brain.latest_review(brand["id"])
     topic_list, topic_notes = topics.build_topics(
-        site_brain.effective_seeds(brand), rows, prev_rows,
+        site_brain.effective_seeds(brand, review=review), rows, prev_rows,
         corpus_pages=corpus.get("pages"),
         competitor_topics=_competitor_topic_pool(brand["id"]),
+        site_review=review,
     )
     degraded.extend(topic_notes)
 
@@ -561,6 +592,12 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
         "todos": todos,
         "topics": topic_list,
         "ga": ga,
+        "todos_not_shown": todos_not_shown,
+        # Search Console rows this run actually read (current 28 days). The
+        # honest "is Search Console behind this brand" signal: ``summary.mode``
+        # says "search-console" even when Search Console AND rank tracking
+        # both failed, because the empty summary defaults to that mode.
+        "gsc_rows": len(rows),
     }
     state.save(f"run-{brand['id']}", run)
     return run

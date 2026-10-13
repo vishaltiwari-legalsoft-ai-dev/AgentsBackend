@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from seo_geo_agent import insights, keywords, state, topics
+from seo_geo_agent import insights, keywords, site_brain, state, topics
 from seo_geo_agent.sources import QueryStat
 
 
@@ -183,7 +183,8 @@ def test_every_registry_write_goes_through_the_transaction(call, args, monkeypat
 
 def test_creating_a_brand_that_already_exists_is_refused():
     """A slug collision must not silently adopt somebody else's brand: the same
-    id owns the same ``geo-config-*`` and ``gsc-auth-*`` documents underneath."""
+    id owns the same ``geo-config-*`` documents and ``seo_gsc_grants/{id}``
+    Search Console grant underneath."""
     insights.create_brand({"id": "acme", "name": "Acme", "domain": "acme.com",
                            "enabled": True})
     with pytest.raises(ValueError, match="already exists"):
@@ -193,29 +194,63 @@ def test_creating_a_brand_that_already_exists_is_refused():
     assert acme["domain"] == "acme.com"   # the original, untouched
 
 
-def test_switching_a_brand_off_keeps_every_document_it_owns():
-    """The self-serve remove. It flips one flag; it destroys nothing.
+def test_switching_a_brand_off_keeps_every_document_it_owns(gsc_connect):
+    """The self-serve remove. It flips one flag; it destroys nothing — the
+    brand's Search Console grant included, so switching it back on resumes.
 
-    ``delete_brand`` is the contrast this pins against: it drops the registry
-    entry and takes ``run-`` and ``todos-`` with it, leaving eighteen other
-    ``…-{brand_id}`` families — ``gsc-auth-{id}`` and its live Search Console
-    refresh token among them — with no route left that can reach them.
+    ``delete_brand`` is the contrast this pins against: it drops the grant, the
+    registry entry, ``run-`` and ``todos-``, and leaves the other
+    ``…-{brand_id}`` families behind.
     """
     insights.create_brand({"id": "acme", "name": "Acme", "domain": "acme.com",
                            "enabled": True})
-    state.save("gsc-auth-acme", {"refresh_token": "x", "property": "sc-domain:acme.com"})
     insights.run_brand({"id": "acme", "name": "Acme", "domain": "acme.com"},
                        trigger="test")
+    # stored after the run so the run never tries to open (and use) the token
+    gsc_connect.store["acme"] = {"property": "sc-domain:acme.com", "refresh_token_enc": "sealed"}
 
     off = insights.set_brand_enabled("acme", False)
     assert off["enabled"] is False
     assert [b["id"] for b in insights.list_brands() if b.get("enabled", True)] != []
     assert "acme" not in {b["id"] for b in insights.list_brands() if b.get("enabled", True)}
     # nothing was destroyed, and the flip goes back
-    assert state.load("gsc-auth-acme")["refresh_token"] == "x"
+    assert gsc_connect.store["acme"]["refresh_token_enc"] == "sealed"
     assert insights.latest_run("acme") is not None
     assert insights.set_brand_enabled("acme", True)["enabled"] is True
     assert "acme" in {b["id"] for b in insights.list_brands() if b.get("enabled", True)}
+
+
+def test_hard_deleting_a_brand_deletes_its_search_console_grant(gsc_connect):
+    """A deleted brand must not leave a sealed live refresh token behind with no
+    brand — and so no route — left that could disconnect it."""
+    insights.create_brand({"id": "acme", "name": "Acme", "domain": "acme.com", "enabled": True})
+    insights.create_brand({"id": "other", "name": "Other", "domain": "other.com", "enabled": True})
+    gsc_connect.store["acme"] = {"property": "sc-domain:acme.com", "refresh_token_enc": "a"}
+    gsc_connect.store["other"] = {"property": "sc-domain:other.com", "refresh_token_enc": "o"}
+
+    insights.delete_brand("acme")
+
+    assert "acme" not in gsc_connect.store
+    assert "acme" not in {b["id"] for b in insights.list_brands()}
+    assert gsc_connect.store["other"]["refresh_token_enc"] == "o"   # only that brand's grant
+
+
+def test_a_grant_delete_that_fails_leaves_the_brand_to_retry(gsc_connect, monkeypatch):
+    """The grant goes first. If that write fails the brand is still listed, so
+    the Creator's delete can be retried — never a gone brand with a live token."""
+    from app.services import firestore_repo
+
+    insights.create_brand({"id": "acme", "name": "Acme", "domain": "acme.com", "enabled": True})
+    gsc_connect.store["acme"] = {"property": "sc-domain:acme.com", "refresh_token_enc": "a"}
+
+    def stalled(brand_id):
+        raise TimeoutError("Firestore deadline exceeded")
+
+    monkeypatch.setattr(firestore_repo, "delete_gsc_grant", stalled)
+    with pytest.raises(TimeoutError):
+        insights.delete_brand("acme")
+    assert "acme" in {b["id"] for b in insights.list_brands()}
+    assert "acme" in gsc_connect.store
 
 
 def test_switching_an_unknown_brand_is_a_lookup_failure_not_a_silent_write():
@@ -296,6 +331,130 @@ def test_build_rank_todos_orders_drops_first():
     assert "comp.com" in unranked["why"]
 
 
+# ------------------------------ site-review to-dos ------------------------------
+
+SITE_CORPUS = {"brand_id": "legalsoft", "page_count": 2, "degraded": [], "pages": [
+    {"url": "https://legalsoft.com/", "title": "Home", "type": "home", "word_count": 900,
+     "summary": "Virtual assistants for law firms.", "schema_types": ["Organization", "WebSite"]},
+    {"url": "https://legalsoft.com/pricing", "title": "Pricing", "type": "other", "word_count": 180,
+     "summary": "Plans and rates.", "schema_types": []},
+]}
+
+
+def _review(monkeypatch, issues: list[dict]) -> dict:
+    payload = {"positioning": "p", "scorecard": {}, "strengths": [], "issues": issues,
+               "suggested_seeds": [], "covered_topics": [], "missing_topics": []}
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: payload)
+    return site_brain.expert_review(insights.list_brands()[0], SITE_CORPUS)
+
+
+def _site_issue(insight, url="https://legalsoft.com/pricing", category="trust", priority="high"):
+    return {"insight": insight, "evidence": f"{url} — no reviews shown",
+            "action": "Add client reviews", "priority": priority, "category": category}
+
+
+def test_site_todo_ids_survive_a_reworded_rerun(monkeypatch):
+    """The model words the same finding differently every run; the id is the
+    category + the page, so the Fix-list row is the same row."""
+    _review(monkeypatch, [_site_issue("No testimonials on the pricing page")])
+    first = site_brain.site_todos("legalsoft")
+    _review(monkeypatch, [_site_issue("Pricing lacks social proof from real clients")])
+    second = site_brain.site_todos("legalsoft")
+    assert [t["id"] for t in first] == [t["id"] for t in second]
+    assert second[0]["page"] == "https://legalsoft.com/pricing"     # the URL, not the evidence sentence
+    assert second[0]["category"] == "trust"
+    _review(monkeypatch, [_site_issue("Pricing lacks social proof", category="conversion")])
+    assert site_brain.site_todos("legalsoft")[0]["id"] != first[0]["id"]   # a different finding
+
+
+def test_site_todo_status_carries_over_a_reworded_rerun(monkeypatch):
+    brand = insights.list_brands()[0]
+    _review(monkeypatch, [_site_issue("No testimonials on the pricing page")])
+    run = insights.run_brand(brand, trigger="test")
+    tid = next(t["id"] for t in run["todos"] if t["kind"] == "site")
+    insights.set_todo_status(brand["id"], tid, "done")
+
+    _review(monkeypatch, [_site_issue("Pricing lacks social proof from real clients")])
+    insights.run_brand(brand, trigger="test")
+    site = [t for t in insights.latest_run(brand["id"])["todos"] if t["kind"] == "site"]
+    assert [(t["id"], t["status"]) for t in site] == [(tid, "done")]
+
+
+def test_status_set_under_the_old_wording_id_is_carried(monkeypatch):
+    """Statuses saved before ids were keyed by page live under the wording-based
+    id. A review stored then (no url field) and the re-run after it both keep them."""
+    legacy_issue = {"insight": "No testimonials on the pricing page",
+                    "evidence": "https://legalsoft.com/pricing (180w) — none",
+                    "action": "Add client reviews", "priority": "high", "category": "trust"}
+    state.save("sitereview-legalsoft", {"brand_id": "legalsoft", "issues": [legacy_issue]})
+    legacy_id = site_brain._legacy_todo_id("legalsoft", legacy_issue)
+    insights.set_todo_status("legalsoft", legacy_id, "assigned")
+
+    todo = site_brain.site_todos("legalsoft")[0]
+    assert todo["page"] == "https://legalsoft.com/pricing"
+    assert todo["id"] == site_brain._todo_id("legalsoft", "trust", "https://legalsoft.com/pricing")
+    assert todo["status"] == "assigned"
+
+    _review(monkeypatch, [_site_issue("Pricing lacks social proof")])     # reworded re-run
+    assert site_brain.site_todos("legalsoft")[0]["status"] == "assigned"
+
+
+def test_merge_todos_reserves_site_slots_and_counts_the_cut():
+    search = [{"id": f"s{i}"} for i in range(25)]
+    site = [{"id": f"w{i}"} for i in range(8)]
+    shown, not_shown = site_brain.merge_todos(search, site, 25)
+    assert len(shown) == 25 and not_shown == 8
+    assert [t["id"] for t in shown[-site_brain.SITE_TODO_SLOTS:]] == [f"w{i}" for i in range(5)]
+    # room either side leaves goes to the other
+    shown, not_shown = site_brain.merge_todos(search[:3], site, 25)
+    assert len(shown) == 11 and not_shown == 0
+    shown, not_shown = site_brain.merge_todos(search, site[:2], 25)
+    assert [t["id"] for t in shown][-2:] == ["w0", "w1"] and not_shown == 2
+
+
+def test_site_todos_are_never_cut_silently_by_max_todos(monkeypatch):
+    """Search-data to-dos fill all 25 slots on their own; site findings used to be
+    appended after them and sliced off without a trace."""
+    brand = insights.list_brands()[0]
+    rows = [row(query=f"legal assistant topic {i}", page=f"https://legalsoft.com/p{i}",
+                impressions=2000, position=8.0) for i in range(30)]
+    monkeypatch.setattr(insights, "gsc_fetch", lambda prop, s, e, service=None: rows)
+    _review(monkeypatch, [_site_issue("No testimonials on the pricing page"),
+                          _site_issue("Home page never says who it serves",
+                                      url="https://legalsoft.com/", category="intent")])
+    run = insights.run_brand(brand, trigger="test")
+    assert len(run["todos"]) == insights.MAX_TODOS
+    assert sum(t["kind"] == "site" for t in run["todos"]) == 2
+    # 30 search + 2 site built, 25 shown: the 5 search to-dos build_todos used to
+    # trim on its own are counted along with the 2 that made room for site ones
+    assert run["todos_not_shown"] == 7
+
+
+def test_build_todos_cap_is_the_default_and_none_returns_every_one():
+    rows = [row(query=f"q{i}", page=f"https://x.com/p{i}", impressions=2000, position=8.0)
+            for i in range(30)]
+    assert len(insights.build_todos("b", rows, [])) == insights.MAX_TODOS
+    assert len(insights.build_todos("b", rows, [], cap=None)) == 30
+    doc = {"snapshots": [{"at": "2026-07-22", "ranks": {
+        f"kw {i}": {"position": None, "top": ["comp.com"]} for i in range(30)}}]}
+    assert len(insights.build_rank_todos("b", doc)) == insights.MAX_TODOS
+    assert len(insights.build_rank_todos("b", doc, cap=None)) == 30
+
+
+def test_rank_mode_counts_the_to_dos_it_cannot_show(monkeypatch):
+    """Without Search Console the fix list comes from rank snapshots; more
+    tracked gaps than MAX_TODOS used to vanish at the 25th without a number."""
+    brand = insights.list_brands()[0]
+    fake_doc = {"snapshots": [{"at": "2026-07-22", "ranks": {
+        f"legal keyword {i}": {"position": None, "top": ["comp.com"]} for i in range(30)}}],
+        "suggested_competitors": ["comp.com"]}
+    monkeypatch.setattr(insights.competitors, "rank_snapshot", lambda b: fake_doc)
+    run = insights.run_brand(brand, trigger="test", today=date(2026, 7, 22))
+    assert run["summary"]["mode"] == "rank-tracking"
+    assert len(run["todos"]) == insights.MAX_TODOS
+    assert run["todos_not_shown"] == 5
+
+
 def test_run_brand_rank_mode_without_gsc(monkeypatch):
     brand = insights.list_brands()[0]
     fake_doc = {"snapshots": [{"at": "2026-07-22", "ranks": {
@@ -327,21 +486,30 @@ STRONG_SERP = {
 
 def test_topics_rank_easy_rising_above_hard_falling():
     brand = {"id": "b", "domain": "x.com", "seeds": ["legal virtual assistant"]}
-    rows = [row(query="legal virtual assistant cost", impressions=900, position=12.0)]
-    prev = [row(query="legal virtual assistant cost", impressions=300, position=12.0)]
+    question = "how much does a legal virtual assistant cost"
+    rows = [row(query=question, impressions=900, position=12.0)]
+    prev = [row(query=question, impressions=300, position=12.0)]
 
     def search(q):
-        return WEAK_SERP if "cost" in q or "legal" in q else STRONG_SERP
+        if "cost" in q:
+            return WEAK_SERP
+        # the seed itself: a strong top 10, but Google still suggests the questions
+        return {**STRONG_SERP, "related": WEAK_SERP["related"], "paa": WEAK_SERP["paa"]}
 
     ranked, notes = topics.build_topics(brand, rows, prev, search=search)
     assert all("Serper" not in n for n in notes)  # only the offline-LLM ideation note is expected
     top = ranked[0]
-    assert "cost" in top["keyword"]
+    assert top["keyword"] == question
+    assert top["source"] == "google suggestion"
+    assert top["from_seed"] == "legal virtual assistant"
     assert top["trend"] == "rising"
     assert top["difficulty"] == "easy win"
     assert top["volume_est"] == 900
     assert top["est_monthly_clicks"] == 99  # 900 * 0.11
     assert "AI Overview" in top["why"]
+    assert top["why"].startswith('Google suggests this for your seed "legal virtual assistant"')
+    seed = next(t for t in ranked if t["source"] == "seed")
+    assert seed["difficulty"] == "hard" and seed["score"] < top["score"]
 
 
 def test_topics_without_serper_still_built_from_gsc():
@@ -445,7 +613,9 @@ def test_clamped_competitor_topic_gets_priority_recomputed_from_final_score():
     seed = next(t for t in ranked if t["source"] == "seed")
     comp = next(t for t in ranked if t["source"] == "competitor-content")
 
-    # the seed's own trend is falling and its volume share is small -> low priority
+    # The seed is low on its OWN evidence — no demotion for being a seed any more:
+    # 0.4*0.5 (no SERP) + 0.35*0.2 (falling) + 0.25*(100/1000) = 0.295.
+    assert seed["score"] == 0.295
     assert seed["priority"] == "low"
     # the competitor topic's raw score (~0.695, would-be "high") gets clamped
     # below the seed floor; its displayed priority must reflect that final score
@@ -491,3 +661,175 @@ def test_live_topics_cap_at_ten():
     live = [t for t in ranked if not t.get("avoided")]
     assert len(live) <= 10
     assert len(ranked) <= 10  # nothing was avoided here, so the cap applies to the whole list
+
+
+# ------------------- blog plan: the user's seeds are hard requirements -------------------
+
+TEN_SEEDS = [
+    "legal virtual assistant", "law firm answering service", "paralegal outsourcing",
+    "legal intake specialist", "virtual receptionist for lawyers", "legal billing assistant",
+    "court filing service", "legal transcription service", "law firm bookkeeping",
+    "estate planning assistant",
+]
+NATO = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        "india", "juliet", "kilo", "lima", "mike", "november", "oscar"]
+
+
+def test_all_ten_user_seeds_become_candidates():
+    """The router keeps up to 10 seeds; the lab used to read only the first 5."""
+    calls = []
+
+    def search(q):
+        calls.append(q)
+        return STRONG_SERP
+
+    brand = {"id": "b", "domain": "x.com", "seeds": TEN_SEEDS}
+    ranked, _ = topics.build_topics(brand, [], [], search=search, max_checks=0)
+    assert sorted(t["keyword"] for t in ranked if t["source"] == "seed") == sorted(TEN_SEEDS)
+    # Google *expansion* stays capped for cost — only the first five seeds pay for it.
+    assert calls == TEN_SEEDS[: topics.MAX_SEEDS]
+
+
+def test_every_user_seed_keeps_a_live_topic_past_the_cap():
+    seeds = ["estate planning assistant", "court filing service", "legal transcription service"]
+    rows = [row(query=f"how to choose vendor {w}", impressions=100 + 10 * i, position=15.0)
+            for i, w in enumerate(NATO)]
+    prev = [row(query=f"how to choose vendor {w}", impressions=10, position=15.0) for w in NATO]
+
+    ranked, _ = topics.build_topics({"id": "b", "domain": "x.com", "seeds": seeds},
+                                    rows, prev, search=None)
+
+    live = [t for t in ranked if not t["avoided"]]
+    assert len(live) == topics.MAX_LIVE_TOPICS  # the cap holds — it makes room, not more rows
+    assert {t["keyword"] for t in live if t["source"] == "seed"} == set(seeds)
+    # the 15 rising search-data questions outscore every seed; the cap dropped the
+    # lowest-scored of them to make room, and kept the 7 strongest
+    data = [t for t in live if t["source"] == "search data"]
+    assert len(data) == 7
+    assert min(t["score"] for t in data) > max(t["score"] for t in live if t["source"] == "seed")
+    assert {t["keyword"] for t in data} == {f"how to choose vendor {w}" for w in NATO[-7:]}
+    # still score-ordered for display
+    assert [t["score"] for t in live] == sorted((t["score"] for t in live), reverse=True)
+
+
+def test_a_seed_is_represented_by_its_best_child_when_that_child_is_shown():
+    """'The seed itself, or its best child': a child already in the top 10 keeps
+    the seed represented, so the cap does not evict anything to re-add the seed."""
+    def search(q):
+        if q == "legal virtual assistant":   # the seed: hard, but Google expands it
+            return {**STRONG_SERP, "related": ["legal virtual assistant pricing guide"]}
+        return WEAK_SERP
+
+    rows = [row(query=f"how to choose vendor {w}", impressions=100 + 10 * i, position=15.0)
+            for i, w in enumerate(NATO[:9])]
+    ranked, _ = topics.build_topics({"id": "b", "domain": "x.com", "seeds": ["legal virtual assistant"]},
+                                    rows, [], search=search, max_checks=20)
+    live = [t for t in ranked if not t["avoided"]]
+    assert len(live) == topics.MAX_LIVE_TOPICS
+    child = next(t for t in live if t["keyword"] == "legal virtual assistant pricing guide")
+    assert child["from_seed"] == "legal virtual assistant"
+    assert child["source"] == "google suggestion"
+    assert "legal virtual assistant" not in {t["keyword"] for t in ranked}  # 11th, and represented
+
+
+def test_seeds_are_not_demoted_for_being_seeds(monkeypatch):
+    monkeypatch.setattr(topics.sources, "llm_json",
+                        lambda system, prompt: ["paralegal outsourcing checklist"])
+    brand = {"id": "b", "domain": "x.com", "seeds": ["legal virtual assistant"]}
+    ranked, _ = topics.build_topics(brand, [], [], search=None)
+    seed = next(t for t in ranked if t["source"] == "seed")
+    idea = next(t for t in ranked if t["source"] == "new idea")
+    # same (absent) evidence -> same score; the old -0.08 put the seed at 0.37
+    assert seed["score"] == idea["score"] == 0.45
+
+
+def test_preselection_is_by_source_then_insertion_not_alphabet():
+    """No Search Console: every volume is 0. The old (volume, key) reverse sort
+    handed the scarce SERP checks to 'why…'/'who…' questions alphabetically."""
+    related = ["best legal assistant software", "legal assistant salary guide",
+               "why hire a legal assistant", "who needs a legal assistant"]
+
+    def run():
+        checks = []
+
+        def search(q):
+            if q == "legal virtual assistant":   # the seed's expansion call
+                return {**STRONG_SERP, "related": related}
+            checks.append(q)
+            return STRONG_SERP
+
+        topics.build_topics({"id": "b", "domain": "x.com", "seeds": ["legal virtual assistant"]},
+                            [], [], search=search, max_checks=3,
+                            site_review={"missing_topics": ["legal intake checklist"]})
+        return checks
+
+    first = run()
+    assert first == ["legal intake checklist", "best legal assistant software",
+                     "legal assistant salary guide"]
+    assert run() == first   # deterministic
+
+
+def test_volume_matching_no_longer_inflates_head_terms():
+    rows = [
+        row(query="legal assistant", impressions=10000),
+        row(query="legal assistant salary guide 2026", impressions=70),
+        row(query="paralegals near me", impressions=500),
+        row(query="paralegals", impressions=40),
+    ]
+    # a short, huge head query no longer lends its impressions to longer topics
+    assert topics._match_impressions("legal assistant salary guide", rows) == 70
+    # a one-word topic counts its exact query only, not every query using the word
+    assert topics._match_impressions("paralegals", rows) == 40
+    # a multi-word topic still collects the longer queries that contain it
+    assert topics._match_impressions("legal assistant", rows) == 10070
+
+    brand = {"id": "b", "domain": "x.com", "seeds": ["legal assistant salary guide"]}
+    ranked, _ = topics.build_topics(brand, rows, [], search=None)
+    seed = next(t for t in ranked if t["source"] == "seed")
+    assert seed["est_monthly_clicks"] == 8   # 70 * 0.11 — was 1,108 with the head query absorbed
+
+
+@pytest.mark.parametrize("anchor", ["site gap", "suggested seed"])
+def test_competitor_clamp_applies_without_typed_seeds(anchor):
+    rows = [row(query="outsourced paralegal staffing", impressions=1000, position=8.0)]
+    if anchor == "site gap":
+        brand = {"id": "b", "domain": "x.com", "seeds": []}
+        review = {"missing_topics": ["legal intake checklist"]}
+    else:
+        brand = {"id": "b", "domain": "x.com", "seeds": [],
+                 "seed_entries": [{"text": "legal intake checklist", "source": "suggested seed"}]}
+        review = {"covered_topics": ["virtual receptionists"]}
+    ranked, _ = topics.build_topics(brand, rows, [], search=None,
+                                    competitor_topics=["outsourced paralegal staffing"],
+                                    site_review=review)
+    anchor_topic = next(t for t in ranked if t["source"] == anchor)
+    comp = next(t for t in ranked if t["source"] == "competitor-content")
+    assert comp["score"] < anchor_topic["score"]   # raw ~0.695 vs 0.375
+    assert ranked.index(anchor_topic) < ranked.index(comp)
+
+
+def test_site_gap_candidates_carry_their_source():
+    review = {"positioning": "Virtual assistants for US law firms.",
+              "missing_topics": ["legal intake checklist", "law firm pricing comparisons"],
+              "covered_topics": []}
+    ranked, notes = topics.build_topics({"id": "b", "domain": "x.com", "seeds": []},
+                                        [], [], search=None, site_review=review)
+    gaps = [t for t in ranked if t["source"] == "site gap"]
+    assert {t["keyword"] for t in gaps} == {"legal intake checklist", "law firm pricing comparisons"}
+    assert all(t["from_seed"] is None for t in gaps)
+    assert topics.NO_REVIEW_NOTE not in notes and topics.EMPTY_REVIEW_NOTE not in notes
+
+
+def test_covered_topics_are_dropped_but_never_a_typed_seed(monkeypatch):
+    monkeypatch.setattr(topics.sources, "llm_json",
+                        lambda system, prompt: ["outsourcing paralegal", "legal intake checklist"])
+    review = {"covered_topics": ["paralegal outsourcing"], "missing_topics": []}
+    ranked, _ = topics.build_topics({"id": "b", "domain": "x.com", "seeds": ["paralegal outsourcing"]},
+                                    [], [], search=None, site_review=review,
+                                    competitor_topics=["outsourcing for paralegal"])
+    keywords_out = {t["keyword"].lower() for t in ranked}
+    assert "paralegal outsourcing" in keywords_out          # the user's own seed stays
+    assert "outsourcing paralegal" not in keywords_out      # the site already covers it
+    assert "outsourcing for paralegal" not in keywords_out  # ...whatever source offers it
+    assert "legal intake checklist" in keywords_out
+    assert next(t for t in ranked if t["keyword"] == "paralegal outsourcing")["source"] == "seed"

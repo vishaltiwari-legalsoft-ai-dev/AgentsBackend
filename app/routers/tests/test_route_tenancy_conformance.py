@@ -221,7 +221,9 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("POST", "/api/auth/google"): (PUBLIC_BY_DESIGN, EXTERNAL_OK),
     ("GET", "/api/canva/callback"): (PUBLIC_BY_DESIGN, INTERNAL_ONLY),
     ("GET", "/api/health"): (PUBLIC_BY_DESIGN, EXTERNAL_OK),
-    ("GET", "/api/seo-geo/oauth/callback"): (PUBLIC_BY_DESIGN, INTERNAL_ONLY),
+    # ``GET /api/seo-geo/oauth/callback`` was here until 2026-10-14. Google now
+    # returns to the console's ``/oauth/google`` page, which posts the code to
+    # the authenticated ``POST /api/seo-geo/oauth/complete`` (counted below).
     # --- shared reference data --------------------------------------------- #
     ("GET", "/api/blog/brands"): (SHARED_CATALOG, INTERNAL_ONLY),
     ("GET", "/api/blog/brands/{brand_id}/inventory"): (SHARED_CATALOG, INTERNAL_ONLY),
@@ -554,6 +556,13 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("POST", "/api/seo-geo/draft-score/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("GET", "/api/seo-geo/keywords/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("POST", "/api/seo-geo/keywords/{brand_id}/run"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    # Search Console connect (2026-10-14, the a12 Inbox pattern). By the owner's
+    # decision any signed-in member may connect a brand's Search Console, so
+    # both are WORKSPACE_SHARED: one grant per brand, shared by the team.
+    # ``start`` binds the consent ``state`` to the caller, the brand and the
+    # purpose; ``complete`` refuses a state issued to anyone else and records
+    # ``connected_by``. The sealed refresh token never leaves the server.
+    ("POST", "/api/seo-geo/oauth/complete"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("GET", "/api/seo-geo/oauth/start/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("GET", "/api/seo-geo/overview"): (WORKSPACE_SHARED, EXTERNAL_OK),
     ("GET", "/api/seo-geo/pages/{brand_id}"): (WORKSPACE_SHARED, INTERNAL_ONLY),
@@ -683,7 +692,13 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
 #: template. Same reach as the listing above (any member, this workspace's
 #: versions only; another workspace's id answers 404), split out so the listing
 #: stays a bodiless read.
-WORKSPACE_SHARED_BASELINE = 89
+#: 89 → 90 on 2026-10-14: ``POST /api/seo-geo/oauth/complete``. Not a widening of
+#: who can connect — ``oauth/start`` was already open to every member — but a
+#: move of the step that stores the grant from a PUBLIC route (the Google
+#: callback, gated only by a signed state) to an authenticated one whose state
+#: must also match the caller. The public route is gone, so the anonymous
+#: surface shrank by one as this count grew by one.
+WORKSPACE_SHARED_BASELINE = 90
 
 #: The GEO editor surface, BY NAME. Not a count — a count would let a future
 #: route join the role while another left it and say nothing, and the thing
@@ -1183,6 +1198,24 @@ def test_a_geo_only_caller_completes_the_whole_geo_journey(
         f"{method} {path} answered 403 to a GEO-only account: {_detail(resp)!r}. "
         "It is part of the GEO journey and must stay open."
     )
+
+
+def test_the_seo_overview_a_geo_only_account_reaches_carries_no_search_console_block(
+    scoped_app,
+) -> None:
+    """``GET /api/seo-geo/overview`` is EXTERNAL_OK only because the console
+    shell reads it; GEO uses none of its Search Console data. So the per-brand
+    ``gsc`` block — who connected it, when, which property — is left out for a
+    GEO-only principal, end to end through the real token and the scope wall,
+    while a member still gets it."""
+    geo = scoped_app.get("/api/seo-geo/overview", headers=_headers(_GEO_ONLY))
+    assert geo.status_code == 200, geo.text
+    assert geo.json()["brands"], "the overview must still list the brands"
+    assert all("gsc" not in c and "gsc_connected" not in c for c in geo.json()["brands"])
+
+    member = scoped_app.get("/api/seo-geo/overview", headers=_headers(_MEMBER))
+    assert member.status_code == 200, member.text
+    assert all("gsc" in c for c in member.json()["brands"])
 
 
 @pytest.mark.parametrize("email", [_MEMBER, _ADMIN, _CREATOR])

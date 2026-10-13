@@ -1572,6 +1572,52 @@ def list_runs_for_user_months(
     return [r for r in rows if run_row_month(r) in wanted]
 
 
+def run_row_day(row: dict[str, Any], tz: Any = None) -> str:
+    """The ``YYYY-MM-DD`` a ``runs`` row belongs to, on ``tz``'s calendar.
+
+    ``created_at`` (UTC ISO, both writers stamp it) is converted when it
+    parses; otherwise the stamped ``day`` / ``date`` (UTC) is used as is.
+    """
+    created = str(row.get("created_at") or "")
+    if created:
+        try:
+            when = datetime.fromisoformat(created)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            return when.astimezone(tz or timezone.utc).date().isoformat()
+        except ValueError:
+            pass
+    return str(row.get("day") or row.get("date") or "")[:10]
+
+
+def run_rollup_for_user(user_id: str, tz: Any = None) -> dict[str, Any] | None:
+    """One user's rows rolled up two ways from ONE projected read:
+    ``by_month`` — ``{"2026-10": {"a1": 12, "a2": 3}}`` (the rows' own UTC
+    month, see :func:`run_row_month`) — and ``by_day`` — ``{"2026-10-07": 4}``
+    on ``tz``'s calendar.
+
+    ``None`` when the read failed, never an empty rollup that would read as
+    "did nothing". A row without an agent counts as "unknown".
+    """
+    if not user_id:
+        return {"by_month": {}, "by_day": {}}
+    rows = _user_run_rows(user_id, ("date", "day", "agent_id"))
+    if rows is None:
+        return None
+    by_month: dict[str, dict[str, int]] = {}
+    by_day: dict[str, int] = {}
+    for r in rows:
+        ym = run_row_month(r)
+        if ym:
+            agent = str(r.get("agent_id") or "unknown")
+            month = by_month.setdefault(ym, {})
+            month[agent] = month.get(agent, 0) + 1
+        day = run_row_day(r, tz)
+        if day:
+            by_day[day] = by_day.get(day, 0) + 1
+    return {"by_month": by_month, "by_day": by_day}
+
+
 def runs_for_user_by_month_and_agent(user_id: str) -> dict[str, dict[str, int]] | None:
     """One user's rows, per ``YYYY-MM`` and per agent — one read per user.
 
@@ -1579,20 +1625,8 @@ def runs_for_user_by_month_and_agent(user_id: str) -> dict[str, dict[str, int]] 
     an empty map that would read as "did nothing". A month absent from the
     map is a month with no rows; a row without an agent counts as "unknown".
     """
-    if not user_id:
-        return {}
-    rows = _user_run_rows(user_id, ("date", "agent_id"))
-    if rows is None:
-        return None
-    out: dict[str, dict[str, int]] = {}
-    for r in rows:
-        ym = run_row_month(r)
-        if not ym:
-            continue
-        agent = str(r.get("agent_id") or "unknown")
-        month = out.setdefault(ym, {})
-        month[agent] = month.get(agent, 0) + 1
-    return out
+    rollup = run_rollup_for_user(user_id)
+    return None if rollup is None else rollup["by_month"]
 
 
 def count_runs_for_user_by_month(user_id: str) -> dict[str, int] | None:
@@ -1795,6 +1829,78 @@ def set_agent_config(agent_id: str, patch: dict[str, Any]) -> dict[str, Any]:
             agent_cfg[field] = value
     agents[agent_id] = agent_cfg
     return set_app_config({"agents": agents})
+
+
+# --------------------------------------------------------------------------- #
+# SEO Analyst (a2) — one Search Console grant per brand
+# --------------------------------------------------------------------------- #
+# ``seo_gsc_grants/{brand_id}`` holds the brand's Search Console connection:
+# the property it reads, the refresh token SEALED by ``seo_geo_agent.gsc_oauth``
+# (nothing here ever receives plaintext from a new connect), and who connected
+# it and when. One document per brand, so the SEO overview reads every brand's
+# grant in ONE batched ``get_all`` — no query, no index.
+#
+# Before 2026-10-14 a grant was written by ``seo_geo_agent.state`` to
+# ``seo_geo/gsc-auth-{brand_id}`` with the token in the clear. That flow never
+# completed in any deployment, but the read still looks there as a fallback so
+# a stray legacy grant is honoured rather than silently ignored, and every save
+# or delete removes it — a plaintext copy does not outlive the next connect.
+
+SEO_GSC_GRANTS = "seo_gsc_grants"
+_SEO_LEGACY_COLLECTION = "seo_geo"
+_SEO_LEGACY_PREFIX = "gsc-auth-"
+#: Bounded on purpose: the overview is a page load, and a Firestore stall must
+#: not hold a worker thread for the client library's default minute.
+_GSC_GRANTS_TIMEOUT_S = 15.0
+
+
+def _legacy_gsc_ref(brand_id: str):
+    return _db().collection(_SEO_LEGACY_COLLECTION).document(f"{_SEO_LEGACY_PREFIX}{brand_id}")
+
+
+def get_gsc_grants(brand_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """``{brand_id: grant}`` for the brands that have one, in one round trip.
+
+    A grant in ``seo_gsc_grants`` wins; a legacy ``seo_geo/gsc-auth-*`` doc is
+    returned only when there is no current one, marked ``legacy: True`` so the
+    caller knows its token is the plaintext ``refresh_token`` field."""
+    ids = [b for b in dict.fromkeys(brand_ids) if b]
+    if not ids:
+        return {}
+    current = _db().collection(SEO_GSC_GRANTS)
+    refs = [current.document(b) for b in ids] + [_legacy_gsc_ref(b) for b in ids]
+    found: dict[str, dict[str, Any]] = {}
+    legacy: dict[str, dict[str, Any]] = {}
+    for snap in _db().get_all(refs, timeout=_GSC_GRANTS_TIMEOUT_S):
+        if not snap.exists:
+            continue
+        if snap.reference.parent.id == _SEO_LEGACY_COLLECTION:
+            legacy[snap.id.removeprefix(_SEO_LEGACY_PREFIX)] = {
+                **(snap.to_dict() or {}), "legacy": True,
+            }
+        else:
+            found[snap.id] = snap.to_dict() or {}
+    return {b: found.get(b) or legacy[b] for b in ids if b in found or b in legacy}
+
+
+def save_gsc_grant(brand_id: str, grant: dict[str, Any]) -> None:
+    """Replace the brand's grant with ``grant`` (already sealed by the caller)
+    and drop any legacy plaintext copy, in one batch."""
+    batch = _db().batch()
+    batch.set(_db().collection(SEO_GSC_GRANTS).document(brand_id),
+              {**grant, "brand_id": brand_id, "updated_at": _now()})
+    batch.delete(_legacy_gsc_ref(brand_id))
+    batch.commit(timeout=_GSC_GRANTS_TIMEOUT_S)
+
+
+def delete_gsc_grant(brand_id: str) -> None:
+    """Forget the brand's grant — current and legacy — in one batch."""
+    batch = _db().batch()
+    batch.delete(_db().collection(SEO_GSC_GRANTS).document(brand_id))
+    batch.delete(_legacy_gsc_ref(brand_id))
+    batch.commit(timeout=_GSC_GRANTS_TIMEOUT_S)
+
+
 # --------------------------------------------------------------------------- #
 # Inbox Triage (a12) — one connection document per user, one tracking
 # document per message
