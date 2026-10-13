@@ -16,6 +16,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from app.security import get_current_user
+from app.services import firestore_repo
 from app.services.run_tracking import JOB, Activity, ActivityTrail
 from seo_geo_agent import insights
 from seo_geo_agent.sources import CredentialMissing
@@ -28,6 +29,10 @@ logger = logging.getLogger("agentos.blog_writer")
 
 BLOG_AGENT_ID = "a9"  # "Blog Writer" slot in the frontend agent catalog
 BLOG_AGENT_NAME = "Blog Writer"
+
+#: Ceiling on the user-directory read that labels an admin's run list. The
+#: names are a label, not the list, so the list does not wait long for them.
+_AUTHOR_LOOKUP_TIMEOUT_S = 10.0
 
 
 #: Every unit of Blog Writer work lands here — see THE RULE in run_tracking.py.
@@ -150,7 +155,43 @@ def list_runs(user: dict = Depends(get_current_user)) -> dict:
         for r in research.list_runs()
         if r.get("user_id") == user.get("id") or user.get("is_admin")
     ]
+    if user.get("is_admin"):
+        runs = _with_authors(runs)
     return {"runs": runs}
+
+
+def _with_authors(runs: list[dict]) -> list[dict]:
+    """Add ``by``, the author's display name, to each row of an admin's list.
+
+    Admin-only, at the one call site above: a non-admin's rows are all their
+    own, so there is no one else's name to give them. ONE read of the user
+    directory for the whole list, never one per row. The name is a label, not
+    the list, so a failed read returns the rows unlabelled with a warning
+    instead of failing the request. A row whose ``user_id`` matches no account
+    (an unstamped legacy run, a deleted user) gets no ``by``. Rows are copied,
+    never edited in place, so the label cannot reach the stored index.
+    """
+    if not runs:
+        return runs
+    try:
+        directory = firestore_repo.list_users(timeout=_AUTHOR_LOOKUP_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 — any failed read degrades to no labels
+        logger.warning(
+            "blog runs: could not read the user directory; listing %d runs without authors",
+            len(runs), exc_info=True,
+        )
+        return runs
+    names: dict[str, str] = {}
+    for account in directory:
+        uid = str(account.get("id") or "")
+        label = str(account.get("name") or "").strip() or str(account.get("email") or "").strip()
+        if uid and label:
+            names[uid] = label
+    out: list[dict] = []
+    for row in runs:
+        name = names.get(str(row.get("user_id") or ""))
+        out.append({**row, "by": name} if name else row)
+    return out
 
 
 @router.get("/blog/runs/{run_id}")

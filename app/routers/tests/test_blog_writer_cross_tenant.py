@@ -32,6 +32,7 @@ import app  # noqa: F401 - side effect: registers agent roots on sys.path
 import pytest
 
 from app.routers.tests.conftest import client
+from app.services import firestore_repo
 from blog_writer_agent import research
 from seo_geo_agent import insights
 
@@ -151,6 +152,31 @@ def test_the_run_list_shows_only_your_own(as_caller):
     body = client.get("/api/blog/runs").text
     assert "bw-owned" in body
     assert "bw-legacy-unstamped" not in body
+
+
+def test_the_run_list_gives_a_non_admin_no_one_elses_name(monkeypatch, as_caller):
+    """Admins get each row's author as `by`. A non-admin gets their own rows
+    only, and the user directory is not even read for them, so no other
+    person's name can come back in their list."""
+    _store(_owned_run())
+    _store(_run_doc("bw-strangers", "Stranger topic", "the stranger's draft", STRANGER["id"]))
+    reads: list[int] = []
+
+    def directory(**_):
+        reads.append(1)
+        return [{"id": OWNER["id"], "name": "Olive Owner", "email": OWNER["email"]},
+                {"id": STRANGER["id"], "name": "Sam Stranger", "email": STRANGER["email"]}]
+
+    monkeypatch.setattr(firestore_repo, "list_users", directory)
+    as_caller(OWNER)
+    r = client.get("/api/blog/runs")
+    assert r.status_code == 200, r.text
+    runs = r.json()["runs"]
+    assert [row["id"] for row in runs] == ["bw-owned"]
+    assert all("by" not in row for row in runs)
+    for foreign in ("Sam Stranger", STRANGER["email"], STRANGER["id"], "Stranger topic"):
+        assert foreign not in r.text
+    assert reads == []
 
 
 def test_a_real_run_id_and_an_invented_one_look_the_same_to_a_stranger(as_caller):
