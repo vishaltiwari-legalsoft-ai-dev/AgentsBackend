@@ -544,10 +544,13 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
     # Site-review findings ride along in the fix list (stable ids keep status).
     todos = (todos + site_brain.site_todos(brand["id"]))[:MAX_TODOS]
 
+    # One review read grounds both the seeds and the blog plan's gap/coverage check.
+    review = site_brain.latest_review(brand["id"])
     topic_list, topic_notes = topics.build_topics(
-        site_brain.effective_seeds(brand), rows, prev_rows,
+        site_brain.effective_seeds(brand, review=review), rows, prev_rows,
         corpus_pages=corpus.get("pages"),
         competitor_topics=_competitor_topic_pool(brand["id"]),
+        site_review=review,
     )
     degraded.extend(topic_notes)
 

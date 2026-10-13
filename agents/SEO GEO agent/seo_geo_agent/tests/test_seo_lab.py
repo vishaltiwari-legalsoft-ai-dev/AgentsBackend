@@ -321,6 +321,98 @@ def test_run_brand_merges_site_todos(monkeypatch):
     assert any(t["kind"] == "site" for t in run["todos"])
 
 
+# ------------------------- blog plan grounded in the site review -------------------------
+
+def test_effective_seeds_merges_typed_and_suggested_with_distinct_tags(monkeypatch):
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: REVIEW_JSON)
+    site_brain.expert_review(BRAND, {"brand_id": "b", "page_count": 1, "pages": [], "degraded": []})
+
+    merged = site_brain.effective_seeds(BRAND)
+    assert merged["seed_entries"] == [
+        {"text": "legal virtual assistant", "source": "seed"},  # typed wins the duplicate
+        {"text": "law firm answering service", "source": "suggested seed"},
+    ]
+    assert merged["seeds"] == BRAND["seeds"]  # rank tracking + keyword lab contract unchanged
+
+    seedless = site_brain.effective_seeds({**BRAND, "seeds": []})
+    assert [e["source"] for e in seedless["seed_entries"]] == ["suggested seed", "suggested seed"]
+    assert seedless["seeds"] == REVIEW_JSON["suggested_seeds"]
+
+    assert site_brain.effective_seeds(BRAND, review=None)["seed_entries"] == [
+        {"text": "legal virtual assistant", "source": "seed"}]
+
+    # the blog plan honours the tags: only what the user typed is a "seed"
+    ranked, _ = topics.build_topics(merged, [], [], search=None)
+    assert {t["keyword"]: t["source"] for t in ranked} == {
+        "legal virtual assistant": "seed", "law firm answering service": "suggested seed"}
+
+
+def test_why_text_is_honest_about_where_each_topic_came_from(monkeypatch):
+    monkeypatch.setattr(topics.sources, "llm_json",
+                        lambda system, prompt: ["paralegal outsourcing checklist"])
+
+    def search(q):
+        return {"organic": [], "related": [f"{q} duties"], "paa": [], "aio_present": False}
+
+    ranked, _ = topics.build_topics(BRAND, [], [], search=search, max_checks=0,
+                                    site_review={"missing_topics": ["legal intake checklist"]})
+    by_source = {t["source"]: t for t in ranked}
+    # an unverified model idea no longer claims to come from Google
+    assert by_source["new idea"]["why"] == "AI-suggested — not yet checked against Google"
+    assert by_source["site gap"]["why"].startswith(
+        "Your site review found buyers looking for this and no page covers it")
+    assert by_source["google suggestion"]["why"] == \
+        'Google suggests this for your seed "legal virtual assistant"'
+    assert by_source["seed"]["why"].startswith("You listed this as a seed keyword")
+    assert all("expansion keyword from live Google suggestions" not in t["why"] for t in ranked)
+
+    suggested_only = {**BRAND, "seeds": [],
+                      "seed_entries": [{"text": "law firm answering service", "source": "suggested seed"}]}
+    ranked, _ = topics.build_topics(suggested_only, [], [], search=search, max_checks=0,
+                                    site_review={"covered_topics": ["virtual assistants"]})
+    child = next(t for t in ranked if t["source"] == "google suggestion")
+    assert child["from_seed"] == "law firm answering service"
+    assert child["why"] == \
+        'Google suggests this for the site review\'s suggested seed "law firm answering service"'
+
+
+def test_volume_label_says_no_search_data_when_there_is_none(monkeypatch):
+    monkeypatch.setattr(topics.sources, "llm_json",
+                        lambda system, prompt: ["paralegal outsourcing checklist"])
+
+    def search(q):
+        return {"organic": [], "related": ["legal virtual assistant duties"], "paa": [],
+                "aio_present": False}
+
+    rows = [row("legal virtual assistant", impressions=500)]
+    ranked, _ = topics.build_topics(BRAND, rows, [], search=search, max_checks=0)
+    by_kw = {t["keyword"]: t for t in ranked}
+    assert by_kw["paralegal outsourcing checklist"]["volume_label"] == "no search data yet"
+    assert by_kw["legal virtual assistant duties"]["volume_label"] == "interest signal only"
+    assert by_kw["legal virtual assistant"]["volume_label"] == "~500/mo (our impressions)"
+
+
+def test_blog_plan_says_when_no_site_review_grounds_it(monkeypatch):
+    brand = insights.list_brands()[0]
+    run = insights.run_brand(brand, trigger="t")
+    assert topics.NO_REVIEW_NOTE in run["degraded"]
+    assert not any(t["source"] == "site gap" for t in run["topics"])
+
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: REVIEW_JSON)
+    site_brain.expert_review(brand, {"brand_id": brand["id"], "page_count": 1, "pages": [], "degraded": []})
+    run = insights.run_brand(brand, trigger="t")
+    assert topics.NO_REVIEW_NOTE not in run["degraded"]
+    assert topics.EMPTY_REVIEW_NOTE not in run["degraded"]
+    gap = next(t for t in run["topics"] if t["source"] == "site gap")
+    assert gap["keyword"] == "pricing comparisons"
+
+    # an older review doc without the topic lists says so — never pretends to be checked
+    site_brain.state.save(f"sitereview-{brand['id']}", {"brand_id": brand["id"], "positioning": "x"})
+    run = insights.run_brand(brand, trigger="t")
+    assert topics.EMPTY_REVIEW_NOTE in run["degraded"]
+    assert not any(t["source"] == "site gap" for t in run["topics"])
+
+
 # ----------------------------- GSC OAuth connect -----------------------------
 
 def _oauth_env(monkeypatch):
