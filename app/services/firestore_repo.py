@@ -914,8 +914,15 @@ def get_or_create_google_user(
     return payload | {"id": user_id}
 
 
-def list_users() -> list[dict[str, Any]]:
-    docs = _db().collection("users").stream()
+def list_users(*, timeout: float | None = None) -> list[dict[str, Any]]:
+    """Every user document, newest account first.
+
+    ``timeout`` bounds the read for a caller that can do without the result —
+    a list that only labels its rows with author names should give up quickly
+    rather than wait out Firestore's default deadline. Unset keeps the default.
+    """
+    users_ref = _db().collection("users")
+    docs = users_ref.stream() if timeout is None else users_ref.stream(timeout=timeout)
     users = [doc.to_dict() | {"id": doc.id} for doc in docs]
     users.sort(key=lambda u: u.get("created_at", ""), reverse=True)
     return users

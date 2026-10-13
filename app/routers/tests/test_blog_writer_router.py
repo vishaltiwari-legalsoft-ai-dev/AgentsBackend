@@ -5,7 +5,9 @@ Serper search, page fetch, sitemap, and the a9 LLM adapter.
 """
 from __future__ import annotations
 
+import logging
 import os
+from types import SimpleNamespace
 
 os.environ["BLOG_OFFLINE"] = "1"
 
@@ -13,7 +15,9 @@ import app  # noqa: F401 - side effect: registers agent roots on sys.path
 import pytest
 
 from app.routers.tests.conftest import client
+from app.services import firestore_repo
 from blog_writer_agent import llm as bw_llm
+from blog_writer_agent import research
 from seo_geo_agent import insights, sources
 
 BRAND = {"id": "legalsoft", "name": "Legal Soft", "domain": "legalsoft.com", "enabled": True}
@@ -21,6 +25,10 @@ BRAND = {"id": "legalsoft", "name": "Legal Soft", "domain": "legalsoft.com", "en
 #: A plain writer — nothing in this router is creator-gated.
 WRITER = {"id": "u1", "email": "writer@legalsoft.com", "is_admin": False,
           "is_creator": False, "session_id": "", "timezone": "UTC"}
+
+#: An admin who is not a creator — admin alone is what unlocks every row.
+ADMIN = {"id": "admin-9", "email": "admin@legalsoft.com", "is_admin": True,
+         "is_creator": False, "session_id": "", "timezone": "UTC"}
 
 
 @pytest.fixture(autouse=True)
@@ -146,6 +154,78 @@ def test_create_run_validation():
     assert client.get("/api/blog/runs").json()["runs"][0]["id"] == run["id"]
     assert client.get(f"/api/blog/runs/{run['id']}").json()["topic"] == "virtual receptionists"
     assert client.get("/api/blog/runs/nope").status_code == 404
+
+
+def _stored_run(rid: str, owner: str) -> None:
+    """A run written straight to the offline store, owned by ``owner``."""
+    research.save_run({"id": rid, "brand_id": "legalsoft", "brand_name": "Legal Soft",
+                       "topic": f"topic {rid}", "created": "2026-10-01T00:00:00Z",
+                       "status": "research", "user_id": owner})
+
+
+class _UsersCollection:
+    """The ``users`` collection, as far as the real ``list_users`` reads it."""
+
+    def __init__(self, docs: dict[str, dict]) -> None:
+        self.docs = docs
+        self.reads: list[float | None] = []
+
+    def collection(self, name: str) -> "_UsersCollection":
+        assert name == "users", name
+        return self
+
+    def stream(self, timeout=None):
+        self.reads.append(timeout)
+        return iter(SimpleNamespace(id=uid, to_dict=lambda d=doc: dict(d))
+                    for uid, doc in self.docs.items())
+
+
+def test_admin_run_list_names_each_author_from_one_directory_read(monkeypatch, as_caller):
+    """`by` is the author's name, else their email; no account, no `by`.
+    Runs the real ``firestore_repo.list_users`` over a faked ``_db``."""
+    _stored_run("bw-named", "u-named")
+    _stored_run("bw-email-only", "u-email-only")
+    _stored_run("bw-deleted-user", "u-deleted")
+    _stored_run("bw-legacy", "")
+    users = _UsersCollection({
+        "u-named": {"name": "Asha Rao", "email": "asha@legalsoft.com"},
+        "u-email-only": {"name": "  ", "email": "ravi@legalsoft.com"},
+    })
+    reads = users.reads
+    monkeypatch.setattr(firestore_repo, "_db", lambda: users)
+    as_caller(ADMIN)
+    r = client.get("/api/blog/runs")
+    assert r.status_code == 200, r.text
+    rows = {row["id"]: row for row in r.json()["runs"]}
+    assert set(rows) == {"bw-named", "bw-email-only", "bw-deleted-user", "bw-legacy"}
+    assert rows["bw-named"]["by"] == "Asha Rao"
+    assert rows["bw-email-only"]["by"] == "ravi@legalsoft.com"
+    assert "by" not in rows["bw-deleted-user"]
+    assert "by" not in rows["bw-legacy"]
+    # One bounded read for the whole list, not one per row.
+    assert len(reads) == 1 and reads[0]
+    # The label lives in the response only; the stored index never carries it.
+    assert all("by" not in row for row in research.list_runs())
+
+
+def test_admin_run_list_survives_a_failed_directory_read(monkeypatch, as_caller, caplog):
+    """The names are a label, not the list: a dead directory read is a
+    warning in the logs and an unlabelled 200, never a 500."""
+    _stored_run("bw-a", "u-a")
+    _stored_run("bw-b", "u-b")
+
+    def dead(**_):
+        raise RuntimeError("firestore unavailable")
+
+    monkeypatch.setattr(firestore_repo, "list_users", dead)
+    as_caller(ADMIN)
+    with caplog.at_level(logging.WARNING, logger="agentos.blog_writer"):
+        r = client.get("/api/blog/runs")
+    assert r.status_code == 200, r.text
+    runs = r.json()["runs"]
+    assert {row["id"] for row in runs} == {"bw-a", "bw-b"}
+    assert all("by" not in row for row in runs)
+    assert "could not read the user directory" in caplog.text
 
 
 def test_research_step_without_key_is_an_honest_424():
