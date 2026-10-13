@@ -177,11 +177,10 @@ class Settings(BaseSettings):
     )
 
     # --- Inbox Triage (a12) ------------------------------------------------
-    # Its OWN Google OAuth client, not the shared Web client above. The shared
-    # client's consent screen also signs in four contractor accounts outside
-    # the Workspace, so it can never become an Internal app — and an Internal
-    # consent screen is what lets a Workspace member grant ``gmail.readonly``
-    # without a verification review. A second GCP project owns this client.
+    # The OAuth client for Gmail consent, and for the SEO agent's Search
+    # Console connect, which reuses it. A separate setting from the sign-in
+    # client above, but in the deployed environments it holds that same Web
+    # client (project helpful-charmer-498509-v5, External consent screen).
     inbox_google_client_id: str = ""
     inbox_google_client_secret: str = ""
     # Fernet key that seals the stored Gmail refresh token. Generate it with

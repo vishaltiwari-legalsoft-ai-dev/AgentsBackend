@@ -500,6 +500,19 @@ def test_any_member_connects_but_only_a_creator_disconnects(gsc, as_creator):
     assert overview["brands"][0]["gsc"]["connected"] is False
 
 
+def test_deleting_a_brand_takes_its_search_console_grant_with_it(gsc, as_creator):
+    """Hard delete through the route: the brand's sealed token goes with it, so
+    no grant outlives the brand that the disconnect route would need to reach it."""
+    r = client.post("/api/seo-geo/oauth/complete", json={"code": "c", "state": _start_state()})
+    assert r.status_code == 200, r.text
+    assert "legalsoft" in gsc.store
+    assert client.delete("/api/seo-geo/brands/legalsoft").status_code == 403   # creator only
+    assert "legalsoft" in gsc.store
+    as_creator()
+    assert client.delete("/api/seo-geo/brands/legalsoft").status_code == 200
+    assert gsc.store == {}
+
+
 def test_overview_reading_flag_comes_from_the_latest_run_not_from_the_cloud_flag():
     """``sources.gsc`` used to be ``use_cloud()`` — "Connected" in prod with
     nothing connected. It is now true only when a brand really has Search
@@ -508,9 +521,65 @@ def test_overview_reading_flag_comes_from_the_latest_run_not_from_the_cloud_flag
 
     assert client.get("/api/seo-geo/overview").json()["sources"]["gsc"] is False
     state.save("run-legalsoft", {"at": "2026-10-14T00:00:00Z", "summary": {"mode": "search-console"},
-                                 "degraded": [], "todos": [], "topics": []})
+                                 "degraded": [], "todos": [], "topics": [], "gsc_rows": 412})
     body = client.get("/api/seo-geo/overview").json()
     card = body["brands"][0]
     assert card["gsc"]["reading"] is True and card["gsc"]["connected"] is False
     assert body["sources"]["gsc"] is True
+
+
+@pytest.mark.parametrize(("summary", "reading"), [
+    ({"mode": "search-console", "impressions_28d": 5400}, True),   # it read rows
+    ({"mode": "search-console", "impressions_28d": 0}, False),     # the both-failed summary
+    ({"mode": "rank-tracking"}, False),
+])
+def test_a_run_stored_before_gsc_rows_reads_from_its_impressions(summary, reading):
+    from seo_geo_agent import state
+
+    state.save("run-legalsoft", {"at": "2026-10-13T00:00:00Z", "summary": summary,
+                                 "degraded": [], "todos": [], "topics": []})
+    assert client.get("/api/seo-geo/overview").json()["brands"][0]["gsc"]["reading"] is reading
+
+
+def _both_sources_fail(monkeypatch):
+    from seo_geo_agent import insights
+    from seo_geo_agent.sources import CredentialMissing
+
+    def no_search_console(*args, **kwargs):
+        raise CredentialMissing("Search Console refused the property")
+
+    def no_serper(brand):
+        raise CredentialMissing("Serper credits exhausted")
+
+    monkeypatch.setattr(insights, "gsc_fetch", no_search_console)
+    monkeypatch.setattr(insights.competitors, "rank_snapshot", no_serper)
+
+
+def test_a_run_where_search_console_and_rank_tracking_both_failed_is_not_reading(monkeypatch):
+    """The empty summary such a run stores still says mode "search-console";
+    Integrations read that as "Connected" with no data behind it."""
+    _both_sources_fail(monkeypatch)
+    assert client.post("/api/seo-geo/run/legalsoft").status_code == 200
+    run = client.get("/api/seo-geo/brands/legalsoft").json()["run"]
+    assert run["summary"]["mode"] == "search-console" and run["gsc_rows"] == 0
+
+    body = client.get("/api/seo-geo/overview").json()
+    assert body["brands"][0]["gsc"]["reading"] is False
+    assert body["sources"]["gsc"] is False
+    assert client.get("/api/seo-geo/brands/legalsoft").json()["gsc"]["reading"] is False
+
+
+def test_a_grant_still_shows_connected_when_its_run_failed_to_read(gsc, monkeypatch):
+    """``connected`` is the stored grant; ``reading`` is what the run got. A
+    grant whose run read nothing is connected, not reading."""
+    r = client.post("/api/seo-geo/oauth/complete", json={"code": "c", "state": _start_state()})
+    assert r.status_code == 200, r.text
+    monkeypatch.setattr(gsc.oauth, "service", lambda brand_id: object())   # no Google client
+    _both_sources_fail(monkeypatch)
+    assert client.post("/api/seo-geo/run/legalsoft").status_code == 200
+
+    body = client.get("/api/seo-geo/overview").json()
+    assert body["brands"][0]["gsc"]["connected"] is True
+    assert body["brands"][0]["gsc"]["reading"] is False
+    assert body["sources"]["gsc"] is True   # a grant exists
 

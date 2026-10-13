@@ -127,8 +127,8 @@ def test_offline_recs_are_honest_heuristics():
     assert doc["ai"] is False  # offline → llm_text raises → heuristic path
     page = doc["pages"][0]
     assert "no-meta" in page["flags"]                       # the audit-grouped finding: a chip
-    assert page["recommendation"] == pages_mod.FLAG_TEXT["thin"]  # page-specific rule speaks
-    assert page["rec_source"] == "rule"
+    assert (page["recommendation"], page["rec_source"], page["rec_chip"]) == (
+        "", "flags", pages_mod.THIN_CHIP)                   # thin content: a chip too
     assert pages_mod.latest("b")["pages"]  # persisted
 
 
@@ -144,6 +144,41 @@ def test_audit_grouped_flags_are_chips_not_repeated_sentences():
     for page in doc["pages"]:
         assert {"no-meta", "title-long", "images-no-alt"} <= set(page["flags"])
         assert page["recommendation"] == "" and page["rec_source"] == "flags"
+        assert page["rec_chip"] is None                     # the flags ARE the chips
+
+
+def test_rule_verdicts_that_repeat_down_the_table_are_chips_not_sentences():
+    """'Healthy — keep it fresh…' and 'Expand this page past 300 words' were the
+    same sentence on every row they fit. Each is now a stable chip id. A long
+    meta description is still a sentence, and thin content still outranks it."""
+    doc = pages_mod.build_page_intel(
+        {"id": "b", "domain": "x.com"},
+        corpus_pages=[_corpus_page(url=f"https://x.com/ok{i}") for i in range(3)]
+        + [_corpus_page(url=f"https://x.com/thin{i}", word_count=90 + i) for i in range(3)]
+        + [_corpus_page(url="https://x.com/both", word_count=50, meta_description="d" * 200),
+           _corpus_page(url="https://x.com/long", meta_description="d" * 200)],
+        ga_pages=[], gsc_rows=[])
+    by_path = {p["path"]: p for p in doc["pages"]}
+    verdict = {path: (p["recommendation"], p["rec_source"], p["rec_chip"]) for path, p in by_path.items()}
+
+    for i in range(3):
+        assert verdict[f"/ok{i}"] == ("", "flags", "healthy")
+        assert verdict[f"/thin{i}"] == ("", "flags", "thin-content")
+        assert by_path[f"/thin{i}"]["word_count"] == 90 + i       # what the chip can say
+    assert verdict["/both"] == ("", "flags", "thin-content")      # thin keeps its precedence
+    assert "meta-long" in by_path["/both"]["flags"]               # ...and meta-long is still a chip
+    assert verdict["/long"] == (pages_mod.FLAG_TEXT["meta-long"], "rule", None)
+
+
+def test_an_ai_row_carries_no_chip(monkeypatch):
+    monkeypatch.setattr(pages_mod, "llm_text", lambda s, p, **kw: (
+        '[{"path": "/thin", "recommendation": "Add the fee schedule PDF as an HTML table."}]'))
+    doc = pages_mod.build_page_intel(
+        {"id": "b", "domain": "x.com"},
+        [_corpus_page(url="https://x.com/thin", word_count=90)], [], [])
+    page = doc["pages"][0]
+    assert (page["rec_source"], page["rec_chip"]) == ("ai", None)
+    assert page["recommendation"].startswith("Add the fee schedule")
 
 
 def test_template_image_is_not_a_chip_on_every_row():
@@ -339,7 +374,7 @@ def test_schema_advice_on_a_corpus_without_schema_facts_is_dropped(monkeypatch):
     monkeypatch.setattr(pages_mod, "llm_text", lambda s, p, **kw: (
         '[{"path": "/help", "recommendation": "Add FAQPage structured data here."}]'))
     doc = pages_mod.build_page_intel({"id": "b", "domain": "x.com"}, old, [], [])
-    assert doc["pages"][0]["rec_source"] == "rule"
+    assert doc["pages"][0]["rec_source"] != "ai"
     assert doc["grounding"]["dropped"][0]["reason"] == "schema-not-fit"
 
 
@@ -379,7 +414,7 @@ def test_ai_recs_success_used_for_top_traffic_only(monkeypatch):
     assert by_path["/p0"]["ai"] is True
     # lowest-traffic page (index n-1) falls outside the top MAX_AI_PAGES slice sent to the LLM
     beyond = by_path[f"/p{n - 1}"]
-    assert beyond["recommendation"] == "Healthy — keep it fresh and add internal links to weaker pages."
+    assert (beyond["recommendation"], beyond["rec_chip"]) == ("", pages_mod.HEALTHY_CHIP)
     assert beyond["ai"] is False
 
 
@@ -389,4 +424,5 @@ def test_ai_recs_malformed_json_falls_back_to_heuristics(monkeypatch):
                                      corpus_pages=[_corpus_page()], ga_pages=[], gsc_rows=[])
     assert doc["ai"] is False
     assert pages_mod.NO_REC_NOTE in doc["notes"]
-    assert all(p["recommendation"] for p in doc["pages"])
+    # every row still says something: a sentence, an advice chip, or its flag chips
+    assert all(p["recommendation"] or p["rec_chip"] or p["flags"] for p in doc["pages"])

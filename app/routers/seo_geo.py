@@ -535,15 +535,29 @@ def _gsc_view(brand: dict, grant: dict | None, run: dict | None) -> dict:
     it is only known from a run, which is what ``reading`` says: the latest run
     got Search Console rows."""
     grant = grant or {}
-    summary = (run or {}).get("summary") or {}
     return {
         "connected": bool(grant),
         "property": grant.get("property"),
         "connected_by": grant.get("connected_by"),
         "connected_at": grant.get("connected_at"),
         "service_account_property": brand.get("gsc_property") or None,
-        "reading": summary.get("mode") == "search-console",
+        "reading": _read_search_console(run),
     }
+
+
+def _read_search_console(run: dict | None) -> bool:
+    """Whether the latest run actually read Search Console rows.
+
+    ``run.gsc_rows`` is the count the run fetched. Never ``summary.mode``: a run
+    whose Search Console AND rank tracking both failed still carries the empty
+    summary, whose mode is "search-console". A run stored before ``gsc_rows``
+    existed counts only if it recorded impressions — Search Console returns no
+    row without one, and the both-failed summary has zero."""
+    run = run or {}
+    if "gsc_rows" in run:
+        return (run.get("gsc_rows") or 0) > 0
+    summary = run.get("summary") or {}
+    return summary.get("mode") == "search-console" and (summary.get("impressions_28d") or 0) > 0
 
 
 @router.get("/seo-geo/oauth/start/{brand_id}")

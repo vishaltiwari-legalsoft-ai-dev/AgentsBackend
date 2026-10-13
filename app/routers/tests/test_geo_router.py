@@ -853,7 +853,8 @@ def test_adding_a_brand_does_not_make_the_next_listing_read_a_month_of_day_docs(
 
 def test_adding_the_same_brand_twice_is_refused_not_overwritten(real_registry):
     """A slug collision must not adopt somebody else's brand: the same id owns
-    the same ``geo-config-*`` and ``gsc-auth-*`` documents underneath it."""
+    the same ``geo-config-*`` documents and ``seo_gsc_grants/{id}`` Search
+    Console grant underneath it."""
     assert add_brand(url="acmelegal.com").status_code == 201
     clash = add_brand(name="Acme Legal", url="somewhere-else.com")
     assert clash.status_code == 409, clash.text
@@ -886,7 +887,7 @@ def test_adding_a_brand_needs_the_geo_editor_role(real_registry, as_caller):
 
 
 def test_switching_a_brand_off_removes_it_everywhere_and_destroys_nothing(
-    real_registry, fake_engines,
+    real_registry, fake_engines, monkeypatch,
 ):
     """The self-serve "remove": one flag, four surfaces, zero destruction.
 
@@ -896,11 +897,23 @@ def test_switching_a_brand_off_removes_it_everywhere_and_destroys_nothing(
     where they are. The destructive path stays Creator-only for the reason
     ``insights.delete_brand`` documents.
     """
+    from app.services import firestore_repo
+    from seo_geo_agent import gsc_oauth
+
+    # The grant lives in ``seo_gsc_grants``, reached only through these three
+    # accessors: an in-memory store stands in, so Firestore is never touched.
+    grants = {"acme-legal": {"property": "sc-domain:acmelegal.com", "refresh_token_enc": "live"}}
+    monkeypatch.setattr(gsc_oauth, "_online", lambda: True)
+    monkeypatch.setattr(firestore_repo, "get_gsc_grants",
+                        lambda ids: {b: dict(grants[b]) for b in ids if b in grants})
+    monkeypatch.setattr(firestore_repo, "save_gsc_grant",
+                        lambda brand_id, grant: grants.__setitem__(brand_id, dict(grant)))
+    monkeypatch.setattr(firestore_repo, "delete_gsc_grant",
+                        lambda brand_id: grants.pop(brand_id, None))
+
     add_brand()
     prompts_for("acme-legal", 2)
     client.post("/api/geo/brands/acme-legal/poll/step", json={"runs": 1, "batch_size": 10})
-    state.save("gsc-auth-acme-legal", {"refresh_token": "live-token",
-                                       "property": "sc-domain:acmelegal.com"})
     assert client.get("/api/geo/brands/acme-legal/answers").json()["total"] > 0
 
     off = client.put("/api/geo/brands/acme-legal/config", json={"enabled": False})
@@ -914,7 +927,7 @@ def test_switching_a_brand_off_removes_it_everywhere_and_destroys_nothing(
     assert "acme-legal" not in str(client.get("/api/issues").json())
 
     # ...and nothing was destroyed
-    assert state.load("gsc-auth-acme-legal")["refresh_token"] == "live-token"
+    assert grants["acme-legal"]["refresh_token_enc"] == "live"
     assert state.load("geo-prompts-acme-legal")["prompts"]
 
 

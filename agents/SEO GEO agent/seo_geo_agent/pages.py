@@ -21,7 +21,13 @@ THIN_WORDS = 300
 NO_REC_NOTE = "AI recommendations unavailable — showing rule-based advice"
 NOT_CRAWLED_FLAG = "not-crawled"
 NOT_CRAWLED_REC = "Not in the site crawl — re-run the site analysis to audit this page."
-HEALTHY_REC = "Healthy — keep it fresh and add internal links to weaker pages."
+
+#: ``rec_chip`` ids: a rule verdict that reads the same on every row it applies
+#: to, so the row carries a stable id the console renders as a chip instead of
+#: the same sentence repeated down the table. The row's ``word_count`` is there
+#: for a "thin" chip that wants to say how thin.
+HEALTHY_CHIP = "healthy"
+THIN_CHIP = "thin-content"
 
 #: The rule sentence behind each flag — also the text AI advice is compared
 #: against: advice that only says this again, in other words, is dropped.
@@ -98,22 +104,27 @@ def _flags(entry: dict, template_srcs: set[str] = frozenset()) -> list[str]:
     return flags
 
 
-def _rule_rec(page: dict) -> tuple[str, str]:
+def _rule_rec(page: dict) -> tuple[str, str, str | None]:
     """Deterministic advice when AI is unavailable (or for pages outside the
-    top-traffic slice) -> ``(recommendation, rec_source)``.
+    top-traffic slice) -> ``(recommendation, rec_source, rec_chip)``.
 
-    A flag the audit already groups (title, meta, H1, alt) stays a chip and
-    gets no sentence: ``("", "flags")``. Only page-specific rules speak.
+    A verdict that would be the same sentence on every row it fits is a chip,
+    not a sentence: ``("", "flags", chip)``. Thin content is :data:`THIN_CHIP`,
+    a page with nothing flagged is :data:`HEALTHY_CHIP`, and a flag the audit
+    already groups (title, meta, H1, alt) is its own chip in ``flags``
+    (``rec_chip`` None). The precedence is the one the sentences had: thin
+    content outranks a long meta description, which still speaks.
     """
     flags = page.get("flags") or []
     if NOT_CRAWLED_FLAG in flags:
-        return NOT_CRAWLED_REC, "rule"
-    for flag in ("thin", "meta-long"):
-        if flag in flags:
-            return FLAG_TEXT[flag], "rule"
+        return NOT_CRAWLED_REC, "rule", None
+    if "thin" in flags:
+        return "", "flags", THIN_CHIP
+    if "meta-long" in flags:
+        return FLAG_TEXT["meta-long"], "rule", None
     if any(f in AUDIT_GROUPED_FLAGS for f in flags):
-        return "", "flags"
-    return HEALTHY_REC, "rule"
+        return "", "flags", None
+    return "", "flags", HEALTHY_CHIP
 
 
 def rewords_flags(recommendation: str, flags: list[str]) -> bool:
@@ -189,7 +200,7 @@ def _entry(merged: dict, path: str) -> dict:
         "views": 0, "sessions": 0, "engagement_rate": 0.0,
         "clicks": 0, "impressions": 0, "position": None,
         "best_query": None, "flags": [], "recommendation": "", "ai": False,
-        "rec_source": "rule", "word_count": 0,
+        "rec_source": "rule", "rec_chip": None, "word_count": 0,
     })
 
 
@@ -265,9 +276,9 @@ def build_page_intel(brand: dict, corpus_pages: list[dict], ga_pages: list[dict]
     for p in merged_list:
         p["ai"] = p["path"] in recs
         if p["ai"]:
-            p["recommendation"], p["rec_source"] = recs[p["path"]], "ai"
+            p["recommendation"], p["rec_source"], p["rec_chip"] = recs[p["path"]], "ai", None
         else:
-            p["recommendation"], p["rec_source"] = _rule_rec(p)
+            p["recommendation"], p["rec_source"], p["rec_chip"] = _rule_rec(p)
 
     doc = {"brand_id": brand["id"], "at": date.today().isoformat(),
            "ai": ai_used, "notes": notes, "grounding": grounding, "pages": merged_list}

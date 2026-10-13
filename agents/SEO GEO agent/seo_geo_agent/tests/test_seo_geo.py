@@ -183,7 +183,8 @@ def test_every_registry_write_goes_through_the_transaction(call, args, monkeypat
 
 def test_creating_a_brand_that_already_exists_is_refused():
     """A slug collision must not silently adopt somebody else's brand: the same
-    id owns the same ``geo-config-*`` and ``gsc-auth-*`` documents underneath."""
+    id owns the same ``geo-config-*`` documents and ``seo_gsc_grants/{id}``
+    Search Console grant underneath."""
     insights.create_brand({"id": "acme", "name": "Acme", "domain": "acme.com",
                            "enabled": True})
     with pytest.raises(ValueError, match="already exists"):
@@ -193,29 +194,63 @@ def test_creating_a_brand_that_already_exists_is_refused():
     assert acme["domain"] == "acme.com"   # the original, untouched
 
 
-def test_switching_a_brand_off_keeps_every_document_it_owns():
-    """The self-serve remove. It flips one flag; it destroys nothing.
+def test_switching_a_brand_off_keeps_every_document_it_owns(gsc_connect):
+    """The self-serve remove. It flips one flag; it destroys nothing — the
+    brand's Search Console grant included, so switching it back on resumes.
 
-    ``delete_brand`` is the contrast this pins against: it drops the registry
-    entry and takes ``run-`` and ``todos-`` with it, leaving eighteen other
-    ``…-{brand_id}`` families — ``gsc-auth-{id}`` and its live Search Console
-    refresh token among them — with no route left that can reach them.
+    ``delete_brand`` is the contrast this pins against: it drops the grant, the
+    registry entry, ``run-`` and ``todos-``, and leaves the other
+    ``…-{brand_id}`` families behind.
     """
     insights.create_brand({"id": "acme", "name": "Acme", "domain": "acme.com",
                            "enabled": True})
-    state.save("gsc-auth-acme", {"refresh_token": "x", "property": "sc-domain:acme.com"})
     insights.run_brand({"id": "acme", "name": "Acme", "domain": "acme.com"},
                        trigger="test")
+    # stored after the run so the run never tries to open (and use) the token
+    gsc_connect.store["acme"] = {"property": "sc-domain:acme.com", "refresh_token_enc": "sealed"}
 
     off = insights.set_brand_enabled("acme", False)
     assert off["enabled"] is False
     assert [b["id"] for b in insights.list_brands() if b.get("enabled", True)] != []
     assert "acme" not in {b["id"] for b in insights.list_brands() if b.get("enabled", True)}
     # nothing was destroyed, and the flip goes back
-    assert state.load("gsc-auth-acme")["refresh_token"] == "x"
+    assert gsc_connect.store["acme"]["refresh_token_enc"] == "sealed"
     assert insights.latest_run("acme") is not None
     assert insights.set_brand_enabled("acme", True)["enabled"] is True
     assert "acme" in {b["id"] for b in insights.list_brands() if b.get("enabled", True)}
+
+
+def test_hard_deleting_a_brand_deletes_its_search_console_grant(gsc_connect):
+    """A deleted brand must not leave a sealed live refresh token behind with no
+    brand — and so no route — left that could disconnect it."""
+    insights.create_brand({"id": "acme", "name": "Acme", "domain": "acme.com", "enabled": True})
+    insights.create_brand({"id": "other", "name": "Other", "domain": "other.com", "enabled": True})
+    gsc_connect.store["acme"] = {"property": "sc-domain:acme.com", "refresh_token_enc": "a"}
+    gsc_connect.store["other"] = {"property": "sc-domain:other.com", "refresh_token_enc": "o"}
+
+    insights.delete_brand("acme")
+
+    assert "acme" not in gsc_connect.store
+    assert "acme" not in {b["id"] for b in insights.list_brands()}
+    assert gsc_connect.store["other"]["refresh_token_enc"] == "o"   # only that brand's grant
+
+
+def test_a_grant_delete_that_fails_leaves_the_brand_to_retry(gsc_connect, monkeypatch):
+    """The grant goes first. If that write fails the brand is still listed, so
+    the Creator's delete can be retried — never a gone brand with a live token."""
+    from app.services import firestore_repo
+
+    insights.create_brand({"id": "acme", "name": "Acme", "domain": "acme.com", "enabled": True})
+    gsc_connect.store["acme"] = {"property": "sc-domain:acme.com", "refresh_token_enc": "a"}
+
+    def stalled(brand_id):
+        raise TimeoutError("Firestore deadline exceeded")
+
+    monkeypatch.setattr(firestore_repo, "delete_gsc_grant", stalled)
+    with pytest.raises(TimeoutError):
+        insights.delete_brand("acme")
+    assert "acme" in {b["id"] for b in insights.list_brands()}
+    assert "acme" in gsc_connect.store
 
 
 def test_switching_an_unknown_brand_is_a_lookup_failure_not_a_silent_write():
@@ -390,7 +425,34 @@ def test_site_todos_are_never_cut_silently_by_max_todos(monkeypatch):
     run = insights.run_brand(brand, trigger="test")
     assert len(run["todos"]) == insights.MAX_TODOS
     assert sum(t["kind"] == "site" for t in run["todos"]) == 2
-    assert run["todos_not_shown"] == 2   # two search to-dos made room, and it is counted
+    # 30 search + 2 site built, 25 shown: the 5 search to-dos build_todos used to
+    # trim on its own are counted along with the 2 that made room for site ones
+    assert run["todos_not_shown"] == 7
+
+
+def test_build_todos_cap_is_the_default_and_none_returns_every_one():
+    rows = [row(query=f"q{i}", page=f"https://x.com/p{i}", impressions=2000, position=8.0)
+            for i in range(30)]
+    assert len(insights.build_todos("b", rows, [])) == insights.MAX_TODOS
+    assert len(insights.build_todos("b", rows, [], cap=None)) == 30
+    doc = {"snapshots": [{"at": "2026-07-22", "ranks": {
+        f"kw {i}": {"position": None, "top": ["comp.com"]} for i in range(30)}}]}
+    assert len(insights.build_rank_todos("b", doc)) == insights.MAX_TODOS
+    assert len(insights.build_rank_todos("b", doc, cap=None)) == 30
+
+
+def test_rank_mode_counts_the_to_dos_it_cannot_show(monkeypatch):
+    """Without Search Console the fix list comes from rank snapshots; more
+    tracked gaps than MAX_TODOS used to vanish at the 25th without a number."""
+    brand = insights.list_brands()[0]
+    fake_doc = {"snapshots": [{"at": "2026-07-22", "ranks": {
+        f"legal keyword {i}": {"position": None, "top": ["comp.com"]} for i in range(30)}}],
+        "suggested_competitors": ["comp.com"]}
+    monkeypatch.setattr(insights.competitors, "rank_snapshot", lambda b: fake_doc)
+    run = insights.run_brand(brand, trigger="test", today=date(2026, 7, 22))
+    assert run["summary"]["mode"] == "rank-tracking"
+    assert len(run["todos"]) == insights.MAX_TODOS
+    assert run["todos_not_shown"] == 5
 
 
 def test_run_brand_rank_mode_without_gsc(monkeypatch):

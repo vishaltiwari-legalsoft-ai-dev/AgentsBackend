@@ -1,9 +1,10 @@
 """Per-user Gmail consent, the refresh-token vault, and the credentials that
 come back out of it.
 
-The mechanics follow ``seo_geo_agent.gsc_oauth`` — an HMAC-signed ``state``,
-an httpx code exchange, ``google.oauth2.credentials.Credentials`` rebuilt from
-the refresh token — with three deliberate differences:
+An HMAC-signed ``state``, an httpx code exchange, and
+``google.oauth2.credentials.Credentials`` rebuilt from the refresh token.
+``seo_geo_agent.gsc_oauth`` (the SEO agent's "Connect Search Console") reuses
+this round trip, this vault key and this client.
 
 * **The redirect URI is the frontend**, ``<app_public_url>/oauth/google``.
   Google sends the browser there; the console POSTs ``{code, state}`` to
@@ -12,12 +13,13 @@ the refresh token — with three deliberate differences:
   ten minutes, and is checked against the caller who completes it.
 * **The refresh token is sealed** with Fernet under ``INBOX_TOKEN_KEY`` before
   it is stored, and nothing in this package or the router ever returns it.
-  ``gsc_oauth`` keeps its token in the clear; that is not copied.
-* **Its own OAuth client** (``INBOX_GOOGLE_CLIENT_ID`` / ``_SECRET``). The
-  shared Web client's consent screen also signs in outside contractors, so
-  it can never become an Internal app — and an Internal consent screen is
-  what lets a Workspace member grant ``gmail.readonly`` without a verification
-  review. A second GCP project owns this client.
+* **The OAuth client** is read from ``INBOX_GOOGLE_CLIENT_ID`` / ``_SECRET``, a
+  setting separate from the sign-in ``GOOGLE_CLIENT_ID``. In the deployed
+  environments it holds that same sign-in Web client, in GCP project
+  ``helpful-charmer-498509-v5``, whose consent screen is External.
+  Because ``gsc_oauth`` shares the client, :func:`revoke` ends the Google
+  account's whole grant to it — a Search Console connection the same account
+  made for a brand included. ``gsc_oauth`` never revokes for that reason.
 """
 
 from __future__ import annotations
