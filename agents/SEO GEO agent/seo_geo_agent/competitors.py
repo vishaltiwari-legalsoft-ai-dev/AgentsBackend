@@ -66,9 +66,31 @@ def rank_snapshot(brand: dict, search=None) -> dict:
     return doc
 
 
-def rank_shifts(brand_id: str) -> list[dict]:
-    """Per-keyword movement between the two latest snapshots."""
-    doc = state.load(f"ranks-{brand_id}")
+def rank_counts(ranks: dict) -> dict:
+    """``{tracked, top3, top10, unranked}`` for one snapshot's ``ranks`` — the
+    one definition the run summary and the rank history share. A position is
+    Serper's place in the top 10; None means no page of ours in it."""
+    positions = [(e or {}).get("position") for e in (ranks or {}).values()]
+    ranked = [p for p in positions if p]
+    return {
+        "tracked": len(positions),
+        "top3": sum(1 for p in ranked if p <= 3),
+        "top10": len(ranked),
+        "unranked": sum(1 for p in positions if p is None),
+    }
+
+
+def rank_history(doc: dict | None) -> list[dict]:
+    """``[{at, tracked, top3, top10, unranked}]``, one per stored snapshot,
+    oldest first (the order they are stored in)."""
+    return [{"at": snap.get("at"), **rank_counts(snap.get("ranks"))}
+            for snap in (doc or {}).get("snapshots") or [] if isinstance(snap, dict)]
+
+
+def rank_shifts(brand_id: str, doc: dict | None = None) -> list[dict]:
+    """Per-keyword movement between the two latest snapshots. ``doc``: the
+    ``ranks-{brand_id}`` document when the caller already loaded it."""
+    doc = doc if doc is not None else state.load(f"ranks-{brand_id}")
     if not doc or not doc.get("snapshots"):
         return []
     latest = doc["snapshots"][-1]

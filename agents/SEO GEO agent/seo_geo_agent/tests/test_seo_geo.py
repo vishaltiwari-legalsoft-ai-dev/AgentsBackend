@@ -430,6 +430,57 @@ def test_site_todos_are_never_cut_silently_by_max_todos(monkeypatch):
     assert run["todos_not_shown"] == 7
 
 
+def test_a_site_review_on_its_own_puts_its_findings_on_the_stored_fix_list(monkeypatch):
+    """"Analyze website" toasted "N finding(s) added to the fix list" while the
+    review saved only itself — the findings joined at the next run. They now
+    fold into the stored run the way page advice does: stable ids, statuses
+    kept, the one merge_todos cut, the cut recounted, and blog-plan pointers
+    at Fix-list positions re-pointed — never left at a different item."""
+    assert insights.fold_site_review("legalsoft") == (False, 0)   # no run yet: no Fix list to add to
+
+    brand = insights.list_brands()[0]
+    rows = [row(query=f"legal assistant q{i:03d}", page=f"https://legalsoft.com/p{i}",
+                impressions=2000, position=8.0) for i in range(24)]
+    monkeypatch.setattr(insights, "gsc_fetch", lambda prop, s, e, service=None: rows)
+    _review(monkeypatch, [_site_issue("No testimonials on the pricing page")])
+    run = insights.run_brand(brand, trigger="test")
+    assert (len(run["todos"]), run["todos_not_shown"], run["search_todos_not_shown"]) == (25, 0, 0)
+    kept_id = next(t["id"] for t in run["todos"] if t["kind"] == "site")
+    insights.set_todo_status("legalsoft", kept_id, "done")
+    stored = state.load("run-legalsoft")
+    stored["topics"] = [
+        {"keyword": "legal assistant q001", "also_in_fix": 2,
+         "why": f"Your seed · {topics.FIX_LIST_WHY.format(n=2)}"},
+        {"keyword": "legal assistant q022", "also_in_fix": 23,
+         "why": f"Your seed · {topics.FIX_LIST_WHY.format(n=23)}"},
+    ]
+    state.save("run-legalsoft", stored)
+
+    _review(monkeypatch, [
+        _site_issue("Pricing lacks social proof from real clients"),            # same page + category
+        _site_issue("Home page never says who it serves", url="https://legalsoft.com/", category="intent"),
+        _site_issue("Pricing copy is thin and generic", category="content"),
+        _site_issue("Pricing page buries the main offer", category="conversion"),
+        _site_issue("Home page menu hides the service pages", url="https://legalsoft.com/",
+                    category="architecture"),
+        _site_issue("Home page never mentions the cities served", url="https://legalsoft.com/",
+                    category="local"),
+    ])
+    assert insights.fold_site_review("legalsoft") == (True, site_brain.SITE_TODO_SLOTS)
+
+    after = insights.latest_run("legalsoft")
+    site = [t for t in after["todos"] if t["kind"] == "site"]
+    assert len(after["todos"]) == insights.MAX_TODOS and len(site) == site_brain.SITE_TODO_SLOTS
+    assert [t["kind"] for t in after["todos"][:20]] == ["striking"] * 20      # search to-dos keep their order
+    assert next(t for t in site if t["id"] == kept_id)["status"] == "done"     # same finding, same row
+    assert all(t.get("label") for t in after["todos"])
+    # 24 search + 6 site built, 25 shown: 4 search to-dos gave up their places, 1 finding didn't fit
+    assert (after["todos_not_shown"], after["search_todos_not_shown"]) == (5, 4)
+    first, cut = after["topics"]
+    assert (first["also_in_fix"], first["why"]) == (2, f"Your seed · {topics.FIX_LIST_WHY.format(n=2)}")
+    assert (cut["also_in_fix"], cut["why"]) == (None, "Your seed")             # its item no longer made the cut
+
+
 def test_build_todos_cap_is_the_default_and_none_returns_every_one():
     rows = [row(query=f"q{i}", page=f"https://x.com/p{i}", impressions=2000, position=8.0)
             for i in range(30)]
@@ -466,6 +517,190 @@ def test_run_brand_rank_mode_without_gsc(monkeypatch):
     assert run["summary"]["tracked"] == 1 and run["summary"]["top10"] == 1
     assert run["todos"][0]["kind"] == "striking"
     assert run["insights"]
+
+
+def test_a_keyword_that_falls_off_page_one_is_a_drop_and_is_counted():
+    """B3: a keyword with a top-10 place last check and none now counted
+    nowhere — not moved_down (no position to compare), and its to-do read as a
+    content gap that was always there. It is the biggest drop there is."""
+    doc = {"snapshots": [
+        {"at": "2026-10-13", "ranks": {
+            "kw gone": {"position": 4, "top": []},
+            "kw slid": {"position": 3, "top": []},
+            "kw near": {"position": 6, "top": []},
+            "kw never": {"position": None, "top": ["comp.com"]},
+        }},
+        {"at": "2026-10-14", "ranks": {
+            "kw gone": {"position": None, "top": ["a.com", "b.com", "c.com", "d.com"]},
+            "kw slid": {"position": 7, "top": []},
+            "kw near": {"position": 6, "top": []},
+            "kw never": {"position": None, "top": ["comp.com"]},
+        }},
+    ]}
+    summary = insights._rank_summary(doc)
+    assert (summary["fell_off"], summary["moved_down"], summary["unranked"]) == (1, 1, 2)
+    assert (summary["ranks_from"], summary["rank_check_failed"]) == ("2026-10-14", False)
+
+    todos = insights.build_rank_todos("b", doc)
+    assert [(t["kind"], t["query"]) for t in todos] == [
+        ("rank_drop", "kw slid"),        # drops first, by position
+        ("rank_drop", "kw gone"),        # the fall off page one, same rule, no position
+        ("striking", "kw near"),         # #6
+        ("striking", "kw slid"),         # #7
+        ("unranked", "kw never"),        # a gap that was always there stays a gap
+    ]
+    gone = todos[1]
+    assert gone["why"].startswith("Dropped out of Google's top 10 for 'kw gone' (was #4)")
+    assert "a.com, b.com, c.com" in gone["why"] and "d.com" not in gone["why"]
+    assert gone["id"] == insights.todo_id("b", "rank_drop", "", "kw gone")   # stable across runs
+    assert gone["est_monthly_clicks"] is None
+    assert any("fell out of the top 10" in b for b in insights._rank_bullets(summary, todos))
+
+
+def _serper_answering(monkeypatch, outcome):
+    """Every Serper call goes through the REAL ``serper_search`` against a mock
+    transport answering ``outcome``: an HTTP status, or an httpx exception
+    class to raise. Only that call sees a cloud flag and a key — the run around
+    it stays on local files, offline. Returns the list of queries searched."""
+    import httpx
+    from types import SimpleNamespace
+
+    from seo_geo_agent import sources
+
+    searched: list[str] = []
+
+    def handler(request):
+        if isinstance(outcome, int):
+            if outcome == 200:
+                return httpx.Response(200, json={"organic": [
+                    {"link": f"https://comp{i}.com/x", "title": "t", "position": i + 1} for i in range(10)]})
+            return httpx.Response(outcome, json={"message": "Not enough credits"})
+        raise outcome("serper is down", request=request)
+
+    real = sources.serper_search
+
+    def search(query, client=None):
+        searched.append(query)
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(sources, "state", SimpleNamespace(use_cloud=lambda: True))
+            m.setenv("SEO_SERPER_API_KEY", "test-key")
+            return real(query, client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    monkeypatch.setattr(sources, "serper_search", search)
+    monkeypatch.setattr(sources, "serper_available", lambda: True)
+    return searched
+
+
+def _serper_outcomes():
+    import httpx
+
+    return [402, 429, 500, 503, httpx.ConnectError, httpx.ReadTimeout]
+
+
+@pytest.mark.parametrize("outcome", _serper_outcomes())
+def test_a_serper_refusal_or_outage_is_a_search_failure_never_a_raw_http_error(monkeypatch, outcome):
+    """``serper_search`` called ``raise_for_status`` and every caller caught
+    only ``CredentialMissing``: one dry spell (402), a 429 or a 5xx raised an
+    ``HTTPStatusError`` straight through the run. It is now a
+    ``SearchUnavailable`` — a ``CredentialMissing`` — whose text names no URL
+    and no key, and whose note reads as a plain sentence."""
+    from seo_geo_agent import sources
+
+    _serper_answering(monkeypatch, outcome)
+    with pytest.raises(sources.SearchUnavailable) as caught:
+        sources.serper_search("legal virtual assistant")
+    exc = caught.value
+    assert isinstance(exc, sources.CredentialMissing)
+    assert str(exc).startswith("Serper search failed")
+    for leak in ("serper.dev", "https://", "test-key", "Not enough credits", "serper is down"):
+        assert leak not in str(exc)                     # no URL, no key, no provider body
+    note = sources.plain_note(f"Serper: {exc}", log=False)
+    assert note != f"Serper: {exc}" and note.startswith("Serper: the ")   # one of the plain sentences
+    assert exc.why.startswith("the search service")
+
+
+def _ranks_two_checks():
+    state.save("ranks-legalsoft", {"suggested_competitors": ["comp.com"], "snapshots": [
+        {"at": "2026-10-12", "ranks": {"legal virtual assistant": {"position": 3, "top": ["comp.com"]},
+                                       "law firm answering service": {"position": 5, "top": ["comp.com"]}}},
+        {"at": "2026-10-13", "ranks": {"legal virtual assistant": {"position": 8, "top": ["comp.com"]},
+                                       "law firm answering service": {"position": None, "top": ["comp.com"]}}},
+    ]})
+
+
+@pytest.mark.parametrize("outcome", _serper_outcomes())
+def test_a_failed_rank_check_keeps_the_last_good_ranks_and_says_so(monkeypatch, outcome):
+    """A Serper dry spell used to make ``run_brand`` raise for every brand:
+    nothing saved, the dashboard frozen on the last good run. The run is now
+    saved; its ranks are the last good check's, marked as carried over, and a
+    "Rank tracking" note says they weren't updated. No snapshot is taken."""
+    from seo_geo_agent import sources
+
+    _ranks_two_checks()
+    _serper_answering(monkeypatch, outcome)
+    brand = insights.list_brands()[0]
+    run = insights.run_brand(brand, trigger="cron", today=date(2026, 10, 14))
+
+    summary = run["summary"]
+    assert summary["mode"] == "rank-tracking"
+    assert (summary["tracked"], summary["top10"], summary["top3"]) == (2, 1, 0)   # the 10-13 check, not zeros
+    assert (summary["moved_down"], summary["fell_off"]) == (1, 1)
+    assert summary["rank_check_failed"] is True and summary["ranks_from"] == "2026-10-13"
+    rank_notes = [n for n in run["degraded"] if n.startswith("Rank tracking")]
+    assert len(rank_notes) == 1 and "rankings weren't updated" in rank_notes[0]
+    assert sources.plain_note(rank_notes[0], log=False) == rank_notes[0]   # survives every read as written
+    assert "2026-10-13" in run["insights"][0]                               # the bullets say whose figures
+    assert {t["kind"] for t in run["todos"]} == {"rank_drop", "striking"}    # the last good check's fix list
+    assert len(state.load("ranks-legalsoft")["snapshots"]) == 2             # no snapshot from a failed check
+    stored = insights.latest_run("legalsoft")
+    assert stored["at"] == "2026-10-14" and stored["degraded"] == run["degraded"]
+
+
+def test_a_failed_rank_check_with_nothing_to_carry_is_still_a_saved_run(monkeypatch):
+    _serper_answering(monkeypatch, 402)
+    brand = insights.list_brands()[0]
+    run = insights.run_brand(brand, trigger="manual:t", today=date(2026, 10, 14))
+    assert run["summary"]["rank_check_failed"] is True and run["summary"]["ranks_from"] is None
+    assert run["summary"]["mode"] == "search-console" and run["gsc_rows"] == 0   # nothing measured, honestly empty
+    assert run["todos"] == []
+    assert any(n.startswith("Rank tracking: Google results couldn't be reached") for n in run["degraded"])
+    assert insights.latest_run("legalsoft")["at"] == "2026-10-14"
+
+
+def test_a_brand_with_no_seeds_survives_a_serper_failure_in_its_blog_plan(monkeypatch):
+    """A brand with no keywords to track makes no rank call — but its blog plan
+    checks the site review's gaps on Google, and that call raised too."""
+    insights.upsert_brand({"id": "noseeds", "name": "No Seeds", "domain": "noseeds.com", "seeds": []})
+    state.save("sitereview-noseeds", {"brand_id": "noseeds", "issues": [],
+                                      "missing_topics": ["virtual receptionist pricing for law firms"]})
+    searched = _serper_answering(monkeypatch, 429)
+    brand = next(b for b in insights.list_brands() if b["id"] == "noseeds")
+    run = insights.run_brand(brand, trigger="cron", today=date(2026, 10, 14))
+    assert searched == ["virtual receptionist pricing for law firms"]   # the plan's check, and only one
+    assert "Serper: the service's usage limit or credits ran out." in run["degraded"]
+    assert [t["keyword"] for t in run["topics"]] == ["virtual receptionist pricing for law firms"]
+    assert insights.latest_run("noseeds") is not None
+
+
+def test_every_todo_in_a_run_carries_a_short_label(monkeypatch):
+    """B1: the dashboard's "This week" rows point at the Fix list in at most
+    eight words instead of copying an item's action. A run stored before
+    labels existed gets them when read."""
+    _review(monkeypatch, [_site_issue("No testimonials on the pricing page")])
+    monkeypatch.setattr(insights.competitors, "rank_snapshot", lambda b: {"snapshots": [{"at": "2026-10-14",
+        "ranks": {"legal virtual assistant": {"position": 6, "top": ["comp.com"]},
+                  "law firm answering service": {"position": None, "top": ["comp.com"]}}}]})
+    run = insights.run_brand(insights.list_brands()[0], trigger="t", today=date(2026, 10, 14))
+    assert [t["label"] for t in run["todos"]] == [
+        "Refresh: “legal virtual assistant”", "New page: “law firm answering service”", "Trust fix: /pricing"]
+    assert all(len(t["label"].split()) <= insights.LABEL_WORDS for t in run["todos"])
+    assert [t["label"] for t in insights.latest_run("legalsoft")["todos"]] == [t["label"] for t in run["todos"]]
+
+    legacy = state.load("run-legalsoft")
+    for todo in legacy["todos"]:
+        del todo["label"]
+    state.save("run-legalsoft", legacy)
+    assert [t["label"] for t in insights.latest_run("legalsoft")["todos"]] == [t["label"] for t in run["todos"]]
 
 
 # --------------------------------- topic lab ---------------------------------

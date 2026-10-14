@@ -105,6 +105,7 @@ def _rows_28d(brand: dict) -> tuple[list, list[str]]:
 SEO_OFFLINE = "seo_offline"                        # this server runs without live services
 SEO_AI_BAD_ANSWER = "seo_ai_bad_answer"            # the model answered, in a shape we can't use
 SEO_SEARCH_UNCONFIGURED = "seo_search_unconfigured"  # no live Google results set up here
+SEO_SEARCH_UNAVAILABLE = "seo_search_unavailable"  # Serper refused (credits, 429, 5xx) or is unreachable
 SEO_NEEDS_REFRESH = "seo_needs_refresh"            # a precondition: run a data refresh first
 SEO_AI_UNAVAILABLE = "seo_ai_unavailable"          # the AI model could not be reached
 SEO_UNAVAILABLE = "seo_unavailable"                # anything else a live service refused
@@ -117,6 +118,8 @@ _SEO_FAILURES = (
      "This server runs without live services, so {what} can't run here."),
     (SEO_SEARCH_UNCONFIGURED, re.compile(r"serper key missing|serper_api_key", re.I),
      "Live Google results aren't set up on this server, so {what} can't run."),
+    (SEO_SEARCH_UNAVAILABLE, re.compile(r"serper search failed", re.I),
+     "Live Google results couldn't be reached, so {what} couldn't run — try again in a few minutes."),
     (SEO_NEEDS_REFRESH, re.compile(r"run a data refresh first", re.I),
      "Run a data refresh first — {what} can't be built without the latest rank snapshots."),
     (SEO_AI_UNAVAILABLE, re.compile(r"llm unavailable|needs the ai model", re.I),
@@ -173,6 +176,8 @@ def overview(user=Depends(get_current_user)):
     grants = seo_oauth.brand_connections(brands)  # one batched read, mismatch judged
     cards = []
     for brand in brands:
+        # Per brand: the run, its status overlay and the site review — every
+        # card field below is read off these, never off another document.
         run = insights.latest_run(brand["id"])
         review = seo_site.latest_review(brand["id"])
         gsc = _gsc_view(brand, grants.get(brand["id"]), run)
@@ -181,13 +186,9 @@ def overview(user=Depends(get_current_user)):
             "gsc_connected": gsc["connected"],
             "gsc": gsc,
             "headline": _headline(run, review),
-            "last_run": run and {
-                "at": run["at"],
-                "summary": run["summary"],
-                "degraded": run["degraded"],
-                "todo_count": len(run["todos"]),
-                "topic_count": len(run["topics"]),
-            },
+            "site_review_at": (review or {}).get("at"),
+            "ga_reading": bool(run and run.get("ga")),
+            "last_run": run and _last_run_card(run),
         })
     body = {
         "sources": {
@@ -202,6 +203,25 @@ def overview(user=Depends(get_current_user)):
             card.pop("gsc", None)
             card.pop("gsc_connected", None)
     return body
+
+
+def _last_run_card(run: dict) -> dict:
+    """An overview card's ``last_run``. ``open_count``: to-dos not done (the
+    saved statuses already overlaid); ``drops``: keywords that lost places or
+    fell out of the top 10 since the previous check; ``rank_check_failed``:
+    this run's rank check failed and its figures are the last good check's."""
+    summary = run.get("summary") or {}
+    todos = run.get("todos") or []
+    return {
+        "at": run["at"],
+        "summary": run["summary"],
+        "degraded": run["degraded"],
+        "todo_count": len(todos),
+        "topic_count": len(run.get("topics") or []),
+        "open_count": sum(1 for t in todos if t.get("status") != "done"),
+        "drops": int(summary.get("moved_down") or 0) + int(summary.get("fell_off") or 0),
+        "rank_check_failed": bool(summary.get("rank_check_failed")),
+    }
 
 
 @router.post("/seo-geo/brands")
@@ -241,9 +261,15 @@ def remove_brand(brand_id: str, user=Depends(require_creator),
 @router.post("/seo-geo/run/{brand_id}")
 def run_brand(brand_id: str, user=Depends(get_current_user),
               act: Activity = trail.records("run", "Full SEO refresh", unit=JOB)):
+    """A full refresh, now. A source that fails (a Serper dry spell, Search
+    Console, GA) is a note in ``degraded`` on a saved run — 200. Only a refresh
+    that could produce nothing at all answers the coded 503."""
     brand = _brand_or_404(brand_id)
     _for(act, brand)
-    run = insights.run_brand(brand, trigger=f"manual:{user['email']}")
+    try:
+        run = insights.run_brand(brand, trigger=f"manual:{user['email']}")
+    except CredentialMissing as exc:
+        raise _seo_unavailable(exc, "the data refresh") from exc
     act.note(f"Full SEO refresh — {len(run['todos'])} to-dos, {len(run['topics'])} topics")
     return {"at": run["at"], "summary": run["summary"], "degraded": run["degraded"],
             "todo_count": len(run["todos"]), "topic_count": len(run["topics"])}
@@ -315,15 +341,23 @@ def brand_detail(brand_id: str, user=Depends(get_current_user)):
 @router.post("/seo-geo/site-review/{brand_id}")
 def run_site_review(brand_id: str, user=Depends(get_current_user),
                     act: Activity = trail.records("site_review", "Expert site review")):
-    """Crawl the brand's site, build the corpus, and run the expert review."""
+    """Crawl the brand's site, build the corpus, and run the expert review.
+
+    Its findings join the stored run's Fix list right away
+    (``insights.fold_site_review``). ``fix_list_updated`` is false when no run
+    exists yet — there is no Fix list until the first run, which then reads
+    this review — and ``findings_on_fix_list`` is how many findings the Fix
+    list now shows (its cap can leave some out)."""
     brand = _brand_or_404(brand_id)
     _for(act, brand)
     try:
         review = seo_site.analyze(brand)
     except CredentialMissing as exc:
         raise _seo_unavailable(exc, "the site review") from exc
-    act.note(f"Expert site review of {brand['domain']}")
-    return review
+    updated, on_list = insights.fold_site_review(brand_id)
+    act.note(f"Expert site review of {brand['domain']}"
+             + (f" — {on_list} finding(s) on the Fix list" if updated else " — no run yet to add findings to"))
+    return {**review, "fix_list_updated": updated, "findings_on_fix_list": on_list}
 
 
 @router.get("/seo-geo/site-review/{brand_id}")
@@ -406,14 +440,20 @@ def get_keywords(brand_id: str, user=Depends(get_current_user)):
 
 @router.get("/seo-geo/competitors/{brand_id}")
 def get_competitors(brand_id: str, user=Depends(get_current_user)):
+    """``checked_at``: the date of the latest rank snapshot (None before the
+    first). ``history``: ``[{at, tracked, top3, top10, unranked}]``, one per
+    stored snapshot, oldest first."""
     brand = _brand_or_404(brand_id)
     ranks_doc = seo_state.load(f"ranks-{brand_id}") or {}
     sitemap_doc = seo_state.load(f"sitemaps-{brand_id}") or {}
+    snapshots = ranks_doc.get("snapshots") or []
     return {
         "tracked": brand.get("competitors", []),
         "suggested": ranks_doc.get("suggested_competitors", []),
-        "shifts": seo_competitors.rank_shifts(brand_id),
+        "shifts": seo_competitors.rank_shifts(brand_id, ranks_doc),
         "feed": sitemap_doc.get("last_feed", {}),
+        "checked_at": snapshots[-1].get("at") if snapshots else None,
+        "history": seo_competitors.rank_history(ranks_doc),
     }
 
 
@@ -713,13 +753,22 @@ def cron_run(request: Request, response: Response,
     unconditional 200 meant a sweep could be dead for weeks with the reason
     buried in a response body nobody reads. 207 stays 2xx on purpose — one
     permanently broken brand must not put the job into an endless retry loop —
-    and the log line is what a human alerts on."""
+    and the log line is what a human alerts on.
+
+    ONE rank snapshot per brand per sweep. A rank-tracking run takes it inside
+    ``run_brand`` (or tries, and says so in its notes); only a Search Console
+    brand, whose run takes none, gets it here. The sweep used to take a second
+    one minutes after the run's, so the two latest snapshots were the same
+    night (every shift ~0), the stored history covered half as many nights and
+    the Serper spend doubled. A brand whose rankings weren't updated still ran:
+    it is counted in ``rank_checks_failed`` and logged, not failed."""
     expected = os.environ.get("SEO_CRON_KEY", "")
     if not expected:
         raise HTTPException(status_code=503, detail="SEO_CRON_KEY not configured")
     if not hmac.compare_digest(request.headers.get("x-cron-key", ""), expected):
         raise HTTPException(status_code=403, detail="Bad cron key")
     results = {}
+    rank_failed: list[str] = []
     for brand in insights.list_brands():
         if not brand.get("enabled", True):
             continue
@@ -728,11 +777,20 @@ def cron_run(request: Request, response: Response,
             entry = {"ok": True, "todo_count": len(run["todos"])}
             # Tracking extras are best-effort: missing keys must not fail the
             # sweep, and they deliberately do NOT count toward the status below.
-            try:
-                seo_competitors.rank_snapshot(brand)
-                entry["ranks"] = "updated"
-            except Exception as exc:  # noqa: BLE001
-                entry["ranks"] = f"skipped: {exc}"
+            if insights.checked_ranks(run):
+                ranks_stale = bool((run.get("summary") or {}).get("rank_check_failed"))
+                entry["ranks"] = ("not updated: the run's rank check failed" if ranks_stale
+                                  else "updated by the run")
+            else:
+                try:
+                    seo_competitors.rank_snapshot(brand)
+                    entry["ranks"] = "updated"
+                    ranks_stale = False
+                except Exception as exc:  # noqa: BLE001
+                    entry["ranks"] = f"skipped: {exc}"
+                    ranks_stale = True
+            if ranks_stale:
+                rank_failed.append(brand["id"])
             try:
                 seo_competitors.sitemap_watch(brand)
                 entry["sitemaps"] = "updated"
@@ -744,7 +802,10 @@ def cron_run(request: Request, response: Response,
             results[brand["id"]] = {"ok": False, "error": str(exc)}
     ok = sum(1 for r in results.values() if r.get("ok"))
     failed = len(results) - ok
-    out = {"brands": results, "ok": ok, "failed": failed}
+    out = {"brands": results, "ok": ok, "failed": failed, "rank_checks_failed": len(rank_failed)}
+    if rank_failed:
+        logger.warning("SEO cron sweep: rankings not updated for %d brand(s): %s",
+                       len(rank_failed), ", ".join(rank_failed))
     if results and ok == 0:
         out["status"] = "failed"
         response.status_code = 502

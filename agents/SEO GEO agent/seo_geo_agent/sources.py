@@ -63,6 +63,22 @@ class CredentialMissing(Exception):
     """A data source has no usable credentials — caller degrades, never crashes."""
 
 
+class SearchUnavailable(CredentialMissing):
+    """Serper answered with an error status, or could not be reached at all.
+
+    A subclass, so every caller that already degrades on ``CredentialMissing``
+    (rank tracking, the blog plan, the keyword lab, the SERP X-ray) degrades on
+    an out-of-credits spell or an outage too, instead of letting an
+    ``httpx.HTTPStatusError`` fail the whole brand run. ``why`` is one plain
+    clause naming the cause, safe to show; the message stays matchable by
+    :func:`plain_reason` and by the router's coded 503s ("serper search failed").
+    """
+
+    def __init__(self, message: str, *, why: str):
+        super().__init__(message)
+        self.why = why
+
+
 # ------------------------------ plain notes ------------------------------
 # A degraded note is ``"<Source>: <reason>"`` and the reason used to be the
 # exception text — ``<HttpError 403 when requesting https://…>`` straight into
@@ -381,8 +397,42 @@ def serper_available() -> bool:
     return bool(_serper_key()) and state.use_cloud()
 
 
+#: Serper's refusals, by HTTP status: (message detail, plain clause). The
+#: detail words are the ones :func:`plain_reason` turns into its sentence
+#: ("credits", "429"); a refused key carries no status code, which would read
+#: as a Google property permission there. The clause is what a rank note says.
+_SERPER_REFUSALS = {
+    402: ("out of credits (HTTP 402)", "the search service has no searches left on its plan"),
+    429: ("rate limited (HTTP 429)", "the search service is turning requests away for now"),
+    401: ("this server's key was refused", "the search service refused this server's key"),
+    403: ("this server's key was refused", "the search service refused this server's key"),
+}
+_SERPER_DOWN = "the search service didn't answer"
+
+
+def _serper_failure(exc: Exception) -> SearchUnavailable:
+    """The :class:`SearchUnavailable` for one failed Serper request. Never
+    carries the response body, the URL or the request headers (the key)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        detail, why = _SERPER_REFUSALS.get(status) or (
+            (f"service unavailable (HTTP {status})", _SERPER_DOWN) if status >= 500
+            else ("the request was refused", "the search service refused the request"))
+        return SearchUnavailable(f"Serper search failed: {detail}", why=why)
+    if isinstance(exc, httpx.TimeoutException):
+        return SearchUnavailable("Serper search failed: timed out", why=_SERPER_DOWN)
+    if isinstance(exc, httpx.HTTPError):
+        return SearchUnavailable(f"Serper search failed: connection error ({type(exc).__name__})",
+                                 why=_SERPER_DOWN)
+    return SearchUnavailable("Serper search failed: the answer couldn't be read", why=_SERPER_DOWN)
+
+
 def serper_search(query: str, client: httpx.Client | None = None) -> dict:
-    """One Google SERP via Serper: organic top-10, related searches, PAA, AIO flag."""
+    """One Google SERP via Serper: organic top-10, related searches, PAA, AIO flag.
+
+    Raises :class:`SearchUnavailable` when Serper refuses (402 out of credits,
+    429, 5xx), cannot be reached, or answers something that is not JSON — the
+    raw failure goes to the log, never into a note or a response."""
     key = _serper_key()
     if not key or not state.use_cloud():
         raise CredentialMissing("SEO_SERPER_API_KEY not set")
@@ -396,6 +446,12 @@ def serper_search(query: str, client: httpx.Client | None = None) -> dict:
         )
         resp.raise_for_status()
         data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError(f"Serper answered a JSON {type(data).__name__}")
+    except (httpx.HTTPError, ValueError) as exc:
+        failure = _serper_failure(exc)
+        _log.warning("%s — raw: %s", failure, f"{type(exc).__name__}: {exc}"[:500])
+        raise failure from exc
     finally:
         if own:
             cli.close()
