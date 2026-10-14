@@ -53,6 +53,17 @@ def _tokens(text: str) -> set[str]:
     return {w for w in text.lower().split() if w not in STOPWORDS and len(w) > 2}
 
 
+def _display(text: str) -> str:
+    """A candidate as the plan shows it: spacing collapsed, no trailing ``?``/``.``."""
+    return " ".join(text.split()).strip("?. ").strip()
+
+
+def topic_key(text: str) -> str:
+    """The one key a phrase has in the blog plan — the same words in any case
+    or spacing are the same topic."""
+    return _display(text).lower()
+
+
 def _token_overlap(cand: set[str], other: set[str]) -> bool:
     """True when `cand` is (near-)covered by `other`: a subset, or sharing >=80% of its tokens."""
     if not cand or not other:
@@ -160,13 +171,25 @@ def _url_path(url: str) -> str:
     return urlparse(url).path or "/"
 
 
+#: Our own result at or above this place is a page to refresh, not a post to write.
+REFRESH_RANK = 3
+#: The one sentence for it, whichever path found it — and ``refresh_url``
+#: always carries the page it names.
+REFRESH_WHY = "You already rank #{n} with {path} — refresh that page rather than writing a new post."
+
+
+def _refresh_why(own: tuple[int, str]) -> str:
+    return REFRESH_WHY.format(n=own[0], path=_url_path(own[1]))
+
+
 def _difficulty(serp: dict, own_domain: str) -> tuple[str, list[str]]:
     """How hard the top 10 is to break into — counting OUR result as ours: a
-    page of ours at #10 is neither a strong rival nor a reason to write anew."""
+    page of ours at #10 is neither a strong rival nor a reason to write anew.
+    Ours in the top REFRESH_RANK: "hard" (for a NEW post) with no evidence —
+    the topic says "refresh that page" itself (:data:`REFRESH_WHY`)."""
     own = _own_result(serp, own_domain)
-    if own and own[0] <= 3:
-        return "hard", [f"we already rank #{own[0]} with {_url_path(own[1])} — refresh that page "
-                        "rather than writing a new post"]
+    if own and own[0] <= REFRESH_RANK:
+        return "hard", []
     others = [r for r in serp["organic"] if not own or r.get("link") != own[1]]
     weak = [r["link"] for r in others if any(w in r["link"].lower() for w in WEAK_DOMAINS)]
     evidence = [f"we rank #{own[0]} with {_url_path(own[1])}"] if own else []
@@ -246,7 +269,10 @@ def _provenance(source: str, from_seed: str | None, seed_is_users: bool) -> str:
 
 
 def _why(source: str, from_seed: str | None, seed_is_users: bool,
-         volume: int, trend: str, difficulty: str | None, evidence: list[str]) -> str:
+         volume: int, trend: str, difficulty: str | None, evidence: list[str],
+         refresh: str = "") -> str:
+    """``refresh`` (:data:`REFRESH_WHY`, when we already rank top 3) stands in
+    for the difficulty: "hard" describes a new post nobody should write."""
     parts = []
     if volume:
         parts.append(f"~{volume:,} impressions/mo already visible to us")
@@ -254,7 +280,9 @@ def _why(source: str, from_seed: str | None, seed_is_users: bool,
                   "falling": "interest is cooling", "flat": ""}[trend]
     if trend_text:
         parts.append(trend_text)
-    if difficulty:
+    if refresh:
+        parts.append(refresh)
+    elif difficulty:
         parts.append(difficulty if not evidence else f"{difficulty}: {'; '.join(evidence)}")
     lead = _provenance(source, from_seed, seed_is_users)
     if not parts and source not in (SRC_GOOGLE, SRC_SEARCH_DATA):
@@ -360,10 +388,10 @@ def build_topics(
 
     def add(cand: str, source: str, from_key: str | None = None) -> str | None:
         """Add one candidate; return its key when it is (now or already) in the pool."""
-        text = " ".join(cand.split()).strip("?. ").strip()
+        text = _display(cand)
         if not text:
             return None
-        key = text.lower()
+        key = topic_key(text)
         if key in candidates:
             return key
         if source != SRC_SEED:  # the user's own words are never filtered out
@@ -468,7 +496,10 @@ def build_topics(
         avoided_url = _cannibalized_by(display, corpus_pages)
         seed_key = parent.get(key)
         from_seed = candidates[seed_key][0] if seed_key else None
-        why = _why(source, from_seed, seed_key in user_set, volume, trend, difficulty, evidence)
+        own = _own_result(serp, brand["domain"]) if serp else None
+        top = own if own and own[0] <= REFRESH_RANK else None
+        why = _why(source, from_seed, seed_key in user_set, volume, trend, difficulty, evidence,
+                   refresh=_refresh_why(top) if top else "")
         topic = {
             "keyword": display,
             "source": source,
@@ -480,13 +511,17 @@ def build_topics(
             "volume_label": _volume_label(volume, source),
             "trend": trend,
             "difficulty": difficulty,
+            # What the difficulty chip says instead of "hard" when we already
+            # rank top 3; None otherwise. ``own_rank``: our place in the top 10.
+            "difficulty_label": f"we rank #{top[0]}" if top else None,
+            "own_rank": own[0] if own else None,
             "est_monthly_clicks": round(volume * 0.11) if volume else None,
             "why": why,
             "score": round(score, 3),
             "avoided": bool(avoided_url),
             "avoided_reason": f"overlaps {avoided_url}" if avoided_url else None,
             "also_in_fix": None,
-            "refresh_url": None,
+            "refresh_url": top[1] if top else None,
         }
         if source == SRC_SEED:
             # The user's own words are a hard requirement: never avoided. Where
@@ -494,14 +529,14 @@ def build_topics(
             # topic stays live and says which page move comes first.
             lead = _provenance(source, None, True)
             fix_at = fix_queries.get(frozenset(_tokens(display)))
-            own = _own_result(serp, brand["domain"]) if serp else None
             if fix_at:
+                # The Fix list holds the page move; the topic points there only.
                 topic["also_in_fix"] = fix_at
                 topic["why"] = f"{lead} · {FIX_LIST_WHY.format(n=fix_at)}"
+                topic["refresh_url"] = None
             elif avoided_url:
                 if own:
-                    note = (f"You already rank #{own[0]} with {_url_path(own[1])} — refresh that page "
-                            "rather than writing a new post.")
+                    note = _refresh_why(own)
                 else:
                     note = (f"Your page {_url_path(avoided_url)} already targets this — refresh it "
                             "rather than writing a new post.")
