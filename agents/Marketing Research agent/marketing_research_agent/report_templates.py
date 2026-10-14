@@ -104,7 +104,8 @@ _PLACEHOLDER_RE = re.compile(r"\{\{\s*([^{}]*?)\s*\}\}")
 #: can never drift apart. An absent metric renders as exactly this.
 ABSENT_MARKER = vrr.render_scalar({}, next(iter(vr.METRICS)))
 
-_FORMAT_WORDS = {vr.MONEY: "dollars", vr.PCT: "percent", vr.INT: "count", "text": "text"}
+_FORMAT_WORDS = {vr.MONEY: "dollars", vr.PCT: "percent", vr.INT: "count", vr.DATE: "date",
+                 "text": "text"}
 _TEXT_SCALAR_NOTES = {
     "title": "The report's title, e.g. “September 2”",
     "month_label": "The report month, e.g. “September 2026”",
@@ -112,7 +113,8 @@ _TEXT_SCALAR_NOTES = {
     "year_month": "The report month as YYYY-MM",
 }
 _KIND_WORDS = {"band": "band", "tiles": "tiles", "chart": "chart", "table": "table",
-               "list": "list", "block": "two-column block", "note": "note"}
+               "list": "list", "block": "two-column block", "note": "note",
+               "cards": "grid of cards"}
 
 
 def _token(name: str) -> str:
@@ -177,6 +179,13 @@ _BLOCK_SUMMARIES: dict[str, Callable[[Mapping[str, Any]], str]] = {
     "standouts": lambda r: _count(r.get("standouts"), "standout"),
     "watch_items": lambda r: _count(r.get("watch_items"), "watch item"),
     "action_summary": lambda r: _count(r.get("actions"), "action"),
+    "lead_status_by_vendor": lambda r: (
+        _count((r.get("lead_status") or {}).get("vendors"), "vendor") + " matched"
+        if (r.get("lead_status") or {}).get("available") else "no lead-status data"),
+    "channel_benchmarks": lambda r: _count((r.get("benchmarks") or {}).get("channels"),
+                                           "channel row"),
+    "vendor_investment": lambda r: _count(r.get("vendors"), "vendor") + " + portfolio total",
+    "vendor_detail": lambda r: _count(r.get("vendors"), "card"),
     "data_gaps": lambda r: _count(r.get("missing"), "missing figure"),
     "footer": lambda r: f"Built from the {r.get('as_of') or '—'} pull",
 }
@@ -218,6 +227,9 @@ def vocabulary(report: Mapping[str, Any] | None = None) -> list[dict]:
     each entry carries its live ``example`` ("$2,737"); without one, None."""
     return [{"placeholder": p.token, "name": p.name, "kind": p.kind, "title": p.title,
              "description": p.description,
+             # The scalar's value kind (money / pct / int / date / text) so a UI can
+             # label a date "Date" rather than "Figure"; None for a block.
+             "format": p.format,
              "example": p.example(report) if report is not None else None}
             for p in PLACEHOLDERS.values()]
 
@@ -1731,9 +1743,9 @@ def _scalar_html(report: Mapping[str, Any], name: str) -> str:
 
 
 def _require_report(report: Any) -> None:
-    if not isinstance(report, Mapping) or report.get("generator") != vr.GENERATOR_VERSION:
+    if not isinstance(report, Mapping) or report.get("generator") not in vr.READABLE_GENERATORS:
         got = report.get("generator") if isinstance(report, Mapping) else type(report).__name__
-        raise ValueError(f"this renderer reads '{vr.GENERATOR_VERSION}' reports, got '{got}'")
+        raise ValueError(f"this renderer reads {vrr.readable_generators()} reports, got '{got}'")
 
 
 def _default_title(report: Mapping[str, Any]) -> str:

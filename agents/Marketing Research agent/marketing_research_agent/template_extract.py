@@ -138,6 +138,19 @@ SECTION_HINTS: dict[str, str] = {
     "standouts": "A list of positive signals shown on its own.",
     "watch_items": "A list of concerns or watch items shown on its own.",
     "action_summary": "A table of vendor, status pill and recommended action.",
+    "lead_status_by_vendor": "A table with one row per vendor and columns for demo "
+                             "statuses from the lead sheet: contract sent, hot lead "
+                             "follow-up, completed/DNC, scheduled, no show, canceled, "
+                             "bad lead, total.",
+    "channel_benchmarks": "A table of the benchmark ceilings or targets per channel "
+                          "(Meta, Google, Email, Total): cost per demo booked, cost per "
+                          "demo completed, show-rate target, plus rule thresholds.",
+    "vendor_investment": "A table with one row per vendor showing budget, spend, "
+                         "management fee, spend including fees, and cost per lead / "
+                         "qualified lead / demo completed on that fee-inclusive basis.",
+    "vendor_detail": "A grid of cards, one per vendor, each with a status pill, a "
+                     "spend-of-budget bar, a handful of key figures and a short "
+                     "recommended action.",
     "data_gaps": "A panel explaining missing figures, em-dashes and the basis "
                  "of the data.",
     "footer": "The closing band with methodology or provenance text.",
@@ -181,12 +194,37 @@ class Usage(TypedDict):
 class ExtractionResult(TypedDict):
     layout: dict                    # passes vendor_report_render.layout_from_dict
     unsupported: list[dict]         # [{title, description}], shown to the user
+    #: Every section of the sample that is NOT in ``layout``, with why: first
+    #: the unsupported ones in the sample's order (reason = the model's one-line
+    #: description of what it shows, or :data:`NO_CATALOG_MATCH` when it gave
+    #: none), then the duplicates the normaliser dropped (reason = why). The one
+    #: list a UI shows under "left out of your template" — nothing a reader saw
+    #: disappears silently.
+    left_out: list[dict]            # [{title, reason}]
     matched_count: int              # sample sections mapped to a catalog type
     model: str                      # the model OpenRouter says served the call
     usage: Usage
     notes: list[dict]               # [{kind, detail, ...}] what the code changed and why
     source: dict                    # {filename, kind, pages, images}
     prompt_version: str
+
+
+#: The reason written for an unsupported section the model described with
+#: nothing at all.
+NO_CATALOG_MATCH = "No section of the vendor report shows this."
+
+
+def left_out_of(unsupported: Sequence[Mapping], notes: Sequence[Mapping]) -> list[dict]:
+    """``[{title, reason}]`` for every sample section not in the layout — see
+    :class:`ExtractionResult`. Derived, so it can never disagree with
+    ``unsupported`` and ``notes``."""
+    out = [{"title": str(u.get("title") or "Untitled section"),
+            "reason": str(u.get("description") or "").strip() or NO_CATALOG_MATCH}
+           for u in unsupported]
+    out += [{"title": str(n.get("title") or n.get("section") or "Untitled section"),
+             "reason": str(n.get("detail") or "")}
+            for n in notes if n.get("kind") == "duplicate"]
+    return out
 
 
 class TemplateExtractionError(Exception):
@@ -898,16 +936,19 @@ def interpret(reply: Mapping) -> tuple[dict, list[dict], int, list[dict]]:
             continue
         if stype in seen:
             _note(notes, "duplicate", f"The sample has a second {stype} section; only the "
-                  "first is kept.", section=stype)
+                  "first is kept.", section=stype,
+                  title=_clean_text(raw.get("title"), TITLE_MAX) or entry.title)
             continue
         seen.add(stype)
         sections.append(_section(entry, raw, notes))
     if "highlights" in seen:
         for part in ("standouts", "watch_items"):
             if part in seen:
+                dropped = next(s for s in sections if s["type"] == part)
                 sections = [s for s in sections if s["type"] != part]
                 _note(notes, "duplicate", f"{part} is already inside highlights; the "
-                      "separate section is dropped.", section=part)
+                      "separate section is dropped.", section=part,
+                      title=dropped.get("title") or vrr.SECTION_REGISTRY[part].title)
     if not sections:
         raise TemplateExtractionError(
             f"None of the {len(unsupported)} section(s) in this sample show data we can "
@@ -1011,6 +1052,7 @@ def extract_layout(data: bytes, kind: Kind, *, filename: str,
     result: ExtractionResult = {
         "layout": layout,
         "unsupported": unsupported,
+        "left_out": left_out_of(unsupported, notes),
         "matched_count": matched,
         "model": spend.served,
         "usage": spend.usage(),

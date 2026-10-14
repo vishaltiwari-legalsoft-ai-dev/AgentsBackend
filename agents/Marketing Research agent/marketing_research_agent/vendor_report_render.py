@@ -541,6 +541,249 @@ def _data_gaps(ctx: _Ctx, spec: SectionSpec) -> str:
             + "".join(blocks) + "</div></div></section>")
 
 
+# --- template-coverage blocks (2026-10-15) ---------------------------------------
+# Four sections a designer's sample commonly has and the built-in report did not:
+# a lead-status table, the benchmark ceilings, an investment-basis table and one
+# card per vendor. Each reads only the report dict; every figure the tracker did
+# not report is the em-dash; no sentence here is generated — the card's action
+# text is the report's rule-based line, verbatim.
+
+def _vs(value: Any, ceiling: Any, polarity: str) -> str:
+    """Tone class for a figure against its own-channel ceiling/target."""
+    if value is None or ceiling is None:
+        return ""
+    if polarity == "down":
+        return "up" if value <= ceiling else "down"
+    return "up" if value >= ceiling else "down"
+
+
+def _range(lo: Any, hi: Any, kind: str) -> str:
+    if lo is None or hi is None:
+        return _ABSENT
+    return f"{_f(lo, kind)}&#8211;{_f(hi, kind)}"
+
+
+def _td(value: Any, kind: str, tone: str = "") -> str:
+    """A figure cell, toned only when there is a tone to give it."""
+    return f'<td class="{tone}">{_f(value, kind)}</td>' if tone else f"<td>{_f(value, kind)}</td>"
+
+
+def _no_data(ctx: _Ctx, spec: SectionSpec, reason: str) -> str:
+    """A block whose data is not in this report says so — never an empty table
+    of zeros."""
+    return _section(ctx, spec.title or SECTION_REGISTRY[spec.type].title,
+                    f'<div class="note">{_esc(reason)}</div>')
+
+
+_LEAD_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("contract_sent", "Contract sent"), ("hot_lead_follow_up", "Hot lead follow-up"),
+    ("completed_dnc", "Completed → DNC"), ("scheduled", "Scheduled"),
+    ("no_show", "No show"), ("canceled", "Canceled"), ("bad_lead", "Bad lead"),
+    ("total", "Total demos"),
+)
+
+
+def _lead_status_table(ctx: _Ctx, spec: SectionSpec) -> str:
+    r = ctx.report
+    ls = r.get("lead_status") or {}
+    if not ls.get("available"):
+        return _no_data(ctx, spec, ls.get("reason") or "No lead-status data for this month.")
+    head = "<th>Vendor</th>" + "".join(f"<th>{_esc(h)}</th>" for _k, h in _LEAD_COLUMNS)
+    body = []
+    for v in ls.get("vendors") or []:
+        cells = [f"<td>{_esc(v.get('vendor'))}</td>"]
+        cells += [f"<td>{_f(v.get(k), vr.INT)}</td>" for k, _h in _LEAD_COLUMNS]
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    totals = ls.get("totals") or {}
+    foot = ("<tr class=\"total\"><td>Matched vendors</td>"
+            + "".join(f"<td>{_f(totals.get(k), vr.INT)}</td>" for k, _h in _LEAD_COLUMNS)
+            + "</tr>")
+    table = ('<div class="vwrap"><table class="vtab"><thead><tr>' + head + "</tr></thead><tbody>"
+             + "".join(body) + "</tbody><tfoot>" + foot + "</tfoot></table></div>")
+    as_of = str(ls.get("as_of") or "")[:10]
+    cap = ("Demo statuses from the lead-analysis sheet"
+           + (f", pulled {_esc(as_of)}" if as_of else "")
+           + ", joined to the vendor tabs by campaign name. Completed → DNC counts demos "
+             "that were completed and whose deal stage is now Lost DNC. Scheduled = demos "
+             "with no outcome recorded yet.")
+    unmatched = ls.get("unmatched_campaigns") or []
+    if unmatched:
+        cap += (" Lead-sheet campaigns with no vendor tab this month: "
+                + _esc("; ".join(str(u) for u in unmatched)) + ".")
+    return _section(ctx, spec.title or SECTION_REGISTRY[spec.type].title,
+                    table + f'<p class="cap" style="margin-top:10px">{cap}</p>')
+
+
+def _channel_benchmarks(ctx: _Ctx, spec: SectionSpec) -> str:
+    r = ctx.report
+    bench = r.get("benchmarks")
+    if not isinstance(bench, Mapping) or not bench.get("channels"):
+        return _no_data(ctx, spec, "Benchmarks were not recorded in this report (it was built "
+                        "before they were included). Rebuild the report to see them.")
+    head = ("<th>Channel</th><th>Cost / qual. demo booked</th><th>Cost / demo completed</th>"
+            "<th>Show-rate target</th>")
+    body = []
+    for c in bench["channels"]:
+        body.append(
+            f"<tr><td>{_esc(c.get('label') or c.get('channel'))}</td>"
+            f"<td>{_range(c.get('cpd_booked_low'), c.get('cpd_booked_high'), vr.MONEY)}</td>"
+            f"<td>{_range(c.get('cpd_completed_low'), c.get('cpd_completed_high'), vr.MONEY)}</td>"
+            f"<td>{_f(c.get('show_rate_target_pct'), vr.PCT)}</td></tr>")
+    table = ('<div class="vwrap"><table class="vtab"><thead><tr>' + head + "</tr></thead><tbody>"
+             + "".join(body) + "</tbody></table></div>")
+    t = bench.get("thresholds") or {}
+    rules = [
+        f"Cost per lead ceiling {_f(t.get('cost_per_lead_ceiling'), vr.MONEY)}",
+        "Cost per qualified lead target "
+        f"{_range(t.get('cost_per_qualified_lead_target_low'), t.get('cost_per_qualified_lead_target_high'), vr.MONEY)}",
+        f"Qualified-lead ratio target {_f(t.get('ql_ratio_great'), vr.PCT)}+",
+        f"Red lines: bad-lead rate {_f(t.get('bad_lead_rate_red'), vr.PCT)}, "
+        f"no-show rate {_f(t.get('no_show_rate_red'), vr.PCT)}, "
+        f"cancellation rate {_f(t.get('canceled_rate_red'), vr.PCT)}",
+    ]
+    cap = ("Ceilings and targets from Targets (editable). A vendor is measured against its "
+           "own channel's row; a channel without a row uses Total. " + " · ".join(rules) + ".")
+    return _section(ctx, spec.title or SECTION_REGISTRY[spec.type].title,
+                    table + f'<p class="cap" style="margin-top:10px">{cap}</p>')
+
+
+#: Investment table columns: (vendor field, portfolio key, header, format, benchmark key).
+_INVESTMENT_COLUMNS: tuple[tuple[str, str | None, str, str, str | None], ...] = (
+    ("budget", "total_budget", "Budget", vr.MONEY, None),
+    ("spend", "total_spend", "Spend", vr.MONEY, None),
+    ("management_fee", "total_management_fees", "Mgmt fee", vr.MONEY, None),
+    ("spend_investment", "total_spend_investment", "Spend incl. fees", vr.MONEY, None),
+    ("cost_per_lead_investment", "cost_per_lead_investment", "CPL incl. fees", vr.MONEY,
+     "cost_per_lead_investment"),
+    ("cost_per_qualified_lead_investment", "cost_per_qualified_lead_investment",
+     "CPQL incl. fees", vr.MONEY, "cost_per_qualified_lead_investment"),
+    ("cost_per_demo_completed_investment", "cost_per_demo_completed_investment",
+     "Cost / demo completed incl. fees", vr.MONEY, "cost_per_demo_completed_investment"),
+)
+
+
+def _ceiling(v: Mapping, key: str | None) -> tuple[Any, str]:
+    b = v.get("benchmarks") or {}
+    if not key:
+        return None, "down"
+    return (b.get("ceilings") or {}).get(key), (b.get("polarity") or {}).get(key, "down")
+
+
+def _vendor_investment(ctx: _Ctx, spec: SectionSpec) -> str:
+    r = ctx.report
+    rows = list(r.get("vendors") or [])
+    if _opt(spec, "sort") == "budget":
+        rows.sort(key=lambda v: -(v.get("budget") or 0))
+    elif _opt(spec, "sort") == "spend":
+        rows.sort(key=lambda v: -(v.get("spend_investment") or v.get("spend") or 0))
+    head = ("<th>Vendor</th><th>Channel</th>"
+            + "".join(f"<th>{_esc(h)}</th>" for _f_, _p, h, _k, _b in _INVESTMENT_COLUMNS))
+    body = []
+    for v in rows:
+        cells = [f"<td>{_esc(v.get('name'))}</td>", f"<td>{_esc(v.get('channel'))}</td>"]
+        for field_, _pk, _h, kind, bkey in _INVESTMENT_COLUMNS:
+            ceiling, polarity = _ceiling(v, bkey)
+            cells.append(_td(v.get(field_), kind, _vs(v.get(field_), ceiling, polarity)))
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    p = r.get("portfolio") or {}
+    total = ["<td>Portfolio total</td>", "<td></td>"]
+    for _field, pkey, _h, kind, _b in _INVESTMENT_COLUMNS:
+        total.append(f"<td>{_f(p.get(pkey) if pkey else None, kind)}</td>")
+    table = ('<div class="vwrap"><table class="vtab"><thead><tr>' + head + "</tr></thead><tbody>"
+             + "".join(body) + '</tbody><tfoot><tr class="total">' + "".join(total)
+             + "</tr></tfoot></table></div>")
+    legend = ('<p class="cap" style="margin-top:10px">Spend incl. fees is the tracker\'s '
+              "Investment column: media spend plus the vendor's management fee. The cost "
+              "ratios divide it by the same lead and demo counts as the Performance figures. "
+              "Green/red: at or under / over the ceiling for that vendor's own channel "
+              "(see Channel benchmarks). The fee total is the sum of the vendors that report "
+              "a fee; an em-dash is a figure not reported or with nothing to divide by yet, "
+              "never a zero.</p>")
+    return _section(ctx, spec.title or SECTION_REGISTRY[spec.type].title, table + legend)
+
+
+#: Card figures: (label, vendor field, format, benchmark key).
+_CARD_FIGURES: tuple[tuple[str, str, str, str | None], ...] = (
+    ("QL ratio", "ql_ratio_pct", vr.PCT, "ql_ratio_pct"),
+    ("Show rate", "show_rate_pct", vr.PCT, "show_rate_pct"),
+    ("Cost / lead", "cost_per_lead", vr.MONEY, "cost_per_lead"),
+    ("Cost / qual. demo booked", "cost_per_qual_demo_booked", vr.MONEY,
+     "cost_per_qual_demo_booked"),
+    ("Cost / demo completed", "cost_per_demo_completed", vr.MONEY, "cost_per_demo_completed"),
+)
+
+
+def _lead_line(v: Mapping, report_ls: Mapping) -> str:
+    ls = v.get("lead_status")
+    if not report_ls.get("available"):
+        reason = report_ls.get("reason") or "No lead-status data for this month."
+        return f'<p class="vlead">Lead status: {_esc(reason)}</p>'
+    if not isinstance(ls, Mapping):
+        return '<p class="vlead">Lead status: no lead-sheet campaign matched this tab.</p>'
+    bits = [f"{_f(ls.get(k), vr.INT)} {_esc(h.lower())}" for k, h in _LEAD_COLUMNS if k != "total"]
+    return (f'<p class="vlead">Lead status ({_f(ls.get("total"), vr.INT)} demos): '
+            + " · ".join(bits) + "</p>")
+
+
+def _vendor_card(v: Mapping, r: Mapping) -> str:
+    bench = v.get("benchmarks") or {}
+    pill = _PILL.get(v.get("status"), "early")
+    head = (f'<div class="vhead"><div><h3>{_esc(v.get("name"))}</h3>'
+            f'<div class="vchan">{_esc(v.get("channel"))} · benchmarks: '
+            f'{_esc(bench.get("label") or "Total")}</div></div>'
+            f'<span class="pill {pill}">{_esc(v.get("status") or "")}</span></div>')
+    budget, spend, util = v.get("budget"), v.get("spend"), v.get("budget_utilized_pct")
+    pace = v.get("pace_pct")
+    if budget and util is not None:
+        width = min(max(util, 0.0), 100.0)
+        over = " over" if util > 100 else ""
+        tick = (f'<div class="tick" style="left:{min(max(pace, 0.0), 100.0):.2f}%" '
+                f'title="Day {_esc(r.get("day_of_month"))} of {_esc(r.get("days_in_month"))}"></div>'
+                if pace is not None else "")
+        bar = (f'<div class="vbar"><div class="fill{over}" style="width:{width:.2f}%"></div>{tick}</div>'
+               f'<div class="vbar-cap">{_f(spend, vr.MONEY)} of {_f(budget, vr.MONEY)} '
+               f'({_f(util, vr.PCT)} used; {_f(pace, vr.PCT)} of the month elapsed'
+               + (f"; runs out {_esc(vr.short_date(v.get('projected_runout_date')))} at this pace"
+                  if v.get("projected_runout_date") else "")
+               + ")</div>")
+    else:
+        bar = (f'<div class="vbar-cap">{_f(spend, vr.MONEY)} spent; '
+               + ("no budget set" if budget is not None else "budget not reported") + "</div>")
+    items = []
+    for label, field_, kind, bkey in _CARD_FIGURES:
+        ceiling, polarity = _ceiling(v, bkey)
+        tone = _vs(v.get(field_), ceiling, polarity)
+        vs = ""
+        if ceiling is not None:
+            word = "target" if polarity == "up" else "ceiling"
+            vs = f"<small>{word} {_f(ceiling, kind)}</small>"
+        items.append(f'<div><dt>{_esc(label)}</dt><dd class="{tone}">{_f(v.get(field_), kind)}{vs}</dd></div>')
+    items.insert(1, ('<div><dt>Demos booked / completed</dt>'
+                     f'<dd>{_f(v.get("qual_demos_booked"), vr.INT)} / '
+                     f'{_f(v.get("demos_completed"), vr.INT)}<small>qualified booked / completed</small></dd></div>'))
+    kv = f'<dl class="kv">{"".join(items)}</dl>'
+    action = v.get("action")
+    act = f'<p class="vact">{_segments(action)}</p>' if action else ""
+    return (f'<div class="vcard">{head}{bar}{kv}'
+            + _lead_line(v, r.get("lead_status") or {}) + act + "</div>")
+
+
+def _vendor_cards(ctx: _Ctx, spec: SectionSpec) -> str:
+    r = ctx.report
+    rows = r.get("vendors") or []
+    if not rows:
+        return _no_data(ctx, spec, "No paid vendor tabs in this pull.")
+    cards = "".join(_vendor_card(v, r) for v in rows)
+    cap = ('<p class="cap" style="margin-top:10px">One card per paid vendor tab, in tab order. '
+           "The bar is spend as a share of budget; the gold tick is how far through the month "
+           "the pull is. Each figure is coloured against the ceiling or target for that "
+           "vendor's own channel. The status pill and action line are the report's "
+           "rule-based ones (see Action summary); an em-dash is a figure not reported or "
+           "with nothing to divide by yet, never a zero.</p>")
+    return _section(ctx, spec.title or SECTION_REGISTRY[spec.type].title,
+                    f'<div class="vcards">{cards}</div>' + cap)
+
+
 #: Said in the header band and the footer of a report built with the built-in
 #: template because the workspace's own template could not be rendered.
 FALLBACK_SENTENCE = "Built with the built-in template because the team template failed."
@@ -630,6 +873,16 @@ SECTION_REGISTRY: dict[str, SectionType] = {s.type: s for s in (
                 lambda c, s: _wrap_list(c, s, _watch_block(c, s))),
     SectionType("action_summary", "Action summary", "table", True, (),
                 {"include_catch_all": True}, _actions),
+    SectionType("lead_status_by_vendor", "Lead status by vendor", "table", True, (), {},
+                _lead_status_table),
+    SectionType("channel_benchmarks", "Channel benchmarks", "table", True, (), {},
+                _channel_benchmarks),
+    SectionType("vendor_investment", "Vendor investment", "table", True,
+                ("total_budget", "total_spend", "total_management_fees",
+                 "total_spend_investment", "cost_per_lead_investment",
+                 "cost_per_qualified_lead_investment", "cost_per_demo_completed_investment"),
+                {"sort": "tab"}, _vendor_investment),
+    SectionType("vendor_detail", "Vendor detail cards", "cards", True, (), {}, _vendor_cards),
     SectionType("data_gaps", "Basis & data gaps", "note", False, (), {}, _data_gaps),
     SectionType("footer", "Footer", "band", False, (), {}, _footer),
 )}
@@ -827,7 +1080,25 @@ table.atab td:first-child{width:22%} table.atab td:nth-child(2){width:15%}
 .pill.strong{background:var(--pos);color:#fff} .pill.early{background:var(--slate);color:#fff}
 .pill.check{background:var(--gold);color:var(--ink)}
 footer{margin-top:24px}
-@media(max-width:900px){.tiles{grid-template-columns:1fr 1fr}}
+.vcards{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+.vcard{background:#fff;border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:var(--shadow)}
+.vcard .vhead{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.vcard h3{font-size:17px;margin:0}
+.vcard .vchan{font-family:__MONO__;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--slate);margin-top:3px}
+.vbar{position:relative;height:8px;background:var(--paper-2);border-radius:100px;margin:14px 0 6px}
+.vbar .fill{height:100%;background:var(--slate);border-radius:100px}
+.vbar .fill.over{background:var(--neg)}
+.vbar .tick{position:absolute;top:-4px;width:2px;height:16px;background:var(--gold)}
+.vbar-cap{font-size:11.5px;color:var(--slate)}
+.kv{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:14px 0 0}
+.kv div{border-top:1px solid var(--paper-2);padding-top:8px}
+.kv dt{font-family:__MONO__;font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:var(--slate)}
+.kv dd{margin:3px 0 0;font-family:__MONO__;font-size:14px;font-weight:600}
+.kv dd.up{color:var(--pos)} .kv dd.down{color:var(--neg)}
+.kv dd small{display:block;font-weight:400;font-size:9.5px;color:var(--slate)}
+.vlead,.vact{font-size:12.5px;margin:12px 0 0}
+.vlead{color:var(--slate)}
+@media(max-width:900px){.tiles{grid-template-columns:1fr 1fr}.vcards{grid-template-columns:1fr}}
 @media(max-width:560px){.tiles{grid-template-columns:1fr}}
 @media print{
  .vwrap{box-shadow:none;overflow:visible}
@@ -838,6 +1109,8 @@ footer{margin-top:24px}
  .tiles{break-inside:avoid}
  .panel h3,.panel .cap{break-after:avoid;page-break-after:avoid}
  .chartcard,.ins .col{break-inside:avoid;page-break-inside:avoid}
+ .vcard{break-inside:avoid;page-break-inside:avoid}
+ .vcards{grid-template-columns:1fr 1fr}
  .dash{color:var(--slate)}
 }
 """
@@ -851,11 +1124,18 @@ def stylesheet(theme: Theme = DEFAULT_THEME) -> str:
     return _FONT_CSS + root + body
 
 
+def readable_generators() -> str:
+    """``'mr-vendor-report/1' / 'mr-vendor-report/2'`` — for refusal messages."""
+    return " / ".join(f"'{g}'" for g in vr.READABLE_GENERATORS)
+
+
 def render(report: Mapping[str, Any], layout: Layout = DEFAULT_LAYOUT) -> str:
-    """The report as one self-contained HTML document. Same input, same bytes."""
-    if not isinstance(report, Mapping) or report.get("generator") != vr.GENERATOR_VERSION:
+    """The report as one self-contained HTML document. Same input, same bytes.
+    Reads every version in ``vendor_report.READABLE_GENERATORS``: a stored
+    ``/1`` run renders with em-dashes where the newer fields would be."""
+    if not isinstance(report, Mapping) or report.get("generator") not in vr.READABLE_GENERATORS:
         raise ValueError(
-            f"this renderer reads '{vr.GENERATOR_VERSION}' reports, got "
+            f"this renderer reads {readable_generators()} reports, got "
             f"'{(report or {}).get('generator') if isinstance(report, Mapping) else type(report).__name__}'")
     validate_layout(layout)
     parts = []

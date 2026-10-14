@@ -952,3 +952,59 @@ def test_the_size_caps_are_the_agreed_ones():
     assert rt.IMAGE_MAX_SIDE == 4096
     assert rt.sniff_upload(b"%PDF-1.4" + b"\x00" * (rt.PDF_MAX_BYTES - 8)).kind == "pdf"
     assert rt.sniff_upload(_png(4096, 4096)).kind == "png"
+
+
+# --- template coverage (2026-10-15): new figures and blocks arrive by themselves -------
+
+def test_the_new_figures_and_blocks_reach_the_vocabulary_and_the_starter_untouched(golden):
+    tokens = {p.token for p in rt.PLACEHOLDERS.values()}
+    starter = rt.starter_html()
+    for token in ("{{total_management_fees}}", "{{total_spend_investment}}",
+                  "{{cost_per_lead_investment}}", "{{cost_per_qualified_lead_investment}}",
+                  "{{cost_per_demo_completed_investment}}", "{{pace_pct}}", "{{pace_gap_pct}}",
+                  "{{projected_runout_date}}", "{{actualized_revenue}}",
+                  "{{actualized_clients}}", "{{not_actualized_revenue}}", "{{roas_pct}}",
+                  "{{table:lead_status_by_vendor}}", "{{table:channel_benchmarks}}",
+                  "{{table:vendor_investment}}", "{{cards:vendor_detail}}"):
+        assert token in tokens, token
+        assert token in starter, token
+    vocab = {e["placeholder"]: e for e in rt.vocabulary(golden)}
+    assert vocab["{{total_management_fees}}"]["example"] == "$9,600"
+    assert vocab["{{total_management_fees}}"]["title"] == "Total Management Fees"
+    assert vocab["{{projected_runout_date}}"]["example"] == "—"      # lasts past month end
+    assert vocab["{{projected_runout_date}}"]["description"].endswith("(date)")
+    # ``format`` is the value kind the UI labels by: date / money / pct / int /
+    # text for scalars, None for every block.
+    assert vocab["{{projected_runout_date}}"]["format"] == "date"
+    assert vocab["{{total_management_fees}}"]["format"] == "money"
+    assert vocab["{{roas_pct}}"]["format"] == "pct"
+    assert vocab["{{actualized_clients}}"]["format"] == "int"
+    assert vocab["{{as_of}}"]["format"] == "text"
+    assert all(e["format"] is None for e in vocab.values() if e["kind"] != "scalar")
+    assert all(e["format"] in ("money", "pct", "int", "date", "text")
+               for e in vocab.values() if e["kind"] == "scalar")
+    assert vocab["{{roas_pct}}"]["example"] == "0.0%"
+    assert vocab["{{cards:vendor_detail}}"]["kind"] == "cards"
+    assert vocab["{{cards:vendor_detail}}"]["example"] == "18 cards"
+    assert vocab["{{table:lead_status_by_vendor}}"]["example"] == "no lead-status data"
+    assert vocab["{{table:channel_benchmarks}}"]["example"] == "4 channel rows"
+    assert vocab["{{table:vendor_investment}}"]["example"] == "18 vendors + portfolio total"
+
+
+def test_a_figure_the_tracker_did_not_report_is_the_em_dash_in_an_html_template_too(report):
+    html = _render("<p>{{projected_runout_date}} / {{total_management_fees}} / {{roas_pct}}</p>"
+                   "<div>{{table:vendor_investment}}</div><div>{{cards:vendor_detail}}</div>"
+                   "<div>{{table:lead_status_by_vendor}}</div>", report)
+    assert "$9,600" in html and "0.0%" in html
+    assert '<span class="dash" title="No figure:' in html     # the run-out date: absent
+    assert html.count('class="mrb"') >= 3 and 'class="vcard"' in html
+    assert "no lead-analysis sheet has been pulled yet" in html
+    report["portfolio"]["total_management_fees"] = None
+    assert rt.PLACEHOLDERS["total_management_fees"].example(report) == "—"
+    assert rt.PLACEHOLDERS["projected_runout_date"].example(report) == "—"
+    # A stored /1 run (no new fields) still renders through an HTML template.
+    report["generator"] = "mr-vendor-report/1"
+    for key in ("benchmarks", "lead_status"):
+        del report[key]
+    html = _render("<p>{{total_spend}}</p><div>{{table:channel_benchmarks}}</div>", report)
+    assert "$2,737" in html and "Benchmarks were not recorded in this report" in html

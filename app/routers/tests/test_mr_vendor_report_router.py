@@ -476,8 +476,16 @@ def test_the_listing_carries_the_builtin_live_examples_and_the_allowance(templat
     assert by_token["{{total_spend}}"]["example"] == "$2,737"
     assert by_token["{{total_spend}}"]["kind"] == "scalar"
     assert by_token["{{table:vendor_scorecard}}"]["kind"] == "table"
-    assert all(set(p) == {"token", "title", "description", "kind", "example"}
+    assert all(set(p) == {"token", "title", "description", "kind", "format", "example"}
                for p in body["placeholders"])
+    # ``format`` labels a scalar's value kind for the UI; a block has none.
+    assert by_token["{{total_spend}}"]["format"] == "money"
+    assert by_token["{{projected_runout_date}}"]["format"] == "date"
+    assert by_token["{{show_rate_pct}}"]["format"] == "pct"
+    assert by_token["{{total_leads}}"]["format"] == "int"
+    assert by_token["{{month_label}}"]["format"] == "text"
+    assert by_token["{{table:vendor_scorecard}}"]["format"] is None
+    assert by_token["{{cards:vendor_detail}}"]["format"] is None
     assert by_token["{{table:vendor_scorecard}}"]["title"] == "Vendor scorecard"
     assert by_token["{{total_spend}}"]["title"] == "Total Spend"
     assert body["default_layout"] == vrr.layout_to_dict(vrr.DEFAULT_LAYOUT)
@@ -1056,3 +1064,77 @@ def test_history_shows_display_names_and_falls_back_to_the_email(templates_on, s
     monkeypatch.setattr(firestore_repo, "get_users_by_ids", unreadable)
     saved = _save({"source_kind": "builder", "layout": LAYOUT})["version"]
     assert saved["created_by_name"] == COLLEAGUE["email"]      # cosmetic: never blocks
+
+
+# --- template coverage (2026-10-15): the lead-status join and the left_out contract ---
+
+LEAD_SUMMARY = {"months": {"2026-09": {"vendors": [{
+    "campaign": "Hawksem LS Meta", "slug": "hawksem-ls-meta", "booked": 2, "completed": 2,
+    "no_show": 0, "canceled": 0, "bad_lead": 0, "pending": 0, "completed_dnc": 0,
+    "deal_stages": {"contract_sent": 2}}]}}}
+
+
+def _lead_run(user_id: str, run_id: str, generated_at: str) -> dict:
+    return {"id": run_id, "kind": "lead_analysis", "user_id": user_id, "agent_id": "a6",
+            "platform": "sheets-leads", "generated_at": generated_at, "source_label": "x",
+            "tab": "Lead Analysis", "gaps": [], "summary": LEAD_SUMMARY}
+
+
+def test_the_build_joins_this_workspaces_lead_run_and_says_so_without_one(vendor_on):
+    from marketing_research_agent import runs as mr_runs
+
+    first = _build()
+    ls = first["structured"]["lead_status"]
+    assert ls["available"] is False
+    assert ls["reason"] == "No lead-status data: no lead-analysis sheet has been pulled yet."
+    assert all(v["lead_status"] is None for v in first["structured"]["vendors"])
+    # Another workspace's lead run is never this workspace's: the same inputs,
+    # so the stored run is served.
+    mr_runs.save_run(_lead_run(OTHER["id"], "lr-other", "2026-09-02T10:00:00+00:00"))
+    assert _build()["reused"] is True
+    # This workspace's lead run joins in, and the stored run is NOT served stale.
+    mr_runs.save_run(_lead_run(USER["id"], "lr-mine", "2026-09-02T11:00:00+00:00"))
+    second = _build()
+    assert second["reused"] is False and second["id"] != first["id"]
+    ls = second["structured"]["lead_status"]
+    assert ls["available"] is True and ls["as_of"] == "2026-09-02T11:00:00+00:00"
+    assert [v["vendor"] for v in ls["vendors"]] == ["Hawksem LS Meta"]
+    hawk = next(v for v in second["structured"]["vendors"] if v["name"] == "Hawksem LS Meta")
+    assert hawk["lead_status"]["contract_sent"] == 2 and hawk["management_fee"] == 2200.0
+    assert second["structured"]["portfolio"]["total_management_fees"] == 9600.0
+    assert client.get(f"/api/mr/vendor-report/{second['id']}/html").status_code == 200
+
+
+def test_a_lead_store_failure_degrades_to_no_lead_data_not_a_failed_build(vendor_on,
+                                                                           monkeypatch):
+    def boom(workspace_id):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(mr_router, "_latest_lead_run", boom)
+    run = _build()
+    assert run["structured"]["lead_status"]["available"] is False
+    assert run["structured"]["portfolio"]["total_spend"] == 2736.93
+
+
+def test_the_extract_answer_carries_left_out_for_the_frontend(templates_on, reader):
+    _calls, answers = reader
+    # A reading that names it is passed through verbatim.
+    answers.append({**_reading(),
+                    "left_out": [{"title": "Social reach", "reason": "a follower chart"}]})
+    body = _upload("/api/mr/report-templates/extract", "s.pdf", PDF).json()
+    assert body["left_out"] == [{"title": "Social reach", "reason": "a follower chart"}]
+    # One from before the field existed gets it derived from unsupported + notes.
+    body = _upload("/api/mr/report-templates/extract", "s.pdf", PDF).json()
+    assert body["left_out"] == [{"title": "Social reach", "reason": "a follower chart"}]
+    # The nothing-matched refusal carries it too, so the UI can show what it saw.
+    answers.append(tx.TemplateExtractionError(
+        "Nothing we can fill.", code="nothing_matched",
+        unsupported=[{"title": "Keyword rankings", "description": ""}]))
+    resp = _upload("/api/mr/report-templates/extract", "s.pdf", PDF)
+    assert resp.status_code == 422
+    assert resp.json()["left_out"] == [{"title": "Keyword rankings",
+                                        "reason": tx.NO_CATALOG_MATCH}]
+    # The listing's placeholders carry the new tokens with live examples.
+    tokens = {p["token"]: p for p in _listing()["placeholders"]}
+    assert tokens["{{total_management_fees}}"]["example"] == "$9,600"
+    assert tokens["{{cards:vendor_detail}}"]["kind"] == "cards"
