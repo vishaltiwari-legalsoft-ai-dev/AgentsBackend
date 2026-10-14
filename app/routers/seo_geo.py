@@ -308,7 +308,7 @@ def brand_detail(brand_id: str, user=Depends(get_current_user)):
         "run": run,
         "gsc": _gsc_view(brand, conn, run),
         "plan": _plan_of_action(brand_id, run),
-        "site_review": seo_site.checked_review(brand_id),
+        "site_review": seo_site.mark_blog_plan(seo_site.checked_review(brand_id), (run or {}).get("topics")),
     }
 
 
@@ -329,7 +329,8 @@ def run_site_review(brand_id: str, user=Depends(get_current_user),
 @router.get("/seo-geo/site-review/{brand_id}")
 def get_site_review(brand_id: str, user=Depends(get_current_user)):
     _brand_or_404(brand_id)
-    return {"review": seo_site.checked_review(brand_id)}
+    run = insights.latest_run(brand_id) or {}
+    return {"review": seo_site.mark_blog_plan(seo_site.checked_review(brand_id), run.get("topics"))}
 
 
 # ------------------------- page intelligence -------------------------

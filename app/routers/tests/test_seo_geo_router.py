@@ -321,6 +321,29 @@ def test_brand_detail_rechecks_the_stored_review_and_says_failures_plainly():
     assert "HttpError" not in str(overview["brands"][0]["last_run"]["degraded"])
 
 
+def test_a_missing_topic_in_the_blog_plan_is_pointed_at_not_repeated():
+    """Staging repeated four site-review gaps word for word as blog topics. The
+    review read by the console says where the plan has each one; the strings
+    stay strings for a console that renders them as text."""
+    from seo_geo_agent import state as seo_state
+
+    gaps = ["Pricing transparency and cost comparison calculators", "Staff profiles and team credentials"]
+    seo_state.save("sitereview-legalsoft", {"brand_id": "legalsoft", "issues": [],
+                                            "grounding": {"kept": 0, "dropped": []}, "missing_topics": gaps})
+    seo_state.save("run-legalsoft", {
+        "brand_id": "legalsoft", "at": "2026-10-14", "trigger": "t", "summary": {}, "insights": [], "ga": None,
+        "todos": [], "degraded": [], "topics": [
+            {"keyword": "law firm intake services", "source": "seed", "avoided": False},
+            {"keyword": "Pricing transparency and cost comparison calculators", "source": "site gap",
+             "avoided": False}]})
+
+    want = [{"topic": gaps[0], "in_blog_plan": 2}, {"topic": gaps[1], "in_blog_plan": None}]
+    review = client.get("/api/seo-geo/brands/legalsoft").json()["site_review"]
+    assert review["missing_topics"] == gaps
+    assert review["missing_topics_detail"] == want
+    assert client.get("/api/seo-geo/site-review/legalsoft").json()["review"]["missing_topics_detail"] == want
+
+
 def test_pages_refresh_moves_site_wide_advice_onto_the_stored_fix_list(monkeypatch):
     import json
 

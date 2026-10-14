@@ -17,7 +17,7 @@ from datetime import date
 
 import httpx
 
-from . import audit, sources, state
+from . import audit, sources, state, topics
 from .sources import CredentialMissing, FETCH_UA, fetch_page, fetch_sitemap
 
 MAX_PAGES = 50
@@ -177,12 +177,12 @@ def build_corpus(brand: dict, fetch=fetch_page, sitemap=fetch_sitemap, max_pages
 
 def _digest_line(p: dict) -> str:
     """One page as the expert model sees it — also the ground truth its numbers are checked against."""
-    topics = ", ".join(p.get("topics", []))
+    page_topics = ", ".join(p.get("topics", []))
     target = f' → targets "{p["target_query"]}"' if p.get("target_query") else ""
     no_cta = " [no clear CTA]" if p.get("cta") is False and p.get("type") in ("home", "service") else ""
     words = f" ({p['word_count']}w)" if p.get("word_count") else ""
     return (f"- [{p.get('type', 'other')}] {p['url']}{words} — {p.get('summary', p['title'])}"
-            + target + no_cta + (f" (topics: {topics})" if topics else ""))
+            + target + no_cta + (f" (topics: {page_topics})" if page_topics else ""))
 
 
 def _digest(corpus: dict) -> str:
@@ -250,13 +250,21 @@ EXPERT_SYSTEM = (
 PRIORITY_RANK = {"high": 0, "medium": 1, "low": 2}
 _URL_RE = re.compile(r"https?://[^\s,;()\[\]<>\"'“”]+")
 _NUM_RE = re.compile(r"(?<![A-Za-z0-9_.])(\d[\d,]*(?:\.\d+)?)")
+#: "the #1 question", "the 2nd objection", "your top 3 pages": a rank or an
+#: ordinal, not a quantity the page has to state.
+_RANK_MARKER = re.compile(r"#\s?\d+\b|\b\d+(?:st|nd|rd|th)\b|\btop[\s-]+\d+\b", re.I)
 
 
-def _numbers(text: str) -> set[str]:
+def _numbers(text: str, claims_only: bool = False) -> set[str]:
     """Numbers in ``text`` (URLs removed), normalised: ``1,200`` == ``1200``, ``4.0`` == ``4``.
-    A digit glued to a letter in front (H1, B2B) is a name, not a number."""
+    A digit glued to a letter in front (H1, B2B) is a name, not a number.
+    ``claims_only``: leave out ranks and ordinals (#1, 2nd, top 3) — what a
+    finding claims, as opposed to everything the data mentions."""
     out: set[str] = set()
-    for raw in _NUM_RE.findall(_URL_RE.sub(" ", text or "")):
+    text = _URL_RE.sub(" ", text or "")
+    if claims_only:
+        text = _RANK_MARKER.sub(" ", text)
+    for raw in _NUM_RE.findall(text):
         n = raw.replace(",", "").rstrip(".")
         if not n:
             continue
@@ -290,6 +298,12 @@ _DIGEST_ARTIFACTS = (
                r"(?:text|content|digest|summar(?:y|ies)|excerpts?|notes)\b", re.I),
     re.compile(r"\s*\b(?:in|from) the (?:site |page )?digest\b", re.I),
 )
+#: A space a removed marker left in front of closing punctuation. A quote
+#: closes only when nothing word-like follows it — "claims 'pre-vetted' staff"
+#: keeps the space before its opening quote; ‘ and “ always open. ``'s``
+#: after a space is a possessive ("firm 's" -> "firm's").
+_SPACE_BEFORE_CLOSER = re.compile(
+    r"\s+(?=[,.;:!?)\]]|['’\"”](?:[\s,.;:!?)\]]|$)|['’]s\b)")
 
 
 def clean_review_text(text) -> str:
@@ -299,7 +313,7 @@ def clean_review_text(text) -> str:
     for rx in _DIGEST_ARTIFACTS:
         out = rx.sub("", out)
     out = re.sub(r"\(\s*\)|\[\s*\]", "", out)
-    out = re.sub(r"\s+([,.;:!?)'’\]])", r"\1", out)
+    out = _SPACE_BEFORE_CLOSER.sub("", out)
     return re.sub(r"\s{2,}", " ", out).strip()
 
 
@@ -517,13 +531,18 @@ def ground_issues(raw_issues, corpus: dict, client_line: str = "") -> tuple[list
     In order: a technical-hygiene finding the audit already owns is dropped;
     the issue must cite (in evidence or insight) the URL of a crawled page; every
     number in the insight and evidence must appear in the input the model was
-    given for the cited page(s) — the action may carry recommendation numbers;
+    given for the cited page(s) — the action may carry recommendation numbers,
+    and a rank or ordinal (#1, 2nd, top 3) is not a number to find; the drop
+    says which field held it (``field``: "insight", what the console shows, or
+    "evidence", carried along as ``evidence`` because the console doesn't);
     a mention of schema / JSON-LD / rich results must fit the cited page per
     ``audit.schema_fit``; a claim that the page lacks a form, phone, contact
     route, booking link, CTA or a link must survive :func:`absence_problem`;
     and per category + page only the highest-priority issue survives. Kept
     text is stripped of digest markers (:func:`clean_review_text`).
-    ``grounding`` = ``{kept, dropped: [{reason, insight, detail}]}``.
+    ``grounding`` = ``{kept, dropped: [{reason, insight, detail}]}``; an
+    "invented-number" drop adds ``field``, ``numbers`` and, for "evidence",
+    ``evidence``.
     """
     pages = corpus.get("pages") or []
     crawled = {sources.norm_url(p.get("url") or ""): p for p in pages if p.get("url")}
@@ -533,9 +552,9 @@ def ground_issues(raw_issues, corpus: dict, client_line: str = "") -> tuple[list
 
     dropped: list[dict] = []
 
-    def drop(reason: str, insight: str, detail: str) -> None:
+    def drop(reason: str, insight: str, detail: str, **extra) -> None:
         dropped.append({"reason": reason, "insight": clean_review_text(insight)[:200],
-                        "detail": detail[:200]})
+                        "detail": detail[:200], **extra})
 
     candidates: list[dict] = []
     for i in raw_issues if isinstance(raw_issues, list) else []:
@@ -564,10 +583,19 @@ def ground_issues(raw_issues, corpus: dict, client_line: str = "") -> tuple[list
         allowed = set(client_nums)
         for page in cited:
             allowed |= _numbers(_digest_line(page))
-        invented = sorted(_numbers(insight + " " + issue["evidence"]) - allowed)
-        if invented:
+        stated = sorted(_numbers(insight, claims_only=True) - allowed)
+        behind = sorted(_numbers(issue["evidence"], claims_only=True) - allowed)
+        if stated:
             drop("invented-number", insight,
-                 f"{', '.join(invented[:5])} not in the data for {cited[0]['url']}")
+                 f"{', '.join(stated[:5])} not in the data for {cited[0]['url']}",
+                 field="insight", numbers=stated[:5])
+            continue
+        if behind:
+            drop("invented-number", insight,
+                 f"the evidence behind it cites {', '.join(behind[:5])}, not in the data for "
+                 f"{cited[0]['url']}",
+                 field="evidence", numbers=behind[:5],
+                 evidence=clean_review_text(issue["evidence"])[:200])
             continue
         problem = audit.schema_claim_problem(
             " ".join((insight, issue["evidence"], issue["action"])), cited[0], site_types)
@@ -674,6 +702,32 @@ def latest_review(brand_id: str) -> dict | None:
     return state.load(f"sitereview-{brand_id}")
 
 
+_STORED_NUMBER_DETAIL = re.compile(r"^(.+?) not in the data for ")
+
+
+def _stored_number_field(drop: dict) -> dict:
+    """An "invented-number" drop stored before ``field`` was recorded, with the
+    field read off its ``detail`` ("15, 20 not in the data for …") where that is
+    certain: a number the insight states -> "insight"; numbers the insight
+    never mentions -> "evidence", the only other field checked. A number the
+    insight holds only as a rank ("#1") stays unmarked — today's check would
+    not count it, and the stored drop doesn't say whether the evidence held it."""
+    if not isinstance(drop, dict) or drop.get("reason") != "invented-number" or "field" in drop:
+        return drop
+    found = _STORED_NUMBER_DETAIL.match(str(drop.get("detail") or ""))
+    if not found:
+        return drop
+    listed = [n.strip() for n in found.group(1).split(",") if n.strip()]
+    insight = str(drop.get("insight") or "")
+    stated = [n for n in listed if n in _numbers(insight, claims_only=True)]
+    if stated:
+        return {**drop, "field": "insight", "numbers": stated}
+    unmentioned = [n for n in listed if n not in _numbers(insight)]
+    if unmentioned:
+        return {**drop, "field": "evidence", "numbers": unmentioned}
+    return drop
+
+
 def recheck_review(review: dict, corpus: dict) -> dict:
     """``review`` as it may be shown today, against today's crawl.
 
@@ -681,13 +735,14 @@ def recheck_review(review: dict, corpus: dict) -> dict:
     facts it needs) still holds findings that check would drop. Its text is
     stripped of digest markers, and every issue is held to
     :func:`absence_problem` again: one the crawl contradicts, or cannot check,
-    moves to ``grounding.dropped`` with that reason — never silently. Pure: the
-    stored review is not rewritten."""
+    moves to ``grounding.dropped`` with that reason — never silently. A number
+    drop stored without its ``field`` gets one where the stored detail settles
+    it (:func:`_stored_number_field`). Pure: the stored review is not rewritten."""
     out = dict(review)
     pages = corpus.get("pages") or []
     crawled = {sources.norm_url(p.get("url") or ""): p for p in pages if p.get("url")}
     grounding = dict(out.get("grounding") or {})
-    dropped = list(grounding.get("dropped") or [])
+    dropped = [_stored_number_field(d) for d in grounding.get("dropped") or []]
     kept: list[dict] = []
     for issue in out.get("issues") or []:
         if not isinstance(issue, dict):
@@ -724,6 +779,26 @@ def checked_review(brand_id: str) -> dict | None:
     if not review:
         return review
     return recheck_review(review, state.load(f"corpus-{brand_id}") or {})
+
+
+def mark_blog_plan(review: dict | None, plan_topics) -> dict | None:
+    """``review`` with ``missing_topics_detail``: each missing topic as
+    ``{"topic", "in_blog_plan"}``, the latter its 1-based place among the blog
+    plan's live topics (``plan_topics``: the latest run's ``topics``) when the
+    plan carries it — same words, case and spacing aside — else None. So the
+    console can point at the plan instead of listing the topic twice.
+
+    ``missing_topics`` stays a list of strings: a console that renders them as
+    text must not be handed objects. Pure."""
+    if not review:
+        return review
+    places: dict[str, int] = {}
+    live = [t for t in plan_topics or [] if isinstance(t, dict) and not t.get("avoided")]
+    for n, topic in enumerate(live, start=1):
+        places.setdefault(topics.topic_key(str(topic.get("keyword") or "")), n)
+    return {**review, "missing_topics_detail": [
+        {"topic": m, "in_blog_plan": places.get(topics.topic_key(m))}
+        for m in _as_list(review.get("missing_topics")) if isinstance(m, str) and m.strip()]}
 
 
 def _todo_id(brand_id: str, category: str, url: str) -> str:

@@ -375,6 +375,21 @@ def test_long_titles_without_a_shared_suffix_stay_per_page():
     assert issues["title-long"]["count"] == 2
 
 
+def test_every_audit_finding_counts_all_its_pages_beside_the_shortened_list():
+    """Staging listed 15 of 25 long titles and 15 of 20 service pages. The list
+    is cut at PAGES_PER_ISSUE; ``count`` is the true total, on every finding,
+    so the console can say "+10 more"."""
+    site = {f"https://x.com/p{i}": facts(f"https://x.com/p{i}", meta="",
+                                        title=f"Page {i} of a long and distinct title nobody else on the site has")
+            for i in range(25)}
+    report = _audit(site)
+    for issue in report["issues"]:
+        assert len(issue["pages"]) == min(issue["count"], audit.PAGES_PER_ISSUE), issue["issue"]
+    issues = _by_kind(report)
+    assert (issues["title-long"]["count"], len(issues["title-long"]["pages"])) == (25, 15)
+    assert (issues["Missing meta description"]["count"], len(issues["Missing meta description"]["pages"])) == (25, 15)
+
+
 def _fit(url, types=(), q=0, kind=None, phone=False, address=False, site=None, errors=(),
          pairs=None, headings=0, linked=0):
     page = {"url": url, "schema_types": list(types), "q_headings": q, "has_phone": phone,
@@ -673,6 +688,140 @@ def test_invented_number_detail_names_the_number(monkeypatch):
     review = site_brain.expert_review(BRAND, REVIEW_CORPUS)
     assert review["issues"] == []
     assert review["grounding"]["dropped"][0]["detail"].startswith("12 not in the data")
+    assert (review["grounding"]["dropped"][0]["field"], review["grounding"]["dropped"][0]["numbers"]) == (
+        "insight", ["12"])
+
+
+# ---------------- round 3: a rank is not a number; a drop says where the number was ----------------
+# Staging's review dropped eight findings for "a number that isn't on the page".
+# Two had only a rank ("#1 question", "#2 objection") in the text the console
+# shows; four had no number there at all — it sat in the evidence, never shown.
+
+def test_a_rank_or_ordinal_is_not_a_number_the_page_must_state(monkeypatch):
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: {**REVIEW_JSON, "issues": [
+        _issue("The pricing page never states a single dollar figure — the #1 question every law firm "
+               "asks before contacting a staffing vendor", "https://x.com/pricing — plans, no prices"),
+        _issue("Pricing is the 1st thing buyers check, and the top 3 rivals answer it up front",
+               "https://x.com/pricing — no figures", category="conversion"),
+        _issue("Every service page claims 'pre-vetted' staff but zero pages explain the vetting process — "
+               "the #2 buyer objection after pricing", "https://x.com/ — 20 role pages say pre-vetted",
+               category="trust"),
+    ]})
+    review = site_brain.expert_review(BRAND, REVIEW_CORPUS)
+    assert [i["insight"][:30] for i in review["issues"]] == ["The pricing page never states ",
+                                                             "Pricing is the 1st thing buyer"]
+    [vetting] = review["grounding"]["dropped"]
+    # #2 is a rank; the 20 in the evidence is the number, and the drop says so
+    assert vetting["insight"] == ("Every service page claims 'pre-vetted' staff but zero pages explain the "
+                                  "vetting process — the #2 buyer objection after pricing")
+    assert (vetting["reason"], vetting["field"], vetting["numbers"]) == ("invented-number", "evidence", ["20"])
+    assert vetting["evidence"] == "https://x.com/ — 20 role pages say pre-vetted"
+    assert vetting["detail"] == "the evidence behind it cites 20, not in the data for https://x.com/"
+
+
+def test_a_number_the_finding_states_is_reported_on_the_finding(monkeypatch):
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: {**REVIEW_JSON, "issues": [
+        _issue("38 service pages all target near-identical 'virtual [role] for law firms' queries with no "
+               "differentiation — Google will pick one winner and suppress the rest",
+               "https://x.com/pricing — 15 near-identical titles", category="intent")]})
+    [drop] = site_brain.expert_review(BRAND, REVIEW_CORPUS)["grounding"]["dropped"]
+    assert (drop["field"], drop["numbers"], drop["detail"]) == (
+        "insight", ["38"], "38 not in the data for https://x.com/pricing")
+    assert "evidence" not in drop                     # the console already shows the insight
+
+
+#: Staging's stored drops, word for word (quotes glued by the old cleaner).
+STAGING_NUMBER_DROPS = [
+    ("The pricing page never states a single dollar figure — the #1 question every law firm asks before "
+     "contacting a staffing vendor", "1 not in the data for https://www.legalsoft.com/pricing"),
+    ("38 service pages all target near-identical'virtual [role] for law firms' queries with no "
+     "differentiation — Google will pick one winner and suppress the rest",
+     "38 not in the data for https://www.legalsoft.com/legal-assistant"),
+    ("Every service page claims'pre-vetted' staff but zero pages explain the vetting process — the #2 "
+     "buyer objection after pricing", "2, 20 not in the data for https://www.legalsoft.com/remote-attorneys"),
+    ("Zero named clients, zero staff profiles, zero video testimonials — trust claims ('1,000+ firms') are "
+     "unverifiable and hurt more than help", "1000 not in the data for https://www.legalsoft.com/about-us"),
+    ("Practice-area pages exist but don't link to relevant role pages — a bankruptcy firm can't discover "
+     "you offer bookkeepers or lien negotiators",
+     "15 not in the data for https://www.legalsoft.com/practice-areas/bankruptcy"),
+    ("No FAQ blocks on any service page — buyers can't get quick answers to objections (contract length, "
+     "replacement policy, timezone, software training)",
+     "1543, 1582 not in the data for https://www.legalsoft.com/faqs"),
+    ("Specialized role pages (lien negotiator, demand writer, document collector) lack deliverable "
+     "specifics — a PI firm can't tell if you handle their exact workflow",
+     "1582 not in the data for https://www.legalsoft.com/lien-negotiator"),
+    ("Firm-size pages (solo, small, midsize, large) are nearly identical templates with no size-specific "
+     "pain points or ROI justification",
+     "1185, 50 not in the data for https://www.legalsoft.com/practice-areas/solo-practices"),
+]
+
+
+def test_a_stored_number_drop_says_which_field_held_the_number():
+    """The review staging stored before ``field`` existed: what the stored
+    detail settles is marked; a number held only as a rank stays unmarked."""
+    site_brain.state.save("sitereview-legalsoft", {"brand_id": "legalsoft", "issues": [], "grounding": {
+        "kept": 0, "dropped": [{"reason": "invented-number", "insight": i, "detail": d}
+                               for i, d in STAGING_NUMBER_DROPS]}})
+    dropped = site_brain.checked_review("legalsoft")["grounding"]["dropped"]
+    assert [(d.get("field"), d.get("numbers")) for d in dropped] == [
+        (None, None),                         # "#1 question": the stored drop can't say more
+        ("insight", ["38"]),
+        ("evidence", ["20"]),                 # "#2" is a rank; 20 is nowhere in the insight
+        ("insight", ["1000"]),
+        ("evidence", ["15"]),
+        ("evidence", ["1543", "1582"]),
+        ("evidence", ["1582"]),
+        ("evidence", ["1185", "50"]),
+    ]
+    assert "field" not in site_brain.latest_review("legalsoft")["grounding"]["dropped"][1]   # not rewritten
+
+
+# ---------------- round 3: an opening quote keeps the space in front of it ----------------
+# Staging showed "claims'pre-vetted' staff": the cleaner deleted the space before
+# every quote, opening ones included. Each string below is what the model wrote.
+
+STAGING_QUOTED = [
+    "Every service page claims 'pre-vetted' staff but zero pages explain the vetting process — the #2 "
+    "buyer objection after pricing",
+    "38 service pages all target near-identical 'virtual [role] for law firms' queries with no "
+    "differentiation — Google will pick one winner and suppress the rest",
+    "Contact page mentions 'global offices' but no locations, phone numbers, or timezone coverage stated "
+    "anywhere — reduces trust and local search visibility",
+    "Claims '1,000+ firms' and 'pre-vetted' everywhere but zero named clients, zero staff credentials, one "
+    "vague case study reference, no review widgets.",
+    "Targets are clear but 38 pages compete for overlapping 'virtual legal assistant' variants — massive "
+    "cannibalization risk.",
+    "https://www.legalsoft.com/platform mentions 'all-in-one functionality' but no screenshots, no "
+    "integration list (Clio, MyCase?), no 'vs hiring through an agency' comparison",
+    "Zero named clients, zero staff profiles, zero video testimonials — trust claims ('1,000+ firms') are "
+    "unverifiable and hurt more than help",
+]
+
+
+@pytest.mark.parametrize("text", STAGING_QUOTED)
+def test_staging_text_with_quotes_comes_out_as_written(text):
+    assert site_brain.clean_review_text(text) == text
+
+
+@pytest.mark.parametrize(("raw", "clean"), [
+    ("claims 'pre-vetted' staff", "claims 'pre-vetted' staff"),
+    ("claims ‘pre-vetted’ staff", "claims ‘pre-vetted’ staff"),
+    ('claims "pre-vetted" staff', 'claims "pre-vetted" staff'),
+    ("claims “pre-vetted” staff", "claims “pre-vetted” staff"),
+    ("claims ’pre-vetted’ staff", "claims ’pre-vetted’ staff"),     # a closing curl used to open
+    ("the firm's intake page", "the firm's intake page"),
+    ("the firm’s intake page", "the firm’s intake page"),
+    ("the firms' intake pages", "the firms' intake pages"),
+    # the space a removed marker leaves still goes before what closes
+    ("the 'Contact us ( )' page", "the 'Contact us' page"),
+    ('the "Book a call [ ]" button', 'the "Book a call" button'),
+    ("the “Book a call ( )” button", "the “Book a call” button"),
+    ("pricing ( ) , then the FAQ ( ) .", "pricing, then the FAQ."),
+    ("the paralegal [ ] 's page", "the paralegal's page"),
+    ("'Lacks a contact form in the provided text'", "'Lacks a contact form'"),
+])
+def test_quotes_and_apostrophes_come_out_right(raw, clean):
+    assert site_brain.clean_review_text(raw) == clean
 
 
 # ------------------- D1: absence claims are checked against the page -------------------
@@ -917,6 +1066,44 @@ def test_blog_plan_says_when_no_site_review_grounds_it(monkeypatch):
     run = insights.run_brand(brand, trigger="t")
     assert topics.EMPTY_REVIEW_NOTE in run["degraded"]
     assert not any(t["source"] == "site gap" for t in run["topics"])
+
+
+#: Staging's site review, "Topics the site doesn't cover yet", word for word.
+STAGING_MISSING = [
+    "Virtual staff vetting and credentialing process",
+    "Pricing transparency and cost comparison calculators",
+    "Client case studies with named firms and outcomes",
+    "Staff profiles and team credentials",
+    "Onboarding timeline and implementation process",
+    "Contract terms, replacement policy, and guarantees",
+    "Software integrations (Clio, MyCase, Filevine, etc.)",
+    "Security and confidentiality protocols (especially for large firms)",
+]
+
+
+def test_a_missing_topic_the_blog_plan_carries_points_at_its_place():
+    """Staging: four of the eight missing topics came back word for word as
+    Site-gap posts. Each one the plan carries says where (1-based, among the
+    live topics the console numbers); one the plan avoids, or lacks, says None."""
+    review = {"missing_topics": STAGING_MISSING, "covered_topics": []}
+    brand = {"id": "b", "domain": "legalsoft.com",
+             "seeds": ["law firm intake services", "personal injury case management"]}
+    corpus = [{"url": "https://www.legalsoft.com/team", "title": "Staff profiles and team credentials"}]
+    ranked, _ = topics.build_topics(brand, [], [], search=None, site_review=review, corpus_pages=corpus)
+    marked = site_brain.mark_blog_plan(review, ranked)
+    assert marked["missing_topics"] == STAGING_MISSING          # still strings: every console renders them
+    assert [m["in_blog_plan"] for m in marked["missing_topics_detail"]] == [3, 4, 5, None, 6, 7, 8, 9]
+    live = [t["keyword"] for t in ranked if not t["avoided"]]
+    for m in marked["missing_topics_detail"]:
+        if m["in_blog_plan"]:
+            assert live[m["in_blog_plan"] - 1] == m["topic"]
+    # case and spacing aside, it is the same topic
+    spaced = site_brain.mark_blog_plan({"missing_topics": [" pricing  TRANSPARENCY and cost comparison "
+                                                           "calculators? "]}, ranked)
+    assert spaced["missing_topics_detail"][0]["in_blog_plan"] == 4
+    # no plan yet, or no review
+    assert site_brain.mark_blog_plan(review, None)["missing_topics_detail"][0]["in_blog_plan"] is None
+    assert site_brain.mark_blog_plan(None, ranked) is None
 
 
 # ----------------------------- GSC OAuth connect -----------------------------

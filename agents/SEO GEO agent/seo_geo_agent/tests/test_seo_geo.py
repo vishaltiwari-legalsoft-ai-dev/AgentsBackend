@@ -890,6 +890,54 @@ def test_a_typed_seed_never_goes_to_avoided():
                                "writing a new post.")
 
 
+def _serp_with_us(link: str, at: int) -> dict:
+    organic = [{"link": f"https://big{i}.com/x", "title": "t", "position": i + 1} for i in range(10)]
+    organic[at - 1] = {"link": link, "title": "Us", "position": at}
+    return {"organic": organic, "related": [], "paa": [], "aio_present": False}
+
+
+def test_a_seed_we_rank_top_three_for_says_refresh_once_with_its_page_and_rank():
+    """Staging: 'outsourced legal billing' said "hard: we already rank #3 with
+    /blog/outsourcing-legal-billing-guide-for-law-firms — refresh that page"
+    with ``refresh_url`` null, beside 'legal virtual assistant' saying it in
+    another voice with its page attached — and both wore a red "hard" chip."""
+    billing = "https://www.legalsoft.com/blog/outsourcing-legal-billing-guide-for-law-firms"
+    serps = {"outsourced legal billing": _serp_with_us(billing, 3),
+             "legal virtual assistant": _serp_with_us("https://www.legalsoft.com/virtual-staffing", 1),
+             "law firm intake services": _serp_with_us("https://www.legalsoft.com/intake", 2),
+             "remote legal secretary": _serp_with_us("https://www.legalsoft.com/remote-legal-secretary", 7)}
+    corpus = [{"url": "https://www.legalsoft.com/virtual-staffing", "title": "Legal Virtual Assistant Staffing",
+               "target_query": "legal virtual assistant"}]
+    brand = {"id": "b", "domain": "legalsoft.com", "seeds": list(serps)}
+    ranked, _ = topics.build_topics(brand, [], [], search=lambda q: serps.get(q, STRONG_SERP),
+                                    corpus_pages=corpus,
+                                    fix_queries={frozenset(topics._tokens("law firm intake services")): 1})
+    by_kw = {t["keyword"]: t for t in ranked}
+    obl, lva = by_kw["outsourced legal billing"], by_kw["legal virtual assistant"]
+    assert obl["why"] == ("You listed this as a seed keyword · You already rank #3 with "
+                          "/blog/outsourcing-legal-billing-guide-for-law-firms — refresh that page rather than "
+                          "writing a new post.")
+    assert obl["refresh_url"] == billing
+    assert lva["why"] == ("You listed this as a seed keyword · You already rank #1 with /virtual-staffing — "
+                          "refresh that page rather than writing a new post.")
+    assert lva["refresh_url"] == "https://www.legalsoft.com/virtual-staffing"
+    # the chip says where we rank; "difficulty" keeps its values (it scores a NEW post)
+    assert (obl["difficulty"], obl["difficulty_label"], obl["own_rank"]) == ("hard", "we rank #3", 3)
+    assert (lva["difficulty"], lva["difficulty_label"], lva["own_rank"]) == ("hard", "we rank #1", 1)
+    # on the Fix list: the page move lives there, the topic only points at it
+    intake = by_kw["law firm intake services"]
+    assert intake["why"] == ("You listed this as a seed keyword · Also on your Fix list as #1 — that page "
+                             "update comes first.")
+    assert (intake["refresh_url"], intake["difficulty_label"]) == (None, "we rank #2")
+    # #7: a new post can still help — no refresh, no rank chip
+    rls = by_kw["remote legal secretary"]
+    assert (rls["refresh_url"], rls["difficulty_label"], rls["own_rank"]) == (None, None, 7)
+    assert "refresh" not in rls["why"]
+    for t in ranked:                                    # the why never says refresh without the page
+        if "refresh" in t["why"]:
+            assert t["refresh_url"], t["keyword"]
+
+
 def test_difficulty_counts_our_own_page_in_the_top_ten():
     """Blog #9 said 'top 10 is all strong sites' while we ranked #10 ourselves."""
     serp = {"organic": [{"link": f"https://big{i}.com/x", "title": "t", "position": i + 1} for i in range(9)]
@@ -898,6 +946,8 @@ def test_difficulty_counts_our_own_page_in_the_top_ten():
     assert topics._difficulty(serp, "legalsoft.com") == (
         "hard", ["we rank #10 with /intake-specialist-remote", "the rest of the top 10 is strong sites"])
     assert topics._difficulty(STRONG_SERP, "legalsoft.com") == ("hard", ["top 10 is all strong sites"])
+    # top 3: "hard" for a new post, and no evidence — the topic's why says "refresh" itself
+    assert topics._difficulty(_serp_with_us("https://www.legalsoft.com/x", 3), "legalsoft.com") == ("hard", [])
 
 
 def test_company_names_are_not_blog_topics():
