@@ -107,6 +107,29 @@ def test_competitors_flow(as_creator):
     assert t.status_code == 200 and t.json()["degraded"]  # offline: no Serper, no fetches
 
 
+def test_competitors_answer_carries_the_rank_history():
+    """B4: the dashboard's "page one over the last checks" line needs one point
+    per stored snapshot, oldest first, and the date of the latest check."""
+    from seo_geo_agent import state as seo_state
+
+    body = client.get("/api/seo-geo/competitors/legalsoft").json()
+    assert (body["checked_at"], body["history"]) == (None, [])
+    seo_state.save("ranks-legalsoft", {"suggested_competitors": [], "snapshots": [
+        {"at": "2026-10-12", "ranks": {"a kw": {"position": 2, "top": []}, "b kw": {"position": None, "top": []}}},
+        {"at": "2026-10-13", "ranks": {"a kw": {"position": 5, "top": []}, "b kw": {"position": 9, "top": []}}},
+        {"at": "2026-10-14", "ranks": {"a kw": {"position": 1, "top": []}, "b kw": {"position": None, "top": []},
+                                       "c kw": {"position": 3, "top": []}}},
+    ]})
+    body = client.get("/api/seo-geo/competitors/legalsoft").json()
+    assert body["checked_at"] == "2026-10-14"
+    assert body["history"] == [
+        {"at": "2026-10-12", "tracked": 2, "top3": 1, "top10": 1, "unranked": 1},
+        {"at": "2026-10-13", "tracked": 2, "top3": 0, "top10": 2, "unranked": 0},
+        {"at": "2026-10-14", "tracked": 3, "top3": 2, "top10": 2, "unranked": 1},
+    ]
+    assert [s["keyword"] for s in body["shifts"]] == ["a kw", "c kw", "b kw"]   # unchanged
+
+
 def test_competitor_profiles_endpoints_offline():
     assert client.get("/api/seo-geo/competitors/legalsoft/profiles").json()["profiles"] is None
     r = client.post("/api/seo-geo/competitors/legalsoft/profiles/refresh")
@@ -154,11 +177,46 @@ def test_site_review_with_a_wrong_shape_answer_is_503_not_500(monkeypatch):
     assert client.get("/api/seo-geo/site-review/legalsoft").json()["review"] is None
 
 
+def test_analyze_website_adds_its_findings_to_the_fix_list_now(monkeypatch):
+    """The console toasts "N finding(s) added to the fix list" after Analyze
+    website, but the review saved only itself: the findings joined the Fix list
+    at the next run. They join the stored run now; with no run yet, the answer
+    says so instead of letting the toast claim it."""
+    from seo_geo_agent import site_brain, state as seo_state
+
+    corpus = {"brand_id": "legalsoft", "page_count": 1, "degraded": [], "pages": [
+        {"url": "https://legalsoft.com/pricing", "title": "Pricing", "type": "other", "word_count": 180,
+         "summary": "Plans and rates.", "schema_types": []}]}
+    monkeypatch.setattr(site_brain, "build_corpus", lambda brand, fetch=None, sitemap=None: corpus)
+    monkeypatch.setattr(site_brain.sources, "llm_json", lambda s, p: {
+        "positioning": "p", "scorecard": {}, "strengths": [], "suggested_seeds": [], "covered_topics": [],
+        "missing_topics": [], "issues": [{
+            "insight": "No testimonials on the pricing page", "action": "Add client reviews",
+            "evidence": "https://legalsoft.com/pricing — no reviews shown", "priority": "high",
+            "category": "trust"}]})
+
+    first = client.post("/api/seo-geo/site-review/legalsoft")
+    assert first.status_code == 200, first.text
+    assert (first.json()["fix_list_updated"], first.json()["findings_on_fix_list"]) == (False, 0)
+
+    seo_state.save("run-legalsoft", {"brand_id": "legalsoft", "at": "2026-10-14", "trigger": "t", "degraded": [],
+                                     "summary": {}, "insights": [], "topics": [], "ga": None,
+                                     "todos": [_todo("t1", "Refresh the page targeting 'x'")]})
+    body = client.post("/api/seo-geo/site-review/legalsoft").json()
+    assert (body["fix_list_updated"], body["findings_on_fix_list"]) == (True, 1)
+    assert body["issues"][0]["category"] == "trust"                       # the review itself, as before
+    todos = client.get("/api/seo-geo/brands/legalsoft").json()["run"]["todos"]
+    assert [t["kind"] for t in todos] == ["striking", "site"]
+    assert (todos[1]["page"], todos[1]["label"]) == ("https://legalsoft.com/pricing", "Trust fix: /pricing")
+    assert "fix_list_updated" not in seo_state.load("sitereview-legalsoft")   # in the answer, never stored
+
+
 #: What a provider failure looks like inside a CredentialMissing: an OpenRouter
 #: error dict, a Google ``HttpError`` repr, an env var name.
 RAW_FAILURES = {
     "seo_ai_unavailable": "LLM unavailable: Error code: 401 - {'error': {'message': 'User not found.', 'code': 401}}",
     "seo_search_unconfigured": "SEO_SERPER_API_KEY not set",
+    "seo_search_unavailable": "Serper search failed: out of credits (HTTP 402)",
     "seo_needs_refresh": "Run a data refresh first — competitor discovery needs rank snapshots",
     "seo_unavailable": "Google Analytics rejected properties/123: <HttpError 403 when requesting "
                        "https://analyticsdata.googleapis.com/v1beta/properties/123:runReport returned "
@@ -173,6 +231,9 @@ LIVE_ROUTES = [
     ("/api/seo-geo/update-plan/legalsoft", {"page": "https://legalsoft.com/x"}, "briefs", "update_plan"),
     ("/api/seo-geo/audit/legalsoft/run", None, "audit", "site_audit"),
     ("/api/seo-geo/ask/legalsoft", {"question": "what next?"}, "advisor", "ask"),
+    # a refresh degrades per source and answers 200; only one that produced
+    # nothing at all reaches this
+    ("/api/seo-geo/run/legalsoft", None, "insights", "run_brand"),
 ]
 
 
@@ -486,6 +547,110 @@ def test_cron_partial_sweep_is_207(monkeypatch, as_creator):
     assert body["status"] == "partial" and body["ok"] == 1 and body["failed"] == 1
 
 
+def _serper(monkeypatch, status: int | None = None) -> list[str]:
+    """Serper for these tests, no network: a plain SERP for every query, or —
+    with ``status`` — the failure ``serper_search`` raises for that HTTP status.
+    Returns the queries searched."""
+    import httpx
+
+    from seo_geo_agent import sources
+
+    searched: list[str] = []
+
+    def search(query, client=None):
+        searched.append(query)
+        if status is not None:
+            request = httpx.Request("POST", sources.SERPER_ENDPOINT)
+            refused = httpx.Response(status, request=request)
+            raise sources._serper_failure(httpx.HTTPStatusError("refused", request=request, response=refused))
+        return {"organic": [{"link": f"https://comp{i}.com/x", "title": "t", "position": i + 1} for i in range(10)],
+                "related": [], "paa": [], "aio_present": False}
+
+    monkeypatch.setattr(sources, "serper_available", lambda: True)
+    monkeypatch.setattr(sources, "serper_search", search)
+    return searched
+
+
+def test_the_sweep_takes_one_rank_snapshot_per_brand_in_either_mode(monkeypatch):
+    """B5: a rank-tracking run takes the night's snapshot, and the sweep then
+    took a second one minutes later — the two latest snapshots were the same
+    night (every shift ~0), the history covered half the nights, Serper spend
+    doubled. A Search Console brand's run takes none, so the sweep still does."""
+    from seo_geo_agent import insights, state as seo_state
+    from seo_geo_agent.sources import CredentialMissing, QueryStat
+
+    insights.upsert_brand({"id": "acme", "name": "Acme", "domain": "acme.com", "enabled": True,
+                           "gsc_property": "sc-domain:acme.com", "seeds": ["acme widgets"]})
+
+    def search_console(prop, start, end, service=None):
+        if prop != "sc-domain:acme.com":
+            raise CredentialMissing("Search Console rejected the property")
+        return [QueryStat(query="acme widgets", page="https://acme.com/w", clicks=40, impressions=900,
+                          ctr=0.044, position=6.0)]
+
+    monkeypatch.setattr(insights, "gsc_fetch", search_console)
+    _serper(monkeypatch)
+    monkeypatch.setenv("SEO_CRON_KEY", "s3cret")
+    r = client.post("/api/seo-geo/cron/run", headers={"x-cron-key": "s3cret"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert insights.latest_run("acme")["summary"]["mode"] == "search-console"
+    assert insights.latest_run("legalsoft")["summary"]["mode"] == "rank-tracking"
+    assert (body["brands"]["legalsoft"]["ranks"], body["brands"]["acme"]["ranks"]) == ("updated by the run", "updated")
+    assert {b: len(seo_state.load(f"ranks-{b}")["snapshots"]) for b in ("legalsoft", "acme")} == {
+        "legalsoft": 1, "acme": 1}
+    assert body["rank_checks_failed"] == 0
+
+
+def test_a_serper_dry_spell_saves_every_run_and_the_sweep_carries_on(monkeypatch, caplog):
+    """A dry spell (402) raised out of run_brand for every brand that searched:
+    nothing saved, the dashboard frozen on the last good run, the sweep a 502.
+    Each run is now saved with the reason, its last good ranks carried over;
+    the sweep moves on, counts the brands whose rankings weren't updated and
+    logs them — and takes no second try that night."""
+    from seo_geo_agent import insights, state as seo_state
+
+    seo_state.save("ranks-legalsoft", {"snapshots": [{"at": "2026-10-13", "ranks": {
+        "legal virtual assistant": {"position": 4, "top": ["comp.com"]}}}]})
+    insights.upsert_brand({"id": "acme", "name": "Acme", "domain": "acme.com", "enabled": True,
+                           "seeds": ["acme widgets"]})
+    searched = _serper(monkeypatch, status=402)
+    monkeypatch.setenv("SEO_CRON_KEY", "s3cret")
+    with caplog.at_level("WARNING", logger="agentos.seo_geo"):
+        r = client.post("/api/seo-geo/cron/run", headers={"x-cron-key": "s3cret"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert (body["status"], body["ok"], body["failed"], body["rank_checks_failed"]) == ("ok", 2, 0, 2)
+    assert body["brands"]["legalsoft"]["ranks"] == "not updated: the run's rank check failed"
+    assert "rankings not updated for 2 brand(s): acme, legalsoft" in caplog.text
+    for brand_id, ranks_from in (("legalsoft", "2026-10-13"), ("acme", None)):
+        run = client.get(f"/api/seo-geo/brands/{brand_id}").json()["run"]
+        assert (run["summary"]["rank_check_failed"], run["summary"]["ranks_from"]) == (True, ranks_from)
+        assert any(n.startswith("Rank tracking: Google results couldn't be reached") for n in run["degraded"])
+    assert len(seo_state.load("ranks-legalsoft")["snapshots"]) == 1
+    assert searched.count("legal virtual assistant") == 2   # the rank check + the blog plan — no sweep retry
+
+
+def test_a_refresh_during_a_serper_dry_spell_answers_200_with_the_note(monkeypatch):
+    """A manual Refresh in a dry spell answered a 500. It answers 200: the run
+    is saved, the ranks are the last good check's and say so."""
+    from seo_geo_agent import state as seo_state
+
+    seo_state.save("ranks-legalsoft", {"snapshots": [{"at": "2026-10-13", "ranks": {
+        "legal virtual assistant": {"position": 4, "top": ["comp.com"]}}}]})
+    _serper(monkeypatch, status=429)
+    r = client.post("/api/seo-geo/run/legalsoft")
+    assert r.status_code == 200, r.text
+    summary = r.json()["summary"]
+    assert (summary["rank_check_failed"], summary["ranks_from"]) == (True, "2026-10-13")
+    assert (summary["tracked"], summary["top10"]) == (1, 1)
+    assert [n for n in r.json()["degraded"] if n.startswith("Rank tracking")] == [
+        "Rank tracking: Google results couldn't be reached on this check (the search service is turning "
+        "requests away for now), so rankings weren't updated."]
+    card = client.get("/api/seo-geo/overview").json()["brands"][0]
+    assert card["last_run"]["rank_check_failed"] is True
+
+
 # ----------------------- Search Console connect (OAuth) -----------------------
 #
 # Google returns to the console's ``/oauth/google``; the console posts
@@ -700,6 +865,37 @@ def test_overview_reading_flag_comes_from_the_latest_run_not_from_the_cloud_flag
     card = body["brands"][0]
     assert card["gsc"]["reading"] is True and card["gsc"]["connected"] is False
     assert body["sources"]["gsc"] is True
+
+
+def test_overview_cards_carry_the_dashboard_fields_from_documents_already_read(monkeypatch):
+    """B2: the portfolio sorts brands by what slipped, what failed and what is
+    still open. Every field comes off the documents the overview already
+    reads — the registry once, then per brand the run, its status overlay and
+    the site review — never off another (the crawl corpus is large)."""
+    from seo_geo_agent import insights, state as seo_state
+
+    seo_state.save("run-legalsoft", {
+        "brand_id": "legalsoft", "at": "2026-10-14", "trigger": "cron", "degraded": [], "insights": [],
+        "topics": [], "ga": {"property": "properties/1", "totals": {}},
+        "summary": {"mode": "rank-tracking", "moved_down": 2, "fell_off": 1, "rank_check_failed": True},
+        "todos": [_todo("t1", "a"), _todo("t2", "b"), _todo("t3", "c", status="done")]})
+    insights.set_todo_status("legalsoft", "t1", "done")
+    seo_state.save("sitereview-legalsoft", {"brand_id": "legalsoft", "at": "2026-10-12", "issues": []})
+    insights.upsert_brand({"id": "acme", "name": "Acme", "domain": "acme.com", "enabled": False})
+
+    reads: list[str] = []
+    real_load = seo_state.load
+    monkeypatch.setattr(seo_state, "load", lambda doc_id: reads.append(doc_id) or real_load(doc_id))
+    cards = {c["brand"]["id"]: c for c in client.get("/api/seo-geo/overview").json()["brands"]}
+
+    legalsoft = cards["legalsoft"]
+    assert (legalsoft["site_review_at"], legalsoft["ga_reading"]) == ("2026-10-12", True)
+    assert {k: legalsoft["last_run"][k] for k in ("at", "todo_count", "open_count", "drops", "rank_check_failed")} \
+        == {"at": "2026-10-14", "todo_count": 3, "open_count": 1, "drops": 3, "rank_check_failed": True}
+    acme = cards["acme"]                       # switched off, still listed: GEO › Brands reads it
+    assert (acme["last_run"], acme["site_review_at"], acme["ga_reading"]) == (None, None, False)
+    assert sorted(reads) == sorted(["brands", "run-legalsoft", "todos-legalsoft", "sitereview-legalsoft",
+                                    "run-acme", "sitereview-acme"])
 
 
 @pytest.mark.parametrize(("summary", "reading"), [

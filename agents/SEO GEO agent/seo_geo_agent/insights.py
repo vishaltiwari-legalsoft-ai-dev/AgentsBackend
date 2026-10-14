@@ -15,6 +15,7 @@ from . import audit, competitors, gsc_oauth, pages as pages_mod, site_brain, sta
 from .sources import (
     CredentialMissing,
     QueryStat,
+    SearchUnavailable,
     ga_discover_property,
     ga_fetch_overview,
     ga_fetch_pages,
@@ -356,6 +357,9 @@ def _rank_todo(brand_id: str, kind: str, kw: str, position, action: str, why: st
 def build_rank_todos(brand_id: str, ranks_doc: dict, *, cap: int | None = MAX_TODOS) -> list[dict]:
     """Fix list from live rank snapshots: drops first, then near-page-1, then gaps.
 
+    A keyword that had a top-10 place at the previous check and has none now
+    is a drop too — the biggest one — not a gap that was always there.
+
     At most ``cap``; ``cap=None`` returns every one, as :func:`build_todos`."""
     snaps = ranks_doc.get("snapshots", [])
     if not snaps:
@@ -374,7 +378,15 @@ def build_rank_todos(brand_id: str, ranks_doc: dict, *, cap: int | None = MAX_TO
                 f"Fell #{before} → #{pos} since the last check — likely a competitor update or stale content",
                 priority=0,
             ))
-        if pos is None:
+        if before and pos is None:
+            todos.append(_rank_todo(
+                brand_id, "rank_drop", kw, None,
+                f"Investigate the ranking drop for '{kw}'",
+                f"Dropped out of Google's top 10 for '{kw}' (was #{before})"
+                + (f" — currently owned by {owners}" if owners else ""),
+                priority=0,
+            ))
+        elif pos is None:
             todos.append(_rank_todo(
                 brand_id, "unranked", kw, None,
                 f"Create or strengthen a page targeting '{kw}'",
@@ -395,30 +407,89 @@ def build_rank_todos(brand_id: str, ranks_doc: dict, *, cap: int | None = MAX_TO
 
 
 def _rank_summary(ranks_doc: dict) -> dict:
+    """The run summary of the latest snapshot against the one before it.
+
+    ``fell_off``: keywords with a top-10 place at the previous check and none
+    now — counted apart from ``moved_down``, which compares two positions.
+    ``ranks_from``: the date of the snapshot these figures come from;
+    ``rank_check_failed`` is set by :func:`_rank_section` when this run's own
+    check failed and the figures are the last good check's."""
     snaps = ranks_doc.get("snapshots", [])
     latest = snaps[-1]["ranks"] if snaps else {}
     prev = snaps[-2]["ranks"] if len(snaps) > 1 else {}
-    positions = [e.get("position") for e in latest.values()]
-    ranked = [p for p in positions if p]
-    moved_up = moved_down = 0
+    ranked = [e.get("position") for e in latest.values() if e.get("position")]
+    moved_up = moved_down = fell_off = 0
     for kw, entry in latest.items():
         before = (prev.get(kw) or {}).get("position")
         now = entry.get("position")
         if before and now:
             moved_up += now < before
             moved_down += now > before
+        elif before:
+            fell_off += 1
     return {
         "mode": "rank-tracking",
-        "tracked": len(positions),
-        "top3": sum(1 for p in ranked if p <= 3),
-        "top10": len(ranked),
-        "unranked": sum(1 for p in positions if p is None),
+        **competitors.rank_counts(latest),
         "moved_up": moved_up,
         "moved_down": moved_down,
+        "fell_off": fell_off,
         "clicks_28d": 0, "clicks_prev_28d": 0, "impressions_28d": 0,
         "avg_position": round(sum(ranked) / len(ranked), 1) if ranked else 0,
+        # 0, not None: the live dashboard formats this number unguarded
+        # (``n(s.est_potential_clicks)``), and None would crash its render.
         "est_potential_clicks": 0,
+        "rank_check_failed": False,
+        "ranks_from": snaps[-1].get("at") if snaps else None,
     }
+
+
+#: The note of a rank check that could not reach Google results. It starts with
+#: "Rank tracking" — the console keys its notice on that, and the Issues rail
+#: files it under rank tracking — and it is a fixed point of ``plain_note``,
+#: which every read of a stored run re-applies. ``{why}``:
+#: ``SearchUnavailable.why``.
+RANK_CHECK_FAILED_NOTE = ("Rank tracking: Google results couldn't be reached on this check ({why}), "
+                          "so rankings weren't updated.")
+
+
+def _rank_section(brand: dict, degraded: list[str]) -> tuple[list[dict], dict, list[str]]:
+    """``(to-dos, summary, bullets)`` from live rank snapshots (no Search Console).
+
+    A check that fails — Serper out of credits, rate-limited, down, or no key —
+    takes no snapshot and never zeroes what the last good one measured: the
+    summary and to-dos are rebuilt from the stored snapshots, marked
+    ``rank_check_failed`` with ``ranks_from`` = that snapshot's date, and the
+    note in ``degraded`` says the rankings weren't updated. With no snapshot to
+    fall back on, the summary is the empty one, still marked failed."""
+    failure = None
+    try:
+        ranks_doc = competitors.rank_snapshot(brand)
+    except CredentialMissing as exc:
+        failure = (RANK_CHECK_FAILED_NOTE.format(why=exc.why) if isinstance(exc, SearchUnavailable)
+                   else plain_note(f"Rank tracking: {exc}"))
+        degraded.append(failure)
+        ranks_doc = state.load(f"ranks-{brand['id']}") or {}
+    if ranks_doc.get("snapshots"):
+        todos = build_rank_todos(brand["id"], ranks_doc, cap=None)
+        summary = _rank_summary(ranks_doc)
+        bullets = _rank_bullets(summary, todos)
+    else:
+        todos, bullets = [], []
+        summary = {**_summary([], [], []), "ranks_from": None}
+    if failure:
+        summary["rank_check_failed"] = True
+        if bullets:
+            bullets.insert(0, f"Rankings weren't updated on this check — the figures below are from "
+                              f"the last good check, on {summary['ranks_from']}.")
+    return todos, summary, bullets
+
+
+def checked_ranks(run: dict) -> bool:
+    """Whether ``run`` was a rank-tracking run: it took this sweep's rank
+    snapshot, or tried and failed (``rank_check_failed``). A Search Console run
+    takes none, so the sweep takes that brand's one snapshot itself."""
+    summary = run.get("summary") or {}
+    return summary.get("mode") == "rank-tracking" or bool(summary.get("rank_check_failed"))
 
 
 def _rank_bullets(summary: dict, todos: list[dict]) -> list[str]:
@@ -428,6 +499,9 @@ def _rank_bullets(summary: dict, todos: list[dict]) -> list[str]:
     ]
     if summary["moved_down"]:
         bullets.append(f"{summary['moved_down']} keyword(s) dropped since the last check — drops lead the fix list.")
+    if summary.get("fell_off"):
+        bullets.append(f"{summary['fell_off']} keyword(s) fell out of the top 10 since the last check — "
+                       "each is on the fix list as a drop.")
     if summary["moved_up"]:
         bullets.append(f"{summary['moved_up']} keyword(s) moved up — whatever changed there is working.")
     if summary["unranked"]:
@@ -569,15 +643,8 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
         bullets = _insight_bullets(summary, todos[:MAX_TODOS])
     else:
         # No Search Console access: run on live rank snapshots instead (Serper).
-        try:
-            ranks_doc = competitors.rank_snapshot(brand)
-            todos = build_rank_todos(brand["id"], ranks_doc, cap=None)
-            summary = _rank_summary(ranks_doc)
-            bullets = _rank_bullets(summary, todos)
-        except CredentialMissing as exc:
-            degraded.append(plain_note(f"Rank tracking: {exc}"))
-            todos, bullets = [], []
-            summary = _summary([], [], [])
+        # This is the sweep's one rank snapshot for the brand (``checked_ranks``).
+        todos, summary, bullets = _rank_section(brand, degraded)
 
     # Live website analytics (GA4) ride along; the run never fails on them.
     ga = None
@@ -616,8 +683,12 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
 
     # Site-review findings ride along in the fix list: reserved slots, and the cut
     # is counted — ``todos_not_shown`` is every search-data or site to-do this
-    # run built that is not in ``todos``.
+    # run built that is not in ``todos``. The search-data share of that cut is
+    # kept apart, so a site review folded in later (``fold_site_review``) can
+    # recount without the to-dos it never saw.
+    search_built = len(todos)
     todos, todos_not_shown = site_brain.merge_todos(todos, site, MAX_TODOS)
+    search_todos_not_shown = search_built - sum(1 for t in todos if t.get("kind") != "site")
 
     # One review read grounds both the seeds and the blog plan's gap/coverage check.
     # A keyword already on the Fix list is that page's job, not a new post's.
@@ -639,10 +710,11 @@ def run_brand(brand: dict, trigger: str, today: date | None = None) -> dict:
         "degraded": degraded,
         "summary": summary,
         "insights": bullets,
-        "todos": todos,
+        "todos": _labelled(todos),
         "topics": topic_list,
         "ga": ga,
         "todos_not_shown": todos_not_shown,
+        "search_todos_not_shown": search_todos_not_shown,
         # Search Console rows this run actually read (current 28 days). The
         # honest "is Search Console behind this brand" signal: ``summary.mode``
         # says "search-console" even when Search Console AND rank tracking
@@ -678,8 +750,75 @@ def refold_page_advice(brand_id: str, page_doc: dict, site: list[dict]) -> None:
              for t in todos]
     shown = {t.get("id") for t in todos}
     todos += [t for t in folded.values() if t.get("origin") == site_brain.PAGE_ADVICE and t["id"] not in shown]
-    run["todos"] = todos
+    run["todos"] = _labelled(todos)
     state.save(f"run-{brand_id}", run)
+
+
+def _labelled(todos: list[dict]) -> list[dict]:
+    """Every to-do with its ``label`` (:func:`todo_label`): at most eight plain
+    words, what the dashboard's "This week" rows show next to "See Fix list #n"."""
+    for todo in todos:
+        todo["label"] = todo_label(todo)
+    return todos
+
+
+def fold_site_review(brand_id: str) -> tuple[bool, int]:
+    """Bring the stored run's Fix list in line with a site review run on its own
+    (``POST /site-review/{id}``) — now, not at the next run.
+
+    The run's search-data to-dos stay as they are, in their order. Its site
+    to-dos (review findings, folded page advice) are rebuilt the way
+    :func:`run_brand` builds them: :func:`site_brain.site_todos` from the new
+    review (stable ids, statuses carried over), the stored page pass's advice
+    folded in, one :func:`site_brain.merge_todos` cut at :data:`MAX_TODOS`, and
+    ``todos_not_shown`` recounted. Blog-plan topics that point at a Fix-list
+    position are re-pointed (:func:`_repoint_fix_list`).
+
+    Returns ``(updated, findings shown)`` — ``(False, 0)`` when no run is stored
+    yet: there is no Fix list until the first run, which then reads the review."""
+    run = state.load(f"run-{brand_id}")
+    if not run:
+        return False, 0
+    stored = run.get("todos") or []
+    search = [t for t in stored if t.get("kind") != "site"]
+    hidden = run.get("search_todos_not_shown")
+    if hidden is None:
+        # A run stored before the search-data share of the cut was recorded.
+        # merge_todos gives site to-dos more than their reserved slots only
+        # when the search-data list ran out, so then none of it was cut; else
+        # the whole count was search-data — exact, except with exactly
+        # SITE_TODO_SLOTS site items shown, where it is the upper bound.
+        site_shown = len(stored) - len(search)
+        hidden = 0 if site_shown > site_brain.SITE_TODO_SLOTS else int(run.get("todos_not_shown") or 0)
+    page_doc = state.load(f"pages-{brand_id}") or {}
+    site = site_brain.fold_page_advice(brand_id, site_brain.site_todos(brand_id), page_doc.get("fix_items"))
+    todos, not_shown = site_brain.merge_todos(search, site, MAX_TODOS)
+    kept_search = sum(1 for t in todos if t.get("kind") != "site")
+    run["todos"] = _labelled(todos)
+    run["search_todos_not_shown"] = hidden + len(search) - kept_search
+    run["todos_not_shown"] = not_shown + hidden
+    _repoint_fix_list(run.get("topics") or [], todos)
+    state.save(f"run-{brand_id}", run)
+    return True, sum(1 for t in todos if t.get("kind") == "site" and t.get("origin") != site_brain.PAGE_ADVICE)
+
+
+def _repoint_fix_list(topic_list: list[dict], todos: list[dict]) -> None:
+    """Blog-plan topics that say "Also on your Fix list as #n" after the Fix
+    list changed under them: the new position, or — when the keyword's to-do
+    no longer made the cut — no pointer at all, never one at a different item."""
+    index = topics.fix_query_index(todos)
+    for topic in topic_list:
+        old = topic.get("also_in_fix") if isinstance(topic, dict) else None
+        if not old:
+            continue
+        new = index.get(frozenset(topics._tokens(str(topic.get("keyword") or ""))))
+        if new == old:
+            continue
+        old_line = topics.FIX_LIST_WHY.format(n=old)
+        why = str(topic.get("why") or "")
+        topic["also_in_fix"] = new
+        topic["why"] = (why.replace(old_line, topics.FIX_LIST_WHY.format(n=new)) if new
+                        else why.replace(f" · {old_line}", "").replace(old_line, ""))
 
 
 def latest_run(brand_id: str) -> dict | None:
@@ -691,6 +830,8 @@ def latest_run(brand_id: str) -> dict | None:
     for todo in run.get("todos", []):
         if todo["id"] in overlay:
             todo["status"] = overlay[todo["id"]]
+        if not todo.get("label"):   # a run stored before labels were
+            todo["label"] = todo_label(todo)
     # A run stored before notes were made plain still carries raw exception text.
     run["degraded"] = [plain_note(n, log=False) for n in run.get("degraded") or [] if isinstance(n, str)]
     return run
