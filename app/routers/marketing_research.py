@@ -262,6 +262,19 @@ def _latest_lead_run(user_id: str, all_runs: list[dict] | None = None) -> dict |
     return newest
 
 
+def _lead_run_soft(workspace_id: str) -> dict | None:
+    """The workspace's newest lead-analysis run for the vendor report's
+    lead-status join — scoped exactly as ``GET /mr/lead-analysis`` scopes it —
+    or None. Fail-soft on purpose: a store failure here degrades the report to
+    an honest "no lead-status data" block, never to a failed build or a 502."""
+    try:
+        return _latest_lead_run(workspace_id)
+    except Exception:  # noqa: BLE001 - degraded, logged, never fatal
+        logger.warning("mr vendor report: the lead-analysis run could not be read; building "
+                       "without the lead-status join", exc_info=True)
+        return None
+
+
 def _tracker_rollups_by_month(user_id: str) -> dict[str, dict[str, dict]]:
     """Tracker funnel counts per month per vendor slug — the join the lead
     sheet's QL-ratio/booking-rate rule needs (the lead sheet has no lead totals,
@@ -2406,6 +2419,11 @@ def vendor_report_build(body: dict | None = None, user=Depends(get_current_user)
     team template that cannot render this report is a 409 ``template_failed``
     with ``can_use_builtin``, and nothing is saved.
 
+    The workspace's newest lead-analysis run (the one ``GET /mr/lead-analysis``
+    shows) is joined in as ``structured.lead_status`` and per vendor as
+    ``vendors[].lead_status``; with no run, or none for that month, the block
+    says so (``lead_status.available: false`` + ``reason``) — never zeros.
+
     Errors carry ``{code, reason, detail}``: ``invalid_month``,
     ``invalid_template``, ``empty_month`` (422) and ``template_failed`` (409).
     """
@@ -2417,9 +2435,11 @@ def vendor_report_build(body: dict | None = None, user=Depends(get_current_user)
         year_month = _year_month_field(body)
     except ValueError as exc:
         return _coded(422, "invalid_month", str(exc), act)
+    ws = _ws(user)
     try:
-        run = vr.build(workspace_id=_ws(user), year_month=year_month,
-                       template=(body or {}).get("template"), use_templates=_templates_on())
+        run = vr.build(workspace_id=ws, year_month=year_month,
+                       template=(body or {}).get("template"), use_templates=_templates_on(),
+                       lead_run=_lead_run_soft(ws))
     except (vr.EmptyMonth, vr.TemplateRefused) as exc:
         return _coded(422, exc.code, str(exc), act)
     except vr.TemplateFailed as exc:
@@ -2734,7 +2754,7 @@ def _preview_source(ws: str) -> tuple[dict | None, dict | None]:
     from marketing_research_agent import vendor_report as vr
 
     try:
-        report = vr.preview_report(workspace_id=ws)
+        report = vr.preview_report(workspace_id=ws, lead_run=_lead_run_soft(ws))
     except mr_snapshots.SnapshotStoreError:
         logger.warning("mr template preview: the snapshot store could not be read",
                        exc_info=True)
@@ -2805,7 +2825,8 @@ def report_templates_list(user=Depends(get_current_user)):
     listed = rt.listing(runs.list_template_versions(ws))
     try:
         from marketing_research_agent import vendor_report as vr
-        report = vr.preview_report(workspace_id=ws, with_previous=False)
+        report = vr.preview_report(workspace_id=ws, with_previous=False,
+                                   lead_run=_lead_run_soft(ws))
     except mr_snapshots.SnapshotStoreError:
         logger.warning("mr templates: no examples - the snapshot store could not be read",
                        exc_info=True)
@@ -2839,12 +2860,21 @@ def report_template_extract(file: UploadFile | None = File(None),
     HTML file is checked instead (the ``check-html`` answer, ``source_kind:
     "html"``) and costs no reading. Nothing is saved.
 
-    200: ``{source_kind, upload, layout, unsupported, matched_count, notes,
-    preview_html, preview_unavailable_reason, readings_left_today}``.
+    200: ``{source_kind, upload, layout, unsupported, left_out, matched_count,
+    notes, preview_html, preview_unavailable_reason, readings_left_today}``.
+
+    ``left_out`` is the contract for "what of my sample is NOT in this
+    template": ``[{title, reason}]``, one entry per sample section that is not
+    in ``layout`` — first the sections no catalog block can show, in the
+    sample's order (``reason`` = what the section shows), then the duplicates
+    dropped (``reason`` = why). It is derived from ``unsupported`` + ``notes``
+    and never empty while either names a dropped section; a UI shows it as the
+    "left out of your template" list.
+
     Errors: ``{code, reason, detail, ...}`` — 422 ``invalid_file`` or an
     extraction code for a bad upload, 429 ``rate_limited``, 503/502 for the AI
-    reader (``unsupported`` included when the sample had sections we cannot
-    fill)."""
+    reader (``unsupported`` and ``left_out`` included when the sample had
+    sections we cannot fill)."""
     from marketing_research_agent import report_templates as rt
     from marketing_research_agent import template_extract as tx
 
@@ -2894,7 +2924,8 @@ def report_template_extract(file: UploadFile | None = File(None),
                            usage.get("cost_usd"))
         else:
             runs.release_template_reading(reading)
-        extra = {"unsupported": exc.unsupported} if exc.unsupported else {}
+        extra = ({"unsupported": exc.unsupported,
+                  "left_out": tx.left_out_of(exc.unsupported, [])} if exc.unsupported else {})
         return _coded(_EXTRACT_STATUS.get(exc.code, 502), exc.code, exc.reason, act,
                       billed=billed, readings_left_today=_readings_left(ws), **extra)
     except Exception:
@@ -2906,6 +2937,8 @@ def report_template_extract(file: UploadFile | None = File(None),
         "upload": upload,
         "layout": result["layout"],
         "unsupported": result["unsupported"],
+        "left_out": result.get("left_out") if result.get("left_out") is not None
+        else tx.left_out_of(result["unsupported"], result["notes"]),
         "matched_count": result["matched_count"],
         "notes": result["notes"],
         **_preview(ws, {"source_kind": source_kind, "spec": result["layout"]}),

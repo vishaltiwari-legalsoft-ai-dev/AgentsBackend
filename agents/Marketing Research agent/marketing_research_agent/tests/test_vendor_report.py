@@ -62,23 +62,31 @@ def _by_name(report: dict) -> dict[str, dict]:
 
 
 def _doc(name: str, *, budget=1000.0, spend=0.0, leads=0.0, ql=0.0, booked=0.0,
-         qbooked=0.0, completed=0.0, dnc=0.0, proj=0.0, actual=0.0, gid=None,
+         qbooked=0.0, completed=0.0, dnc=0.0, proj=0.0, actual=0.0, clients=0.0,
+         not_actual=0.0, fee=None, inv_budget=None, inv_spend=None, gid=None,
          captured="2026-09-10T10:00:00+00:00", date_iso="2026-09-10") -> dict:
     """One vendor doc in the stored shape (canonical.team_overall only). Each
-    title gets its own gid unless one is given — tabs never share a gid."""
+    title gets its own gid unless one is given — tabs never share a gid. The
+    Investment column equals Performance unless ``inv_*`` is given; ``fee=None``
+    leaves the management-fee row off the tab (absent, as on a tab without it)."""
+    team = {
+        "budget": {"performance": budget,
+                   "investment": budget if inv_budget is None else inv_budget},
+        "spend": {"performance": spend, "investment": spend if inv_spend is None else inv_spend},
+        "leads": {"total": leads, "qualified": ql, "lost_dnc_bad_lead": dnc},
+        "demos": {"total_booked_all": booked, "qualified_booked_all": qbooked,
+                  "completed_all": completed},
+        "projected_revenue": {"total_amount_sold_actualized": proj},
+        "actualized_revenue": {"amount_sold": actual, "revenue_clients": clients},
+        "not_actualized_revenue": {"amount_sold": not_actual},
+    }
+    if fee is not None:
+        team["management_fees_investment"] = fee
     return {
         "vendor": name, "vendor_slug": snapshots.slugify(name),
         "gid": gid if gid is not None else sum(map(ord, name)) * 1000 + len(name),
         "date": date_iso, "month": date_iso[:7], "captured_at": captured,
-        "canonical": {"team_overall": {
-            "budget": {"performance": budget, "investment": budget},
-            "spend": {"performance": spend, "investment": spend},
-            "leads": {"total": leads, "qualified": ql, "lost_dnc_bad_lead": dnc},
-            "demos": {"total_booked_all": booked, "qualified_booked_all": qbooked,
-                      "completed_all": completed},
-            "projected_revenue": {"total_amount_sold_actualized": proj},
-            "actualized_revenue": {"amount_sold": actual},
-        }, "channels": {}},
+        "canonical": {"team_overall": team, "channels": {}},
     }
 
 
@@ -364,7 +372,11 @@ def test_revenue_is_never_compared_across_months(golden):
     n = golden["new_this_period"]
     assert "revenue_rolled_off" not in n
     assert not any("revenue" in s["text"].lower() for s in n["sentences"])
-    assert "actualized_revenue" not in golden["vendors"][0]
+    # Revenue IS read per vendor (month to date, 2026-10-15) — but only this
+    # month's: no row of new_this_period carries a revenue figure of any kind.
+    for key in ("budget_changes", "newly_funded", "paused", "still_zero", "first_seen"):
+        for item in n[key]:
+            assert not any("revenue" in k for k in item), (key, item)
 
 
 def test_vendors_pair_across_months_by_gid_then_title_then_brand_marker():
@@ -750,3 +762,330 @@ def test_a_preview_report_is_computed_never_stored(store):
 def test_periods_lists_the_months_with_a_sweep(store):
     assert vr.periods() == [{"year_month": "2026-09", "label": "September 2026"},
                             {"year_month": "2026-08", "label": "August 2026"}]
+
+
+# --- template coverage (2026-10-15): investment basis, pace, revenue, lead status ------
+# The owner's rule: if the tracker has the figure, fill it; if not, flag it.
+# Every new figure below is pinned on the golden 2026-09-02 sweep AND on the
+# absent-is-not-zero path.
+
+NEW_SCALARS = ("total_management_fees", "total_spend_investment", "cost_per_lead_investment",
+               "cost_per_qualified_lead_investment", "cost_per_demo_completed_investment",
+               "pace_pct", "pace_gap_pct", "projected_runout_date", "actualized_revenue",
+               "actualized_clients", "not_actualized_revenue", "roas_pct")
+NEW_BLOCKS = ("lead_status_by_vendor", "channel_benchmarks", "vendor_investment", "vendor_detail")
+
+
+def _lead_vendor(campaign: str, **counts) -> dict:
+    """One lead-sheet vendor bucket as ``lead_analysis.summarize`` writes it."""
+    base = {"booked": 0, "completed": 0, "no_show": 0, "canceled": 0, "bad_lead": 0,
+            "pending": 0, "completed_dnc": 0, "deal_stages": {}}
+    base.update(counts)
+    return {"campaign": campaign, "slug": snapshots.slugify(campaign), **base}
+
+
+LEAD_SUMMARY = {"months": {"2026-09": {"vendors": [
+    # "ElevateMKT" (lead sheet) vs the tab "Elevate MKT LS Email": joins only
+    # with separators removed.
+    _lead_vendor("ElevateMKT LS Email", booked=5, completed=2, no_show=1, canceled=1,
+                 pending=1, completed_dnc=1,
+                 deal_stages={"contract_sent": 1, "hot_leads": 1, "lost_dnc": 1, "none": 2}),
+    _lead_vendor("Hawksem LS Meta", booked=2, completed=2,
+                 deal_stages={"contract_sent": 2}),
+    _lead_vendor("Mystery Co", booked=1, no_show=1),          # no such tab
+]}}}
+
+
+def test_the_golden_management_fees_are_the_seven_vendors_figures_summed(golden):
+    fees = {v["name"]: v["management_fee"] for v in golden["vendors"]}
+    assert {n: f for n, f in fees.items() if f} == {
+        "Hawksem LS Google": 2200.0, "Hawksem LS Meta": 2200.0,
+        "DanteAgency LI Google": 1700.0, "Advantech RA Google": 1200.0,
+        "SaffronEdge LS Meta": 1000.0, "EHackers LS Email": 1000.0,
+        "DanteAgency ChatGPT": 300.0}
+    assert all(f is not None for f in fees.values())    # every final tab carries the row
+    p = golden["portfolio"]
+    assert p["total_management_fees"] == 9600.0
+    assert p["total_spend_investment"] == 12336.93
+    assert p["cost_per_lead_investment"] == round(12336.93 / p["total_leads"], 2)
+    assert p["cost_per_qualified_lead_investment"] == round(12336.93 / p["qualified_leads"], 2)
+    assert p["cost_per_demo_completed_investment"] == round(12336.93 / p["demos_completed"], 2)
+    assert not any(m["metric"] == "total_management_fees" for m in golden["missing"])
+    hawk = _by_name(golden)["Hawksem LS Meta"]
+    assert (hawk["budget_investment"], hawk["spend_investment"]) == (7200.0, 2543.72)
+    assert hawk["cost_per_lead_investment"] == round(2543.72 / hawk["leads"], 2)
+    # The Performance figures the published report rests on did not move.
+    assert (p["total_budget"], p["total_spend"], p["total_leads"]) == (95600.0, 2736.93, 18.0)
+
+
+def test_a_fee_total_nobody_reports_is_none_and_a_partial_sum_names_who_is_left_out():
+    r = vr.compute(_sweep(_doc("A LS Meta"), _doc("B LS Meta")), targets=_targets())
+    assert r["portfolio"]["total_management_fees"] is None
+    assert {"metric": "total_management_fees", "label": "Total Management Fees",
+            "vendors": "portfolio", "reason": "no vendor tab reports a management fee"} \
+        in r["missing"]
+    assert "&#8212;" in vrr.render_scalar(r, "total_management_fees")
+    r = vr.compute(_sweep(_doc("A LS Meta", fee=500.0), _doc("B LS Meta")), targets=_targets())
+    assert r["portfolio"]["total_management_fees"] == 500.0     # those who report it
+    m = next(m for m in r["missing"] if m["metric"] == "total_management_fees")
+    assert m["vendors"] == ["B LS Meta"] and "sum of the vendors that report it" in m["reason"]
+    # A tab that reports a $0 fee reports a figure: counted, not treated as absent.
+    r = vr.compute(_sweep(_doc("A LS Meta", fee=0.0), _doc("B LS Meta", fee=250.0)),
+                   targets=_targets())
+    assert r["portfolio"]["total_management_fees"] == 250.0
+    assert not any(m["metric"] == "total_management_fees" for m in r["missing"])
+
+
+def test_the_investment_column_is_read_as_is_with_no_fallback_and_its_ratios_recomputed():
+    doc = _doc("A LS Meta", budget=5000, spend=400, leads=4, ql=2, completed=1, fee=1000,
+               inv_budget=6000, inv_spend=1400)
+    r = vr.compute(_sweep(doc), targets=_targets())
+    v = _by_name(r)["A LS Meta"]
+    assert (v["budget"], v["spend"]) == (5000.0, 400.0)                 # Performance, unchanged
+    assert (v["budget_investment"], v["spend_investment"], v["management_fee"]) == (
+        6000.0, 1400.0, 1000.0)
+    assert (v["cost_per_lead_investment"], v["cost_per_qualified_lead_investment"],
+            v["cost_per_demo_completed_investment"]) == (350.0, 700.0, 1400.0)
+    assert (v["cost_per_lead"], v["cost_per_qualified_lead"],
+            v["cost_per_demo_completed"]) == (100.0, 200.0, 400.0)
+    assert (r["portfolio"]["total_spend_investment"],
+            r["portfolio"]["cost_per_lead_investment"]) == (1400.0, 350.0)
+    # A blank Investment cell is absent, never back-filled from Performance.
+    blank = _doc("B LS Meta", spend=100, leads=1)
+    blank["canonical"]["team_overall"]["spend"]["investment"] = None
+    r = vr.compute(_sweep(blank), targets=_targets())
+    v = _by_name(r)["B LS Meta"]
+    assert v["spend"] == 100.0 and v["spend_investment"] is None
+    assert v["cost_per_lead_investment"] is None
+    assert r["portfolio"]["total_spend_investment"] is None
+    assert {"metric": "total_spend_investment", "label": "Total Spend incl. Fees",
+            "vendors": ["B LS Meta"], "reason": "not reported on the vendor tab"} in r["missing"]
+
+
+def test_pace_is_the_day_over_the_month_and_run_out_is_a_date_only_inside_the_month(golden):
+    p = golden["portfolio"]
+    assert (golden["day_of_month"], golden["days_in_month"]) == (2, 30)
+    assert p["pace_pct"] == 6.67
+    assert p["pace_gap_pct"] == round(p["budget_utilized_pct"] - 6.67, 2) == -3.81
+    assert p["projected_runout_date"] is None     # $2,737 in 2 days vs $95,600 lasts past Sep 30
+    assert any(m["metric"] == "projected_runout_date" and "lasts past month end" in m["reason"]
+               for m in golden["missing"])
+    by = _by_name(golden)
+    assert all(v["pace_pct"] == 6.67 for v in golden["vendors"])
+    assert by["Hawksem LS Meta"]["projected_runout_date"] == "2026-09-29"  # $343.72 / 2 days
+    assert by["Anushka LS Meta"]["projected_runout_date"] == "2026-09-19"
+    assert by["Hawksem LS Google"]["projected_runout_date"] is None       # $0 spent: no rate
+    assert by["AB Twitter LS"]["pace_gap_pct"] is None                    # $0 budget: no util.
+    # Synthetic: day 10, $900 of $1,000 at $90/day runs out on the 11th; already
+    # over budget gives the (past) day it ran out; no spend gives nothing.
+    r = vr.compute(_sweep(_doc("A LS Meta", budget=1000, spend=900),
+                          _doc("B LS Meta", budget=1000, spend=1200),
+                          _doc("C LS Meta", budget=1000, spend=0)), targets=_targets())
+    by = _by_name(r)
+    assert by["A LS Meta"]["projected_runout_date"] == "2026-09-11"
+    assert by["A LS Meta"]["pace_gap_pct"] == round(90.0 - round(10 / 30 * 100, 2), 2)
+    assert by["B LS Meta"]["projected_runout_date"] == "2026-09-08"
+    assert by["C LS Meta"]["projected_runout_date"] is None
+    # Portfolio: $2,100 of $3,000 at $210/day leaves $900, 4 more days: the 14th.
+    assert vrr.render_scalar(r, "projected_runout_date") == "Sep 14"
+    assert vr.fmt("2026-09-29", vr.DATE) == "Sep 29" and vr.fmt(None, vr.DATE) == "—"
+
+
+def test_revenue_is_the_trackers_actualized_blocks_and_roas_is_recomputed_as_the_tab_does(
+        store, golden):
+    p = golden["portfolio"]
+    assert (p["actualized_revenue"], p["actualized_clients"],
+            p["not_actualized_revenue"]) == (0.0, 0.0, 3671.0)
+    assert p["roas_pct"] == 0.0      # $0 actualized over $2,737 spent: a reported zero
+    assert _by_name(golden)["Hawksem LS Meta"]["not_actualized_revenue"] == 3671.0
+    # The formula is the tracker's own: on every 2026-08-31 tab that prints a
+    # ROAS, the recomputed figure IS that figure (actualized revenue / spend).
+    checked = 0
+    for doc in snapshots.previous_month_sweep("2026-09")["docs"]:
+        sheet = (((doc.get("canonical") or {}).get("team_overall") or {}).get("kpis") or {}
+                 ).get("roas_pct")
+        if sheet:
+            row = vr._vendor_row(doc, [])
+            assert row["roas_pct"] == sheet == round(
+                row["actualized_revenue"] / row["spend"] * 100, 2), doc["vendor"]
+            checked += 1
+    assert checked >= 4
+    # No spend means no ROAS (never 0%); revenue with a clients row is read too.
+    r = vr.compute(_sweep(_doc("A LS Meta", actual=500.0, clients=1, not_actual=900.0)),
+                   targets=_targets())
+    v = _by_name(r)["A LS Meta"]
+    assert (v["actualized_revenue"], v["actualized_clients"], v["not_actualized_revenue"]) == (
+        500.0, 1.0, 900.0)
+    assert v["roas_pct"] is None and r["portfolio"]["roas_pct"] is None
+    assert any(m["metric"] == "roas_pct" and m["reason"] == "no spend yet" for m in r["missing"])
+
+
+def test_lead_status_joins_by_slug_exact_first_then_with_separators_removed(store):
+    sweep = snapshots.vendor_sweep("2026-09")
+    r = vr.compute(sweep, targets=_targets(), lead_summary=LEAD_SUMMARY,
+                   lead_as_of="2026-09-02T10:00:00+00:00")
+    ls = r["lead_status"]
+    assert ls["available"] is True and ls["reason"] is None
+    assert ls["as_of"] == "2026-09-02T10:00:00+00:00"
+    assert [v["vendor"] for v in ls["vendors"]] == ["Hawksem LS Meta", "Elevate MKT LS Email"]
+    elevate = _by_name(r)["Elevate MKT LS Email"]["lead_status"]
+    assert elevate == {"campaign": "ElevateMKT LS Email", "contract_sent": 1,
+                       "hot_lead_follow_up": 1, "completed_dnc": 1, "scheduled": 1,
+                       "no_show": 1, "canceled": 1, "bad_lead": 0, "completed": 2, "total": 5}
+    assert _by_name(r)["Hawksem LS Meta"]["lead_status"]["contract_sent"] == 2
+    assert _by_name(r)["Meta 360 RA"]["lead_status"] is None       # no campaign for it
+    assert ls["unmatched_campaigns"] == ["Mystery Co"]
+    assert ls["totals"]["total"] == 7 and ls["totals"]["completed_dnc"] == 1
+    # Exact beats compact: with both spellings on the sheet the exact one joins
+    # and the other is listed, not guessed onto the same tab.
+    both = {"months": {"2026-09": {"vendors": [
+        _lead_vendor("ElevateMKT LS Email", booked=9),
+        _lead_vendor("Elevate MKT LS Email", booked=1)]}}}
+    r = vr.compute(sweep, targets=_targets(), lead_summary=both)
+    assert _by_name(r)["Elevate MKT LS Email"]["lead_status"]["total"] == 1
+    assert r["lead_status"]["unmatched_campaigns"] == ["ElevateMKT LS Email"]
+    # The month's vendor list on its own is accepted too.
+    r = vr.compute(sweep, targets=_targets(),
+                   lead_summary=LEAD_SUMMARY["months"]["2026-09"]["vendors"])
+    assert r["lead_status"]["available"] is True
+
+
+def test_without_lead_data_the_report_says_so_and_never_zero_fills(store):
+    sweep = snapshots.vendor_sweep("2026-09")
+    none = vr.compute(sweep, targets=_targets())
+    assert none["lead_status"] == {
+        "available": False, "as_of": None, "vendors": [], "unmatched_campaigns": [],
+        "totals": None,
+        "reason": "No lead-status data: no lead-analysis sheet has been pulled yet."}
+    assert all(v["lead_status"] is None for v in none["vendors"])
+    other_month = vr.compute(sweep, targets=_targets(),
+                             lead_summary={"months": {"2026-08": {"vendors": []}}})
+    assert other_month["lead_status"]["available"] is False
+    assert "September 2026" in other_month["lead_status"]["reason"]
+    no_match = vr.compute(sweep, targets=_targets(),
+                          lead_summary={"months": {"2026-09": {"vendors": [
+                              _lead_vendor("Mystery Co", booked=3)]}}})
+    assert no_match["lead_status"]["available"] is False
+    assert no_match["lead_status"]["unmatched_campaigns"] == ["Mystery Co"]
+    assert "matched a vendor tab" in no_match["lead_status"]["reason"]
+
+
+def test_the_new_blocks_render_with_data_and_say_so_without(store):
+    sweep = snapshots.vendor_sweep("2026-09")
+    without = vr.compute(sweep, targets=_targets())
+    with_ = vr.compute(sweep, targets=_targets(), lead_summary=LEAD_SUMMARY,
+                       lead_as_of="2026-09-02T10:00:00+00:00")
+
+    html = vrr.render_block(without, vrr.SectionSpec("lead_status_by_vendor"))
+    assert "no lead-analysis sheet has been pulled yet" in html and "<table" not in html
+    html = vrr.render_block(with_, vrr.SectionSpec("lead_status_by_vendor"))
+    assert "<th>Completed → DNC</th>" in html and "<th>Scheduled</th>" in html
+    assert "<td>Elevate MKT LS Email</td>" in html
+    assert "pulled 2026-09-02" in html
+    assert "Lead-sheet campaigns with no vendor tab this month: Mystery Co." in html
+    assert "Matched vendors" in html and "$0" not in html
+
+    html = vrr.render_block(with_, vrr.SectionSpec("channel_benchmarks"))
+    assert "<td>Meta</td><td>$400&#8211;$550</td><td>$700&#8211;$850</td><td>55.0%</td>" in html
+    assert "<td>Total</td>" in html and "Cost per lead ceiling $220" in html
+    assert "bad-lead rate 30.0%" in html
+
+    html = vrr.render_block(with_, vrr.SectionSpec("vendor_investment"))
+    assert "<th>Mgmt fee</th>" in html and "<th>Spend incl. fees</th>" in html
+    assert ("<td>Hawksem LS Meta</td><td>Meta</td><td>$5,000</td><td>$344</td><td>$2,200</td>"
+            "<td>$2,544</td>") in html
+    assert '<td class="down">$1,272</td>' in html          # CPL incl. fees vs the $220 ceiling
+    assert ("<td>Portfolio total</td><td></td><td>$95,600</td><td>$2,737</td><td>$9,600</td>"
+            in html)
+    assert html.count('<span class="dash"') >= 10              # unfunded vendors: em-dash
+    sorted_ = vrr.render_block(with_, vrr.SectionSpec("vendor_investment",
+                                                      options={"sort": "spend"}))
+    assert sorted_.index("Hawksem LS Meta") < sorted_.index("Meta 360 RA")
+
+    cards = vrr.render_block(with_, vrr.SectionSpec("vendor_detail"))
+    assert cards.count('class="vcard"') == 18
+    for pill in ('pill strong">Strong Start', 'pill early">Too Early', 'pill check">Check In'):
+        assert pill in cards
+    assert 'class="tick" style="left:6.67%"' in cards           # the pace tick
+    assert ("Lead status (5 demos): 1 contract sent · 1 hot lead follow-up · "
+            "1 completed → dnc") in cards
+    assert cards.count("no lead-sheet campaign matched this tab") == 16
+    assert "runs out Sep 29 at this pace" in cards
+    assert "Keep tracking." in cards                            # the rule-based action, verbatim
+    assert "<small>ceiling $850</small>" in cards and "<small>target 55.0%</small>" in cards
+    assert vrr.render_block(without, vrr.SectionSpec("vendor_detail")).count(
+        "Lead status: No lead-status data") == 18
+
+    empty = vr.compute(_sweep(), targets=_targets())
+    assert "No paid vendor tabs in this pull." in vrr.render_block(
+        empty, vrr.SectionSpec("vendor_detail"))
+
+    full = vrr.render(with_, vrr.layout_from_dict({"sections": [{"type": t} for t in NEW_BLOCKS]}))
+    lowered = full.lower()
+    for banned in ("<script", "<link", "@import", "http://", "https://", "<img", "<iframe"):
+        assert banned not in lowered, banned
+    hostile = vr.compute(_sweep(_doc("<script>x</script> LS Meta", spend=1, leads=1)),
+                         targets=_targets(),
+                         lead_summary=[_lead_vendor("<script>x</script> LS Meta", booked=1)])
+    assert "<script>" not in vrr.render_block(hostile, vrr.SectionSpec("vendor_detail"))
+    assert "<script>" not in vrr.render_block(hostile, vrr.SectionSpec("lead_status_by_vendor"))
+
+
+def test_a_stored_v1_run_still_renders_with_em_dashes_where_the_new_fields_would_be(golden):
+    old = copy.deepcopy(golden)
+    old["generator"] = "mr-vendor-report/1"
+    for key in ("benchmarks", "lead_status"):
+        del old[key]
+    for key in NEW_SCALARS:
+        del old["portfolio"][key]
+    for v in old["vendors"]:
+        for key in ("management_fee", "budget_investment", "spend_investment", "benchmarks",
+                    "lead_status", "pace_pct", "pace_gap_pct", "projected_runout_date",
+                    "actualized_revenue", "actualized_clients", "not_actualized_revenue",
+                    *vr._VENDOR_COST_RATIOS):
+            v.pop(key, None)
+    assert vrr.render(old)                                     # the built-in layout renders
+    html = vrr.render(old, vrr.layout_from_dict({"sections": [{"type": t} for t in NEW_BLOCKS]}))
+    assert "Benchmarks were not recorded in this report" in html
+    assert "No lead-status data for this month." in html
+    assert html.count('class="vcard"') == 18
+    assert "&#8212;" in vrr.render_scalar(old, "total_management_fees")
+    assert "&#8212;" in vrr.render_scalar(old, "projected_runout_date")
+    with pytest.raises(ValueError, match="mr-vendor-report/1"):
+        vrr.render({**golden, "generator": "mr-vendor-report/0"})
+
+
+def test_the_new_figures_and_blocks_are_catalog_entries_so_templates_get_them_for_free():
+    kinds = {"total_management_fees": vr.MONEY, "total_spend_investment": vr.MONEY,
+             "cost_per_lead_investment": vr.MONEY, "pace_pct": vr.PCT, "pace_gap_pct": vr.PCT,
+             "projected_runout_date": vr.DATE, "actualized_revenue": vr.MONEY,
+             "actualized_clients": vr.INT, "not_actualized_revenue": vr.MONEY,
+             "roas_pct": vr.PCT}
+    for key, kind in kinds.items():
+        assert vr.METRICS[key][1] == kind, key
+    vocab = vrr.placeholder_vocabulary()
+    assert set(NEW_SCALARS) <= set(vocab["scalars"])
+    assert {"{{table:lead_status_by_vendor}}", "{{table:channel_benchmarks}}",
+            "{{table:vendor_investment}}", "{{cards:vendor_detail}}"} <= set(vocab["blocks"])
+    assert vocab["blocks"]["{{cards:vendor_detail}}"]["kind"] == "cards"
+    # The pills are the three the report already had; nothing relabelled.
+    assert vr.STATUSES == ("Strong Start", "Too Early", "Check In")
+
+
+def test_a_fresh_lead_sheet_pull_re_derives_instead_of_serving_the_stale_join(store):
+    first = vr.build(workspace_id="ws-1", year_month="2026-09")
+    assert first["structured"]["lead_status"]["available"] is False
+    lead_run = {"id": "lr1", "kind": "lead_analysis", "user_id": "ws-1",
+                "generated_at": "2026-09-02T10:00:00+00:00", "summary": LEAD_SUMMARY}
+    second = vr.build(workspace_id="ws-1", year_month="2026-09", lead_run=lead_run)
+    assert second["id"] != first["id"] and second["reused"] is False
+    assert second["structured"]["lead_status"]["available"] is True
+    assert second["structured"]["lead_status"]["as_of"] == "2026-09-02T10:00:00+00:00"
+    again = vr.build(workspace_id="ws-1", year_month="2026-09", lead_run=lead_run)
+    assert again["reused"] is True and again["id"] == second["id"]
+    newer = {**lead_run, "id": "lr2", "generated_at": "2026-09-03T10:00:00+00:00"}
+    third = vr.build(workspace_id="ws-1", year_month="2026-09", lead_run=newer)
+    assert third["id"] != second["id"]
+    preview = vr.preview_report(workspace_id="ws-1", lead_run=lead_run)
+    assert preview["lead_status"]["available"] is True
+    assert len(runs.list_runs("ws-1", kind="vendor_report")) == 3

@@ -20,8 +20,32 @@ of upcoming demos can't trip a flag.
 
 from __future__ import annotations
 
+import re
+from typing import Any, Mapping
+
 from . import goals
 from .snapshots import slugify
+
+
+def compact_slug(slug: str | None) -> str:
+    """A slug with its separators removed, for the second pass of a join: the
+    lead sheet writes "ElevateMKT LS Email" where the tracker tab is "Elevate
+    MKT LS Email", so ``elevatemkt-ls-email`` and ``elevate-mkt-ls-email`` are
+    one vendor."""
+    return re.sub(r"[^a-z0-9]+", "", (slug or "").lower())
+
+
+def lookup_slug(table: Mapping[str, Any], slug: str | None) -> Any:
+    """``table[slug]`` — the exact key first; failing that, the ONE key that
+    matches with hyphens and spaces removed. Two compact matches is ambiguous
+    and gives ``None`` (never a guess)."""
+    if not slug:
+        return None
+    if slug in table:
+        return table[slug]
+    want = compact_slug(slug)
+    hits = [k for k in table if compact_slug(k) == want]
+    return table[hits[0]] if len(hits) == 1 else None
 
 # Header aliases → canonical field. A tab qualifies as the lead sheet when all
 # of _REQUIRED resolve in one header row (the combination is specific enough
@@ -253,6 +277,9 @@ def _new_bucket(campaign: str) -> dict:
         "campaign": campaign, "slug": slugify(campaign), "matched_vendor": None,
         "booked": 0, "completed": 0, "no_show": 0, "canceled": 0, "bad_lead": 0,
         "pending": 0, "other": 0,
+        # Completed demos whose deal stage is already Lost DNC: the call
+        # happened, the lead is gone. A cross-count, not one of the outcomes.
+        "completed_dnc": 0,
         "deal_stages": {}, "services_sold": 0, "amount": 0.0, "mrr": 0.0,
         "brands": {}, "sources": {},
     }
@@ -283,6 +310,8 @@ def summarize(records: list[dict], *,
         bucket["booked"] += 1
         key = r["outcome"] if r["outcome"] in (*_RESOLVED, "pending") else "other"
         bucket[key] += 1
+        if r["outcome"] == "completed" and r["stage"] == "lost_dnc":
+            bucket["completed_dnc"] += 1
         bucket["deal_stages"][r["stage"]] = bucket["deal_stages"].get(r["stage"], 0) + 1
         bucket["services_sold"] += r["services_sold"]
         bucket["amount"] += r["amount"]
@@ -303,7 +332,7 @@ def summarize(records: list[dict], *,
             v["bad_lead_rate_pct"] = _pct(v["bad_lead"], v["resolved"])
             v["amount"] = round(v["amount"], 2)
             v["mrr"] = round(v["mrr"], 2)
-            tr = (rollups.get(ym) or {}).get(v["slug"])
+            tr = lookup_slug(rollups.get(ym) or {}, v["slug"])
             if tr:
                 v["matched_vendor"] = tr.get("vendor")
                 leads = tr.get("leads") or 0
@@ -320,7 +349,8 @@ def summarize(records: list[dict], *,
             v["flags"] = _evaluate(v, t)
             v["story"] = _story(v)
             vendors.append(v)
-            for k in ("booked", *_RESOLVED, "pending", "other", "services_sold"):
+            for k in ("booked", *_RESOLVED, "pending", "other", "completed_dnc",
+                      "services_sold"):
                 totals[k] += v[k]
             totals["amount"] = round(totals["amount"] + v["amount"], 2)
             totals["mrr"] = round(totals["mrr"] + v["mrr"], 2)

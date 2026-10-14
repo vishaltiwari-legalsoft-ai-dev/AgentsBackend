@@ -535,3 +535,39 @@ def test_a_transparent_png_is_flattened_on_white():
     images, _ = te.prepare_images(_png(400, 300, mode="RGBA"), "png")
     img = Image.open(io.BytesIO(images[0]))
     assert img.mode == "RGB" and img.getpixel((5, 5)) == (255, 255, 255)
+
+
+# --- left_out: nothing a reader saw disappears silently (2026-10-15) -----------------
+
+def test_left_out_names_every_sample_section_not_in_the_layout_with_its_reason(model):
+    result = _run(model, _payload(_reply(
+        S("vendor_scorecard", "Scorecard"),
+        {**S("unsupported", "Organic sessions"),
+         "description": "Weekly organic sessions from GA4."},
+        S("unsupported", "Backlinks"),
+        S("highlights", "Highlights"), S("standouts", "Wins"),
+        S("action_summary", "Actions"), S("action_summary", "More actions"),
+    )))
+    assert result["left_out"] == [
+        {"title": "Organic sessions", "reason": "Weekly organic sessions from GA4."},
+        {"title": "Backlinks", "reason": te.NO_CATALOG_MATCH},
+        {"title": "More actions",
+         "reason": "The sample has a second action_summary section; only the first is kept."},
+        {"title": "Wins",
+         "reason": "standouts is already inside highlights; the separate section is dropped."},
+    ]
+    assert result["left_out"] == te.left_out_of(result["unsupported"], result["notes"])
+    assert [s["type"] for s in result["layout"]["sections"]] == [
+        "vendor_scorecard", "highlights", "action_summary", "data_gaps"]
+    assert result["matched_count"] == 3
+    clean = _run(model, _payload(_reply(S("vendor_scorecard", "Scorecard"))))
+    assert clean["left_out"] == []
+    # The new catalog sections are real targets for the reader, with a hint each.
+    for stype in ("lead_status_by_vendor", "channel_benchmarks", "vendor_investment",
+                  "vendor_detail"):
+        assert stype in te.SECTION_HINTS and f"- {stype}:" in te.system_prompt()
+    mapped = _run(model, _payload(_reply(S("vendor_detail", "Vendor cards"),
+                                         S("vendor_investment", "Investment", sort="spend"))))
+    assert [s["type"] for s in mapped["layout"]["sections"]] == [
+        "vendor_detail", "vendor_investment", "data_gaps"]
+    assert mapped["layout"]["sections"][1]["options"] == {"sort": "spend"}

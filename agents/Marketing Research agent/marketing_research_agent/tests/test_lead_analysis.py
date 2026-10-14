@@ -208,3 +208,36 @@ def test_overview_without_lead_summary_is_unchanged(monkeypatch):
     out = reports.overview(ds, "u1")
     assert out["lead_quality"] is None
     assert all(f["metric"] != "bad_lead_rate" for f in out["flag_summary"])
+
+
+# --- vendor-report join (2026-10-15) -------------------------------------------
+
+def test_completed_dnc_is_the_cross_count_of_a_completed_demo_now_marked_lost_dnc():
+    rows = [_row(outcome="Completed", stage="Lost DNC"),
+            _row(outcome="Completed", stage="Contract Sent"),
+            _row(outcome="Bad Lead", stage="Lost DNC"),      # lost, but never completed
+            _row(outcome="", stage="")]
+    records, _ = la.parse_lead_rows(_grid(rows), year=2026)
+    s = la.summarize(records)
+    v = s["months"]["2026-08"]["vendors"][0]
+    assert v["completed"] == 2 and v["deal_stages"]["lost_dnc"] == 2
+    assert v["completed_dnc"] == 1
+    assert s["months"]["2026-08"]["totals"]["completed_dnc"] == 1
+
+
+def test_the_tracker_join_matches_a_slug_with_its_separators_removed_exact_first():
+    records, _ = la.parse_lead_rows(_grid([_row(campaign="ElevateMKT LS Email")]), year=2026)
+    rollup = {"2026-08": {"elevate-mkt-ls-email": {
+        "vendor": "Elevate MKT LS Email", "leads": 10, "qualified_leads": 5, "demos_booked": 2}}}
+    s = la.summarize(records, tracker_rollups=rollup)
+    v = s["months"]["2026-08"]["vendors"][0]
+    assert v["slug"] == "elevatemkt-ls-email"
+    assert v["matched_vendor"] == "Elevate MKT LS Email" and s["unmatched_campaigns"] == []
+    assert v["tracker"]["leads"] == 10
+
+    assert la.compact_slug("elevate-mkt-ls-email") == "elevatemktlsemail"
+    table = {"meta-360-ra": "exact", "meta360-ra": "compact"}
+    assert la.lookup_slug(table, "meta-360-ra") == "exact"            # exact wins
+    assert la.lookup_slug({"meta360-ra": "compact"}, "meta-360-ra") == "compact"
+    assert la.lookup_slug({"meta360-ra": 1, "meta-3-60-ra": 2}, "meta-360-ra") is None  # ambiguous
+    assert la.lookup_slug(table, "") is None and la.lookup_slug(table, None) is None

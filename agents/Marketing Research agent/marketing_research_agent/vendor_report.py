@@ -19,13 +19,22 @@ Rules a reader of the output can rely on:
 
 1. **Absent is not zero.** A row a vendor tab does not report is ``None`` here,
    ``—`` on the page, and named in ``missing``. A portfolio total is published
-   only when every vendor reports the field.
+   only when every vendor reports the field — with one stated exception, the
+   management-fee total (:data:`_PARTIAL_SUMS`), which is the sum of the
+   vendors that report a fee and ``None`` when none does.
 2. **Ratios are recomputed from summed components**, never averaged, and a
    zero denominator gives ``None`` with its reason, never a 0% or $0.
 3. **One denominator per word.** "Qualified demos booked" is the show-rate
    denominator everywhere; "demos booked (all)" is a separate count. The sample
    template printed one column labelled "Demos booked" totalling 16 beside a
    show rate dividing by 14.
+4. **Two bases, both named.** The tracker's Performance column is the report's
+   basis everywhere it does not say otherwise; the Investment column (spend
+   plus the vendor's management fee) is read separately into the ``*_investment``
+   fields and never substituted for a Performance figure.
+5. **Joins say what they could not join.** The lead-sheet join
+   (``lead_status``) names the campaigns that matched no tab and the month it
+   had no data for; a vendor with no match carries ``None``, not zeros.
 """
 
 from __future__ import annotations
@@ -34,18 +43,25 @@ import calendar
 import hashlib
 import json
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 from . import config, goals
 
 #: Bumped whenever the same inputs would produce different numbers, rows or
 #: sentences. Part of the idempotency key, so a bump re-derives.
-GENERATOR_VERSION = "mr-vendor-report/1"
+GENERATOR_VERSION = "mr-vendor-report/2"
+
+#: Report versions the renderer reads. ``/1`` runs (stored before the investment,
+#: pace, revenue and lead-status fields existed) still render: a field they do
+#: not carry is an em-dash, never a zero, so an old run stays honest rather than
+#: refused. A build never SERVES a ``/1`` run, because the version is part of
+#: the cache key: the first build after this bump re-derives.
+READABLE_GENERATORS = ("mr-vendor-report/1", GENERATOR_VERSION)
 
 KIND = "vendor_report"
 
-MONEY, PCT, INT = "money", "pct", "int"
+MONEY, PCT, INT, DATE = "money", "pct", "int", "date"
 
 #: The request's word for the built-in template: the explicit override, and the
 #: only way a build falls back to it (a build never falls back silently).
@@ -72,6 +88,23 @@ METRICS: dict[str, tuple[str, str]] = {
     "cost_per_qual_demo_booked": ("Cost / Qual. Demo Booked", MONEY),
     "cost_per_demo_completed": ("Cost / Demo Completed", MONEY),
     "projected_revenue": ("Projected Revenue", MONEY),
+    # --- investment basis (2026-10-15): the tracker's Investment column, which
+    # is spend plus the vendor's management fee. Totals and ratios on this basis
+    # sit beside the Performance ones; neither replaces the other.
+    "total_management_fees": ("Total Management Fees", MONEY),
+    "total_spend_investment": ("Total Spend incl. Fees", MONEY),
+    "cost_per_lead_investment": ("Cost / Lead incl. Fees", MONEY),
+    "cost_per_qualified_lead_investment": ("Cost / Qual. Lead incl. Fees", MONEY),
+    "cost_per_demo_completed_investment": ("Cost / Demo Completed incl. Fees", MONEY),
+    # --- pace: how far through the month the pull is, against the budget.
+    "pace_pct": ("Month Elapsed", PCT),
+    "pace_gap_pct": ("Utilization vs. Pace", PCT),
+    "projected_runout_date": ("Projected Budget Run-out", DATE),
+    # --- revenue: the tracker's actualized / not-actualized blocks.
+    "actualized_revenue": ("Actualized Revenue", MONEY),
+    "actualized_clients": ("Actualized Clients", INT),
+    "not_actualized_revenue": ("Not-Actualized Revenue", MONEY),
+    "roas_pct": ("ROAS", PCT),
 }
 
 #: Additive portfolio fields: report key -> vendor-row field.
@@ -85,7 +118,18 @@ _ADDITIVE = {
     "demos_completed": "demos_completed",
     "dnc_bad_leads": "dnc_bad_leads",
     "projected_revenue": "projected_revenue",
+    "total_spend_investment": "spend_investment",
+    "actualized_revenue": "actualized_revenue",
+    "actualized_clients": "actualized_clients",
+    "not_actualized_revenue": "not_actualized_revenue",
 }
+
+#: The one portfolio total summed over the vendors that REPORT it (owner rule,
+#: 2026-10-15): the roll-up tab's management-fee cell has been blank since June
+#: 2026, so the fee total can only come from the vendor tabs, and a vendor tab
+#: with no fee row must not withhold the others' fees. No vendor reporting a fee
+#: gives ``None`` — never $0. ``missing`` names the vendors left out of the sum.
+_PARTIAL_SUMS = {"total_management_fees": "management_fee"}
 
 #: Ratios: key -> (numerator, denominator, scale, reason when the denominator is 0).
 _RATIOS = {
@@ -98,14 +142,33 @@ _RATIOS = {
     "cost_per_qual_demo_booked": ("spend", "qual_demos_booked", 1.0,
                                   "no qualified demos booked yet"),
     "cost_per_demo_completed": ("spend", "demos_completed", 1.0, "no demos completed yet"),
+    "cost_per_lead_investment": ("spend_investment", "leads", 1.0, "no leads yet"),
+    "cost_per_qualified_lead_investment": ("spend_investment", "qualified_leads", 1.0,
+                                           "no qualified leads yet"),
+    "cost_per_demo_completed_investment": ("spend_investment", "demos_completed", 1.0,
+                                           "no demos completed yet"),
+    # Recomputed, never read from the tab's own ROAS row. Verified 2026-10-15
+    # against the stored 2026-08-31 docs: the tracker's ROAS row is actualized
+    # revenue over Performance spend (HawkSEM LS Google 3,750 / 11,390.63 =
+    # 32.92%, the figure on the tab), so that is the formula here.
+    "roas_pct": ("actualized_revenue", "spend", 100.0, "no spend yet"),
 }
 
-#: The ratios the per-vendor scorecard prints (the cost-per ratios are
-#: portfolio-only — on a vendor with one lead they are noise).
+#: The ratios the per-vendor scorecard prints and names in ``missing`` when a
+#: vendor's denominator is zero.
 _VENDOR_RATIOS = ("budget_utilized_pct", "ql_ratio_pct", "show_rate_pct")
 
+#: Also computed per vendor (for the vendor cards and the investment table), but
+#: NOT named in ``missing`` row by row: on a vendor with one lead they are noise,
+#: and the em-dash on the card already says "nothing to divide by yet".
+_VENDOR_COST_RATIOS = ("cost_per_lead", "cost_per_qualified_lead", "cost_per_qual_demo_booked",
+                       "cost_per_demo_completed", "cost_per_lead_investment",
+                       "cost_per_qualified_lead_investment",
+                       "cost_per_demo_completed_investment", "roas_pct")
+
 #: Vendor-row field -> (dot path into ``canonical.team_overall``, mode).
-#: ``pair`` = the {performance, investment} block, read on the Performance basis.
+#: ``pair`` = the {performance, investment} block, read on the Performance basis;
+#: ``inv`` = the same block read on the Investment basis, with no fallback.
 _FIELDS: dict[str, tuple[str, str]] = {
     "budget": ("budget", "pair"),
     "spend": ("spend", "pair"),
@@ -120,6 +183,15 @@ _FIELDS: dict[str, tuple[str, str]] = {
     # LS Meta = 3,671), which is exactly the label snapshots._TEAM_MAP maps here.
     # A tab without the row still reads None, i.e. absent, never $0.
     "projected_revenue": ("projected_revenue.total_amount_sold_actualized", "value"),
+    # Investment basis + revenue (snapshots._TEAM_MAP paths, verified 2026-10-15
+    # against the 2026-09-02 docs: HawkSEM LS Google fee 2,200, investment spend
+    # 2,200; Copy of Meta 360 LS actualized 3,359 from 1 client).
+    "management_fee": ("management_fees_investment", "value"),
+    "budget_investment": ("budget", "inv"),
+    "spend_investment": ("spend", "inv"),
+    "actualized_revenue": ("actualized_revenue.amount_sold", "value"),
+    "actualized_clients": ("actualized_revenue.revenue_clients", "value"),
+    "not_actualized_revenue": ("not_actualized_revenue.amount_sold", "value"),
 }
 
 #: Labels for the vendor-row fields, used in ``missing``.
@@ -128,6 +200,10 @@ _FIELD_LABELS = {
     "qualified_leads": "Qualified Leads", "dnc_bad_leads": "DNC Bad Leads",
     "demos_booked": "Demos Booked (all)", "qual_demos_booked": "Qual. Demos Booked",
     "demos_completed": "Demos Completed", "projected_revenue": "Projected Revenue",
+    "management_fee": "Management Fee", "budget_investment": "Budget incl. Fees",
+    "spend_investment": "Spend incl. Fees", "actualized_revenue": "Actualized Revenue",
+    "actualized_clients": "Actualized Clients",
+    "not_actualized_revenue": "Not-Actualized Revenue",
 }
 
 #: Raw counts never charted against a benchmark (there is no fixed % for a count).
@@ -200,7 +276,17 @@ def count(v: float | None) -> str:
     return "—" if v is None else f"{v:,.0f}"
 
 
-def fmt(v: float | None, kind: str) -> str:
+def short_date(iso: str | None) -> str:
+    """``"Sep 25"`` for an ISO date; the em-dash for none."""
+    if not iso:
+        return "—"
+    d = date.fromisoformat(str(iso)[:10])
+    return f"{calendar.month_abbr[d.month]} {d.day}"
+
+
+def fmt(v: Any, kind: str) -> str:
+    if kind == DATE:
+        return short_date(v)
     return money(v) if kind == MONEY else pct(v) if kind == PCT else count(v)
 
 
@@ -237,8 +323,7 @@ def _month_name(ym: str) -> str:
 
 
 def _short_date(iso: str) -> str:
-    d = date.fromisoformat(iso[:10])
-    return f"{calendar.month_abbr[d.month]} {d.day}"
+    return short_date(iso)
 
 
 def _is_non_media(doc: Mapping) -> bool:
@@ -362,15 +447,207 @@ def _vendor_row(doc: Mapping, notes: list[dict]) -> dict:
                                       "column — the Performance cell is blank"})
                 perf = inv
             row[field] = perf
+        elif mode == "inv":
+            row[field] = _num((raw or {}).get("investment")) if isinstance(raw, dict) else None
         else:
             row[field] = _num(raw)
     channel, keyword = channel_of(name)
     row["channel"] = channel
     row["channel_keyword"] = keyword
-    for key in _VENDOR_RATIOS:
+    for key in _VENDOR_RATIOS + _VENDOR_COST_RATIOS:
         n, d, scale, _reason = _RATIOS[key]
         row[key] = _div(row[n], row[d], scale)
     return row
+
+
+def _partial_sum(rows: Sequence[dict], field: str) -> tuple[float | None, list[str]]:
+    """The field summed over the vendors that report it, plus the vendors that
+    did not. ``None`` when nobody reports it — a total nobody reported is not $0."""
+    present = [r[field] for r in rows if r.get(field) is not None]
+    absent = [r["name"] for r in rows if r.get(field) is None]
+    if not present:
+        return None, absent
+    return round(sum(present), 2), absent
+
+
+# --- pace ----------------------------------------------------------------------------
+
+def _pace(budget: float | None, spend: float | None, utilized_pct: float | None, *,
+          as_of: str, day: int, days_in_month: int) -> dict[str, Any]:
+    """Month elapsed, utilization against it, and the day the budget runs out at
+    the month-to-date daily rate — ``None`` when there is no spend yet, no
+    budget, or the run-out lands outside this month (then the budget lasts)."""
+    pace_pct = round(day / days_in_month * 100, 2)
+    gap = None if utilized_pct is None else round(utilized_pct - pace_pct, 2)
+    runout: str | None = None
+    if budget is not None and spend is not None and spend > 0 and day > 0:
+        per_day = spend / day
+        days_left = (budget - spend) / per_day
+        start = date.fromisoformat(as_of)
+        try:
+            when = start + timedelta(days=int(days_left // 1))
+        except OverflowError:
+            when = None
+        if when is not None and when.year == start.year and when.month == start.month:
+            runout = when.isoformat()
+    return {"pace_pct": pace_pct, "pace_gap_pct": gap, "projected_runout_date": runout}
+
+
+# --- per-vendor benchmarks -----------------------------------------------------------
+
+#: Vendor-row ratio -> where its own-channel benchmark comes from: a threshold
+#: name, or a :class:`goals.ChannelGoal` field read from the vendor's channel
+#: set (its own set when it has one, else Total). ``polarity`` as in movers.
+_VENDOR_BENCHMARKS: dict[str, tuple[str, str, str]] = {
+    "cost_per_lead": ("threshold", "cost_per_lead_ceiling", "down"),
+    "cost_per_qualified_lead": ("threshold", "cost_per_qualified_lead_target_high", "down"),
+    "cost_per_qual_demo_booked": ("channel", "cpd_booked_high", "down"),
+    "cost_per_demo_completed": ("channel", "cpd_completed_high", "down"),
+    "cost_per_lead_investment": ("threshold", "cost_per_lead_ceiling", "down"),
+    "cost_per_qualified_lead_investment": ("threshold", "cost_per_qualified_lead_target_high",
+                                           "down"),
+    "cost_per_demo_completed_investment": ("channel", "cpd_completed_high", "down"),
+    "ql_ratio_pct": ("threshold", "ql_ratio_great", "up"),
+    "show_rate_pct": ("channel", "completed_demo_pct", "up"),
+}
+
+
+def _vendor_benchmarks(channel: str, targets: dict) -> dict[str, Any]:
+    """``{"set": <CHANNEL_GOALS key>, "label": ..., "ceilings": {ratio: value}}`` for
+    one vendor: every per-vendor ratio against ITS OWN channel's figures (the
+    Total set when the channel has none). A figure not set is ``None``."""
+    channel_set = _GOAL_SET.get(channel, TOTAL_SET)
+    goal = goals.channel_goal(channel_set, targets)
+    thr = goals.thresholds(targets)
+    ceilings: dict[str, float | None] = {}
+    for key, (source, field, _polarity) in _VENDOR_BENCHMARKS.items():
+        if source == "threshold":
+            value = _num(thr.get(field))
+        else:
+            value = _num(getattr(goal, field, None)) if goal else None
+            if value is not None and field == "completed_demo_pct":
+                value = round(value * 100, 2)
+        ceilings[key] = value
+    return {"set": channel_set, "label": "Meta" if channel_set == "META" else channel_set,
+            "ceilings": ceilings,
+            "polarity": {k: p for k, (_s, _f, p) in _VENDOR_BENCHMARKS.items()}}
+
+
+def _benchmark_table(targets: dict) -> dict:
+    """The channel ceilings and rule thresholds as data for the benchmarks
+    block — read once here so the renderer never touches the targets store."""
+    thr = goals.thresholds(targets)
+    channels = []
+    for name in ("META", "Google", "Email", TOTAL_SET):
+        g = goals.channel_goal(name, targets)
+        channels.append({
+            "channel": name, "label": "Meta" if name == "META" else name,
+            "cpd_booked_low": _num(getattr(g, "cpd_booked_low", None)) if g else None,
+            "cpd_booked_high": _num(getattr(g, "cpd_booked_high", None)) if g else None,
+            "cpd_completed_low": _num(getattr(g, "cpd_completed_low", None)) if g else None,
+            "cpd_completed_high": _num(getattr(g, "cpd_completed_high", None)) if g else None,
+            "show_rate_target_pct": (round(g.completed_demo_pct * 100, 2)
+                                     if g and _num(g.completed_demo_pct) is not None else None),
+        })
+    keys = ("cost_per_lead_ceiling", "cost_per_qualified_lead_target_low",
+            "cost_per_qualified_lead_target_high", "ql_ratio_great", "bad_lead_rate_red",
+            "no_show_rate_red", "canceled_rate_red")
+    return {"channels": channels, "thresholds": {k: _num(thr.get(k)) for k in keys}}
+
+
+# --- lead-status join ------------------------------------------------------------------
+
+def _compact(slug: str | None) -> str:
+    from .lead_analysis import compact_slug   # the join rule lives with the lead sheet
+
+    return compact_slug(slug)
+
+
+def _lead_vendors(lead_summary: Any, ym: str) -> tuple[list[dict] | None, str | None]:
+    """The month's lead-sheet vendor buckets out of what the caller passed: a
+    ``lead_analysis`` run's ``summary`` (``{"months": {ym: {"vendors": [...]}}}``)
+    or that month's ``vendors`` list itself. ``(None, reason)`` when there is
+    nothing for this month — a reason, never an empty table of zeros."""
+    if lead_summary is None:
+        return None, "No lead-status data: no lead-analysis sheet has been pulled yet."
+    if isinstance(lead_summary, Mapping):
+        months = lead_summary.get("months")
+        if not isinstance(months, Mapping) or not months:
+            return None, "No lead-status data: the lead-analysis run holds no months."
+        block = months.get(ym)
+        if not isinstance(block, Mapping):
+            return None, f"No lead-status data for {_month_name(ym)} in the lead-analysis sheet."
+        vendors = block.get("vendors")
+    else:
+        vendors = lead_summary
+    if not isinstance(vendors, (list, tuple)):
+        return None, f"No lead-status data for {_month_name(ym)} in the lead-analysis sheet."
+    return [v for v in vendors if isinstance(v, Mapping)], None
+
+
+def _lead_status_row(v: Mapping) -> dict:
+    stages = v.get("deal_stages") or {}
+
+    def n(value: Any) -> int:
+        return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+    return {
+        "campaign": v.get("campaign"),
+        "contract_sent": n(stages.get("contract_sent")),
+        "hot_lead_follow_up": n(stages.get("hot_leads")),
+        "completed_dnc": n(v.get("completed_dnc")),
+        "scheduled": n(v.get("pending")),
+        "no_show": n(v.get("no_show")),
+        "canceled": n(v.get("canceled")),
+        "bad_lead": n(v.get("bad_lead")),
+        "completed": n(v.get("completed")),
+        "total": n(v.get("booked")),
+    }
+
+
+def _lead_status(rows: Sequence[dict], lead_summary: Any, ym: str,
+                 lead_as_of: str | None) -> dict:
+    """Join the lead sheet's per-campaign demo statuses onto the vendor rows by
+    slug — exact first, then with hyphens and spaces removed ("elevatemkt-ls-email"
+    is the tab "elevate-mkt-ls-email"). Every vendor row gets ``lead_status``:
+    its counts, or ``None`` when the sheet has no campaign for it. Campaigns
+    that match no tab are listed, never dropped."""
+    vendors, reason = _lead_vendors(lead_summary, ym)
+    for r in rows:
+        r["lead_status"] = None
+    if vendors is None:
+        return {"available": False, "reason": reason, "as_of": lead_as_of, "vendors": [],
+                "unmatched_campaigns": [], "totals": None}
+    by_slug: dict[str, Mapping] = {}
+    for v in vendors:
+        slug = str(v.get("slug") or "")
+        if slug and slug not in by_slug:
+            by_slug[slug] = v
+    by_compact: dict[str, list[str]] = {}
+    for slug in by_slug:
+        by_compact.setdefault(_compact(slug), []).append(slug)
+    joined: set[str] = set()
+    out_rows: list[dict] = []
+    for r in rows:
+        slug = r.get("slug") or ""
+        hit = slug if slug in by_slug else None
+        if hit is None:
+            cands = [s for s in by_compact.get(_compact(slug), []) if s not in joined]
+            hit = cands[0] if len(cands) == 1 else None
+        if hit is None:
+            continue
+        joined.add(hit)
+        status = _lead_status_row(by_slug[hit])
+        r["lead_status"] = status
+        out_rows.append({"vendor": r["name"], "slug": slug, "lead_slug": hit, **status})
+    unmatched = sorted(str(by_slug[s].get("campaign") or s) for s in by_slug if s not in joined)
+    totals = {k: sum(x[k] for x in out_rows) for k in
+              ("contract_sent", "hot_lead_follow_up", "completed_dnc", "scheduled", "no_show",
+               "canceled", "bad_lead", "completed", "total")} if out_rows else None
+    return {"available": bool(out_rows), "reason": (None if out_rows else
+            f"No lead-sheet campaign matched a vendor tab for {_month_name(ym)}."),
+            "as_of": lead_as_of, "vendors": out_rows, "unmatched_campaigns": unmatched,
+            "totals": totals}
 
 
 def _sum(rows: Sequence[dict], field: str) -> tuple[float | None, list[str]]:
@@ -626,13 +903,22 @@ def _new_this_period(rows: Sequence[dict], previous: Mapping | None,
 
 
 def compute(sweep: Mapping, *, targets: dict, previous: Mapping | None = None,
-            rollup: Mapping | None = None) -> dict:
+            rollup: Mapping | None = None, lead_summary: Any = None,
+            lead_as_of: str | None = None) -> dict:
     """One sweep in, the whole report out — see the module docstring.
 
     ``sweep`` is ``snapshots.vendor_sweep()``'s shape: ``{"date", "docs",
     "excluded"}``. A roll-up doc found in ``docs`` is used as ``rollup`` (and
     never counted as a vendor); non-media tabs (Website) are excluded from every
     figure and named. ``targets`` is one resolved ``goals.get_targets`` dict.
+
+    ``lead_summary`` is optional: the newest ``lead_analysis`` run's ``summary``
+    (or just its ``months[ym].vendors`` list). With it, every vendor row carries
+    ``lead_status`` (contract sent, hot-lead follow-up, completed→DNC, scheduled,
+    no-show, canceled, bad lead, total) joined by slug, and ``report["lead_status"]``
+    holds the table. Without it — or without this month in it — the report says
+    so in ``lead_status.reason``; nothing is zero-filled. ``lead_as_of`` is that
+    run's ``generated_at``, for provenance only.
     """
     sweep_date = str(sweep.get("date") or "")
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", sweep_date):
@@ -647,14 +933,20 @@ def compute(sweep: Mapping, *, targets: dict, previous: Mapping | None = None,
     non_media = [d for d in docs if _is_non_media(d)]
     paid_docs = [d for d in docs if not _is_rollup(d) and not _is_non_media(d)]
 
+    day = int(sweep_date[8:10])
+    days_in_month = calendar.monthrange(int(ym[:4]), int(ym[5:7]))[1]
+
     basis_notes: list[dict] = []
     rows = [_vendor_row(d, basis_notes) for d in paid_docs]
     for r in rows:
         r["show_rate_target"] = _show_target_for(r["channel"], targets)
+        r["benchmarks"] = _vendor_benchmarks(r["channel"], targets)
+        r.update(_pace(r["budget"], r["spend"], r["budget_utilized_pct"], as_of=sweep_date,
+                       day=day, days_in_month=days_in_month))
 
     # --- portfolio ---------------------------------------------------------
     missing: list[dict] = []
-    portfolio: dict[str, float | None] = {}
+    portfolio: dict[str, Any] = {}
     sums: dict[str, float | None] = {}
     for key, field in _ADDITIVE.items():
         total, absent = _sum(rows, field)
@@ -662,6 +954,16 @@ def compute(sweep: Mapping, *, targets: dict, previous: Mapping | None = None,
         if absent:
             missing.append({"metric": key, "label": METRICS[key][0], "vendors": absent,
                             "reason": "not reported on the vendor tab"})
+    for key, field in _PARTIAL_SUMS.items():
+        total, absent = _partial_sum(rows, field)
+        portfolio[key] = sums[field] = total
+        if total is None and rows:
+            missing.append({"metric": key, "label": METRICS[key][0], "vendors": "portfolio",
+                            "reason": "no vendor tab reports a management fee"})
+        elif absent:
+            missing.append({"metric": key, "label": METRICS[key][0], "vendors": absent,
+                            "reason": "not reported on the vendor tab — the total is the sum "
+                                      "of the vendors that report it"})
     for key, (n, d, scale, reason) in _RATIOS.items():
         portfolio[key] = _div(sums[n], sums[d], scale)
         if portfolio[key] is None:
@@ -702,14 +1004,27 @@ def compute(sweep: Mapping, *, targets: dict, previous: Mapping | None = None,
                        "beating": gap >= 0})
     movers.sort(key=lambda m: (-m["gap_pct"], m["key"]))
 
+    # --- pace (portfolio) ------------------------------------------------------
+    portfolio.update(_pace(portfolio["total_budget"], portfolio["total_spend"],
+                           portfolio["budget_utilized_pct"], as_of=sweep_date, day=day,
+                           days_in_month=days_in_month))
+    if portfolio["projected_runout_date"] is None:
+        if not portfolio["total_spend"]:
+            why = "no spend recorded yet, so there is no daily rate to project from"
+        elif portfolio["total_budget"] is None:
+            why = "the budget total is withheld (see above)"
+        else:
+            why = "at the month-to-date daily rate the budget lasts past month end"
+        missing.append({"metric": "projected_runout_date",
+                        "label": METRICS["projected_runout_date"][0],
+                        "vendors": "portfolio", "reason": why})
+
     # --- statuses -----------------------------------------------------------
     for r in rows:
         r["status"], r["status_rule"] = _status(r, thr)
     for r in rows:
         r["action"] = _action(r, rows, thr)
 
-    day = int(sweep_date[8:10])
-    days_in_month = calendar.monthrange(int(ym[:4]), int(ym[5:7]))[1]
     small = ((portfolio["total_leads"] or 0) < thr["vendor_small_sample_min_leads"]
              or (portfolio["qual_demos_booked"] or 0) < thr["vendor_small_sample_min_demos"])
 
@@ -741,6 +1056,8 @@ def compute(sweep: Mapping, *, targets: dict, previous: Mapping | None = None,
         "targets": {**mix, "items": target_items,
                     "show_rate_goals": {name: _show_target_for(name, targets)
                                         for name in ("Meta", "Google", "Email")}},
+        "benchmarks": _benchmark_table(targets),
+        "lead_status": _lead_status(rows, lead_summary, ym, lead_as_of),
         "movers": movers,
         "movers_not_charted": not_charted,
         "vendors": rows,
@@ -1101,10 +1418,11 @@ def _notes(report: Mapping) -> dict:
 # --- idempotency + the I/O seam ------------------------------------------------------
 
 def cache_key(*, sweep: Mapping, previous: Mapping | None, rollup: Mapping | None,
-              targets: Mapping, template: Mapping) -> str:
+              targets: Mapping, template: Mapping, lead_run: Mapping | None = None) -> str:
     """Same sweep capture + same comparison + same targets + same template +
-    same generator → same key → the stored run is served instead of re-derived.
-    A recapture on the same day moves ``captured_at`` and so the key."""
+    same lead-analysis run + same generator → same key → the stored run is
+    served instead of re-derived. A recapture on the same day moves
+    ``captured_at`` and so the key; a fresh lead-sheet pull moves ``generated_at``."""
     def stamp(s: Mapping | None) -> list:
         if not s:
             return []
@@ -1117,8 +1435,17 @@ def cache_key(*, sweep: Mapping, previous: Mapping | None, rollup: Mapping | Non
         "targets": {"thresholds": targets.get("thresholds"),
                     "channel_goals": targets.get("channel_goals")},
         "template": dict(template),
+        "lead": [lead_run.get("id"), lead_run.get("generated_at")] if lead_run else None,
     }, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _lead_inputs(lead_run: Mapping | None) -> dict:
+    """``compute``'s lead kwargs out of a stored ``lead_analysis`` run (or None)."""
+    if not isinstance(lead_run, Mapping):
+        return {"lead_summary": None, "lead_as_of": None}
+    return {"lead_summary": lead_run.get("summary"),
+            "lead_as_of": lead_run.get("generated_at")}
 
 
 class EmptyMonth(LookupError):
@@ -1181,27 +1508,36 @@ def _inputs(workspace_id: str, year_month: str | None, *, with_previous: bool = 
 
 
 def preview_report(*, workspace_id: str, year_month: str | None = None,
-                   with_previous: bool = True) -> dict | None:
+                   with_previous: bool = True, lead_run: Mapping | None = None) -> dict | None:
     """This workspace's report for the newest (or the given) month, computed and
     NOT stored: what a template preview and the placeholder examples render
     from, so a team sees its own real figures in a template before saving it.
     ``None`` when there are no vendor figures yet. Store failures surface as
-    ``snapshots.SnapshotStoreError``."""
+    ``snapshots.SnapshotStoreError``. ``lead_run`` is the workspace's newest
+    ``lead_analysis`` run, or None — the route reads it, this module never does."""
     try:
         sweep, previous, rollup, targets = _inputs(workspace_id, year_month,
                                                    with_previous=with_previous)
     except EmptyMonth:
         return None
-    report = compute(sweep, targets=targets, previous=previous, rollup=rollup)
+    report = compute(sweep, targets=targets, previous=previous, rollup=rollup,
+                     **_lead_inputs(lead_run))
     report["build"] = {"built_at": datetime.now(timezone.utc).isoformat(),
                        "sweep_date": sweep["date"], "template": {"kind": "preview"}}
     return report
 
 
 def build(*, workspace_id: str, year_month: str | None = None,
-          template: Any = None, use_templates: bool = False) -> dict:
+          template: Any = None, use_templates: bool = False,
+          lead_run: Mapping | None = None) -> dict:
     """Read, compute, render-check, persist (or serve the stored run). Returns the
     run with ``reused`` saying which happened.
+
+    ``lead_run`` is the workspace's newest ``lead_analysis`` run (the route reads
+    it the way ``GET /mr/lead-analysis`` does, and passes None when there is
+    none or the read failed). It joins the lead sheet's demo statuses onto the
+    vendor rows and is part of the cache key, so a fresh lead-sheet pull
+    re-derives rather than serving the stale join.
 
     ``use_templates`` is the route's ``MR_REPORT_TEMPLATES`` switch. On, a build
     with no ``template`` renders through the workspace's active template; the
@@ -1226,7 +1562,8 @@ def build(*, workspace_id: str, year_month: str | None = None,
     version = team if template is None else None
 
     sweep, previous, rollup, targets = _inputs(workspace_id, year_month)
-    structured = compute(sweep, targets=targets, previous=previous, rollup=rollup)
+    structured = compute(sweep, targets=targets, previous=previous, rollup=rollup,
+                         **_lead_inputs(lead_run))
     built_at = datetime.now(timezone.utc).isoformat()
 
     tpl = template_ref(version)
@@ -1243,7 +1580,7 @@ def build(*, workspace_id: str, year_month: str | None = None,
             tpl["fallback"] = {**ref, "reason": exc.reason}
 
     key = cache_key(sweep=sweep, previous=previous, rollup=rollup, targets=targets,
-                    template=tpl)
+                    template=tpl, lead_run=lead_run)
     for run in runs.list_runs(workspace_id, kind=KIND):
         if (run.get("structured") or {}).get("cache_key") == key:
             return {**run, "reused": True}
