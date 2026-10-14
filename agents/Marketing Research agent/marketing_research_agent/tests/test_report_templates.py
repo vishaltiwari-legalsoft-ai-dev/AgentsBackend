@@ -973,6 +973,16 @@ def test_the_new_figures_and_blocks_reach_the_vocabulary_and_the_starter_untouch
     assert vocab["{{total_management_fees}}"]["title"] == "Total Management Fees"
     assert vocab["{{projected_runout_date}}"]["example"] == "—"      # lasts past month end
     assert vocab["{{projected_runout_date}}"]["description"].endswith("(date)")
+    # ``format`` is the value kind the UI labels by: date / money / pct / int /
+    # text for scalars, None for every block.
+    assert vocab["{{projected_runout_date}}"]["format"] == "date"
+    assert vocab["{{total_management_fees}}"]["format"] == "money"
+    assert vocab["{{roas_pct}}"]["format"] == "pct"
+    assert vocab["{{actualized_clients}}"]["format"] == "int"
+    assert vocab["{{as_of}}"]["format"] == "text"
+    assert all(e["format"] is None for e in vocab.values() if e["kind"] != "scalar")
+    assert all(e["format"] in ("money", "pct", "int", "date", "text")
+               for e in vocab.values() if e["kind"] == "scalar")
     assert vocab["{{roas_pct}}"]["example"] == "0.0%"
     assert vocab["{{cards:vendor_detail}}"]["kind"] == "cards"
     assert vocab["{{cards:vendor_detail}}"]["example"] == "18 cards"

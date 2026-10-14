@@ -227,6 +227,9 @@ def vocabulary(report: Mapping[str, Any] | None = None) -> list[dict]:
     each entry carries its live ``example`` ("$2,737"); without one, None."""
     return [{"placeholder": p.token, "name": p.name, "kind": p.kind, "title": p.title,
              "description": p.description,
+             # The scalar's value kind (money / pct / int / date / text) so a UI can
+             # label a date "Date" rather than "Figure"; None for a block.
+             "format": p.format,
              "example": p.example(report) if report is not None else None}
             for p in PLACEHOLDERS.values()]
 

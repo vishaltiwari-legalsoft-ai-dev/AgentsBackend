@@ -476,8 +476,16 @@ def test_the_listing_carries_the_builtin_live_examples_and_the_allowance(templat
     assert by_token["{{total_spend}}"]["example"] == "$2,737"
     assert by_token["{{total_spend}}"]["kind"] == "scalar"
     assert by_token["{{table:vendor_scorecard}}"]["kind"] == "table"
-    assert all(set(p) == {"token", "title", "description", "kind", "example"}
+    assert all(set(p) == {"token", "title", "description", "kind", "format", "example"}
                for p in body["placeholders"])
+    # ``format`` labels a scalar's value kind for the UI; a block has none.
+    assert by_token["{{total_spend}}"]["format"] == "money"
+    assert by_token["{{projected_runout_date}}"]["format"] == "date"
+    assert by_token["{{show_rate_pct}}"]["format"] == "pct"
+    assert by_token["{{total_leads}}"]["format"] == "int"
+    assert by_token["{{month_label}}"]["format"] == "text"
+    assert by_token["{{table:vendor_scorecard}}"]["format"] is None
+    assert by_token["{{cards:vendor_detail}}"]["format"] is None
     assert by_token["{{table:vendor_scorecard}}"]["title"] == "Vendor scorecard"
     assert by_token["{{total_spend}}"]["title"] == "Total Spend"
     assert body["default_layout"] == vrr.layout_to_dict(vrr.DEFAULT_LAYOUT)

@@ -2833,7 +2833,8 @@ def report_templates_list(user=Depends(get_current_user)):
         report = None
     placeholders = [{"token": p["placeholder"], "title": p["title"],
                      "description": p["description"], "kind": p["kind"],
-                     "example": p["example"]}
+                     # money / pct / int / date / text for a scalar, null for a block
+                     "format": p["format"], "example": p["example"]}
                     for p in rt.vocabulary(report)]
     return {
         "enabled": True,
