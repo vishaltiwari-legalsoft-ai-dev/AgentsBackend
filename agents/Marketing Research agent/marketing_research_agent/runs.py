@@ -367,7 +367,10 @@ def list_runs(user_id, kind: str | tuple[str, ...] | None = None) -> list[dict]:
 # never lists a template as a saved report.
 
 TEMPLATE_REPORTS = frozenset({"vendor_performance"})
-TEMPLATE_SOURCE_KINDS = frozenset({"pdf", "image", "html", "builder"})
+#: ``html`` is a placeholder template (its HTML is stored); ``html_sample`` is a
+#: designed HTML page with typed-in figures that the AI reader mapped to a
+#: layout — stored as a spec, exactly like ``pdf`` and ``image``.
+TEMPLATE_SOURCE_KINDS = frozenset({"pdf", "image", "html", "html_sample", "builder"})
 BUILTIN_TEMPLATE_ID = "builtin"
 
 #: Firestore's document limit is 1 MiB; leave headroom for the envelope.
