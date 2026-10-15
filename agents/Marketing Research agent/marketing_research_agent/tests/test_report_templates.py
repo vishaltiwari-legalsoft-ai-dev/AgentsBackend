@@ -1008,3 +1008,37 @@ def test_a_figure_the_tracker_did_not_report_is_the_em_dash_in_an_html_template_
         del report[key]
     html = _render("<p>{{total_spend}}</p><div>{{table:channel_benchmarks}}</div>", report)
     assert "$2,737" in html and "Benchmarks were not recorded in this report" in html
+
+
+# --- a placeholder-free file is a sample for the AI reader (2026-10-15) --------------
+
+def test_a_placeholder_free_file_is_flagged_for_the_reader_and_nothing_else_is():
+    free = _check(_page("<h1>Vendor report</h1><p>Spend was $2,737.</p>",
+                        "<style>:root{--ink:#123456}</style><script>x()</script>"))
+    assert free.is_placeholder_free and not free.can_save
+    assert free.errors[0].message == rt.NO_PLACEHOLDERS_MESSAGE
+    assert free.removed["scripts"] == 1 and "<script" not in free.sanitized_html
+    # A template with placeholders, right or wrong, is a template.
+    assert not _check(_page("<p>{{total_spend}}</p>")).is_placeholder_free
+    assert not _check(_page("<p>{{totl_spend}}</p>")).is_placeholder_free
+    assert not _check(_page('<p title="{{total_spend}}">x</p>')).is_placeholder_free
+    # A refused file has no sanitized text and is not a sample either.
+    assert not rt.check_html(b"\xff\xfe<p>x</p>").is_placeholder_free
+    assert not rt.check_html(_fill(b"<svg><style>", b"<b><div>", b"")).is_placeholder_free
+
+
+def test_sanitized_document_takes_the_checked_html_apart():
+    checked = _check(_page("<h1>A &amp; B</h1><table><tr><th>V</th></tr></table>",
+                           "<title>Our report</title><style>:root{--gold:#C89614} h1{color:red}"
+                           "</style>"))
+    doc = rt.sanitized_document(checked.sanitized_html)
+    assert doc.title == "Our report"
+    assert doc.styles == (":root{--gold:#C89614} h1{color:red}",)
+    assert "".join(doc.parts) == "<h1>A &amp; B</h1><table><tbody><tr><th>V</th></tr></tbody></table>"
+    assert rt.theme_tokens(list(doc.styles)) == {"gold": "#C89614"}
+    # Raw HTML handed here by mistake is cleaned, not trusted.
+    raw = rt.sanitized_document('<p onclick="x()">hi</p><script>evil()</script>')
+    assert "".join(raw.parts) == "<p>hi</p>"
+    for bad in ("", "   ", "<p>\x00</p>"):
+        with pytest.raises(ValueError):
+            rt.sanitized_document(bad)

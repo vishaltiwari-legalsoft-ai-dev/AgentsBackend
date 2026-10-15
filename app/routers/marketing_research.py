@@ -2798,6 +2798,12 @@ def _html_check_body(ws: str, data: bytes, upload: dict) -> dict | JSONResponse:
     except rt.TemplateCheckUnavailable:
         logger.warning("mr template check unavailable", exc_info=True)
         return _coded(503, "check_unavailable", _CHECK_UNAVAILABLE)
+    return _html_result_body(ws, result, upload)
+
+
+def _html_result_body(ws: str, result, upload: dict) -> dict:
+    """The ``check-html`` answer for a :class:`CheckResult` (``source_kind:
+    "html"``), with a preview when it can be saved."""
     body = {**result.to_dict(), "source_kind": "html", "upload": upload}
     if result.can_save:
         body.update(_preview(ws, {"source_kind": "html", "html": result.sanitized_html}))
@@ -2857,9 +2863,15 @@ def report_template_extract(file: UploadFile | None = File(None),
                                 "template_extract", "Read a sample report for a template",
                                 unit=OUTPUT)):
     """Read a sample report (PDF, PNG or JPEG) into a layout, with a preview in
-    this workspace's real figures. What the file IS comes from its bytes; an
-    HTML file is checked instead (the ``check-html`` answer, ``source_kind:
-    "html"``) and costs no reading. Nothing is saved.
+    this workspace's real figures. What the file IS comes from its bytes. An
+    HTML file is checked first: one with placeholders is a template and gets
+    the ``check-html`` answer (``source_kind: "html"``, no reading spent); one
+    that cleaned fine but has NO placeholders is a designed page with its
+    figures typed in — a sample — and goes through the same AI layout reader
+    as a PDF, as the text outline of the SANITIZED document (never rendered),
+    costing one reading. Its answer has the PDF shape with ``source_kind:
+    "html_sample"`` plus ``removed`` (what the sanitizer took out). Nothing is
+    saved.
 
     200: ``{source_kind, upload, layout, unsupported, left_out, matched_count,
     notes, preview_html, preview_unavailable_reason, readings_left_today}``.
@@ -2892,11 +2904,25 @@ def report_template_extract(file: UploadFile | None = File(None),
     except rt.UploadRejected as exc:
         return _coded(422, "invalid_file", exc.reason, act)
     upload = _upload_facts(data, filename, sniffed)
+    extra: dict = {}
     if sniffed.kind == "html":
-        act.skip("an HTML upload is checked, not read by the model")
-        return _html_check_body(ws, data, upload)
-
-    source_kind = "pdf" if sniffed.kind == "pdf" else "image"
+        try:
+            checked = rt.check_html(data)
+        except rt.TemplateCheckUnavailable:
+            logger.warning("mr template check unavailable", exc_info=True)
+            return _coded(503, "check_unavailable", _CHECK_UNAVAILABLE, act)
+        if not checked.is_placeholder_free:
+            act.skip("an HTML template is checked, not read by the model")
+            return _html_result_body(ws, checked, upload)
+        # A designed page with typed-in figures: a sample. The reader gets the
+        # SANITIZED document (scripts, handlers, external URLs already gone),
+        # never the upload's bytes, and reads it as text, never in a browser.
+        source_kind, reader_kind = "html_sample", "html"
+        data = checked.sanitized_html.encode("utf-8")
+        extra = {"removed": dict(checked.removed)}
+    else:
+        source_kind = "pdf" if sniffed.kind == "pdf" else "image"
+        reader_kind = sniffed.kind
     # One atomic check-and-take on the workspace's daily meter: a burst of
     # simultaneous readings can never all take the last slot.
     try:
@@ -2909,7 +2935,7 @@ def report_template_extract(file: UploadFile | None = File(None),
                       "HTML templates and arranging sections by hand need no reading.", act,
                       readings_left_today=0)
     try:
-        result = tx.extract_layout(data, sniffed.kind, filename=filename or "upload",
+        result = tx.extract_layout(data, reader_kind, filename=filename or "upload",
                                    activity=act)
     except tx.TemplateExtractionError as exc:
         usage = exc.usage or {}
@@ -2944,6 +2970,7 @@ def report_template_extract(file: UploadFile | None = File(None),
         "notes": result["notes"],
         **_preview(ws, {"source_kind": source_kind, "spec": result["layout"]}),
         "readings_left_today": _readings_left(ws),
+        **extra,
     }
 
 
@@ -3003,8 +3030,8 @@ def report_template_save(body: dict | None = None, user=Depends(get_current_user
                              "template_save", "Saved a report template", unit=CHANGE)):
     """Save a template version for the whole workspace; it becomes active.
 
-    Body: ``{source_kind: "pdf"|"image"|"html"|"builder", filename?, layout?, html?}``
-    (``html`` for ``source_kind: "html"``, ``layout`` otherwise). The server
+    Body: ``{source_kind: "pdf"|"image"|"html"|"html_sample"|"builder", filename?,
+    layout?, html?}`` (``html`` for ``source_kind: "html"``, ``layout`` otherwise). The server
     re-checks everything: HTML through ``check_html`` (the SANITIZED result is
     what is stored), a layout through ``validate_layout`` and one render against
     the newest real figures. 200 ``{version, active}``; 422

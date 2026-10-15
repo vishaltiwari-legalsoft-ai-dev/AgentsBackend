@@ -279,6 +279,15 @@ class TemplateError:
                 "message": self.message, "suggestion": self.suggestion}
 
 
+#: The one error a clean, placeholder-free file gets. A constant so the extract
+#: route can recognise that file structurally (``is_placeholder_free``) and hand
+#: it to the AI layout reader instead of dead-ending on this message.
+NO_PLACEHOLDERS_MESSAGE = (
+    "This template has no placeholders, so it would show none of the report's figures. "
+    "Typed-in numbers are never used; add placeholders such as {{total_spend}} where the "
+    "figures belong.")
+
+
 @dataclass(frozen=True)
 class CheckResult:
     """What :func:`check_html` found. ``sanitized_html`` is what a save stores;
@@ -292,6 +301,18 @@ class CheckResult:
     @property
     def can_save(self) -> bool:
         return not self.errors and bool(self.sanitized_html)
+
+    @property
+    def is_placeholder_free(self) -> bool:
+        """A file that cleaned fine and whose ONLY problem is that it has no
+        placeholders: a designed page with its figures typed in. That is a
+        sample report, not a template, and the extract route reads it with the
+        AI layout reader (``template_extract``, kind ``"html"``). A file with
+        misplaced or unknown placeholders is a template with mistakes and stays
+        on the check path; a refused file (too big, not UTF-8, too complex) has
+        no sanitized text and stays there too."""
+        return (bool(self.sanitized_html) and not self.placeholders_used and bool(self.errors)
+                and all(e.message == NO_PLACEHOLDERS_MESSAGE for e in self.errors))
 
     def to_dict(self) -> dict:
         return {"sanitized_html": self.sanitized_html,
@@ -1414,10 +1435,7 @@ def _analyse(text: str) -> tuple[CheckResult, _Doc | None]:
             errors.append(TemplateError(line, tok, f"{tok} sits inside markup that is removed "
                                         "when the template is cleaned, so it would never show."))
     if not doc.occurrences and not errors:
-        errors.append(TemplateError(
-            None, None, "This template has no placeholders, so it would show none of the "
-            "report's figures. Typed-in numbers are never used; add placeholders such as "
-            "{{total_spend}} where the figures belong."))
+        errors.append(TemplateError(None, None, NO_PLACEHOLDERS_MESSAGE))
 
     errors.sort(key=lambda e: (e.line is None, e.line or 0))
     if len(errors) > MAX_ERRORS:
@@ -1641,6 +1659,35 @@ def check_html(raw: bytes) -> CheckResult:
         return _refused(f"This template is too complex to check within {budget:g} seconds. "
                         "Simplify its markup and upload it again.")
     return result
+
+
+@dataclass(frozen=True)
+class SanitizedDocument:
+    """HTML that :func:`check_html` produced, taken apart for a reader: the
+    plain-text title, the cleaned stylesheets, and the body as html5ever's
+    canonical pieces — tags (``<name attrs>`` / ``</name>``) and escaped text,
+    alternating, every element closed. ``theme_tokens(styles)`` gives the
+    ``:root`` colour tokens it declares."""
+
+    title: str | None
+    styles: tuple[str, ...]
+    parts: tuple[str, ...]
+
+
+def sanitized_document(sanitized_html: str) -> SanitizedDocument:
+    """Re-read HTML this module already produced (canonical and small, so no
+    worker is needed — the same rule as :func:`render_html_template`). The text
+    is cleaned again on the way, so a caller that passes something else still
+    gets sanitized pieces. Raises ``ValueError`` when it cannot be read."""
+    if not isinstance(sanitized_html, str) or not sanitized_html.strip():
+        raise ValueError("no HTML to read")
+    if "\x00" in sanitized_html:
+        raise ValueError("the HTML contains a NUL byte")
+    result, doc = _analyse(sanitized_html)
+    if doc is None:
+        first = result.errors[0].message if result.errors else "it could not be checked"
+        raise ValueError(f"the HTML could not be read: {first}")
+    return SanitizedDocument(title=doc.title, styles=tuple(doc.styles), parts=tuple(doc.parts))
 
 
 # --- rendering an HTML template -----------------------------------------------------

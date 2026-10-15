@@ -400,14 +400,21 @@ def trail_rows(monkeypatch):
     return rows
 
 
+#: The bytes each stubbed reading was handed (the HTML-sample tests check that
+#: it is the SANITIZED document, never the upload). Cleared per test.
+RECEIVED: list[bytes] = []
+
+
 @pytest.fixture()
 def reader(monkeypatch):
     """Stands in for the model: records each call, answers from a queue."""
     calls: list[dict] = []
     answers: list = []
+    RECEIVED.clear()
 
     def fake(data, kind, *, filename, activity=None):
         calls.append({"kind": kind, "filename": filename, "size": len(data)})
+        RECEIVED.append(bytes(data))
         answer = answers.pop(0) if answers else _reading()
         if isinstance(answer, Exception):
             raise answer
@@ -1138,3 +1145,106 @@ def test_the_extract_answer_carries_left_out_for_the_frontend(templates_on, read
     tokens = {p["token"]: p for p in _listing()["placeholders"]}
     assert tokens["{{total_management_fees}}"]["example"] == "$9,600"
     assert tokens["{{cards:vendor_detail}}"]["kind"] == "cards"
+
+
+# --- a designed HTML page with typed-in figures is read as a sample (2026-10-15) ---------
+
+DESIGNED_HTML = (b"<!DOCTYPE html><html><head><title>Q3</title><style>:root{--ink:#123456}</style>"
+                 b"<script>steal()</script></head><body onload=\"x()\">"
+                 b"<h1>Vendor performance</h1><table><tr><th>Vendor</th><th>Spend</th></tr>"
+                 b"<tr><td>Acme</td><td>$2,737</td></tr></table>"
+                 b"<a href=\"https://evil.example\">more</a></body></html>")
+
+
+def test_a_designed_html_with_typed_in_numbers_goes_through_the_reader(templates_on, reader,
+                                                                        trail_rows):
+    calls, _ = reader
+    resp = _upload("/api/mr/report-templates/extract", "q3 report.html", DESIGNED_HTML,
+                   "text/html")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["source_kind"] == "html_sample"
+    assert len(calls) == 1 and calls[0]["kind"] == "html"
+    assert calls[0]["filename"] == "q3 report.html"
+    # The reader was handed the SANITIZED document, not the upload's bytes.
+    sent = RECEIVED[-1]
+    assert calls[0]["size"] == len(sent) != len(DESIGNED_HTML)
+    assert sent.startswith(b"<!DOCTYPE html><html lang=\"en\">")
+    for gone in (b"<script", b"steal", b"onload", b"evil.example", b"href="):
+        assert gone not in sent, gone
+    assert b"<th>Vendor</th>" in sent
+    assert body["upload"]["kind"] == "html" and body["upload"]["filename"] == "q3 report.html"
+    assert body["layout"] == LAYOUT and body["matched_count"] == 3
+    assert body["left_out"] == [{"title": "Social reach", "reason": "a follower chart"}]
+    assert body["removed"]["scripts"] == 1 and body["removed"]["handlers"] == 1
+    assert body["removed"]["external_urls"] == 1
+    assert "errors" not in body and "can_save" not in body        # not the check answer
+    assert body["preview_html"].startswith("<!DOCTYPE html>")
+    assert "Vendor scorecard" in body["preview_html"]
+    assert body["readings_left_today"] == 9                       # it IS a reading
+    assert [r["action"] for r in trail_rows] == ["template_extract"]
+    assert _listing()["versions"] == []                           # nothing saved
+    # The arranged layout saves under its honest kind, as a layout version.
+    saved = _save({"source_kind": "html_sample", "filename": "q3 report.html",
+                   "layout": body["layout"]})
+    assert saved["version"]["kind"] == "layout"
+    assert saved["version"]["source_kind"] == "html_sample"
+    assert _listing()["active"]["source_kind"] == "html_sample"
+
+
+def test_an_html_template_with_placeholders_still_never_reaches_the_reader(templates_on,
+                                                                          reader, trail_rows):
+    calls, _ = reader
+    for raw in (HTML, b"<p>{{totl_spend}}</p><script>x</script>",
+                b'<p title="{{total_spend}}">typed-in $2,737</p>'):
+        resp = _upload("/api/mr/report-templates/extract", "t.html", raw, "text/html")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["source_kind"] == "html" and "errors" in resp.json()
+    assert calls == [] and trail_rows == [] and RECEIVED == []
+    assert _listing()["readings_left_today"] == 10
+
+
+def test_an_html_sample_reading_fails_as_honestly_as_a_pdf_and_never_falls_back(
+        templates_on, reader):
+    _, answers = reader
+    answers.append(tx.TemplateExtractionError(
+        "The AI reader is not configured: no OpenRouter key.", code="no_key"))
+    resp = _upload("/api/mr/report-templates/extract", "q3.html", DESIGNED_HTML, "text/html")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["code"] == "no_key" and body["billed"] is False
+    assert "no placeholders" not in body["reason"] and "can_save" not in body
+    assert body["readings_left_today"] == 10                      # given back
+    answers.append(tx.TemplateExtractionError(
+        "Reading this upload could cost up to $0.40.", code="cost_ceiling"))
+    assert _upload("/api/mr/report-templates/extract", "q3.html", DESIGNED_HTML,
+                   "text/html").status_code == 422
+    answers.append(tx.TemplateExtractionError(
+        "The AI reader did not answer.", code="timeout",
+        usage={"input_tokens": 900, "output_tokens": 0, "cost_usd": 0.01, "calls": 1}))
+    billed = _upload("/api/mr/report-templates/extract", "q3.html", DESIGNED_HTML, "text/html")
+    assert billed.status_code == 503 and billed.json()["billed"] is True
+    assert billed.json()["readings_left_today"] == 9              # a billed failure counts
+
+
+def test_an_html_sample_reading_counts_against_the_daily_allowance(templates_on, reader):
+    calls, _ = reader
+    for _ in range(10):
+        assert _upload("/api/mr/report-templates/extract", "q3.html", DESIGNED_HTML,
+                       "text/html").status_code == 200
+    refused = _upload("/api/mr/report-templates/extract", "q3.html", DESIGNED_HTML, "text/html")
+    assert refused.status_code == 429 and refused.json()["code"] == "rate_limited"
+    assert len(calls) == 10                                       # the 11th never ran
+    # The check path still works with the allowance spent: it costs no reading.
+    assert _upload("/api/mr/report-templates/extract", "t.html", HTML,
+                   "text/html").json()["can_save"] is True
+
+
+def test_a_checker_that_cannot_run_blocks_the_html_sample_path_too(templates_on, reader,
+                                                                   monkeypatch):
+    calls, _ = reader
+    monkeypatch.setattr(rt, "check_html",
+                        lambda data: (_ for _ in ()).throw(rt.TemplateCheckUnavailable("busy")))
+    resp = _upload("/api/mr/report-templates/extract", "q3.html", DESIGNED_HTML, "text/html")
+    assert resp.status_code == 503 and resp.json()["code"] == "check_unavailable"
+    assert calls == [] and _listing()["readings_left_today"] == 10
