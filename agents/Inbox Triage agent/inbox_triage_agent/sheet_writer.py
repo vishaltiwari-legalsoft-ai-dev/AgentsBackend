@@ -57,7 +57,9 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Protocol
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Iterator, Protocol
 
 from app.services.google_http import (
     _RETRY_ATTEMPTS, _RETRY_BACKOFF_SECONDS, _is_transient, cached_credentials,
@@ -133,6 +135,39 @@ class SheetsUnsure(SheetsUnavailable):
     """A batch was sent and no answer came back — a timeout, a reset, a 5xx.
     It may have been applied. Never an instruction to send it again: the
     sheet is asked first."""
+
+
+class SheetsUnreachable(SheetsUnavailable):
+    """Google Sheets (or Drive, for the check) could not be reached at all:
+    every attempt the shared retry made timed out or came back 5xx/429. Not a
+    refusal and not a layout problem — those say something about the sheet;
+    this says something about the path to Google. The fire's circuit breaker
+    (``pipeline``) counts exactly this class, and nothing else."""
+
+
+#: The fire's absolute deadline (a ``time.monotonic()`` value) for every Sheets
+#: and Drive call made under :func:`within_deadline`. ``None`` — the default,
+#: and what every caller outside a fire sees — means the shared retry behaves
+#: as it always has. A context variable rather than a parameter on the eight
+#: public functions and their test fakes: the fire is one synchronous call
+#: chain on one worker thread, and the deadline belongs to the whole chain.
+_fire_deadline: ContextVar[float | None] = ContextVar("inbox_fire_deadline", default=None)
+
+
+@contextmanager
+def within_deadline(deadline: float | None) -> Iterator[None]:
+    """Run the block with every Sheets/Drive retry bounded by ``deadline``:
+    no attempt is started that could not finish before it."""
+    token = _fire_deadline.set(deadline)
+    try:
+        yield
+    finally:
+        _fire_deadline.reset(token)
+
+
+def current_deadline() -> float | None:
+    """The deadline the enclosing :func:`within_deadline` set, or ``None``."""
+    return _fire_deadline.get()
 
 
 class Hold(Protocol):
@@ -316,12 +351,19 @@ def _run(request, *, what: str, service: str = "Sheets"):
     from googleapiclient.errors import HttpError
 
     try:
-        return execute_with_retry(request, what=f"{service} {what}", unavailable=SheetsUnavailable)
+        return execute_with_retry(
+            request, what=f"{service} {what}", unavailable=SheetsUnreachable,
+            deadline=_fire_deadline.get(),
+            attempt_seconds=DRIVE_TIMEOUT_SECONDS if service == "Drive" else SHEETS_TIMEOUT_SECONDS,
+        )
     except HttpError as exc:
         raise _refused(exc, what=what, service=service) from exc
-    except SheetsUnavailable as exc:
-        raise SheetsUnavailable(
-            f"{service} {what} failed after {_RETRY_ATTEMPTS} attempts ({_cause_of(exc.__cause__)})"
+    except SheetsUnreachable as exc:
+        attempts = int(getattr(exc, "attempts", _RETRY_ATTEMPTS))
+        noun = "attempt" if attempts == 1 else "attempts"
+        tail = "; stopped before the fire's deadline" if getattr(exc, "deadline_hit", False) else ""
+        raise SheetsUnreachable(
+            f"{service} {what} failed after {attempts} {noun} ({_cause_of(exc.__cause__)}{tail})"
         ) from exc.__cause__
 
 
@@ -1289,7 +1331,7 @@ def write_rows(
         return _as_found(rows, new_rows, updates)
     if refusal is not None:
         raise refusal
-    raise SheetsUnavailable(
+    raise SheetsUnreachable(
         f"Sheets row write got no answer in {WRITE_ATTEMPTS} attempts and the sheet does not "
         "show it; nothing was written."
     )

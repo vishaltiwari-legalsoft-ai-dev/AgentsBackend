@@ -246,3 +246,94 @@ def test_signing_token_refresh_overrides_google_auths_120s_default(monkeypatch):
     monkeypatch.setattr(google_requests.Request, "__call__", fake_call)
     storage._TimedRequest()("https://metadata.google.internal/token")
     assert captured["timeout"] == storage._AUTH_TIMEOUT_SECONDS
+
+
+# --------------------------------------------------------------------------- #
+# The shared retry (``google_http.execute_with_retry``): three attempts with
+# 1s + 3s between them, as every caller has had since 2026-09-18 — and, only
+# when a caller passes a deadline, no attempt that could not finish before it.
+# Pinned 2026-10-19: Marketing Research's sheet reads pass no deadline and
+# must keep the old behaviour; the Inbox Triage fire passes its own share.
+# --------------------------------------------------------------------------- #
+
+class _FailingRequest:
+    def __init__(self, error: Exception):
+        self.error, self.executes = error, 0
+
+    def execute(self):
+        self.executes += 1
+        raise self.error
+
+
+class _Unavailable(RuntimeError):
+    pass
+
+
+@pytest.fixture()
+def retry_clock(monkeypatch):
+    from app.services import google_http
+
+    clock = {"t": 0.0, "slept": []}
+    monkeypatch.setattr(google_http.time, "monotonic", lambda: clock["t"])
+
+    def sleep(seconds):
+        clock["slept"].append(seconds)
+        clock["t"] += seconds
+    monkeypatch.setattr(google_http.time, "sleep", sleep)
+    return clock
+
+
+def test_execute_with_retry_without_a_deadline_makes_three_attempts_as_before(retry_clock):
+    from app.services import google_http
+
+    req = _FailingRequest(TimeoutError("timed out"))
+    with pytest.raises(_Unavailable, match="Sheets read failed after 3 attempts: timed out") as caught:
+        google_http.execute_with_retry(req, what="Sheets read", unavailable=_Unavailable)
+    assert req.executes == 3 and retry_clock["slept"] == [1.0, 3.0]
+    assert caught.value.attempts == 3 and caught.value.deadline_hit is False
+
+
+def test_execute_with_retry_never_starts_an_attempt_that_cannot_finish_before_the_deadline(retry_clock):
+    from app.services import google_http
+
+    # 32s left and a 30s socket deadline: the 1s wait fits (31 ≤ 32), the 3s
+    # wait after the second failure does not (1 + 3 + 30 > 32) — two attempts.
+    req = _FailingRequest(TimeoutError("timed out"))
+    with pytest.raises(_Unavailable) as caught:
+        google_http.execute_with_retry(
+            req, what="Sheets read", unavailable=_Unavailable, deadline=32.0, attempt_seconds=30.0,
+        )
+    assert req.executes == 2 and retry_clock["slept"] == [1.0]
+    assert str(caught.value) == "Sheets read failed after 2 attempts (stopped before the deadline): timed out"
+    assert caught.value.attempts == 2 and caught.value.deadline_hit is True
+
+    # Nothing left for a second attempt: one, and said in the singular.
+    retry_clock["t"], retry_clock["slept"] = 0.0, []
+    req = _FailingRequest(TimeoutError("timed out"))
+    with pytest.raises(_Unavailable, match="failed after 1 attempt "):
+        google_http.execute_with_retry(
+            req, what="Sheets read", unavailable=_Unavailable, deadline=5.0, attempt_seconds=30.0,
+        )
+    assert req.executes == 1 and retry_clock["slept"] == []
+
+    # A deadline far away changes nothing.
+    req = _FailingRequest(TimeoutError("timed out"))
+    with pytest.raises(_Unavailable, match="failed after 3 attempts: "):
+        google_http.execute_with_retry(
+            req, what="Sheets read", unavailable=_Unavailable, deadline=10_000.0, attempt_seconds=30.0,
+        )
+    assert req.executes == 3
+
+
+def test_execute_with_retry_re_raises_a_refusal_at_once_with_or_without_a_deadline(retry_clock):
+    from types import SimpleNamespace
+
+    from googleapiclient.errors import HttpError
+
+    from app.services import google_http
+
+    for kwargs in ({}, {"deadline": 1000.0, "attempt_seconds": 30.0}):
+        req = _FailingRequest(HttpError(SimpleNamespace(status=403, reason="forbidden"), b"body"))
+        with pytest.raises(HttpError):
+            google_http.execute_with_retry(req, what="Sheets read", unavailable=_Unavailable, **kwargs)
+        assert req.executes == 1 and retry_clock["slept"] == []

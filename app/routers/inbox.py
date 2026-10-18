@@ -343,10 +343,15 @@ def cron_poll(
     read = sum(int(u.get("messages_read") or 0) for u in users)
     if not failed and not rows and not retried and not read and not disconnected:
         reasons = {u.get("skipped") for u in users if u.get("skipped")}
-        act.skip(
-            "previous fire still running" if reasons == {"previous fire still running"}
-            else "idle fire: nothing connected or no new mail"
-        )
+        paused = sum(1 for u in users if u.get("skipped") == pipeline.SKIPPED_SHEET_UNREACHABLE)
+        if reasons == {"previous fire still running"}:
+            act.skip("previous fire still running")
+        elif paused:
+            # An open Sheets breaker: not a failure (those were reported when
+            # the breaker opened), so no 207 and no trail row — but not "idle".
+            act.skip(f"sheet unreachable: polling paused for {paused} connection(s)")
+        else:
+            act.skip("idle fire: nothing connected or no new mail")
     else:
         act.note(
             f"Scheduled inbox poll — {rows} rows added, {retried} re-checked, "

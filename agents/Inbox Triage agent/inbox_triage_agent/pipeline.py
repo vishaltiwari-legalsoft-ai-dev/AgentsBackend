@@ -7,7 +7,9 @@ nothing else.
 One fire, in order:
 
 1. Load the connection and take the lease (one transaction). Not connected,
-   no sheet, or a sheet check that is not ``ok`` → skip. The sheet is
+   a Sheets breaker still open from the last fires (see
+   :data:`SHEET_BREAKER_TRIPS_DEFAULT`), no sheet, or a sheet check that is
+   not ``ok`` → skip. The sheet is
    re-checked — ownership included — when the last check failed, is over an
    hour old, was made for a different address than the one firing, or has
    not yet tried to put the Inbox tab in newest-first order (a one-time
@@ -61,6 +63,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -77,7 +80,7 @@ from .sheet_layout import RowFacts, agent_values, parse_sheet_ref, sheet_url
 from .sheet_writer import (
     CHECK_MR_SOURCE, CHECK_OK, ORDER_BLOCKED, ORDER_RETRY_SECONDS, ORDER_SETTLED,
     RETRIED_COVER_SECONDS, WORKTREE_CLAIMED, WORKTREE_OURS, LayoutMismatch, SheetCheck,
-    SheetsUnavailable,
+    SheetsUnavailable, SheetsUnreachable,
 )
 from .summarise import ModelCallFailed, ModelUnavailable
 from .triage import NEEDS_REVIEW, TEAM_TIMEZONE, Rejected, Verdict
@@ -104,6 +107,19 @@ RETRIAGE_DONE = "done"
 #: Consecutive model-call failures that mean "the model is down", not "this
 #: email is odd" — the fire is abandoned before anything is written.
 MODEL_FAILURE_TRIP = 3
+#: The Sheets circuit breaker, per connection. Consecutive fires on which
+#: Google Sheets could not be reached (:class:`SheetsUnreachable` — timeouts
+#: and 5xx after the shared retry, never a refusal or a layout problem) that
+#: open it, and how long it stays open. While open, the fire is skipped with
+#: :data:`SKIPPED_SHEET_UNREACHABLE` and costs the cron nothing; the first
+#: fire after the cool-off tries once — a success closes it, a failure opens
+#: it again. The checkpoint never moves on a skip: mail is delayed, not lost.
+#: Born 2026-10-19: one unreachable sheet took ~95s of every five-minute fire
+#: for seven hours (3 × 30s timeouts + backoff) and the cron answered 207 the
+#: whole time, paging the owner for a connection nothing could be done about.
+SHEET_BREAKER_TRIPS_DEFAULT = 3
+SHEET_BREAKER_COOLOFF_DEFAULT_SECONDS = 1200.0
+SKIPPED_SHEET_UNREACHABLE = "sheet_unreachable"
 #: Wall clock for one user's fire. The scheduler's attempt deadline is 300s;
 #: the cron endpoint keeps its whole request under ~270s.
 FIRE_BUDGET_SECONDS = 240.0
@@ -182,6 +198,38 @@ def _parse_iso(value) -> datetime | None:
 # --------------------------------------------------------------------------- #
 # Lifecycle — connect, sheet, disconnect, status
 # --------------------------------------------------------------------------- #
+
+def _breaker_trips() -> int:
+    """``INBOX_SHEET_BREAKER_TRIPS`` — consecutive unreachable fires that open
+    the breaker. Bounded 1..20; anything unreadable is the default, said so."""
+    raw = os.environ.get("INBOX_SHEET_BREAKER_TRIPS", "")
+    try:
+        return max(1, min(int(raw), 20)) if raw else SHEET_BREAKER_TRIPS_DEFAULT
+    except ValueError:
+        logger.warning("INBOX_SHEET_BREAKER_TRIPS=%r is not a number — using default", raw)
+        return SHEET_BREAKER_TRIPS_DEFAULT
+
+
+def _breaker_cooloff_seconds() -> float:
+    """``INBOX_SHEET_BREAKER_COOLOFF_SECONDS`` — how long an open breaker skips
+    the connection. Bounded to one poll interval .. one day."""
+    raw = os.environ.get("INBOX_SHEET_BREAKER_COOLOFF_SECONDS", "")
+    try:
+        return (
+            max(float(POLL_INTERVAL_SECONDS), min(float(raw), 86400.0)) if raw
+            else SHEET_BREAKER_COOLOFF_DEFAULT_SECONDS
+        )
+    except ValueError:
+        logger.warning("INBOX_SHEET_BREAKER_COOLOFF_SECONDS=%r is not a number — using default", raw)
+        return SHEET_BREAKER_COOLOFF_DEFAULT_SECONDS
+
+
+def _breaker_open_until(doc: dict) -> datetime | None:
+    """When the connection's Sheets breaker closes, or ``None`` when it is
+    not open. Read with a default: every document written before the breaker
+    existed has no ``sheet_breaker`` map."""
+    return _parse_iso((doc.get("sheet_breaker") or {}).get("open_until"))
+
 
 def _fresh_backfill(now: datetime) -> dict:
     return {
@@ -435,11 +483,18 @@ def status_payload(user_id: str, *, now: datetime | None = None) -> dict:
     sheet = doc.get("sheet") or {}
     backfill = doc.get("backfill") or {}
     last_poll = doc.get("last_poll") or {}
+    breaker = doc.get("sheet_breaker") or {}
+    open_until = _breaker_open_until(doc)
+    breaker_open = open_until is not None and now < open_until
     connected = bool(gmail.get("connected"))
     last_at = _parse_iso(last_poll.get("at"))
     next_poll = None
     if connected:
         next_poll = _iso(last_at + timedelta(seconds=POLL_INTERVAL_SECONDS)) if last_at else _iso(now)
+        if breaker_open:
+            # Fires still come every five minutes, but each is skipped until
+            # the cool-off ends: that is the next time mail is really tried.
+            next_poll = _iso(open_until)
     return {
         "enabled": True,
         "service_account_email": sheet_writer.service_account_email(),
@@ -471,6 +526,12 @@ def status_payload(user_id: str, *, now: datetime | None = None) -> dict:
             "error": last_poll.get("error") or None,
         },
         "next_poll_at": next_poll,
+        # Read with a default on the console (deploy skew): absent before 10-19.
+        "sheet_breaker": {
+            "open": breaker_open,
+            "open_until": _iso(open_until) if breaker_open else None,
+            "failures": int(breaker.get("failures") or 0),
+        },
         "rows_24h": rows_in_window(doc.get("recent_fires") or [], now),
         "needs_review": int(doc.get("needs_review") or 0),
         "generated_at": _iso(now),
@@ -693,6 +754,13 @@ def fire(
     if not doc or not (doc.get("gmail") or {}).get("connected"):
         report.skipped = "gmail not connected"
         return report
+    open_until = _breaker_open_until(doc)
+    if open_until is not None and now < open_until:
+        # Sheets could not be reached on the last fires; nothing is asked of
+        # Google (or of the lease) until the cool-off ends. Not a failure:
+        # the failures that opened the breaker were reported as failures.
+        report.skipped = SKIPPED_SHEET_UNREACHABLE
+        return report
     # Read-and-take in one transaction: two overlapping fires cannot both see
     # the lease free. The document it returns is the one the fire works from.
     until = now + timedelta(seconds=LEASE_SECONDS)
@@ -704,10 +772,13 @@ def fire(
     doc = leased
     lease = _Lease(user_id, owner=owner, now=now, started=started, until=until)
     try:
-        _fire_leased(
-            user_id, doc, report, email=email, deadline=started + budget_seconds, now=now,
-            lease=lease,
-        )
+        # Every Sheets/Drive retry inside is bounded by this fire's deadline,
+        # so one unreachable sheet cannot spend the next connection's share.
+        with sheet_writer.within_deadline(started + budget_seconds):
+            _fire_leased(
+                user_id, doc, report, email=email, deadline=started + budget_seconds, now=now,
+                lease=lease,
+            )
     except LeaseLost:
         # Not a failure and not this fire's to record: the document belongs
         # to the fire that holds the lease now, which reads the same mail.
@@ -722,9 +793,11 @@ def fire(
     except (GmailUnavailable, SheetsUnavailable, ModelUnavailable, TokenRefreshFailed, HttpError) as exc:
         reason = _panel_reason(exc)
         logger.warning("a12 fire for user %s failed: %s", user_label(user_id), reason)
-        firestore_repo.save_inbox_connection(user_id, {
-            "last_poll": {"at": _iso(now), "ok": False, "messages_read": 0, "error": reason},
-        })
+        patch: dict = {}
+        if isinstance(exc, SheetsUnreachable):
+            reason = _count_unreachable(user_id, doc, now, reason, patch)
+        patch["last_poll"] = {"at": _iso(now), "ok": False, "messages_read": 0, "error": reason}
+        firestore_repo.save_inbox_connection(user_id, patch)
         report.ok, report.error = False, reason
     finally:
         try:
@@ -733,6 +806,34 @@ def fire(
             logger.exception("a12: could not clear the fire lease for user %s", user_label(user_id))
         report.seconds = round(time.monotonic() - started, 1)
     return report
+
+
+def _count_unreachable(user_id: str, doc: dict, now: datetime, reason: str, patch: dict) -> str:
+    """One more fire on which Sheets could not be reached. Adds the breaker's
+    new state to ``patch`` and returns the sentence ``last_poll`` carries —
+    the failure's own, plus how long polling is paused once the breaker
+    opens. The count is consecutive: :func:`_persist` zeroes it on the next
+    fire that gets through."""
+    breaker = dict(doc.get("sheet_breaker") or {})
+    failures = int(breaker.get("failures") or 0) + 1
+    trips = _breaker_trips()
+    state: dict = {"failures": failures, "open_until": None, "opened_at": None}
+    if failures >= trips:
+        cooloff = _breaker_cooloff_seconds()
+        open_until = now + timedelta(seconds=cooloff)
+        state["open_until"], state["opened_at"] = _iso(open_until), _iso(now)
+        minutes = max(1, int(round(cooloff / 60)))
+        logger.warning(
+            "a12 sheet breaker OPEN for user %s: Google Sheets unreachable on %d fire(s) in a row; "
+            "skipping this connection for %d min (until %s)",
+            user_label(user_id), failures, minutes, _iso(open_until),
+        )
+        reason = (
+            f"{reason.rstrip('.')}. Google Sheets could not be reached on {failures} polls in a "
+            f"row, so polling is paused for {minutes} min; mail is delayed, not lost."
+        )
+    patch["sheet_breaker"] = state
+    return reason
 
 
 def _panel_reason(exc: BaseException) -> str:
@@ -883,6 +984,16 @@ def _persist(
     }
     if checkpoint:
         patch["checkpoint"] = {"history_id": checkpoint, "updated_at": _iso(now)}
+    breaker = doc.get("sheet_breaker") or {}
+    if breaker.get("failures") or breaker.get("open_until"):
+        # Sheets answered this whole fire: the consecutive count starts over,
+        # and a breaker that had opened is closed — said once, at INFO.
+        if breaker.get("open_until"):
+            logger.info(
+                "a12 sheet breaker CLOSED for user %s: Google Sheets reachable again after %s "
+                "failed fire(s)", user_label(user_id), breaker.get("failures") or "?",
+            )
+        patch["sheet_breaker"] = {"failures": 0, "open_until": None, "opened_at": None}
     firestore_repo.save_inbox_connection(user_id, patch)
 
 

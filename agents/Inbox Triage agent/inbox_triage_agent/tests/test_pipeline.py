@@ -836,7 +836,9 @@ def test_status_for_a_user_who_never_connected_is_enabled_with_nulls(store, shee
                   "ordering": None, "ordering_note": None},
         "backfill": {"state": None, "done": 0, "total": None},
         "last_poll": {"at": None, "ok": None, "messages_read": 0, "error": None},
-        "next_poll_at": None, "rows_24h": 0, "needs_review": 0, "generated_at": NOW.isoformat(),
+        "next_poll_at": None,
+        "sheet_breaker": {"open": False, "open_until": None, "failures": 0},
+        "rows_24h": 0, "needs_review": 0, "generated_at": NOW.isoformat(),
     }
 
 
@@ -2940,3 +2942,206 @@ def test_a_sheet_that_cannot_be_sorted_still_gets_its_mail_and_says_why_where_th
     assert ids[:3] == ["today", "n4", "n3"] and ids[-1] == "b7"
     shown = pipeline.status_payload(UID, now=NOW)["sheet"]
     assert (shown["ordering"], shown["ordering_note"]) == ("applied", None)
+
+
+# --------------------------------------------------------------------------- #
+# Pinned 2026-10-19: the per-connection Sheets circuit breaker. On 10-18 one
+# connection's sheet could not be reached for seven hours; every five-minute
+# fire spent ~95s on it (3 × 30s timeouts + backoff), starved the other
+# three connections of their share, and the cron answered 207 the whole time.
+# After N unreachable fires in a row the connection is skipped for a cool-off
+# — reported as skipped, not failed — and tried once when it ends.
+# --------------------------------------------------------------------------- #
+
+import logging as _logging  # noqa: E402
+
+from inbox_triage_agent.sheet_writer import SheetsRefused, SheetsUnreachable  # noqa: E402
+
+COOLOFF = timedelta(seconds=pipeline.SHEET_BREAKER_COOLOFF_DEFAULT_SECONDS)
+
+
+def _unreachable_id_rows(tried: list):
+    def id_rows(spreadsheet_id, *, svc=None):
+        tried.append(spreadsheet_id)
+        raise SheetsUnreachable("Sheets id column read failed after 3 attempts (timed out)")
+    return id_rows
+
+
+def _fire_n_times(count: int, start: datetime = NOW) -> list:
+    return [pipeline.fire(UID, email=EMAIL, now=start + timedelta(minutes=5 * i)) for i in range(count)]
+
+
+def test_three_unreachable_fires_are_failures_then_the_breaker_opens_and_the_next_is_skipped(
+    connected, mailbox, sheet, monkeypatch, caplog
+):
+    tried: list = []
+    monkeypatch.setattr(sheet_writer, "id_rows", _unreachable_id_rows(tried))
+    mailbox.messages = {"m1": _message("m1")}
+    mailbox.history_added = ["m1"]
+
+    with caplog.at_level(_logging.INFO, logger="agentos.inbox.pipeline"):
+        reports = _fire_n_times(3)
+
+    # The first N are honest failures — a sustained real break stays visible.
+    assert all(r.ok is False and r.skipped is None and "Sheets" in r.error for r in reports)
+    assert len(tried) == 3
+    opened_at = NOW + timedelta(minutes=10)
+    doc = connected.connections[UID]
+    assert doc["sheet_breaker"] == {
+        "failures": 3, "open_until": (opened_at + COOLOFF).isoformat(), "opened_at": opened_at.isoformat(),
+    }
+    assert doc["last_poll"]["ok"] is False
+    assert "polling is paused for 20 min; mail is delayed, not lost" in doc["last_poll"]["error"]
+    assert reports[-1].error == doc["last_poll"]["error"], "the cron envelope says the same as the panel"
+    opened = [r for r in caplog.records if "sheet breaker OPEN" in r.getMessage()]
+    assert len(opened) == 1 and opened[0].levelno == _logging.WARNING
+    assert opened[0].name == "agentos.inbox.pipeline"
+    assert pipeline.user_label(UID) in opened[0].getMessage()
+    assert UID not in caplog.text and EMAIL not in caplog.text and "@" not in caplog.text
+
+    # The next fire: skipped, not failed; nothing asked of Google, the store
+    # or the lease; the checkpoint where it was.
+    events, leases = list(connected.events), list(connected.lease_attempts)
+    skipped = pipeline.fire(UID, email=EMAIL, now=opened_at + timedelta(minutes=5))
+    assert skipped.skipped == "sheet_unreachable" and skipped.ok is True and skipped.error is None
+    assert skipped.as_dict()["skipped"] == pipeline.SKIPPED_SHEET_UNREACHABLE
+    assert len(tried) == 3 and connected.events == events and connected.lease_attempts == leases
+    assert connected.connections[UID]["checkpoint"]["history_id"] == "800"
+    assert sheet.inserted == []
+
+    # The panel sees it: open, until when, and that the next real try is then.
+    shown = pipeline.status_payload(UID, now=opened_at + timedelta(minutes=5))
+    assert shown["sheet_breaker"] == {"open": True, "open_until": (opened_at + COOLOFF).isoformat(), "failures": 3}
+    assert shown["next_poll_at"] == (opened_at + COOLOFF).isoformat()
+    assert shown["last_poll"]["ok"] is False and "paused" in shown["last_poll"]["error"]
+
+
+def test_after_the_cool_off_one_fire_tries_a_failure_re_opens_it_and_a_success_closes_it(
+    connected, mailbox, sheet, monkeypatch, caplog
+):
+    tried: list = []
+    monkeypatch.setattr(sheet_writer, "id_rows", _unreachable_id_rows(tried))
+    _fire_n_times(3)
+    open_until = NOW + timedelta(minutes=10) + COOLOFF
+
+    # One second before the cool-off ends: still skipped, still not tried.
+    assert pipeline.fire(UID, email=EMAIL, now=open_until - timedelta(seconds=1)).skipped == "sheet_unreachable"
+    assert len(tried) == 3
+
+    # The cool-off ends: tried once; still unreachable → a failure, and open again.
+    report = pipeline.fire(UID, email=EMAIL, now=open_until)
+    assert report.ok is False and report.skipped is None and len(tried) == 4
+    doc = connected.connections[UID]
+    assert doc["sheet_breaker"]["failures"] == 4
+    assert doc["sheet_breaker"]["open_until"] == (open_until + COOLOFF).isoformat()
+    assert pipeline.fire(UID, email=EMAIL, now=open_until + timedelta(minutes=5)).skipped == "sheet_unreachable"
+
+    # Sheets is back: the try after the second cool-off gets through, mail
+    # lands, the count is zero, and the close is said once at INFO.
+    monkeypatch.setattr(sheet_writer, "id_rows", sheet.id_rows)
+    mailbox.messages = {"m1": _message("m1")}
+    mailbox.history_added = ["m1"]
+    later = open_until + COOLOFF
+    with caplog.at_level(_logging.INFO, logger="agentos.inbox.pipeline"):
+        report = pipeline.fire(UID, email=EMAIL, now=later)
+    assert report.ok is True and report.skipped is None and report.new_rows == 1
+    doc = connected.connections[UID]
+    assert doc["sheet_breaker"] == {"failures": 0, "open_until": None, "opened_at": None}
+    assert doc["last_poll"] == {"at": later.isoformat(), "ok": True, "messages_read": 1, "error": None}
+    closed = [r for r in caplog.records if "sheet breaker CLOSED" in r.getMessage()]
+    assert len(closed) == 1 and closed[0].levelno == _logging.INFO
+    assert closed[0].name == "agentos.inbox.pipeline" and pipeline.user_label(UID) in closed[0].getMessage()
+    assert UID not in caplog.text and "@" not in caplog.text
+    assert pipeline.status_payload(UID, now=later)["sheet_breaker"] == {"open": False, "open_until": None, "failures": 0}
+    # The next ordinary fire writes no breaker state at all: the field is
+    # touched only while there is something to say.
+    mailbox.history_added = []
+    saves_before = len([e for e in connected.events if e.startswith("save:")])
+    pipeline.fire(UID, email=EMAIL, now=later + timedelta(minutes=5))
+    new_saves = [e for e in connected.events if e.startswith("save:")][saves_before:]
+    assert new_saves and not any("sheet_breaker" in e for e in new_saves)
+
+
+def test_the_count_is_consecutive_a_fire_that_gets_through_starts_it_over(connected, mailbox, sheet, monkeypatch):
+    real, down = sheet.id_rows, {"on": True}
+
+    def flaky(spreadsheet_id, *, svc=None):
+        if down["on"]:
+            raise SheetsUnreachable("Sheets layout failed after 3 attempts (timed out)")
+        return real(spreadsheet_id, svc=svc)
+    monkeypatch.setattr(sheet_writer, "id_rows", flaky)
+
+    _fire_n_times(2)
+    assert connected.connections[UID]["sheet_breaker"]["failures"] == 2
+    down["on"] = False
+    assert pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=10)).ok is True
+    assert connected.connections[UID]["sheet_breaker"]["failures"] == 0
+    down["on"] = True
+    _fire_n_times(2, start=NOW + timedelta(minutes=15))
+    doc = connected.connections[UID]
+    assert doc["sheet_breaker"]["failures"] == 2 and doc["sheet_breaker"]["open_until"] is None
+    third = pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=25))
+    assert third.ok is False and third.skipped is None, "the third in a row is the failure that opens it"
+    assert connected.connections[UID]["sheet_breaker"]["open_until"] is not None
+
+
+def test_a_refusal_a_layout_problem_or_gmail_being_down_never_counts_toward_the_breaker(
+    connected, mailbox, sheet, monkeypatch
+):
+    """Those say something about the sheet or about Gmail — not about the
+    path to Sheets — and keep being reported as failures, fire after fire."""
+    def refused(spreadsheet_id, *, svc=None):
+        raise SheetsRefused("Sheets id column read was refused: HTTP 403", status=403)
+    monkeypatch.setattr(sheet_writer, "id_rows", refused)
+    for report in _fire_n_times(4):
+        assert report.ok is False and report.skipped is None
+    assert "sheet_breaker" not in connected.connections[UID]
+
+    def gmail_down(svc, *a, **kw):
+        raise gmail_client.GmailUnavailable("Gmail history failed after 3 attempts: timed out")
+    monkeypatch.setattr(sheet_writer, "id_rows", sheet.id_rows)
+    monkeypatch.setattr(gmail_client, "history_since", gmail_down)
+    for report in _fire_n_times(4, start=NOW + timedelta(hours=1)):
+        assert report.ok is False and report.skipped is None and "Gmail" in report.error
+    assert "sheet_breaker" not in connected.connections[UID]
+
+
+def test_the_breaker_knobs_are_env_configurable_bounded_and_read_at_fire_time(
+    connected, mailbox, sheet, monkeypatch
+):
+    monkeypatch.delenv("INBOX_SHEET_BREAKER_TRIPS", raising=False)
+    monkeypatch.delenv("INBOX_SHEET_BREAKER_COOLOFF_SECONDS", raising=False)
+    assert pipeline._breaker_trips() == 3 and pipeline._breaker_cooloff_seconds() == 1200.0
+    for raw, expected in (("1", 1), ("0", 1), ("99", 20), ("many", 3)):
+        monkeypatch.setenv("INBOX_SHEET_BREAKER_TRIPS", raw)
+        assert pipeline._breaker_trips() == expected, raw
+    for raw, expected in (("600", 600.0), ("5", 300.0), ("1e9", 86400.0), ("soon", 1200.0)):
+        monkeypatch.setenv("INBOX_SHEET_BREAKER_COOLOFF_SECONDS", raw)
+        assert pipeline._breaker_cooloff_seconds() == expected, raw
+
+    monkeypatch.setenv("INBOX_SHEET_BREAKER_TRIPS", "1")
+    monkeypatch.setenv("INBOX_SHEET_BREAKER_COOLOFF_SECONDS", "600")
+    monkeypatch.setattr(sheet_writer, "id_rows", _unreachable_id_rows([]))
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+    assert report.ok is False and "paused for 10 min" in report.error
+    assert connected.connections[UID]["sheet_breaker"]["open_until"] == (NOW + timedelta(minutes=10)).isoformat()
+    assert pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(minutes=5)).skipped == "sheet_unreachable"
+
+
+def test_the_fire_bounds_every_sheets_retry_by_its_own_deadline(connected, mailbox, sheet, monkeypatch):
+    """The whole fire's deadline — the connection's share of the cron budget
+    — reaches ``sheet_writer`` for the duration of the fire and no longer, so
+    the shared retry never starts an attempt the share cannot pay for."""
+    clock = _Clock()
+    monkeypatch.setattr(pipeline.time, "monotonic", clock.monotonic)
+    real, seen = sheet.id_rows, []
+
+    def recording(spreadsheet_id, *, svc=None):
+        seen.append(sheet_writer.current_deadline())
+        return real(spreadsheet_id, svc=svc)
+    monkeypatch.setattr(sheet_writer, "id_rows", recording)
+
+    assert sheet_writer.current_deadline() is None
+    report = pipeline.fire(UID, email=EMAIL, now=NOW, budget_seconds=100.0)
+    assert report.ok is True and seen == [1100.0]
+    assert sheet_writer.current_deadline() is None, "cleared when the fire ends"

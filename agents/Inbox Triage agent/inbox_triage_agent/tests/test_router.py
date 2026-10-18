@@ -31,7 +31,7 @@ COLLEAGUE = {"id": "user-bbbb", "email": "him@legalsoft.com",
              "session_id": "s", "timezone": "UTC"}
 STATUS_KEYS = {
     "enabled", "service_account_email", "gmail", "sheet", "backfill", "last_poll",
-    "next_poll_at", "rows_24h", "needs_review", "generated_at",
+    "next_poll_at", "sheet_breaker", "rows_24h", "needs_review", "generated_at",
 }
 
 
@@ -735,3 +735,68 @@ def test_a_non_ascii_state_is_400_not_500(as_user, configured, store, trail):
     resp = client.post("/api/inbox/oauth/complete", json={"code": "c", "state": f"{head}.é{signature[1:]}"})
     assert resp.status_code == 400 and "not valid" in resp.json()["detail"]
     assert trail == [] and store.connections == {}
+
+
+# --------------------------------------------------------------------------- #
+# Pinned 2026-10-19: a connection skipped by its open Sheets breaker does not
+# degrade the fire (no 207, no trail row) — the fresh failures that opened it
+# did, and a fresh failure still does.
+# --------------------------------------------------------------------------- #
+
+OTHER_SID = "1zyxwvutsrqponmlkjihgfedcba9876543210"
+
+
+def test_a_connection_paused_by_its_breaker_is_skipped_not_207_while_a_fresh_failure_still_is(
+    monkeypatch, store, trail, mailbox, sheet, model, grant, members_domain
+):
+    from inbox_triage_agent.sheet_writer import SheetsUnreachable
+
+    monkeypatch.setenv("INBOX_CRON_KEY", "test-only-key")
+    _member(store, OWNER)
+    _member(store, {"id": "ub", "email": "b@legalsoft.com"})
+    now = datetime.now(timezone.utc)
+    store.connections["ub"]["sheet_breaker"] = {
+        "failures": 3, "open_until": (now + timedelta(minutes=15)).isoformat(),
+        "opened_at": (now - timedelta(minutes=5)).isoformat(),
+    }
+    mailbox.messages = {"m1": _message("m1")}
+    mailbox.history_added = ["m1"]
+
+    resp = client.post("/api/inbox/cron/poll", headers={"x-cron-key": "test-only-key"})
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok" and body["failed"] == 0 and body["skipped"] == 1 and body["ok"] == 1
+    by_user = {u["user"]: u for u in body["users"]}
+    paused = by_user[pipeline.user_label("ub")]
+    assert paused["skipped"] == "sheet_unreachable" and paused["ok"] is True and paused["error"] is None
+    assert by_user[pipeline.user_label(OWNER["id"])]["new_rows"] == 1, "the other connection's fire ran"
+    assert "ub" not in resp.text and "@" not in resp.text
+
+    # The same connection with its breaker closed and its sheet unreachable:
+    # a fresh failure, and the fire is honestly degraded.
+    store.connections["ub"]["sheet_breaker"] = {"failures": 0, "open_until": None, "opened_at": None}
+    store.connections["ub"]["sheet"]["id"] = OTHER_SID
+    real_id_rows = sheet.id_rows
+
+    def unreachable_for_ub(spreadsheet_id, *, svc=None):
+        if spreadsheet_id == OTHER_SID:
+            raise SheetsUnreachable("Sheets id column read failed after 3 attempts (timed out)")
+        return real_id_rows(spreadsheet_id, svc=svc)
+    monkeypatch.setattr(sheet_writer, "id_rows", unreachable_for_ub)
+
+    resp = client.post("/api/inbox/cron/poll", headers={"x-cron-key": "test-only-key"})
+    assert resp.status_code == 207 and resp.json()["status"] == "partial"
+    assert resp.json()["failed"] == 1 and store.connections["ub"]["sheet_breaker"]["failures"] == 1
+
+
+def test_a_fire_where_the_only_connection_is_paused_records_no_trail_row(
+    monkeypatch, store, trail, members_domain
+):
+    monkeypatch.setenv("INBOX_CRON_KEY", "test-only-key")
+    _member(store, OWNER)
+    monkeypatch.setattr(pipeline, "fire", lambda uid, *, email, budget_seconds: FireReport(
+        user_id=uid, skipped=pipeline.SKIPPED_SHEET_UNREACHABLE))
+    resp = client.post("/api/inbox/cron/poll", headers={"x-cron-key": "test-only-key"})
+    assert resp.status_code == 200 and resp.json()["skipped"] == 1 and resp.json()["failed"] == 0
+    assert trail == []

@@ -138,7 +138,10 @@ def _is_transient(exc: BaseException) -> bool:
     return isinstance(exc, (TimeoutError, OSError))
 
 
-def execute_with_retry(request, *, what: str, unavailable: type[Exception]):
+def execute_with_retry(
+    request, *, what: str, unavailable: type[Exception],
+    deadline: float | None = None, attempt_seconds: float = 0.0,
+):
     """``request.execute()`` that rides out a transient failure.
 
     Retries are deliberately *not* pushed down into ``num_retries`` on
@@ -149,10 +152,23 @@ def execute_with_retry(request, *, what: str, unavailable: type[Exception]):
     distinguish "the API refused us" from "the workbook is empty" and that
     distinction must survive this wrapper. When every attempt fails,
     ``unavailable`` is raised with the count and the last cause, so the caller
-    gets its own exception class rather than a generic one.
+    gets its own exception class rather than a generic one. The instance
+    carries ``attempts`` (how many were made) and ``deadline_hit``.
+
+    ``deadline`` (a ``time.monotonic()`` value) makes the retry deadline-aware:
+    a retry that could not finish before it — its backoff plus
+    ``attempt_seconds``, the transport's socket deadline — is not started, and
+    ``unavailable`` is raised at once with the attempts so far. Without a
+    deadline the behaviour is exactly what it was (three attempts, 1s + 3s);
+    the Marketing Research sheet reads pass none. Added 2026-10-19 after one
+    unreachable sheet cost ~95s per cron fire for seven hours (3 × 30s
+    timeouts + 4s backoff) and starved the other connections of their share.
     """
     last: BaseException | None = None
+    attempts = 0
+    deadline_hit = False
     for attempt in range(_RETRY_ATTEMPTS):
+        attempts += 1
         try:
             return request.execute()
         except Exception as exc:  # noqa: BLE001 — re-raised below unless transient
@@ -160,10 +176,23 @@ def execute_with_retry(request, *, what: str, unavailable: type[Exception]):
                 raise
             last = exc
             if attempt < len(_RETRY_BACKOFF_SECONDS):
+                wait = _RETRY_BACKOFF_SECONDS[attempt]
+                if deadline is not None and time.monotonic() + wait + attempt_seconds > deadline:
+                    deadline_hit = True
+                    logger.warning(
+                        "%s failed (%s); not retrying — another attempt could not finish "
+                        "before the deadline (attempt %d/%d made)",
+                        what, exc, attempts, _RETRY_ATTEMPTS,
+                    )
+                    break
                 logger.warning(
                     "%s failed (%s); retrying in %ss (attempt %d/%d)",
-                    what, exc, _RETRY_BACKOFF_SECONDS[attempt],
-                    attempt + 2, _RETRY_ATTEMPTS,
+                    what, exc, wait, attempt + 2, _RETRY_ATTEMPTS,
                 )
-                time.sleep(_RETRY_BACKOFF_SECONDS[attempt])
-    raise unavailable(f"{what} failed after {_RETRY_ATTEMPTS} attempts: {last}") from last
+                time.sleep(wait)
+    noun = "attempt" if attempts == 1 else "attempts"
+    tail = " (stopped before the deadline)" if deadline_hit else ""
+    err = unavailable(f"{what} failed after {attempts} {noun}{tail}: {last}")
+    err.attempts = attempts  # type: ignore[attr-defined]
+    err.deadline_hit = deadline_hit  # type: ignore[attr-defined]
+    raise err from last

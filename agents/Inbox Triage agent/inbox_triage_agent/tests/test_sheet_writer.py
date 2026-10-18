@@ -2489,3 +2489,74 @@ def test_a_message_id_she_turned_into_a_number_is_still_found_and_not_written_tw
         SID, [_agent("1992837465001234", "2026-09-18 09:00")], svc=sheets)
 
     assert written.new_rows == [3] and len(_body(sheets)) == 3
+
+
+# --------------------------------------------------------------------------- #
+# Pinned 2026-10-19: the shared retry under a fire's deadline. Without one
+# (every caller outside a fire, Marketing Research included) it is what it
+# was: three attempts, 1s + 3s. Inside ``within_deadline`` it never starts an
+# attempt that could not finish — the 30s socket deadline plus the wait —
+# before the fire's share of the cron budget ends.
+# --------------------------------------------------------------------------- #
+
+class _Failing:
+    def __init__(self, error: Exception):
+        self.error, self.executes = error, 0
+
+    def execute(self):
+        self.executes += 1
+        raise self.error
+
+
+@pytest.fixture()
+def retry_clock(monkeypatch):
+    from app.services import google_http
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(google_http.time, "monotonic", lambda: clock["t"])
+    return clock
+
+
+def test_without_a_fire_deadline_the_retry_is_what_it_was(retry_clock):
+    assert sheet_writer.current_deadline() is None
+    req = _Failing(TimeoutError("timed out"))
+    with pytest.raises(sheet_writer.SheetsUnreachable, match=re.escape("failed after 3 attempts (timed out)")) as caught:
+        sheet_writer._run(req, what="id column read")
+    assert req.executes == 3 and isinstance(caught.value, SheetsUnavailable)
+    assert "stopped" not in str(caught.value)
+
+
+def test_a_fire_deadline_stops_the_retry_before_an_attempt_that_cannot_finish(retry_clock):
+    # 20s left: a 1s wait plus a 30s socket deadline does not fit — one
+    # attempt, the same class the fire already maps, and an honest count.
+    req = _Failing(TimeoutError("timed out"))
+    with sheet_writer.within_deadline(retry_clock["t"] + 20.0):
+        with pytest.raises(sheet_writer.SheetsUnreachable) as caught:
+            sheet_writer._run(req, what="id column read")
+    assert req.executes == 1
+    assert str(caught.value) == "Sheets id column read failed after 1 attempt (timed out; stopped before the fire's deadline)"
+    assert isinstance(caught.value, SheetsUnavailable)
+    # 100s left: every attempt fits, exactly as without a deadline.
+    req = _Failing(_http_error(503))
+    with sheet_writer.within_deadline(retry_clock["t"] + 100.0):
+        with pytest.raises(sheet_writer.SheetsUnreachable, match=re.escape("failed after 3 attempts (HTTP 503)")):
+            sheet_writer._run(req, what="layout")
+    assert req.executes == 3
+    assert sheet_writer.current_deadline() is None, "the scope ends with the block"
+
+
+def test_a_refusal_under_a_deadline_is_still_a_refusal_and_never_unreachable(retry_clock):
+    req = _Failing(_http_error(403))
+    with sheet_writer.within_deadline(retry_clock["t"] + 5.0):
+        with pytest.raises(sheet_writer.SheetsRefused) as caught:
+            sheet_writer._run(req, what="id column read")
+    assert req.executes == 1 and caught.value.status == 403
+    assert not isinstance(caught.value, sheet_writer.SheetsUnreachable)
+
+
+def test_the_drive_check_is_bounded_by_the_same_deadline_with_its_own_socket_timeout(retry_clock):
+    req = _Failing(TimeoutError("timed out"))
+    with sheet_writer.within_deadline(retry_clock["t"] + sheet_writer.DRIVE_TIMEOUT_SECONDS + 0.5):
+        with pytest.raises(sheet_writer.SheetsUnreachable, match=re.escape("Drive permissions failed after 1 attempt")):
+            sheet_writer._run(req, what="permissions", service="Drive")
+    assert req.executes == 1
