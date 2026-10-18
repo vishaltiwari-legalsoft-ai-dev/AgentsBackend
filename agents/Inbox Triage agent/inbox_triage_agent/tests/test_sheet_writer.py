@@ -2219,20 +2219,226 @@ def test_a_sheet_with_rows_she_has_hidden_is_never_marked_newest_first_while_it_
     assert _marked(sheets) and dates == sorted(dates, reverse=True)
 
 
-def test_a_sheet_whose_filter_is_hiding_rows_is_not_sorted_around_them():
+def test_a_sheet_whose_filter_is_hiding_rows_is_filtered_not_blocked_and_nothing_moves():
     """The first live sheet, as the census found it on 2026-09-30: a basic
-    filter hiding 343 of its 642 rows."""
+    filter hiding 343 of its 642 rows. Until 2026-10-19 that was ``blocked``
+    with "Remove filter" and an hourly retry. The filter is how she works,
+    so it is a state of its own: ``filtered``, a neutral note, no sort sent,
+    no marker written (the tab is NOT in order and the marker must not say
+    it is), and the sheet exactly as she left it."""
     sheets = _split_of_ten()
     sheets.filtered_rows = {2, 5, 7}
     before = copy.deepcopy(sheets.grid["Inbox"])
 
     result = _check_as_a_poll(sheets)
 
-    assert result.status == "ok" and result.ordering == sheet_writer.ORDER_BLOCKED
+    assert result.status == "ok" and result.ordering == sheet_writer.ORDER_FILTERED
+    assert result.ordering_note == sheet_layout.FILTERED_NOTE
     assert not _marked(sheets) and sheets.grid["Inbox"] == before and _sorts(sheets) == []
-    assert "a filter is hiding 3 rows (rows 3, 6, 8)" in result.ordering_note
-    assert "Remove filter" in result.ordering_note
+    assert "batchUpdate:rows" not in sheets.names() and "batchUpdate:marker" not in sheets.names()
+    for banned in ("Remove filter", "every hour", "not been put", "hiding"):
+        assert banned not in result.ordering_note, banned
+    assert "Filter active on the Inbox tab" in result.ordering_note
+    assert "new mail is added at the top" in result.ordering_note
 
+
+
+
+def test_a_filtered_tab_with_a_vertical_merge_is_still_blocked_on_the_merge():
+    """A merge is refused by Sheets outright — for the sort and for moving a
+    row through it — so it is said first, exactly as before the filter became
+    a state of its own: ``blocked``, the merge note, the hourly retry."""
+    sheets = _split_of_ten()
+    sheets.filtered_rows = {2, 5, 7}
+    sheets.merges = [dict(MERGE_K3_K4)]
+    before = copy.deepcopy(sheets.grid["Inbox"])
+
+    result = _check_as_a_poll(sheets)
+
+    assert result.status == "ok" and result.ordering == sheet_writer.ORDER_BLOCKED
+    assert "merged cells at K3:K4" in result.ordering_note and "every hour" in result.ordering_note
+    assert "Filter active" not in result.ordering_note
+    assert not _marked(sheets) and sheets.grid["Inbox"] == before and _sorts(sheets) == []
+
+
+def test_hidden_rows_or_a_mixed_date_column_under_her_filter_do_not_make_it_blocked():
+    """Both only matter to a sort, and a filtered tab is not sorted."""
+    hidden = _split_of_ten()
+    hidden.filtered_rows = {2}
+    hidden.hidden_rows = {3, 4}
+    result = _check_as_a_poll(hidden)
+    assert (result.ordering, result.ordering_note) == (
+        sheet_writer.ORDER_FILTERED, sheet_layout.FILTERED_NOTE)
+    assert not _marked(hidden) and _sorts(hidden) == []
+
+    mixed = _split_of_ten()
+    mixed.filtered_rows = {5}
+    grid = mixed.rows("Inbox")
+    for r in (2, 8):
+        grid[r][0] = RealDate(grid[r][0])
+    result = _check_as_a_poll(mixed)
+    assert (result.ordering, result.ordering_note) == (
+        sheet_writer.ORDER_FILTERED, sheet_layout.FILTERED_NOTE)
+    assert not _marked(mixed) and _sorts(mixed) == []
+
+
+def test_a_filtered_tab_that_is_already_newest_first_is_marked_and_nothing_is_sent_to_sort_it():
+    """Her filter on a tab that is in order already: there is nothing to
+    move, so the marker is written and the answer is ``applied`` like any
+    other in-order tab — the filter changes nothing here."""
+    sheets = newest_first_sheet()
+    sheets.filtered_rows = {2}
+    before = copy.deepcopy(sheets.grid["Inbox"])
+
+    result = _check_as_a_poll(sheets)
+
+    assert (result.ordering, result.ordering_note) == (sheet_writer.ORDER_APPLIED, "")
+    assert _marked(sheets) and _sorts(sheets) == [] and sheets.grid["Inbox"] == before
+
+
+def test_a_check_told_the_tab_is_filtered_reads_nothing_about_its_rows_and_still_proves_the_sheet():
+    """The hourly ownership check on a filtered sheet. The pipeline hands
+    the writer the answer it already has (``ordering_known``); the writer
+    answers it again without the whole-tab row-metadata read or the Date
+    column read, and the layout batch — the proof the hub can still edit
+    the sheet — goes as on every check."""
+    sheets = _split_of_ten()
+    sheets.filtered_rows = {2, 5, 7}
+    first = _check_as_a_poll(sheets)
+    assert first.ordering == sheet_writer.ORDER_FILTERED
+    assert any("ranges" in kw for name, kw in sheets.calls if name == "get"), \
+        "the first look reads the tab's row metadata"
+    assert "values.get" in sheets.names(), "and its Date column"
+    sheets.calls.clear()
+
+    again = sheet_writer.check(
+        SID, caller_email=CALLER, svc=sheets, drive=FakeDrive(), reorder=True,
+        ordering_known=sheet_writer.ORDER_FILTERED,
+    )
+
+    assert again.status == "ok"
+    assert (again.ordering, again.ordering_note) == (
+        sheet_writer.ORDER_FILTERED, sheet_layout.FILTERED_NOTE)
+    assert all("ranges" not in kw for name, kw in sheets.calls if name == "get"), \
+        "no row-layout read of the whole tab"
+    assert "values.get" not in sheets.names(), "no Date column read"
+    assert "batchUpdate:layout" in sheets.names(), "the check still proved it can edit the sheet"
+    assert _sorts(sheets) == [] and not _marked(sheets)
+
+
+def test_a_known_filtered_answer_yields_to_the_marker_and_to_a_check_that_is_not_a_poll():
+    """The marker on the sheet is the stronger fact: a tab recorded as
+    newest first is ``already``, whatever the pipeline thought it knew. And
+    a panel check (no ``reorder``) handed the answer still returns it: the
+    answer moves no rows, so there is nothing a non-poll may not do."""
+    sheets = newest_first_sheet()
+    assert _check_as_a_poll(sheets).ordering == sheet_writer.ORDER_APPLIED
+    result = sheet_writer.check(
+        SID, caller_email=CALLER, svc=sheets, drive=FakeDrive(), reorder=True,
+        ordering_known=sheet_writer.ORDER_FILTERED,
+    )
+    assert (result.ordering, result.ordering_note) == (sheet_writer.ORDER_ALREADY, "")
+
+    filtered = _split_of_ten()
+    filtered.filtered_rows = {2}
+    result = _check(filtered)  # a panel check: not a poll
+    assert result.ordering == sheet_writer.ORDER_PENDING, "a panel check never looks at the rows"
+    result = sheet_writer.check(
+        SID, caller_email=CALLER, svc=filtered, drive=FakeDrive(),
+        ordering_known=sheet_writer.ORDER_FILTERED,
+    )
+    assert (result.ordering, result.ordering_note) == (
+        sheet_writer.ORDER_FILTERED, sheet_layout.FILTERED_NOTE)
+    assert "values.get" not in filtered.names()
+
+
+#: Request kinds that would clear, replace, shrink or sort around a basic
+#: filter on the Inbox tab, or move cells positionally. None may be sent by
+#: a row write; the audit of 2026-10-19 found none in the module, and this
+#: keeps it so.
+FILTER_TOUCHING = frozenset({
+    "sortRange", "setBasicFilter", "clearBasicFilter", "addFilterView", "updateFilterView",
+    "deleteFilterView", "duplicateFilterView", "deleteDimension", "deleteRange", "cutPaste",
+    "copyPaste", "appendCells", "appendDimension", "autoFill", "randomizeRange",
+    "updateSheetProperties", "deleteSheet",
+})
+
+
+def test_mail_landing_on_a_filtered_sheet_sends_nothing_that_touches_the_filter_and_writes_no_hidden_row_by_position():
+    """The write path on the manager's sheet: every request is an insert or
+    a move INSIDE the filter's range, or ``updateCells`` addressed by the row
+    the Message ID was read on — never a range over the header, never a
+    sort, never anything that resets a filter. A row her filter hides is
+    found by its id and rewritten on its own row; the row she can see above
+    it is not written over. Her filter's hidden row moves down with the
+    insert, as Sheets moves it."""
+    sheets = newest_first_sheet()  # c (row 2), b (row 3), a (row 4)
+    sheets.filtered_rows = {2}  # row 3 — b — hidden by her filter
+    before = {row[COL_MESSAGE_ID - 1]: list(row) for row in _body(sheets)}
+    rewrite = _agent("b", "2026-09-18 09:00")
+    rewrite[4] = "Summary b, re-read."
+
+    written = sheet_writer.write_rows(
+        SID, [_agent("d", "2026-09-29 10:15")], updates={"b": rewrite}, svc=sheets
+    )
+
+    assert written.new_rows == [2] and written.updated == {"b": 4} and written.missing == []
+    batches = _row_batches(sheets)
+    assert len(batches) == 1
+    kinds = [next(iter(request)) for request in batches[0]]
+    assert set(kinds) <= {"insertDimension", "moveDimension", "updateCells"}, kinds
+    assert not set(kinds) & FILTER_TOUCHING
+    for request in batches[0]:
+        if "updateCells" in request:
+            assert "start" in request["updateCells"] and "range" not in request["updateCells"], \
+                "cells are addressed by their row, never by a range that could reset the header"
+            assert request["updateCells"]["start"]["rowIndex"] >= 1, "never the header row"
+            assert request["updateCells"]["fields"] == "userEnteredValue"
+        if "insertDimension" in request:
+            rng = request["insertDimension"]["range"]
+            assert rng["dimension"] == "ROWS" and rng["startIndex"] >= 1
+    every_request = [r for name, kw in sheets.calls if name.startswith("batchUpdate")
+                     for r in kw["body"]["requests"]]
+    assert not {next(iter(r)) for r in every_request} & FILTER_TOUCHING
+
+    body = _body(sheets)
+    assert [row[COL_MESSAGE_ID - 1] for row in body] == ["d", "c", "b", "a"]
+    assert body[1] == before["c"], "the visible row above the hidden one was not written over"
+    assert body[2][4] == "Summary b, re-read." and body[2][9:] == before["b"][9:], \
+        "the hidden row was rewritten on its own row, her Status and Notes untouched"
+    assert body[3] == before["a"]
+    assert sheets.filtered_rows == {3}, "her filter's hidden row moved down with the insert"
+    assert sheets.row("Inbox", 0, 11) == list(HEADERS), "the header row — the filter's row — never moves"
+
+
+def test_set_up_on_a_filtered_sheet_sends_nothing_that_touches_the_filter():
+    """Set-up, migration and the formatting pass together, on a legacy
+    sheet she has a filter on: the one structural request — the Action
+    column insert — is INSIDE the filter's columns and extends it; nothing
+    sorts, clears or replaces the filter. ``updateSheetProperties`` is the
+    one exception to the banned set: it writes ``frozenRowCount`` only."""
+    sheets = legacy_sheet()
+    sheets.filtered_rows = {5, 9, 12}
+
+    result = sheet_writer.check(SID, caller_email=CALLER, svc=sheets, drive=FakeDrive(), reorder=True)
+
+    assert result.status == "ok"
+    every_request = [r for name, kw in sheets.calls if name.startswith("batchUpdate")
+                     for r in kw["body"]["requests"]]
+    kinds = {next(iter(r)) for r in every_request}
+    assert not kinds & (FILTER_TOUCHING - {"updateSheetProperties"}), kinds & FILTER_TOUCHING
+    for r in every_request:
+        if "updateSheetProperties" in r:
+            assert r["updateSheetProperties"]["fields"] == "gridProperties.frozenRowCount"
+        if "updateCells" in r and r["updateCells"]["start"]["rowIndex"] == 0:
+            assert r["updateCells"]["fields"] == "userEnteredValue", \
+                "the header rewrite sets values only — a filter is a sheet property, not a cell"
+    header_writes = [kw["body"]["data"] for name, kw in sheets.calls if name == "values.batchUpdate"]
+    for data in header_writes:
+        for item in data:
+            assert re.fullmatch(r"[A-Za-z]+!A1:[A-Z]+1", item["range"]), \
+                f"a header write is row 1 and nothing below it: {item['range']}"
+    assert "values.clear" not in sheets.names() and "values.batchClear" not in sheets.names()
 
 def test_a_date_column_of_text_and_real_dates_is_never_marked_newest_first_while_it_is_not():
     """Seen live (S5c, S5d): every text date first, then every real date -

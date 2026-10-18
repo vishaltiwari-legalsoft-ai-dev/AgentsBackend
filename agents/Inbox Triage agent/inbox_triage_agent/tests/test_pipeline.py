@@ -253,6 +253,8 @@ class FakeSheet:
         self.checked_for: list[str] = []
         #: whether each check was allowed to run the one-time reorder
         self.reorders: list[bool] = []
+        #: the ``filtered`` answer each check was handed to carry forward ("" = none)
+        self.known: list[str] = []
         self.check_holds: list = []
         self.events: list[str] = []
         #: 1-based row number -> the eleven cells A..K, hers included
@@ -283,10 +285,11 @@ class FakeSheet:
     def worktree_column(self, name: str) -> list[str]:
         return [row[WORKTREE_HEADERS.index(name)] for row in self.worktree]
 
-    def check(self, spreadsheet_id, *, caller_email, reorder=False, hold=None):
+    def check(self, spreadsheet_id, *, caller_email, reorder=False, hold=None, ordering_known=""):
         self.checks += 1
         self.checked_for.append(caller_email)
         self.reorders.append(reorder)
+        self.known.append(ordering_known)
         #: what a poll hands the writer so the sort can prove the lease
         self.check_holds.append(hold)
         return self.check_result
@@ -1384,11 +1387,13 @@ def test_a_fire_that_starts_during_the_one_time_reorder_is_skipped_and_never_ask
     inner: list = []
     overlapped: list = []
 
-    def check_with_an_overlap(sid, *, caller_email, reorder=False, hold=None):
+    def check_with_an_overlap(sid, *, caller_email, reorder=False, hold=None, ordering_known=""):
         if not overlapped:  # the first fire's check only
             overlapped.append(True)
             inner.append(pipeline.fire(UID, email=EMAIL, now=NOW + timedelta(seconds=30)))
-        return sheet.check(sid, caller_email=caller_email, reorder=reorder, hold=hold)
+        return sheet.check(
+            sid, caller_email=caller_email, reorder=reorder, hold=hold, ordering_known=ordering_known
+        )
     monkeypatch.setattr(sheet_writer, "check", check_with_an_overlap)
 
     first = pipeline.fire(UID, email=EMAIL, now=NOW)
@@ -2274,6 +2279,179 @@ def test_a_sheet_that_could_not_be_sorted_gets_its_mail_and_the_sort_waits_an_ho
     doc = connected.connections[UID]
     assert (doc["sheet"]["ordering"], doc["sheet"]["ordering_note"]) == ("applied", "")
     assert pipeline.status_payload(UID, now=NOW)["sheet"]["ordering_note"] is None
+
+
+def test_a_sheet_she_keeps_a_filter_on_is_filtered_gets_its_mail_and_is_looked_at_again_only_daily(
+    connected, mailbox, sheet
+):
+    """Pinned 2026-10-19. One manager runs the inbox agent for a team and
+    keeps a basic filter on her Inbox tab. That is how she works, not a
+    defect: the state is ``filtered`` with a neutral note, mail lands, the
+    hourly ownership check carries the answer forward instead of reading the
+    rows again, and only after a day is the tab looked at afresh."""
+    from inbox_triage_agent.sheet_layout import FILTERED_NOTE
+
+    connected.connections[UID]["sheet"]["ordering"] = "pending"
+    connected.connections[UID]["backfill"]["state"] = "done"
+    sheet.check_result = SheetCheck("ok", "Her inbox", "", "ours", "filtered", FILTERED_NOTE)
+    mailbox.messages = {"m1": _message("m1")}
+    mailbox.history_added = ["m1"]
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok and report.skipped is None and report.error is None
+    assert report.new_rows == 1 and [row[ID] for row in sheet.inserted] == ["m1"], "mail landed"
+    assert sheet.checks == 1 and sheet.reorders == [True] and sheet.known == [""], \
+        "the first look is a real look, by the fire under its lease"
+    doc = connected.connections[UID]
+    assert doc["sheet"]["check"] == "ok"
+    assert (doc["sheet"]["ordering"], doc["sheet"]["ordering_note"]) == ("filtered", FILTERED_NOTE)
+    looked_at = doc["sheet"]["ordering_at"]
+    assert looked_at == doc["sheet"]["checked_at"], "dated when the rows were looked at"
+    # The stamps are wall-clock, as on every check; ``now`` below is derived from them.
+    assert doc["last_poll"]["ok"] is True and doc["last_poll"]["error"] is None
+    shown = pipeline.status_payload(UID, now=NOW)["sheet"]
+    assert (shown["ordering"], shown["ordering_note"]) == ("filtered", FILTERED_NOTE)
+    assert set(shown) == {"id", "url", "title", "check", "checked_at", "ordering", "ordering_note"}, \
+        "the panel's sheet block is unchanged in shape; the new state is a value, not a key"
+    for banned in ("every hour", "Remove filter", "not been put"):
+        assert banned not in FILTERED_NOTE
+
+    # The fires of the next hour write their mail and ask nothing.
+    checked_at = pipeline._parse_iso(doc["sheet"]["checked_at"])
+    for minutes in (5, 30, 59):
+        mailbox.messages[f"n{minutes}"] = _message(f"n{minutes}")
+        mailbox.history_added = [f"n{minutes}"]
+        later = pipeline.fire(UID, email=EMAIL, now=checked_at + timedelta(minutes=minutes))
+        assert later.ok and later.new_rows == 1
+    assert sheet.checks == 1
+
+    # Every hourly check for the rest of the day carries the answer: the
+    # writer is told the tab is filtered and reads nothing about its rows.
+    mailbox.history_added = []
+    t = checked_at
+    for _ in range(3):
+        t += timedelta(minutes=61)
+        assert pipeline.fire(UID, email=EMAIL, now=t).ok
+    assert sheet.checks == 4 and sheet.known == ["", "filtered", "filtered", "filtered"]
+    assert sheet.reorders == [True] * 4, "each is a fire's check, under its lease"
+    doc = connected.connections[UID]
+    assert doc["sheet"]["ordering_at"] == looked_at, "the answer's date is the day it was looked at"
+    assert doc["sheet"]["checked_at"] >= looked_at, "the ownership check itself moved on"
+    assert (doc["sheet"]["ordering"], doc["sheet"]["ordering_note"]) == ("filtered", FILTERED_NOTE)
+
+    # A day after the look, the next fire looks afresh — and finds the filter still there.
+    assert pipeline.FILTER_RECHECK_SECONDS == 86400
+    fresh = pipeline._parse_iso(looked_at) + timedelta(seconds=pipeline.FILTER_RECHECK_SECONDS + 60)
+    assert pipeline.fire(UID, email=EMAIL, now=fresh).ok
+    assert sheet.checks == 5 and sheet.known[-1] == "" and sheet.reorders[-1] is True
+    doc = connected.connections[UID]
+    assert doc["sheet"]["ordering"] == "filtered"
+    assert doc["sheet"]["ordering_at"] > looked_at, "dated afresh"
+    assert doc["sheet"]["ordering_at"] == doc["sheet"]["checked_at"]
+
+    # She removes the filter and re-checks from the panel: a panel check may
+    # not move rows, so it leaves the question open, and the next fire
+    # looks for real and sorts.
+    sheet.check_result = SheetCheck("ok", "Her inbox", "", "ours", "pending")
+    pipeline.recheck_sheet(UID, email=EMAIL)
+    assert sheet.reorders[-1] is False and sheet.known[-1] == ""
+    assert connected.connections[UID]["sheet"]["ordering"] == "pending"
+    sheet.check_result = SheetCheck("ok", "Her inbox", "", "ours", "applied")
+    assert pipeline.fire(UID, email=EMAIL, now=fresh + timedelta(minutes=5)).ok
+    assert sheet.reorders[-1] is True and sheet.known[-1] == ""
+    doc = connected.connections[UID]
+    assert (doc["sheet"]["ordering"], doc["sheet"]["ordering_note"]) == ("applied", "")
+    assert pipeline.status_payload(UID, now=NOW)["sheet"]["ordering_note"] is None
+
+
+def test_a_filtered_connection_is_settled_until_the_day_is_up_however_many_hourly_checks_passed(
+    connected, sheet
+):
+    """The pure gate: ``_ensure_sheet_checked`` on a document that says
+    ``filtered``. Fresh and inside the hour: no check at all. Stale: a
+    check that carries the answer. A day after ``ordering_at`` — however
+    recent ``checked_at`` is — a check that does not."""
+    from inbox_triage_agent.sheet_layout import FILTERED_NOTE
+
+    looked = NOW - timedelta(hours=20)
+    doc = connected.connections[UID]
+    doc["sheet"].update(ordering="filtered", ordering_note=FILTERED_NOTE,
+                        ordering_at=looked.isoformat(), checked_at=(NOW - timedelta(minutes=10)).isoformat())
+    sheet.check_result = SheetCheck("ok", "Her inbox", "", "ours", "filtered", FILTERED_NOTE)
+
+    assert pipeline._ensure_sheet_checked(UID, doc, NOW, email=EMAIL) is doc
+    assert sheet.checks == 0
+
+    doc["sheet"]["checked_at"] = (NOW - timedelta(minutes=61)).isoformat()
+    pipeline._ensure_sheet_checked(UID, doc, NOW, email=EMAIL)
+    assert sheet.checks == 1 and sheet.known == ["filtered"]
+    assert connected.connections[UID]["sheet"]["ordering_at"] == looked.isoformat()
+
+    doc = connected.connections[UID]
+    doc["sheet"]["checked_at"] = (NOW - timedelta(minutes=1)).isoformat()  # just checked
+    pipeline._ensure_sheet_checked(UID, doc, looked + timedelta(days=1, minutes=1), email=EMAIL)
+    assert sheet.checks == 2 and sheet.known == ["filtered", ""], "a day on: a real look, though not stale"
+
+    # A document from before ``ordering_at`` existed falls back to ``checked_at``.
+    doc = connected.connections[UID]
+    doc["sheet"].pop("ordering_at")
+    doc["sheet"]["checked_at"] = (NOW - timedelta(minutes=5)).isoformat()
+    assert pipeline._ensure_sheet_checked(UID, doc, NOW, email=EMAIL) is doc
+    doc["sheet"]["checked_at"] = (NOW - timedelta(days=2)).isoformat()
+    pipeline._ensure_sheet_checked(UID, doc, NOW, email=EMAIL)
+    assert sheet.known[-1] == ""
+
+
+def test_a_filtered_sheet_through_the_real_writer_gets_its_mail_on_top_and_is_not_re_read_hourly(
+    store, mailbox, model, grant, monkeypatch
+):
+    """The manager's sheet, end to end with the fire's own writer: a basic
+    filter hiding rows of a tab that is not newest first. Mail lands on top
+    inside her filter, no sort is sent, the panel reads ``filtered`` with the
+    neutral note, and the hourly check that follows reads neither the
+    tab's row metadata nor its Date column."""
+    from inbox_triage_agent.sheet_layout import FILTERED_NOTE
+    from inbox_triage_agent.tests.test_sheet_writer import _body, split_sheet
+
+    grid = split_sheet()
+    grid.filtered_rows = {2, 5, 9}
+    order = [row[ID] for row in _body(grid)]
+    before = {row[ID]: row for row in _body(grid)}
+    _real_sheet(monkeypatch, grid)
+    store.connections[UID] = _connected_doc()
+    store.connections[UID]["sheet"].pop("ordering")  # connected before the rule
+    store.connections[UID]["backfill"]["state"] = "done"
+    store.connections[UID]["retriage"] = {"state": "done", "skipped": []}
+    mailbox.messages = {"today": _message("today", at=_at(29, 10))}
+    mailbox.history_added = ["today"]
+
+    report = pipeline.fire(UID, email=EMAIL, now=NOW)
+
+    assert report.ok and report.error is None and report.new_rows == 1
+    body = _body(grid)
+    assert [row[ID] for row in body] == ["today", *order], \
+        "new mail at the top, and the sheet in the order she keeps it"
+    assert {row[ID]: row for row in body if row[ID] != "today"} == before
+    assert "batchUpdate:order" not in grid.names()
+    assert grid.filtered_rows == {3, 6, 10}, "her filter's hidden rows moved down with the insert"
+    shown = pipeline.status_payload(UID, now=NOW)
+    assert shown["sheet"]["check"] == "ok"
+    assert (shown["sheet"]["ordering"], shown["sheet"]["ordering_note"]) == ("filtered", FILTERED_NOTE)
+    assert shown["last_poll"]["ok"] is True and shown["last_poll"]["error"] is None
+
+    # The hourly check: ownership proved, the layout batch sent, and not
+    # one read of the rows for their order.
+    mailbox.history_added = []
+    checked_at = pipeline._parse_iso(store.connections[UID]["sheet"]["checked_at"])
+    grid.calls.clear()
+    assert pipeline.fire(UID, email=EMAIL, now=checked_at + timedelta(minutes=61)).ok
+    assert "batchUpdate:layout" in grid.names()
+    assert all("ranges" not in kw for name, kw in grid.calls if name == "get"), \
+        "no whole-tab row-metadata read"
+    assert "values.get" not in grid.names(), "no Date column read"
+    assert "batchUpdate:order" not in grid.names()
+    assert store.connections[UID]["sheet"]["ordering"] == "filtered"
 
 
 def test_a_connection_stored_before_the_note_existed_reads_as_no_note(connected, sheet):

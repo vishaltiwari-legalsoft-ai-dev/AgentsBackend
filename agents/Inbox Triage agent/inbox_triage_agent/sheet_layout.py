@@ -16,7 +16,11 @@ included, moves down intact. The agent sorts the tab exactly ONCE per sheet
 written before this rule into the same order, and records that it did
 (:func:`order_marker_requests`) only after reading the tab back and finding
 it newest first (:func:`first_out_of_order`). A tab the sort cannot put right
-(:func:`sort_blocker`) is left exactly as it is, and says why.
+(:func:`sort_blocker`) is left exactly as it is, and says why. A tab she
+keeps a basic filter on is not a tab with something wrong: the sort is simply
+not run, because Sheets sorts AROUND the rows a filter hides and a rewrite
+would move her hidden rows out from under the filter she set
+(:func:`filtered_note`). New mail is inserted at the top as on every sheet.
 
 **One reading of a date.** Placement, the newest-first check and the decision
 to sort all read a Date cell through :func:`date_key`, on the value Sheets
@@ -395,18 +399,21 @@ def vertical_merges(merges: list[dict] | None, *, from_row: int = 1) -> list[dic
 
 
 def sort_blocker(
-    dates: list, *, merges: list[dict] | None, hidden_by_filter: list[int],
-    hidden_by_user: list[int],
+    dates: list, *, merges: list[dict] | None, hidden_by_user: list[int],
 ) -> str | None:
     """Why ``sortRange`` would not leave this tab newest first — the first
     reason that applies, as the middle of a sentence — or ``None`` when it
     would. Each was seen on a real sheet: Sheets refuses a range holding a
-    vertical merge; it sorts AROUND rows a filter or she has hidden, leaving
-    them where they were; and sorted descending it puts every text cell above
-    every number, so a column of both comes out as two runs.
+    vertical merge; it sorts AROUND rows she has hidden, leaving them where
+    they were; and sorted descending it puts every text cell above every
+    number, so a column of both comes out as two runs.
 
-    ``hidden_*`` are 1-based sheet rows. The words name what to change and
-    where."""
+    Rows a FILTER hides are not a blocker and are not asked about here: a
+    filter is how she works, and the writer answers it with
+    :func:`filtered_note` instead of a sort (``sheet_writer._put_in_order``).
+
+    ``hidden_by_user`` are 1-based sheet rows. The words name what to change
+    and where."""
     vertical = vertical_merges(merges)
     if vertical:
         where = ", ".join(a1_range(merge) for merge in vertical[:4])
@@ -414,13 +421,6 @@ def sort_blocker(
         return (
             f"it has merged cells at {where}{more}, and Google Sheets cannot sort rows that "
             "are merged together. Unmerge them (Format > Merge cells > Unmerge)."
-        )
-    if hidden_by_filter:
-        count = len(hidden_by_filter)
-        return (
-            f"a filter is hiding {count} row{'s' if count != 1 else ''} "
-            f"(rows {_row_spans(hidden_by_filter)}), and Google Sheets sorts around hidden "
-            "rows. Show every row (Data > Remove filter, or clear the filter's conditions)."
         )
     if hidden_by_user:
         return (
@@ -447,6 +447,22 @@ def order_note(reason: str, *, retry: str) -> str:
     """What the panel shows while the tab is not in order: what is in the
     way, what to do about it, and what is still happening meanwhile."""
     return _NOTE_HEAD + reason.rstrip() + _NOTE_TAIL.format(retry=retry)
+
+
+#: What the panel shows for a tab she keeps a basic filter on. Not a
+#: warning and not a request: the filter stays, mail lands at the top, and
+#: the one-time sort is not run — Sheets would sort around the rows the
+#: filter hides, and a rewrite of every row would move her hidden rows out
+#: from under the filter she set. No retry words: nothing is being retried.
+FILTERED_NOTE = (
+    "Filter active on the Inbox tab — new mail is added at the top; the sheet is not "
+    "re-sorted so your filter and hidden rows stay exactly as you set them."
+)
+
+
+def filtered_note() -> str:
+    """The sentence for the panel while the Inbox tab carries her filter."""
+    return FILTERED_NOTE
 
 
 def unrecorded_note(why: str, *, retry: str) -> str:

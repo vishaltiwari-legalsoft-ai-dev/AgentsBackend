@@ -788,7 +788,7 @@ SPLIT = ["Date", "2026-09-18 09:00", "2026-09-17 09:00", "2026-09-19 08:00"]
 
 
 def _blocker(dates=None, **kw):
-    given = {"merges": [], "hidden_by_filter": [], "hidden_by_user": [], **kw}
+    given = {"merges": [], "hidden_by_user": [], **kw}
     return sl.sort_blocker(SPLIT if dates is None else dates, **given)
 
 
@@ -812,10 +812,6 @@ def test_a_blocker_names_what_to_change_and_where():
                                          "endColumnIndex": 13, "startRowIndex": 5, "endRowIndex": 8}])
     assert "K3:K4, M6:M8" in two
 
-    filtered = _blocker(hidden_by_filter=[3, 4, 6, 9])
-    assert "a filter is hiding 4 rows (rows 3-4, 6, 9)" in filtered and "Remove filter" in filtered
-    assert "a filter is hiding 1 row (rows 7)" in _blocker(hidden_by_filter=[7])
-
     hidden = _blocker(hidden_by_user=[4, 5])
     assert "rows 4-5 are hidden" in hidden and "Unhide" in hidden
 
@@ -827,7 +823,25 @@ def test_a_blocker_names_what_to_change_and_where():
     assert "1 cell is text: A4" in mostly_real
 
     # What Sheets refuses outright is said before what it would merely do wrongly.
-    assert "merged cells" in _blocker(merges=[MERGE_K3_K4], hidden_by_filter=[3])
+    assert "merged cells" in _blocker(merges=[MERGE_K3_K4], hidden_by_user=[3])
+
+
+def test_a_filter_is_not_a_blocker_and_its_note_asks_nothing_of_her():
+    """Pinned 2026-10-19. Rows a basic filter hides used to be the second
+    blocker, with "Remove filter" as the advice. The filter is how one
+    manager works her team's inbox, so it is no longer a blocker at all:
+    ``sort_blocker`` does not take it, and the writer answers it with a note
+    that is information, not a request and not a retry."""
+    import inspect
+
+    assert "hidden_by_filter" not in inspect.signature(sl.sort_blocker).parameters
+    note = sl.filtered_note()
+    assert note == sl.FILTERED_NOTE == (
+        "Filter active on the Inbox tab — new mail is added at the top; the sheet is not "
+        "re-sorted so your filter and hidden rows stay exactly as you set them."
+    )
+    for banned in ("Remove filter", "tries", "again", "not been put", "yet", "cannot", "Unhide"):
+        assert banned not in note, banned
 
 
 def test_the_note_says_what_is_wrong_that_mail_still_lands_and_when_it_is_tried_again():

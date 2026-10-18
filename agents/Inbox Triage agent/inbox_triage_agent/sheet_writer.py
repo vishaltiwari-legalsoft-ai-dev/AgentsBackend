@@ -16,7 +16,13 @@ over anything. And the tab is sorted exactly once per sheet
 from before that rule into the same order; a marker on the sheet records it
 — written only after the tab was read back and found in order — and after
 that her row order is hers again. A tab the sort cannot put right is left as
-it is, with the reason recorded for the panel, and mail goes on landing.
+it is, with the reason recorded for the panel, and mail goes on landing. A
+tab she keeps a basic filter on is not sorted at all and is not a defect:
+the state is ``filtered``, the note is neutral, and nothing is retried
+(:func:`_put_in_order`). No request this module sends on the Inbox tab
+touches a filter: rows are inserted and moved inside its range, cells are
+addressed by the row their Message ID is on, and the one request that would
+move rows around a filter — ``sortRange`` — is the one that is not sent.
 
 A batch that moves rows is sent ONCE (:func:`_send_once`), never retried as
 it stands: the same insert applied twice writes over another message's row.
@@ -74,9 +80,9 @@ from .sheet_layout import (
     MIGRATION_INSERTS, ORDER_VERSION, STATUS_OPTIONS, UPCOMING_FORMULA, UPCOMING_HEADERS,
     UPCOMING_TAB, WORKTREE_HEADER_RANGE, WORKTREE_HEADERS, WORKTREE_MARKER_KEY,
     WORKTREE_ROWS_RANGE, WORKTREE_TAB, column_letter, first_out_of_order, header_state,
-    insert_requests, is_newest_first, landed, order_marker_requests, order_note, place, pushed,
-    rows_sequence, rows_stamp, rows_stamped_by, same_formula, sort_blocker, sort_requests,
-    unrecorded_note, update_requests,
+    filtered_note, insert_requests, is_newest_first, landed, order_marker_requests, order_note,
+    place, pushed, rows_sequence, rows_stamp, rows_stamped_by, same_formula, sort_blocker,
+    sort_requests, unrecorded_note, update_requests, vertical_merges,
 )
 from .triage import NEEDS_REVIEW
 
@@ -196,10 +202,16 @@ FORMAT_FAILED = "failed"
 #: connection's lease, may move rows. ``blocked``: a poll tried and the tab
 #: could not be put in order; the note says why, the tab is as it was, mail
 #: still lands, and the sort is tried again after :data:`ORDER_RETRY_SECONDS`.
+#: ``filtered``: she keeps a basic filter on the tab. Not a defect and not
+#: retried: the sort is not run (Sheets sorts around the rows a filter hides,
+#: and a rewrite would move her hidden rows out from under the filter), mail
+#: lands at the top, the note is neutral, and the pipeline looks again at
+#: most daily (``pipeline.FILTER_RECHECK_SECONDS``) or when she re-checks.
 ORDER_APPLIED = "applied"
 ORDER_ALREADY = "already"
 ORDER_PENDING = "pending"
 ORDER_BLOCKED = "blocked"
+ORDER_FILTERED = "filtered"
 #: The answers that mean the sheet is in newest-first order.
 ORDER_SETTLED = frozenset({ORDER_APPLIED, ORDER_ALREADY})
 #: How long after a blocked attempt the next one is made. An hour: the same
@@ -241,7 +253,8 @@ class Setup:
     worktree_sheet_id: int | None = None
     #: One of the ORDER_* values.
     ordering: str = ORDER_PENDING
-    #: Why the tab is not in order, for the panel; "" unless ``blocked``.
+    #: The sentence for the panel: why the tab is not in order (``blocked``)
+    #: or that her filter is being left alone (``filtered``); "" otherwise.
     ordering_note: str = ""
 
 
@@ -256,7 +269,8 @@ class SheetCheck:
     worktree: str = field(default="", compare=False)
     #: One of the ORDER_* values when set-up ran; "" otherwise. Same reason.
     ordering: str = field(default="", compare=False)
-    #: The sentence for the panel when ``ordering`` is ``blocked``; "" otherwise.
+    #: The sentence for the panel when ``ordering`` is ``blocked`` or
+    #: ``filtered``; "" otherwise.
     ordering_note: str = field(default="", compare=False)
 
 
@@ -391,7 +405,7 @@ def _send_once(request, *, what: str, service: str = "Sheets"):
 
 def check(
     spreadsheet_id: str, *, caller_email: str, svc=None, drive=None, reorder: bool = False,
-    hold: Hold | None = None,
+    hold: Hold | None = None, ordering_known: str = "",
 ) -> SheetCheck:
     """Is this the caller's sheet, and can the hub see and edit it?
 
@@ -413,7 +427,13 @@ def check(
     the rows are moved — so no other write of the agent's can be half-way
     through the rows while they move. A sort that could not be done is not a
     failed check: the answer is still ``ok``, with ``ordering`` ``blocked``
-    and the reason in ``ordering_note``."""
+    and the reason in ``ordering_note``.
+
+    ``ordering_known`` is what the caller's record already says about the
+    tab's order and does not want re-examined this pass — today only
+    :data:`ORDER_FILTERED`. With it, set-up reads nothing about the rows and
+    answers that state again; the pipeline owns how long a filtered answer
+    stands before it is looked at afresh."""
     svc = svc or service()
     try:
         meta = _metadata(spreadsheet_id, svc)
@@ -427,7 +447,10 @@ def check(
         return SheetCheck(CHECK_NOT_YOURS, "")
     title = str((meta.get("properties") or {}).get("title") or "")
     try:
-        done = setup(spreadsheet_id, svc=svc, meta=meta, reorder=reorder, hold=hold)
+        done = setup(
+            spreadsheet_id, svc=svc, meta=meta, reorder=reorder, hold=hold,
+            ordering_known=ordering_known,
+        )
     except SheetsRefused as exc:
         if exc.status == 403:
             return SheetCheck(CHECK_NOT_EDITABLE, "")
@@ -536,7 +559,7 @@ def _worktree_marker_requests(meta: dict, sheet_id: int) -> list[dict]:
 
 def setup(
     spreadsheet_id: str, *, svc=None, meta: dict | None = None, reorder: bool = False,
-    hold: Hold | None = None,
+    hold: Hold | None = None, ordering_known: str = "",
 ) -> Setup:
     """Idempotent: the three tabs exist, row 1 carries the headers, row 1 is
     frozen, the Message ID column is hidden, Status has its dropdown, and
@@ -686,6 +709,7 @@ def setup(
     )
     ordering, ordering_note = _order_once(
         spreadsheet_id, svc, meta, inbox_sheet_id=inbox_sheet_id, reorder=reorder, hold=hold,
+        ordering_known=ordering_known,
     )
     return Setup(
         formatting=formatting, worktree=worktree_state, worktree_sheet_id=worktree_sheet_id,
@@ -774,7 +798,7 @@ def _date_column(spreadsheet_id: str, svc) -> list:
 
 def _order_once(
     spreadsheet_id: str, svc, meta: dict, *, inbox_sheet_id: int, reorder: bool,
-    hold: Hold | None = None,
+    hold: Hold | None = None, ordering_known: str = "",
 ) -> tuple[str, str]:
     """Bring the Inbox tab into newest-first order, once per sheet. Returns
     ``(ORDER_* value, note for the panel)``.
@@ -794,24 +818,37 @@ def _order_once(
 
     Never raises for a sheet that cannot be sorted, and neither does a fire
     stop for one: the answer is ``blocked`` with the reason, and new mail is
-    written to the top of the tab as it stands."""
+    written to the top of the tab as it stands.
+
+    A tab she keeps a basic filter on is ``filtered``: no sort, a neutral
+    note, and — when the caller says it already knows (``ordering_known``) —
+    not a single read of the rows, so an hourly check costs the sheet
+    nothing for its order."""
     if is_newest_first(meta):
         return ORDER_ALREADY, ""
+    if ordering_known == ORDER_FILTERED:
+        return ORDER_FILTERED, filtered_note()
     if not reorder:
         return ORDER_PENDING, ""
     try:
-        note = _put_in_order(spreadsheet_id, svc, inbox_sheet_id=inbox_sheet_id, hold=hold)
+        ordering, note = _put_in_order(
+            spreadsheet_id, svc, inbox_sheet_id=inbox_sheet_id, hold=hold
+        )
     except SheetsRefused as exc:
-        note = _not_sorted("Google Sheets refused the sort" + (
+        ordering, note = ORDER_BLOCKED, _not_sorted("Google Sheets refused the sort" + (
             f": {exc.detail.rstrip('.')}." if exc.detail else f" (HTTP {exc.status})."
         ))
     except SheetsUnavailable as exc:
-        note = _not_sorted(f"Google Sheets did not answer ({_cause_of(exc.__cause__)}).")
-    if note is None:
+        ordering, note = ORDER_BLOCKED, _not_sorted(
+            f"Google Sheets did not answer ({_cause_of(exc.__cause__)})."
+        )
+    if ordering == ORDER_APPLIED:
         logger.info("a12: Inbox rows are newest first (%s)", ORDER_VERSION)
-        return ORDER_APPLIED, ""
-    logger.warning("a12: the Inbox tab is not marked newest first. %s", note)
-    return ORDER_BLOCKED, note
+    elif ordering == ORDER_FILTERED:
+        logger.info("a12: the Inbox tab carries her filter; the one-time sort is not run")
+    else:
+        logger.warning("a12: the Inbox tab is not marked newest first. %s", note)
+    return ordering, note
 
 
 def _not_sorted(reason: str) -> str:
@@ -820,20 +857,33 @@ def _not_sorted(reason: str) -> str:
 
 def _put_in_order(
     spreadsheet_id: str, svc, *, inbox_sheet_id: int, hold: Hold | None
-) -> str | None:
-    """``None`` when the tab is newest first and marked; otherwise the note
-    for the panel."""
+) -> tuple[str, str]:
+    """``(applied, "")`` when the tab is newest first and marked;
+    ``(blocked, note)`` when it could not be; ``(filtered, note)`` when she
+    keeps a filter on it and the sort is therefore not run.
+
+    Order of the decision: a vertical merge first — Sheets refuses to sort
+    through one and to move a row out of one, so it is a fact about the
+    sheet worth saying whatever else is true, exactly as before. Then her
+    filter: the sort would go around the rows it hides and leave the tab in
+    an order the marker could not honestly record, and the alternative — an
+    in-memory sort written back over every row — would move her hidden rows
+    out from under the filter's criteria and leave cell notes, comments and
+    per-cell formatting on the rows they were on. So nothing moves, and
+    hidden rows or a Date column of two kinds, which only matter to a sort,
+    are not held against a tab that is not being sorted."""
     if hold is not None:
         hold.prove()
     shape = _shape(spreadsheet_id, svc, hidden_rows=True)
     dates = _date_column(spreadsheet_id, svc)
     if first_out_of_order(dates) is not None:
-        blocker = sort_blocker(
-            dates, merges=shape.merges, hidden_by_filter=shape.hidden_by_filter,
-            hidden_by_user=shape.hidden_by_user,
-        )
+        blocker = sort_blocker(dates, merges=shape.merges, hidden_by_user=shape.hidden_by_user)
+        if blocker and vertical_merges(shape.merges):
+            return ORDER_BLOCKED, _not_sorted(blocker)
+        if shape.hidden_by_filter:
+            return ORDER_FILTERED, filtered_note()
         if blocker:
-            return _not_sorted(blocker)
+            return ORDER_BLOCKED, _not_sorted(blocker)
         token = uuid.uuid4().hex
         requests = rows_stamp(shape.meta, token=token, now_epoch=int(time.time()))
         requests += sort_requests(inbox_sheet_id)
@@ -848,25 +898,31 @@ def _put_in_order(
             )
         except SheetsUnsure:
             if not rows_stamped_by(_metadata(spreadsheet_id, svc), token):
-                return _not_sorted("Google Sheets did not answer when asked to sort it.")
+                return ORDER_BLOCKED, _not_sorted(
+                    "Google Sheets did not answer when asked to sort it."
+                )
             logger.warning("a12: the row reorder's reply was lost, but the sheet shows it applied")
         except SheetsRefused:
             if rows_sequence(_metadata(spreadsheet_id, svc)) != rows_sequence(shape.meta):
-                return _not_sorted("another write to the sheet landed while it was being sorted.")
+                return ORDER_BLOCKED, _not_sorted(
+                    "another write to the sheet landed while it was being sorted."
+                )
             raise
         wrong = first_out_of_order(_date_column(spreadsheet_id, svc))
         if wrong is not None:
-            return _not_sorted(
+            return ORDER_BLOCKED, _not_sorted(
                 f"the agent sorted it, but row {wrong} is still newer than the row above it, "
                 "so the order could not be confirmed."
             )
     try:
         _mark_in_order(spreadsheet_id, svc)
     except SheetsRefused as exc:
-        return unrecorded_note(exc.detail.rstrip(".") or f"HTTP {exc.status}", retry=_ORDER_RETRY_WORDS)
+        return ORDER_BLOCKED, unrecorded_note(
+            exc.detail.rstrip(".") or f"HTTP {exc.status}", retry=_ORDER_RETRY_WORDS
+        )
     except SheetsUnavailable as exc:
-        return unrecorded_note(_cause_of(exc.__cause__), retry=_ORDER_RETRY_WORDS)
-    return None
+        return ORDER_BLOCKED, unrecorded_note(_cause_of(exc.__cause__), retry=_ORDER_RETRY_WORDS)
+    return ORDER_APPLIED, ""
 
 
 def _mark_in_order(spreadsheet_id: str, svc) -> None:

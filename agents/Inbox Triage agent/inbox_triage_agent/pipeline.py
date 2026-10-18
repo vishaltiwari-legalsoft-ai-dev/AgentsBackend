@@ -78,9 +78,9 @@ from .gmail_client import GmailUnavailable, HistoryExpired, MessageGone
 from .gmail_oauth import ExchangeFailed, RevokedGrant, TokenKeyMissing, TokenRefreshFailed
 from .sheet_layout import RowFacts, agent_values, parse_sheet_ref, sheet_url
 from .sheet_writer import (
-    CHECK_MR_SOURCE, CHECK_OK, ORDER_BLOCKED, ORDER_RETRY_SECONDS, ORDER_SETTLED,
-    RETRIED_COVER_SECONDS, WORKTREE_CLAIMED, WORKTREE_OURS, LayoutMismatch, SheetCheck,
-    SheetsUnavailable, SheetsUnreachable,
+    CHECK_MR_SOURCE, CHECK_OK, ORDER_BLOCKED, ORDER_FILTERED, ORDER_RETRY_SECONDS,
+    ORDER_SETTLED, RETRIED_COVER_SECONDS, WORKTREE_CLAIMED, WORKTREE_OURS, LayoutMismatch,
+    SheetCheck, SheetsUnavailable, SheetsUnreachable,
 )
 from .summarise import ModelCallFailed, ModelUnavailable
 from .triage import NEEDS_REVIEW, TEAM_TIMEZONE, Rejected, Verdict
@@ -162,6 +162,12 @@ LEASE_SECONDS = 300
 SKIPPED_LEASE_LOST = "lease taken over by a later fire"
 POLL_INTERVAL_SECONDS = 300
 SHEET_RECHECK_SECONDS = 3600
+#: How long a ``filtered`` answer about the Inbox tab's order stands before
+#: a fire looks at the rows again. A day: her filter is how she works, not a
+#: condition waiting to clear, so the hourly check carries the answer forward
+#: (``ordering_known``) and reads nothing about the rows. A re-check from the
+#: panel looks afresh at once.
+FILTER_RECHECK_SECONDS = 86400
 #: When the history checkpoint is unusable: re-list from the time that
 #: checkpoint was taken — the last poll that got through all of its mail —
 #: less a day, and let the id map drop what is already on the sheet. The
@@ -327,7 +333,7 @@ def is_mr_sheet(spreadsheet_id: str) -> bool:
 
 def _check_and_store(
     user_id: str, spreadsheet_id: str, *, email: str, extra: dict | None = None,
-    reorder: bool = False, hold: "_Lease | None" = None,
+    reorder: bool = False, hold: "_Lease | None" = None, ordering_known: str = "",
 ) -> dict:
     """MR's sheets are refused before Google is asked anything; every other
     sheet goes through ``sheet_writer.check``, which proves the caller owns
@@ -336,20 +342,26 @@ def _check_and_store(
 
     ``reorder`` is passed by the fire and by nothing else, with its lease as
     ``hold``: the one-time newest-first sort moves rows, and only the holder
-    of the lease may."""
+    of the lease may. ``ordering_known`` is the stored ``filtered`` answer a
+    fire carries forward so the hourly check reads nothing about the rows;
+    ``ordering_at`` is rewritten only when the rows were actually looked at,
+    so it dates the answer and not the last time it was repeated."""
     if is_mr_sheet(spreadsheet_id):
         result = SheetCheck(CHECK_MR_SOURCE, "")
     else:
         result = sheet_writer.check(
-            spreadsheet_id, caller_email=email, reorder=reorder, hold=hold
+            spreadsheet_id, caller_email=email, reorder=reorder, hold=hold,
+            ordering_known=ordering_known,
         )
+    carried = bool(ordering_known) and result.ordering == ordering_known
+    checked_at = _iso(_utcnow())
     doc = firestore_repo.save_inbox_connection(user_id, {
         "sheet": {
             "id": spreadsheet_id,
             "url": sheet_url(spreadsheet_id),
             "title": result.title if result.status == CHECK_OK else "",
             "check": result.status,
-            "checked_at": _iso(_utcnow()),
+            "checked_at": checked_at,
             "checked_for": str(email or "").strip().lower(),
             # applied / already / failed: a refused formatting pass is on the
             # record here, not only in a log line.
@@ -361,13 +373,18 @@ def _check_and_store(
             # the key :func:`_worktree_pass` gates on: without it the tab is
             # created and styled and then never filled.
             "worktree": result.worktree,
-            # applied / already / pending / blocked — and "" for an answer
-            # that is not ``ok``. ``pending`` is re-checked by the next fire;
-            # ``blocked`` an hour later (:func:`_ensure_sheet_checked`).
+            # applied / already / pending / blocked / filtered — and "" for
+            # an answer that is not ``ok``. ``pending`` is re-checked by the
+            # next fire; ``blocked`` an hour later; ``filtered`` a day later
+            # (:func:`_ensure_sheet_checked`).
             "ordering": result.ordering,
-            # Why the tab is not in newest-first order, in words for the
-            # panel; "" whenever it is, or has not been tried.
+            # Why the tab is not in newest-first order, or that her filter is
+            # being left alone, in words for the panel; "" whenever it is in
+            # order, or has not been tried.
             "ordering_note": result.ordering_note,
+            # When the rows were last looked at for their order. Kept as it
+            # was when a check only carried a ``filtered`` answer forward.
+            **({} if carried else {"ordering_at": checked_at}),
         },
         **(extra or {}),
     })
@@ -509,8 +526,10 @@ def status_payload(user_id: str, *, now: datetime | None = None) -> dict:
             "title": sheet.get("title") or None,
             "check": sheet.get("check") or None,
             "checked_at": sheet.get("checked_at") or None,
-            # Both read with a default: a document stored before they existed
-            # has neither.
+            # All read with a default: a document stored before they existed
+            # has none. ``ordering`` is one of applied / already / pending /
+            # blocked / filtered; ``filtered`` (added 10-19) is her own basic
+            # filter being left alone, and is information, not a warning.
             "ordering": sheet.get("ordering") or None,
             "ordering_note": sheet.get("ordering_note") or None,
         },
@@ -1029,7 +1048,13 @@ def _ensure_sheet_checked(
     tried and found the tab ``blocked`` is NOT tried again by the next fire:
     it waits :data:`ORDER_RETRY_SECONDS`, so a sheet that cannot be sorted
     costs the API nothing on the fires in between — and those fires write
-    their mail."""
+    their mail.
+
+    A tab found ``filtered`` is not waiting for anything: the answer stands
+    for :data:`FILTER_RECHECK_SECONDS` from the time the rows were looked at
+    (``ordering_at``), and the hourly ownership check inside that window
+    hands the writer the answer (``ordering_known``) instead of asking the
+    sheet about its rows again."""
     sheet = doc.get("sheet") or {}
     if not sheet.get("id"):
         return doc
@@ -1038,12 +1063,21 @@ def _ensure_sheet_checked(
     stale = age is None or age > SHEET_RECHECK_SECONDS
     same_caller = sheet.get("checked_for") == str(email or "").strip().lower()
     ordering = str(sheet.get("ordering") or "")
-    settled = ordering in ORDER_SETTLED or (
+    looked_at = _parse_iso(sheet.get("ordering_at")) or checked_at
+    looked_age = None if looked_at is None else (now - looked_at).total_seconds()
+    filtered_stands = (
+        ordering == ORDER_FILTERED and looked_age is not None
+        and looked_age <= FILTER_RECHECK_SECONDS
+    )
+    settled = ordering in ORDER_SETTLED or filtered_stands or (
         ordering == ORDER_BLOCKED and age is not None and age <= ORDER_RETRY_SECONDS
     )
     if sheet.get("check") == CHECK_OK and not stale and same_caller and settled:
         return doc
-    return _check_and_store(user_id, str(sheet["id"]), email=email, reorder=True, hold=hold)
+    return _check_and_store(
+        user_id, str(sheet["id"]), email=email, reorder=True, hold=hold,
+        ordering_known=ORDER_FILTERED if filtered_stands else "",
+    )
 
 
 def _read_id_map(

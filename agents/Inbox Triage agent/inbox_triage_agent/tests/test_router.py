@@ -137,6 +137,32 @@ def test_status_carries_why_the_sheet_is_not_sorted_to_the_panel_and_nothing_whe
     assert set(body) == STATUS_KEYS and SID not in note
 
 
+def test_status_carries_a_filtered_sheet_as_information_with_the_same_shape(as_user, store):
+    """Pinned 2026-10-19. ``ordering`` gains the value ``filtered`` for a
+    sheet she keeps a basic filter on; the note is neutral. The payload's
+    keys do not change — the console reads the new value with a default —
+    and ``ordering_at``, the pipeline's own bookkeeping, does not travel."""
+    from inbox_triage_agent.sheet_layout import FILTERED_NOTE
+
+    as_user(OWNER)
+    store.connections[OWNER["id"]] = _connected_doc()
+    store.connections[OWNER["id"]]["sheet"].update(
+        ordering="filtered", ordering_note=FILTERED_NOTE, ordering_at="2026-10-19T04:00:00+00:00",
+    )
+    store.connections[OWNER["id"]]["last_poll"] = {
+        "at": "2026-10-19T04:05:00+00:00", "ok": True, "messages_read": 3, "error": None}
+
+    body = client.get("/api/inbox/status").json()
+
+    assert (body["sheet"]["ordering"], body["sheet"]["ordering_note"]) == ("filtered", FILTERED_NOTE)
+    assert body["sheet"]["check"] == "ok" and body["last_poll"]["ok"] is True
+    assert set(body) == STATUS_KEYS
+    assert set(body["sheet"]) == {"id", "url", "title", "check", "checked_at", "ordering", "ordering_note"}
+    assert "ordering_at" not in resp_text(body) and SID not in FILTERED_NOTE
+    for banned in ("every hour", "Remove filter", "not been put", "tries"):
+        assert banned not in FILTERED_NOTE
+
+
 def test_status_needs_a_signed_in_caller():
     assert client.get("/api/inbox/status").status_code == 401
 
@@ -547,7 +573,7 @@ def test_sheet_routes_check_ownership_against_the_callers_signed_in_address(as_u
     as_user(OWNER)
     seen: list[str] = []
     monkeypatch.setattr(sheet_writer, "check",
-                        lambda sid, *, caller_email, reorder=False, hold=None:
+                        lambda sid, *, caller_email, reorder=False, hold=None, ordering_known="":
                         seen.append(caller_email) or SheetCheck("not_yours", ""))
     body = client.put("/api/inbox/sheet", json={"ref": SID}).json()
     assert body["sheet"]["check"] == "not_yours" and body["sheet"]["title"] is None
