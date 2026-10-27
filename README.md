@@ -26,9 +26,12 @@ Dockerfile             Cloud Run image (Python 3.12)
 ## Run locally
 
 ```bash
-python -m venv .venv
+# CPython 3.12 — the Cloud Run image's interpreter. constraints.txt pins the
+# image's exact package set; a venv built without it is not the test gate.
+python3.12 -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+pip install --upgrade pip==26.2.2
+pip install -r requirements.txt -c constraints.txt
 copy .env.example .env        # fill values (see ../credentials.md)
 uvicorn app.main:app --reload --port 8080
 ```
