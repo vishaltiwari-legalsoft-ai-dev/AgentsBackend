@@ -206,7 +206,12 @@ def test_speakers_come_from_brief_and_card_never_the_model():
                                "provenance": "stated"}}
     sp, notes = ev.speakers(intake, load_card())
     assert sp[0]["title"] == "Founder" and any("differs from brand card" in n for n in notes)
-    sp, notes = ev.speakers({}, load_card())
+    # No speaker in the brief: the card's spokesperson is quoted (live finding
+    # 2026-10-28) — a placeholder only when the card names nobody either.
+    card = load_card()
+    sp, notes = ev.speakers({}, card)
+    assert sp[0]["name"] == card["spokespeople"][0]["name"] and sp[0]["provenance"] == "brand_card"
+    sp, notes = ev.speakers({}, card | {"spokespeople": []})
     assert sp[0]["name"].startswith("[VERIFY") and notes
 
 

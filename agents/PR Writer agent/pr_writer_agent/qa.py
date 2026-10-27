@@ -75,7 +75,9 @@ def _w(check, message, where="", excerpt="") -> Finding:
 # --------------------------------------------------------------------------- #
 
 VERIFY = re.compile(r"\[VERIFY(?::[^\]]*)?\]")
-QUOTE_PENDING = re.compile(r"\[QUOTE\s*[–—-]\s*PENDING APPROVAL:\s*([^\]]+)\]")
+# The speaker inside the marker may itself be a placeholder ("[VERIFY: exact
+# title]"), so one level of nested brackets is part of the marker, not its end.
+QUOTE_PENDING = re.compile(r"\[QUOTE\s*[–—-]\s*PENDING APPROVAL:\s*((?:[^\[\]]|\[[^\[\]]*\])+)\]")
 _URL = re.compile(r"https?://\S+|www\.\S+")
 
 # Periods that do not end a sentence. Months, titles and "No." never end

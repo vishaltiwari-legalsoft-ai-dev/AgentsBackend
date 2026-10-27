@@ -220,7 +220,8 @@ def _as_stated(field: dict) -> dict:
     return field
 
 
-def run_intake(news: str, facts: str, brand: dict, *, known_brands: list[str], invoke) -> dict:
+def run_intake(news: str, facts: str, brand: dict, *, known_brands: list[str], invoke,
+               card_agent: dict | None = None) -> dict:
     """Intake over the one-sentence news and the requester's optional facts box.
 
     The facts box is the requester's own words, so what intake extracts from
@@ -232,6 +233,16 @@ def run_intake(news: str, facts: str, brand: dict, *, known_brands: list[str], i
     result = steps.run_intake(news, stated={"brand": brand.get("name") or brand.get("id"), "news": news},
                               pasted=facts, known_brands=known_brands, invoke=invoke)
     result["intake"] = {k: _as_stated(v) if isinstance(v, dict) else v for k, v in result["intake"].items()}
+    # The brand card's approved spokesperson answers "who is quoted?": the
+    # draft quotes them (evidence.speakers falls back to the card), so the
+    # clarify card must not ask for one.
+    on_card = [p for p in ev.normalize_card(card_agent).get("spokespeople") or []
+               if isinstance(p, dict) and str(p.get("name") or "").strip()]
+    if on_card and "spokespeople" in result.get("missing", []):
+        result["missing"] = [m for m in result["missing"] if m != "spokespeople"]
+        result["questions"] = [steps.QUESTIONS[m] for m in result["missing"] if m in steps.QUESTIONS]
+        result.setdefault("notes", []).append(
+            f"spokesperson: the brand card's {str(on_card[0]['name']).strip()} will be quoted")
     return result
 
 
@@ -690,13 +701,14 @@ def wire_blocks(draft: dict, quote_state: dict[str, str]) -> list[dict]:
         out.append({"id": bid, "kind": kind, "text": text, "revisable": revisable, "quote_id": quote_id,
                     "claim_ids": [], "cites": list(cites), "last_comment": last_comment})
 
+    clean = lambda t: ev.strip_cites(t or "").strip()  # noqa: E731 — evidence ids are internal
     if ct.release_line and draft.get("release_line"):
-        add("release_line", "release_line", draft["release_line"])
-    add("headline", "headline", draft.get("headline", ""))
+        add("release_line", "release_line", clean(draft["release_line"]))
+    add("headline", "headline", clean(draft.get("headline", "")))
     if ct.subhead_chars and draft.get("subhead"):
-        add("subheadline", "subheadline", draft["subhead"])
+        add("subheadline", "subheadline", clean(draft["subhead"]))
     if ct.dateline and draft.get("dateline"):
-        add("dateline", "dateline", draft["dateline"])
+        add("dateline", "dateline", clean(draft["dateline"]))
     for b in draft.get("blocks", []):
         text = ev.strip_cites(b.get("text", "")).strip()
         if b.get("kind") == "quote":
@@ -726,7 +738,12 @@ def wire_markers(blocks: list[dict], claims: list[dict]) -> list[dict]:
             placeholder_ids.setdefault(c["text"], []).append(c["id"])
     out = []
     for b in blocks:
+        # A placeholder speaker inside a pending-quote marker belongs to that
+        # marker's chip; marking it separately would overlap the quote token.
+        quote_spans = [m.span() for m in qa.QUOTE_PENDING.finditer(b["text"])]
         for m in qa.VERIFY.finditer(b["text"]):
+            if any(start <= m.start() and m.end() <= end for start, end in quote_spans):
+                continue
             token = m.group(0)
             label = token[1:-1].partition(":")[2].strip() or "fact"
             queue = placeholder_ids.get(token) or []

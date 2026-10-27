@@ -286,6 +286,21 @@ def speakers(intake: dict, card: dict) -> tuple[list[dict], list[str]]:
             "approval_contact": (card_row or {}).get("approval_contact", ""),
         })
     if not out:
+        # No speaker in the brief: the brand card's approved spokesperson (the
+        # first listed is the default voice) speaks before any placeholder does.
+        card_row = next((s for s in card["spokespeople"] if isinstance(s, dict) and str(s.get("name") or "").strip()),
+                        None)
+        if card_row:
+            name = str(card_row["name"]).strip()
+            out.append({
+                "id": "sp-1", "name": name,
+                "title": str(card_row.get("title") or "").strip() or f"[VERIFY: exact title for {name}]",
+                "organization": card["short_name"],
+                "talking_points": str(card_row.get("topics") or ""), "provenance": "brand_card",
+                "approval_contact": str(card_row.get("approval_contact") or ""),
+            })
+            notes.append(f"no spokesperson in the brief — the brand card's spokesperson {name} is quoted")
+    if not out:
         out.append({
             "id": "sp-1", "name": "[VERIFY: spokesperson name]", "title": "[VERIFY: exact title]",
             "organization": card["short_name"], "talking_points": "", "provenance": "missing",
