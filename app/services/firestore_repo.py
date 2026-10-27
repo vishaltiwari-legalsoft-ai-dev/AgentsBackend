@@ -3298,6 +3298,68 @@ def update_pr_flow(
     return _pr_commit(_apply)
 
 
+# --- per-brand task leases (card suggestions) ---------------------------------
+# ``pr_leases/{task}__{brand_id}``: one small doc per (task, brand) so that only
+# ONE request at a time spends search and model calls on a brand-level job that
+# has no run to carry its lease. Never touches ``brand_cards``: a suggestion is
+# read-only on the card, and the card's revision must not move when nobody
+# saved anything. Access: get by id only.
+
+PR_LEASES = "pr_leases"
+_PR_LEASE_TASK_RE = re.compile(r"^[a-z_]{1,32}$")
+
+
+def _pr_lease_ref(brand_id: str, task: str):
+    if not _PR_LEASE_TASK_RE.match(task or ""):
+        raise ValueError(f"not a lease task: {task!r}")
+    return _db().collection(PR_LEASES).document(f"{task}__{_pr_brand_id(brand_id)}")
+
+
+def lease_pr_brand_task(brand_id: str, task: str, *, user_id: str, lease_s: float) -> dict[str, Any]:
+    """Take the per-brand lease on ``task`` (e.g. ``card_suggest``).
+
+    In one transaction: a lease still in force -> ``{"acquired": False,
+    "retry_after_s": n}`` and nothing written; otherwise (free, released or
+    expired) it is taken for ``lease_s`` seconds by ``user_id``, a person.
+    ``lease_s`` must cover the request's whole server deadline. 1 read + 0-1 write."""
+    holder = _pr_require_human(user_id)
+    if lease_s <= 0:
+        raise ValueError("lease_s must be positive")
+    ref = _pr_lease_ref(brand_id, task)
+
+    def _apply(txn) -> dict[str, Any]:
+        snap = ref.get(transaction=txn)
+        current = (snap.to_dict() or {}) if snap.exists else {}
+        now = _now()
+        until = str(current.get("lease_until") or "")
+        if current.get("holder") and until > now:
+            left = datetime.fromisoformat(until) - datetime.fromisoformat(now)
+            return {"acquired": False, "retry_after_s": max(1, int(left.total_seconds()) + 1)}
+        txn.set(ref, {"brand_id": brand_id, "task": task, "holder": holder, "started_at": now,
+                      "lease_until": _pr_iso_after(lease_s), "updated_at": now})
+        return {"acquired": True, "retry_after_s": 0}
+
+    return _transact(_apply)
+
+
+def release_pr_brand_task(brand_id: str, task: str, *, user_id: str) -> bool:
+    """Release the lease IF ``user_id`` still holds it (an expired lease taken
+    over by someone else is left alone). Returns whether it was released."""
+    holder = _pr_require_human(user_id)
+    ref = _pr_lease_ref(brand_id, task)
+
+    def _apply(txn) -> bool:
+        snap = ref.get(transaction=txn)
+        current = (snap.to_dict() or {}) if snap.exists else {}
+        if current.get("holder") != holder:
+            return False
+        now = _now()
+        txn.set(ref, {**current, "holder": None, "lease_until": None, "released_at": now, "updated_at": now})
+        return True
+
+    return _transact(_apply)
+
+
 def get_pr_runs_by_ids(run_ids: list[str], *, user_id: str) -> list[dict[str, Any]]:
     """The full run docs for ``run_ids`` in ONE batched read, keeping only the
     ones ``user_id`` participates in, in the order asked. Absent = no access.

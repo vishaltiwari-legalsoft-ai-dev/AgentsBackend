@@ -174,11 +174,24 @@ def check_lede(draft: dict, ct: ContentType) -> list[Finding]:
     return []
 
 
+#: Below this share of the minimum a draft is not yet the content type (an
+#: error); between it and the minimum it is short but complete (a warning).
+SHORT_BODY_ERROR_SHARE = 0.75
+
+
 def check_body_length(draft: dict, ct: ContentType) -> list[Finding]:
+    """Too long is an error. Too short is an error only when far short: a
+    brief with few facts gives an accurate 360-word release, and treating
+    400 words as a hard floor pushes the rewrite toward filler — the QA fix
+    can add no facts (live eval 2026-10-28: 4 of 10 releases, 295-362
+    words, all accurate, all failed on length alone)."""
     n = sum(word_count(b.get("text", "")) for b in _body_blocks(draft))
     lo, hi = ct.words
-    if not lo <= n <= hi:
+    if n > hi or n < lo * SHORT_BODY_ERROR_SHARE:
         return [_e("body_length", f"body is {n} words; a {ct.label.lower()} runs {lo}–{hi}", "body")]
+    if n < lo:
+        return [_w("body_length", f"body is {n} words, short of the usual {lo}–{hi} for a "
+                   f"{ct.label.lower()}; more facts would let it run longer", "body")]
     return []
 
 
@@ -376,12 +389,17 @@ def _numeric_sentence(sentence: str) -> bool:
     return bool(_NUMERIC.search(_NAMED_DIGITS.sub(" ", scan_text(sentence))))
 
 
+def _numbers(sentence: str) -> set[str]:
+    return {n.replace(",", "") for n in _NUM_TOKEN.findall(_NAMED_DIGITS.sub(" ", scan_text(sentence)))}
+
+
 def check_numbers(draft: dict, ev_index: dict) -> list[Finding]:
     """Every sentence carrying a number, % or $ cites an evidence id that
     exists, or the figure sits inside a [VERIFY] placeholder. Headline and
     subhead figures must appear in a cited body sentence."""
     out: list[Finding] = []
     cited_numbers: set[str] = set()
+    uncited: list[tuple[str, str]] = []
     for b in draft.get("blocks", []):
         for sent in sentences(b.get("text", "")):
             ids = ev.cites_in(sent)
@@ -392,10 +410,17 @@ def check_numbers(draft: dict, ev_index: dict) -> list[Finding]:
             if not _numeric_sentence(sent):
                 continue
             if any(i in ev_index for i in ids):
-                cited_numbers.update(n.replace(",", "") for n in _NUM_TOKEN.findall(scan_text(sent)))
+                cited_numbers.update(_numbers(sent))
             else:
-                out.append(_e("uncited_number", "figure without an evidence citation or [VERIFY]",
-                              b.get("id", ""), scan_text(sent).strip()))
+                uncited.append((b.get("id", ""), sent))
+    # A figure repeated from a cited sentence ("With 5,000 placements behind
+    # it...") is grounded by that citation, as a headline figure is. Only a
+    # sentence whose every figure is backed that way passes.
+    for where, sent in uncited:
+        found = _numbers(sent)
+        if not found or not found <= cited_numbers:
+            out.append(_e("uncited_number", "figure without an evidence citation or [VERIFY]",
+                          where, scan_text(sent).strip()))
     for where in ("headline", "subhead"):
         for n in _NUM_TOKEN.findall(_NAMED_DIGITS.sub(" ", scan_text(draft.get(where, "")))):
             if n.replace(",", "") not in cited_numbers:
@@ -637,6 +662,36 @@ def check_snippets(snippets: dict, draft_markdown: str) -> list[Finding]:
 # The whole pass
 # --------------------------------------------------------------------------- #
 
+_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8,
+           "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+_WEEKDAY_DATE = re.compile(
+    r"\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+"
+    r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2}),\s+(\d{4})\b")
+
+
+def check_weekdays(draft: dict) -> list[Finding]:
+    """A weekday written next to a full date must be that date's weekday. The
+    model adds weekdays the brief never gave ("Tuesday, Feb. 3, 2027" for a
+    Wednesday, live eval 2026-10-28), and a reporter's calendar takes it at
+    its word. The message names the right day, so the QA fix can apply it."""
+    out: list[Finding] = []
+    pieces = [("headline", draft.get("headline", "")), ("subhead", draft.get("subhead", ""))]
+    pieces += [(b.get("id", ""), b.get("text", "")) for b in draft.get("blocks", [])]
+    for where, text in pieces:
+        for m in _WEEKDAY_DATE.finditer(scan_text(text or "")):
+            try:
+                real = date(int(m.group(4)), _MONTHS[m.group(2).lower()[:3]], int(m.group(3)))
+            except ValueError:
+                out.append(_e("weekday_mismatch", f"\"{m.group(0)}\" is not a real date", where, m.group(0)))
+                continue
+            actual = _WEEKDAYS[real.weekday()]
+            if actual != m.group(1):
+                out.append(_e("weekday_mismatch", f"\"{m.group(0)}\": that date is a {actual}, not a "
+                              f"{m.group(1)}; write {actual} or drop the weekday", where, m.group(0)))
+    return out
+
+
 def run_qa(draft: dict, ct: ContentType, *, card: dict, evidence: list[dict],
            primary_keyword: str | None = None, allowed_urls: list[str] | None = None,
            today: date | None = None) -> QAReport:
@@ -653,6 +708,7 @@ def run_qa(draft: dict, ct: ContentType, *, card: dict, evidence: list[dict],
     findings += check_structure(draft, ct)
     findings += check_language(draft, ev_index, card["avoid"])
     findings += check_numbers(draft, ev_index)
+    findings += check_weekdays(draft)
     if allowed_urls is not None:
         findings += check_urls(draft, allowed_urls)
     findings += check_long_sentences(draft, ct)
@@ -682,5 +738,5 @@ FIXABLE = frozenset({
     "language_hype", "language_superlative", "language_legal", "language_healthcare",
     "language_ai", "language_announce", "language_brand_avoid", "ap_month", "ap_ordinal",
     "ap_time", "ap_percent", "ap_numbers", "quote_length", "keyword_placement", "byline_voice",
-    "byline_company",
+    "byline_company", "uncited_number", "weekday_mismatch",
 })

@@ -349,3 +349,102 @@ def test_research_extract_keeps_only_quotes_found_on_the_page(fake):
     assert [e["id"] for e in out["evidence"]] == ["ev-1"]
     assert out["evidence"][0]["url"] == "https://example.org/report" and out["evidence"][0]["third_party"]
     assert any("not on https://example.org/report" in n for n in out["notes"])
+
+
+def test_a_key_fact_that_only_restates_the_news_sentence_is_dropped():
+    """Live eval 2026-10-28 (m01, m03): Sonnet 5.5 returned the news sentence
+    as a key fact, so 'key facts' stopped being reported missing and the
+    requester was never asked for one."""
+    sentence = "Legal Soft opens a new training center for virtual paralegals."
+    fields = _empty_fields(key_facts={"items": [
+        {"fact": "Legal Soft is opening a new training center.", "source": "", "from": "sentence",
+         "excerpt": "Legal Soft opens a new training center for virtual paralegals."}]})
+    merged, notes = steps.merge_intake(sentence, {}, "", fields)
+    assert merged["key_facts"]["provenance"] == "missing"
+    assert "key_facts" in steps.missing_fields(merged)
+    assert any("restates the news sentence" in n for n in notes)
+
+
+def test_a_figure_inside_the_sentence_is_still_a_key_fact():
+    sentence = "Legal Soft celebrates its 5,000th virtual paralegal placement this month."
+    fields = _empty_fields(key_facts={"items": [
+        {"fact": "5,000 placements", "source": "", "from": "sentence", "excerpt": "5,000th virtual paralegal placement"}]})
+    merged, _ = steps.merge_intake(sentence, {}, "", fields)
+    assert [f["fact"] for f in merged["key_facts"]["value"]] == ["5,000 placements"]
+
+
+def test_finalize_takes_the_first_headline_and_subhead_that_fit_the_anatomy(golden, card, evidence):
+    """Live eval: the top headline was 67 characters (rule 70-100) while the
+    second fit; the model ranks well but counts badly."""
+    from pr_writer_agent import content_types as cts
+
+    ct = cts.get("press_release")
+    lo, hi = ct.headline_chars
+    short, fits = "A" * (lo - 3), "B" * (lo + 5)
+    sub_lo, _ = ct.subhead_chars
+    payload = {"release_line": "FOR IMMEDIATE RELEASE",
+               "headline_options": [{"text": short, "rationale": "r"}, {"text": fits, "rationale": "r"},
+                                    {"text": "C" * (lo + 6), "rationale": "r"}],
+               "subhead_options": [{"text": "s" * (sub_lo - 1)}, {"text": "t" * (sub_lo + 10)}],
+               "blocks": [{"kind": "lede", "text": "x [br-1].", "speaker_id": None}], "injection_notes": []}
+    intake = {"release_timing": {"value": None, "provenance": "missing", "excerpt": ""}}
+    d = steps.finalize_draft(payload, ct, card, intake, evidence, [])
+    assert d["headline"] == fits and d["subhead"] == "t" * (sub_lo + 10)
+    assert [o["text"] for o in d["headline_options"]][0] == short  # the options keep the model's order
+
+
+def test_qa_fix_never_swaps_in_a_headline_that_fits_worse(golden, card, evidence, fake):
+    from pr_writer_agent import content_types as cts
+
+    ct = cts.get(golden["content_type"])
+    golden["qa"] = {"findings": [{"check": "subhead_length", "severity": "error", "where": "subhead",
+                                  "message": "m", "excerpt": ""}]}
+    before = golden["subhead"]
+    worse = "w" * (ct.subhead_chars[1] + 25)
+    invoke = fake({"headline": None, "subhead": worse, "blocks": [], "unfixable": [], "injection_notes": []})
+    d = steps.run_qa_fix(golden, card, evidence, primary_keyword="virtual records assistant",
+                         allowed=["https://legalsoft.com"], today=TODAY, invoke=invoke)
+    assert d["subhead"] == before
+
+
+def test_a_block_kind_the_type_does_not_have_keeps_its_words_in_the_block_before(card, evidence):
+    """Live eval: a media advisory came back with a "cta" block; QA failed it on
+    structure, which no rewrite can fix. Its text joins the previous block."""
+    from pr_writer_agent import content_types as cts
+
+    ct = cts.get("media_advisory")
+    blocks = [{"kind": k, "text": f"{k} text [br-1].", "speaker_id": None} for k in ct.parts]
+    blocks.append({"kind": "cta", "text": "To book an interview, contact the team.", "speaker_id": None})
+    payload = {"release_line": "MEDIA ADVISORY", "subhead_options": [], "injection_notes": [], "blocks": blocks,
+               "headline_options": [{"text": "H" * 80, "rationale": "r"}] * 3}
+    intake = {"release_timing": {"value": None, "provenance": "missing", "excerpt": ""}}
+    d = steps.finalize_draft(payload, ct, card, intake, evidence, [])
+    assert [b["kind"] for b in d["blocks"]] == list(ct.parts)
+    assert d["blocks"][-1]["text"].endswith("why text [br-1]. To book an interview, contact the team.")
+    assert [b["id"] for b in d["blocks"]] == [f"b{i}" for i in range(1, len(ct.parts) + 1)]
+    assert any("'cta' block is not part of" in n for n in d["notes"])
+
+
+def test_a_qa_fix_that_is_cut_off_keeps_the_checked_draft(golden, card, evidence, fake):
+    """Live eval: the QA rewrite hit max_tokens and failed the whole draft step;
+    the retry repeats the same rewrite, so the run was stuck. The draft stays."""
+    from pr_writer_agent import llm as pr_llm
+
+    golden["qa"] = {"findings": [{"check": "subhead_length", "severity": "error", "where": "subhead",
+                                  "message": "m", "excerpt": ""}]}
+    before = [b["text"] for b in golden["blocks"]]
+    cut = fake(pr_llm.Reply(text='{"headline": "x', finish_reason="length"))
+    d = steps.run_qa_fix(golden, card, evidence, primary_keyword="k", allowed=["https://legalsoft.com"],
+                         today=TODAY, invoke=cut)
+    assert [b["text"] for b in d["blocks"]] == before
+    assert any("QA fix not applied (LLMTruncated)" in n for n in d["notes"])
+
+
+def test_a_provider_outage_in_the_qa_fix_still_fails_loudly(golden, card, evidence, fake):
+    from pr_writer_agent import llm as pr_llm
+
+    golden["qa"] = {"findings": [{"check": "subhead_length", "severity": "error", "where": "subhead",
+                                  "message": "m", "excerpt": ""}]}
+    with pytest.raises(pr_llm.LLMUnavailable):
+        steps.run_qa_fix(golden, card, evidence, primary_keyword="k", allowed=["https://legalsoft.com"],
+                         today=TODAY, invoke=fake(pr_llm.LLMUnavailable("down")))

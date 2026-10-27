@@ -415,6 +415,13 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     # able to call it.
     ("PUT", "/api/pr/brands/{brand_id}/card"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("GET", "/api/pr/members"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    # PR Writer (a13), 2026-10-28. Card suggestions read the brand's own public
+    # web pages plus a Serper ``site:`` search and make one model call, then
+    # hand back a suggestion the caller may pour into the card editor. It
+    # writes nothing to ``brand_cards`` (only a per-brand lease doc), but it is
+    # billed, brand-level and gated in the handler by the SAME rule as the card
+    # PUT (the card's comms lead, or a workspace admin), so it sits beside it.
+    ("POST", "/api/pr/brands/{brand_id}/card/suggest"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     # ``GET /api/agents/health`` was entered here on 2026-09-02 for the hub's
     # per-agent rollup — but the endpoint itself never landed in any router
     # (the frontend's ``agentsHealth`` client is equally unconsumed). The entry
@@ -748,7 +755,13 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
 #: reviewer pickers — a real, small widening of who sees colleagues' addresses,
 #: accepted by the owner on 2026-10-27. Both INTERNAL_ONLY. Every run route is
 #: participant-scoped and counted under TENANT_SCOPED, not here.
-WORKSPACE_SHARED_BASELINE = 92
+#: 92 → 93 on 2026-10-28: ``POST /api/pr/brands/{id}/card/suggest`` reads the
+#: brand's own public web pages and makes one model call to suggest card
+#: content. It writes nothing to the card (a per-brand lease doc only) and is
+#: gated in the handler by the card PUT's rule (comms lead or admin), but it is
+#: billed brand-level work reachable by every internal member who meets that
+#: rule, so it is counted rather than hidden under SHARED_CATALOG.
+WORKSPACE_SHARED_BASELINE = 93
 
 #: The GEO editor surface, BY NAME. Not a count — a count would let a future
 #: route join the role while another left it and say nothing, and the thing

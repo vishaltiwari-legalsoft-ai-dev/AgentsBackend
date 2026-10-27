@@ -54,6 +54,18 @@ class Reply:
     model: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
+    #: What the provider billed for this call, from OpenRouter's ``usage.cost``.
+    #: ``None`` when the provider did not report it — never estimated here.
+    cost_usd: float | None = None
+
+
+def total_cost(replies) -> float | None:
+    """Summed provider cost, or ``None`` unless EVERY reply reported one: a
+    sum over only some calls would understate the spend and read as real."""
+    costs = [getattr(r, "cost_usd", None) for r in replies]
+    if not costs or any(c is None for c in costs):
+        return None
+    return round(sum(costs), 6)
 
 
 @dataclass
@@ -66,6 +78,7 @@ class Result:
         return {"calls": len(self.calls),
                 "input_tokens": sum(c.input_tokens for c in self.calls),
                 "output_tokens": sum(c.output_tokens for c in self.calls),
+                "cost_usd": total_cost(self.calls),
                 "models": sorted({c.model for c in self.calls if c.model})}
 
 
@@ -80,17 +93,44 @@ def default_invoke(system: str, user: str, *, slot: str, timeout_s: float, max_t
 
         llm = get_llm(temperature, fast=(slot == "fast"), agent_id=AGENT_ID,
                       timeout=timeout_s, max_tokens=max_tokens)
-        msg = llm.invoke([("system", system), ("user", user)])
+        msg = llm.invoke([("system", system), ("user", user)], extra_body=request_extras(llm))
     except Exception as exc:  # noqa: BLE001 — no key, provider down, timeout
         raise LLMUnavailable(f"model call failed ({slot} slot): {type(exc).__name__}: {exc}") from exc
+    return reply_from_message(msg, fallback_model=str(getattr(llm, "model_name", "")))
+
+
+#: OpenRouter usage accounting: the response's ``usage`` then carries ``cost``
+#: (USD actually billed for the call). Sent on every call so the cost is
+#: reported, not inferred from a price table.
+USAGE_ACCOUNTING = {"usage": {"include": True}}
+
+
+def request_extras(llm) -> dict:
+    """The model's own request extras (e.g. the fast slot's reasoning effort)
+    plus usage accounting. A per-call ``extra_body`` replaces the model's
+    whole ``extra_body`` in LangChain, so the two are merged here."""
+    return {**(getattr(llm, "extra_body", None) or {}), **USAGE_ACCOUNTING}
+
+
+def provider_cost(meta: dict) -> float | None:
+    """``usage.cost`` from a LangChain ``response_metadata``; ``None`` when the
+    provider did not report a number."""
+    cost = ((meta or {}).get("token_usage") or {}).get("cost")
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    return float(cost)
+
+
+def reply_from_message(msg, *, fallback_model: str = "") -> Reply:
     meta = getattr(msg, "response_metadata", None) or {}
     usage = getattr(msg, "usage_metadata", None) or {}
     return Reply(
         text=str(msg.content),
         finish_reason=meta.get("finish_reason"),
-        model=str(meta.get("model_name") or getattr(llm, "model_name", "")),
+        model=str(meta.get("model_name") or fallback_model),
         input_tokens=int(usage.get("input_tokens") or 0),
         output_tokens=int(usage.get("output_tokens") or 0),
+        cost_usd=provider_cost(meta),
     )
 
 

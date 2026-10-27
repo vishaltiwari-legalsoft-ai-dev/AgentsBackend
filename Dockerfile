@@ -17,8 +17,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+# constraints.txt freezes the resolved tree (see its header): requirements.txt
+# says what we need, constraints.txt says which versions a rebuild may pick.
+# Without it the 2026-10-27 rebuild silently moved 45 packages (PyMuPDF 1.28->2.0).
+COPY requirements.txt constraints.txt ./
+RUN pip install --upgrade "pip==26.2.2" && pip install -r requirements.txt -c constraints.txt
 
 COPY app ./app
 COPY agents ./agents

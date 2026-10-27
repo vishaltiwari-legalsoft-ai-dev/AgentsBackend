@@ -504,7 +504,14 @@ def test_flow_writes_are_participant_scoped_and_cannot_touch_the_step_table(db):
         repo.finish_pr_step(rid, "draft", user_id=OWNER, state="done", flow_patch={"steps": {}})
 
 
-def test_update_pr_flow_needs_a_person_and_writes_only_flow(db):
+def test_update_pr_flow_needs_a_person_and_writes_only_flow(db, monkeypatch):
+    # ``updated_at`` is asserted to move, so the store's clock must move between
+    # the create and the update. On the real clock the two land in one tick
+    # (CPython 3.12 on Windows: datetime.now steps ~1 ms; both writes take less)
+    # and the test then measures the OS timer, not the write. Step the seam.
+    stamps = (f"2026-10-28T00:00:00.{n:06d}+00:00" for n in range(1, 1000))
+    monkeypatch.setattr(repo, "_now", lambda: next(stamps))
+
     rid = _run(db)["id"]
     before = _copy(db.doc(f"pr_runs/{rid}"))
     with pytest.raises(repo.PrActorRefused):

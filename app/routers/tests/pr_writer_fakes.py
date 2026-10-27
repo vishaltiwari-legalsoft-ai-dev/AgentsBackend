@@ -65,6 +65,8 @@ class FakeModel:
         self.fail: dict[str, BaseException] = {}
         self.calls: list[str] = []
         self.revise_text: str | None = None
+        #: Provider cost each reply reports (``usage.cost``); ``None`` = not reported.
+        self.cost_usd: float | None = None
 
     _STEPS = (
         ("Intake extraction.", "intake"), ("Escalation screen.", "screen"),
@@ -88,7 +90,8 @@ class FakeModel:
         if step in self.fail:
             raise self.fail[step]
         payload = getattr(self, f"_{step}")(user)
-        return pr_llm.Reply(text=json.dumps(payload), finish_reason="stop", model="fake")
+        return pr_llm.Reply(text=json.dumps(payload), finish_reason="stop", model="fake",
+                            cost_usd=self.cost_usd)
 
     def _intake(self, user: str) -> dict:
         full = self.complete

@@ -110,10 +110,13 @@ END EMAIL {nonce}
 
 Return the JSON object for the email above."""
 
-#: Request parameters. Triage gains nothing from sampling; a valid reply is
-#: ~110 tokens, 400 makes a runaway reply cheap to abandon.
+#: Request parameters. Triage gains nothing from sampling (the fast-slot
+#: default, Sonnet 5.5, ignores temperature anyway). A valid reply is ~90-150
+#: tokens; 1000 still abandons a runaway reply cheaply and leaves room for the
+#: thinking a Claude 5 model spends from the same max_tokens, which at 400
+#: could cut a reply off and send the row to needs_review.
 TEMPERATURE = 0.0
-MAX_TOKENS = 400
+MAX_TOKENS = 1000
 
 
 @dataclass(frozen=True)

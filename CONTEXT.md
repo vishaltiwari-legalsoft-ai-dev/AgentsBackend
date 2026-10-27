@@ -262,7 +262,8 @@ For multi-tenant production, these should move to a persisted per-user token sto
 
 | Setting | Default | Use |
 |---------|---------|-----|
-| `OPENROUTER_MODEL` | `anthropic/claude-sonnet-4.5` | Website analysis, brand style profile, master prompt |
+| `OPENROUTER_MODEL` | `anthropic/claude-opus-4.6` | Reasoning slot: drafting, synthesis, art direction |
+| `OPENROUTER_FAST_MODEL` | `anthropic/claude-sonnet-5.5` | Fast slot: parsing and classification (`fast=True`) |
 | `OPENROUTER_IMAGE_MODEL` | `google/gemini-3-pro-image-preview` | Creative image generation |
 | `OPENROUTER_IMAGE_MODEL_HERO` | `black-forest-labs/flux.2-max` | Optional alt/background model |
 | `OPENROUTER_VISION_MODEL` | `openai/gpt-4o-mini` | OCR on uploaded images |

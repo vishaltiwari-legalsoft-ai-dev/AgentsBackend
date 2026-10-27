@@ -64,6 +64,10 @@ class CardIn(BaseModel):
     boilerplate_approval: Optional[dict[str, Any]] = None
 
 
+class SuggestIn(BaseModel):
+    extra_urls: list[str] = Field(default_factory=list, max_length=20)
+
+
 class ClarifyIn(BaseModel):
     mode: Literal["answers", "placeholders"]
     answers: dict[str, str] = Field(default_factory=dict)
@@ -121,6 +125,18 @@ def put_card(brand_id: str, body: CardIn, user: dict = Depends(get_current_user)
     act.note(f"Saved the {card['brand_name']} brand card (revision {card['revision']})", brand_id=brand_id,
              brand=card["brand_name"])
     return card
+
+
+@router.post("/pr/brands/{brand_id}/card/suggest")
+def suggest_card(brand_id: str, body: Optional[SuggestIn] = None, user: dict = Depends(get_current_user),
+                 act: Activity = trail.records("card_suggest", "Suggested brand card fields")) -> dict:
+    """A pure suggestion from the brand's own public pages: nothing is written
+    to the card; the person saves what they keep with ``PUT …/card``."""
+    meter = svc.new_meter()
+    out = _call(lambda: svc.suggest_card(brand_id, user, body.extra_urls if body else [], meter))
+    act.note("Suggested brand card fields from the brand's website", brand_id=brand_id,
+             count=len(out["read_pages"]), usage=meter.as_dict())  # fixed summary; no page text, no URLs
+    return out
 
 
 @router.get("/pr/members")

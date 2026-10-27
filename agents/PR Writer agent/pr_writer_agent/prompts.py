@@ -267,6 +267,7 @@ _INTAKE_TASK = """Intake extraction. Read the requester's one-sentence news (USE
 - "from": "sentence" when the value comes from the user sentence, "pasted" when from pasted material, "none" when neither says it (then value is null or the list is empty).
 - "excerpt": the shortest verbatim span you took the value from (empty when from is "none"). It must be copied exactly.
 - Extract only what is written. Do not infer a spokesperson's title, a date's year, a partner or a figure that is not there; leave it missing instead.
+- key_facts are the supporting facts and figures. The news sentence itself is not a key fact; when nothing beyond it is written, key_facts is an empty list.
 - release_date is YYYY-MM-DD only when a full date is written; embargo keeps the written wording.
 - brand must be one of the KNOWN BRANDS, or null. content_type must be one of the listed ids, or null.
 - Do not re-extract a field that appears in STATED FIELDS unless the pasted material says something different about it; code keeps the stated value either way."""
@@ -280,7 +281,11 @@ _ANGLE_TASK = """News angle. Decide why a journalist would care and why now, for
 _DRAFT_TASK = """Draft. Write the full draft for the content type given, following its CONTENT TYPE RULES and the ANGLE.
 - blocks: the required kinds in order, plus optional kinds only if they earn their place. One paragraph per block. Do not write the dateline, boilerplate, media contact or "###"; code adds them.
 - Quote blocks: "text" is the quote itself without quotation marks or attribution; "speaker_id" is an id from SPEAKERS. Never attribute a quote to anyone not in SPEAKERS. Other blocks: speaker_id null.
-- Every factual sentence ends with its evidence id(s) before the final punctuation. Missing facts become [VERIFY: what is needed and from whom].
+- A quote the content type needs from someone not in SPEAKERS (e.g. a partner with no named spokesperson) is not written as a quote block: write a paragraph block holding only [VERIFY: quote from <organization>: speaker name, title and their approval]. Never put a [VERIFY] about the speaker, a dash or a name inside quote text.
+- Every factual sentence ends with its evidence id(s) before the final punctuation, including a sentence that repeats a figure or date already cited. Missing facts become [VERIFY: what is needed and from whom].
+- Never add a weekday the evidence does not state; write the date alone ("Feb. 3, 2027").
+- Every number comes from the EVIDENCE. No illustrative or hypothetical figures ("suppose a firm spends $5,000 a month"): make the point in words instead.
+- Aim inside the content type's word range, using context the evidence supports; never pad with filler or repetition.
 - URLs only from ALLOWED URLS.
 - headline_options: three, best first, each with a one-line rationale. subhead_options: recommended first, then an alternate (empty list when the type has no subheadline).
 - SENSITIVITIES are hard requirements (e.g. "no pricing" means no pricing anywhere)."""
@@ -289,6 +294,8 @@ _QA_FIX_TASK = """Line edit against QA findings. The draft below failed the list
 - keep every fact, every evidence id marker and every [VERIFY: ...] placeholder; do not add facts;
 - return only the blocks you changed (by id) and a new headline/subhead only if a finding is about them (else null);
 - quotes stay proposals in the speaker's voice;
+- uncited_number: end the sentence with the evidence id whose claim states that figure; if no evidence states it, replace the figure with [VERIFY: the figure and its source]. Never cite an id that does not state the figure;
+- a length finding: count characters or words and land well inside the range, not on its edge;
 - a finding you cannot fix without new facts goes in "unfixable" with the reason."""
 
 _FACT_CHECK_TASK = """Fact-check extraction. List every factual claim in the draft: numbers, dates, names, titles, product names, awards, partner details, certifications, superlatives and industry statistics. One row per claim.
@@ -338,17 +345,22 @@ _EVIDENCE_TASK = """Evidence extraction for a press draft. For each fenced page,
 - page_id: the fenced page's id.
 Return an empty list when a page has nothing usable. Never invent."""
 
+# Fast-step max_tokens leave >= 4x the typical output. The fast slot moved to
+# Sonnet 5.5 on 2026-10-28: its tokenizer counts the same text as ~1.4x the
+# tokens, and any thinking it does is spent from max_tokens. At the old caps
+# (sized for Sonnet 4.5) snippets was cut off on 2 of 20 live-eval briefs.
+# A cap only bounds a runaway reply; it costs nothing when unused.
 STEPS: dict[str, Step] = {s.name: s for s in (
-    Step("intake", "fast", 45, 2500, 0.0, INTAKE_SCHEMA, _INTAKE_TASK, 3800, 700),
-    Step("research_extract", "fast", 60, 3000, 0.0, EVIDENCE_EXTRACT_SCHEMA, _EVIDENCE_TASK, 9500, 1500),
+    Step("intake", "fast", 45, 5000, 0.0, INTAKE_SCHEMA, _INTAKE_TASK, 3800, 700),
+    Step("research_extract", "fast", 60, 6000, 0.0, EVIDENCE_EXTRACT_SCHEMA, _EVIDENCE_TASK, 9500, 1500),
     Step("angle", "main", 60, 1500, 0.4, ANGLE_SCHEMA, _ANGLE_TASK, 3200, 500),
     Step("draft", "main", 65, 4000, 0.4, DRAFT_SCHEMA, _DRAFT_TASK, 3900, 2200),
     Step("qa_fix", "main", 60, 4000, 0.3, QA_FIX_SCHEMA, _QA_FIX_TASK, 4300, 1400, conditional=True),
-    Step("fact_check", "fast", 60, 3000, 0.0, FACT_CHECK_SCHEMA, _FACT_CHECK_TASK, 4000, 1200),
-    Step("seo", "fast", 40, 1500, 0.3, SEO_SCHEMA, _SEO_TASK, 3000, 500),
-    Step("distribution", "fast", 40, 1500, 0.3, DISTRIBUTION_SCHEMA, _DISTRIBUTION_TASK, 2000, 600),
-    Step("snippets", "fast", 40, 1200, 0.4, SNIPPETS_SCHEMA, _SNIPPETS_TASK, 2700, 450),
-    Step("reviewer_notes", "fast", 40, 1500, 0.2, REVIEWER_NOTES_SCHEMA, _REVIEWER_NOTES_TASK, 2900, 500),
+    Step("fact_check", "fast", 60, 6000, 0.0, FACT_CHECK_SCHEMA, _FACT_CHECK_TASK, 4000, 1200),
+    Step("seo", "fast", 40, 3000, 0.3, SEO_SCHEMA, _SEO_TASK, 3000, 500),
+    Step("distribution", "fast", 40, 3000, 0.3, DISTRIBUTION_SCHEMA, _DISTRIBUTION_TASK, 2000, 600),
+    Step("snippets", "fast", 40, 3000, 0.4, SNIPPETS_SCHEMA, _SNIPPETS_TASK, 2700, 450),
+    Step("reviewer_notes", "fast", 40, 3000, 0.2, REVIEWER_NOTES_SCHEMA, _REVIEWER_NOTES_TASK, 2900, 500),
     Step("revise_block", "main", 60, 1500, 0.4, REVISION_SCHEMA, _REVISION_TASK, 2800, 400, conditional=True),
 )}
 

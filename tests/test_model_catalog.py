@@ -189,3 +189,39 @@ def test_admin_saves_a_live_catalog_model(live_catalog, monkeypatch):
             fastapi_app.dependency_overrides.pop(get_current_user, None)
         else:
             fastapi_app.dependency_overrides[get_current_user] = prev
+
+
+# Anthropic models deprecated or retired on the Claude API, keyed by their
+# OpenRouter id, with the retirement date (platform.claude.com, "Model
+# deprecations", read 2026-10-28). Add a row when Anthropic announces one.
+DEPRECATED_MODELS = {
+    "anthropic/claude-sonnet-4.5": "2026-11-30",
+    "anthropic/claude-opus-4.1": "2026-08-05",
+    "anthropic/claude-opus-4": "2026-06-15",
+    "anthropic/claude-sonnet-4": "2026-06-15",
+    "anthropic/claude-3.7-sonnet": "2026-02-19",
+    "anthropic/claude-3.5-haiku": "2026-02-19",
+    "anthropic/claude-3-haiku": "2026-04-20",
+}
+
+
+def test_no_default_or_curated_model_is_deprecated():
+    """A default or a curated dropdown entry on a retiring model breaks every
+    agent that inherits it on retirement day (Sonnet 4.5 was the fast-slot
+    default until 2026-10-28). Curated entries are offered even after
+    OpenRouter drops a model, so they must not name one either."""
+    from app.config import Settings
+    from app.services import agent_config
+
+    defaults = {name: field.default for name, field in Settings.model_fields.items()
+                if name.endswith("_model") or name.endswith("_model_hero")}
+    stale = {name: mid for name, mid in defaults.items() if mid in DEPRECATED_MODELS}
+    assert not stale, f"settings defaults on deprecated models: {stale}"
+    curated = {str(m["id"]) for options in agent_config.MODEL_CATALOG.values() for m in options}
+    assert not curated & set(DEPRECATED_MODELS)
+
+
+def test_fast_slot_default_is_sonnet_5_5():
+    from app.config import Settings
+
+    assert Settings.model_fields["openrouter_fast_model"].default == "anthropic/claude-sonnet-5.5"

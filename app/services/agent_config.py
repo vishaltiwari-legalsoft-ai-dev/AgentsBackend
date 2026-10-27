@@ -89,10 +89,10 @@ TEXT_MODELS: list[dict[str, str | bool]] = [
         "recommended": True,
     },
     {
-        "id": "anthropic/claude-sonnet-4.5",
-        "name": "Claude Sonnet 4.5",
+        "id": "anthropic/claude-sonnet-5.5",
+        "name": "Claude Sonnet 5.5",
         "provider": "Anthropic",
-        "description": "Fast, capable all-rounder. Great default for cheaper tasks.",
+        "description": "Fast, capable all-rounder; the fast-slot default. Replaces Sonnet 4.5 (retires 2026-11-30).",
     },
     {
         "id": "anthropic/claude-haiku-4.5",
@@ -129,8 +129,8 @@ VISION_MODELS: list[dict[str, str | bool]] = [
         "description": "Higher-accuracy image understanding.",
     },
     {
-        "id": "anthropic/claude-sonnet-4.5",
-        "name": "Claude Sonnet 4.5",
+        "id": "anthropic/claude-sonnet-5.5",
+        "name": "Claude Sonnet 5.5",
         "provider": "Anthropic",
         "description": "Multimodal reading with strong reasoning.",
     },
@@ -216,8 +216,7 @@ AGENTS: list[dict[str, str | bool | list[str]]] = [
         "live": True,
         # One classification call per email through
         # inbox_triage_agent.summarise (agent_id="a12") — parsing-grade work,
-        # so the fast model is the only dropdown. Default
-        # anthropic/claude-haiku-4.5 is in TEXT_MODELS above.
+        # so the fast model is the only dropdown.
         "fields": ["openrouter_fast_model"],
     },
     {

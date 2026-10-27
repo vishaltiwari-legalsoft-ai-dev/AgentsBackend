@@ -1018,6 +1018,11 @@ def test_a_missing_preview_says_why_in_a_code_the_console_can_act_on(
     assert (failed["preview_unavailable_code"], failed["preview_unavailable_reason"]) == (
         "template_failed", "it broke")
     monkeypatch.undo()
+    # undo() also drops the fixture's MR_RUNS_DIR: without it the reading meter
+    # lands in the repo tree and survives between runs, so this test failed with
+    # "rate_limited" after ten suite runs in one UTC day.
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "targets.json"))
     monkeypatch.setenv("MR_VENDOR_REPORT", "1")
     monkeypatch.setenv("MR_REPORT_TEMPLATES", "1")
     monkeypatch.setattr(tx, "extract_layout", lambda data, kind, **kw: _reading())
@@ -1032,6 +1037,8 @@ def test_a_missing_preview_says_why_in_a_code_the_console_can_act_on(
     assert down["preview_unavailable_code"] == "store_unavailable" and down["layout"]
 
     monkeypatch.undo()
+    monkeypatch.setenv("MR_RUNS_DIR", str(tmp_path))
+    monkeypatch.setenv("MR_TARGETS_FILE", str(tmp_path / "targets.json"))
     monkeypatch.setenv("MR_VENDOR_REPORT", "1")
     monkeypatch.setenv("MR_REPORT_TEMPLATES", "1")
     empty = tmp_path / "no-snaps"

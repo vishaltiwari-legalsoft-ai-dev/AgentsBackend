@@ -23,6 +23,15 @@ def test_every_step_fits_the_relay_even_when_every_attempt_times_out(step):
     assert step.slot in ("main", "fast")
 
 
+@pytest.mark.parametrize("step", [s for s in (*prompts.STEPS.values(), escalation.SCREEN_STEP) if s.slot == "fast"],
+                         ids=lambda s: s.name)
+def test_fast_steps_leave_room_for_tokenizer_and_thinking(step):
+    """Sonnet 5.5 (fast slot since 2026-10-28) counts ~1.4x the tokens for the
+    same text and spends any thinking from max_tokens; a cut-off step fails
+    the user's run (snippets did, at 1200, in the live eval)."""
+    assert step.max_tokens >= 4 * step.est_output_tokens
+
+
 def test_sequence_names_real_steps():
     for name in prompts.SEQUENCE:
         assert name in prompts.STEPS or name == "screen"

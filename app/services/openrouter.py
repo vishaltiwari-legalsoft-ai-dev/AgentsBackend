@@ -56,6 +56,9 @@ def get_llm(
     call, ~70 tokens back, inside a cron fire): the 120s default is right for
     a long reasoning turn and wrong for a classifier, where two hung calls
     would eat the whole fire. Both keep the previous behaviour when omitted.
+
+    On the fast slot, a model that reasons on every call gets the configured
+    low reasoning effort (see :func:`fast_reasoning_body`).
     """
     resolved = model or runtime_config.get_for_agent(
         agent_id, "openrouter_fast_model" if fast else "openrouter_model"
@@ -69,7 +72,30 @@ def get_llm(
         timeout=timeout,
         max_retries=2,
         max_tokens=max_tokens,
+        extra_body=fast_reasoning_body(resolved) if fast else None,
     )
+
+
+# Claude 5-family models think on every call unless told otherwise (OpenRouter
+# lists reasoning as mandatory on Sonnet 5.5 and on by default on the rest),
+# and thinking tokens count against ``max_tokens``. On the fast slot that cost
+# a real failure: measured 2026-10-28, Sonnet 5.5 at its default effort spent
+# 300 thinking tokens on a PR Writer escalation screen capped at 400 and was
+# cut off. At effort "low" the same 72 fast-slot calls used no thinking tokens,
+# p50 2.0 s (vs 2.1 s), max 7.7 s (vs 13.4 s), and none was cut off. Older
+# models are left alone: sending an effort to them would turn thinking ON.
+_THINKS_BY_DEFAULT = re.compile(r"^anthropic/claude-(?:opus|sonnet|haiku|fable|mythos)-5\b")
+
+
+def fast_reasoning_body(model_id: str) -> dict | None:
+    """The OpenRouter request extras for a fast-slot call on ``model_id``:
+    ``{"reasoning": {"effort": ...}}`` for a model that thinks by default,
+    else ``None`` (request unchanged). Env: OPENROUTER_FAST_REASONING_EFFORT;
+    empty sends nothing."""
+    effort = (settings.openrouter_fast_reasoning_effort or "").strip()
+    if not effort or not _THINKS_BY_DEFAULT.match(model_id or ""):
+        return None
+    return {"reasoning": {"effort": effort}}
 
 
 # Models known to accept a "4K" image_size. Everything else tops out at 2K —
