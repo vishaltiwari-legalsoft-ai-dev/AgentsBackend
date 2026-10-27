@@ -228,6 +228,12 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("GET", "/api/blog/brands"): (SHARED_CATALOG, INTERNAL_ONLY),
     ("GET", "/api/blog/brands/{brand_id}/inventory"): (SHARED_CATALOG, INTERNAL_ONLY),
     ("GET", "/api/blog/brands/{brand_id}/voice"): (SHARED_CATALOG, INTERNAL_ONLY),
+    # PR Writer (a13), 2026-10-27: the brand list (the seo_geo registry plus
+    # whether each brand has a card) and one brand's card. Team reference data
+    # keyed on the seo_geo brand id — there is no third brand registry. The
+    # card's WRITE is counted under WORKSPACE_SHARED below.
+    ("GET", "/api/pr/brands"): (SHARED_CATALOG, INTERNAL_ONLY),
+    ("GET", "/api/pr/brands/{brand_id}/card"): (SHARED_CATALOG, INTERNAL_ONLY),
     ("GET", "/api/brands"): (SHARED_CATALOG, INTERNAL_ONLY),
     ("GET", "/api/brands/{brand_id}"): (SHARED_CATALOG, INTERNAL_ONLY),
     ("GET", "/api/brands/{brand_id}/kit"): (SHARED_CATALOG, INTERNAL_ONLY),
@@ -261,6 +267,34 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("GET", "/api/blog/runs/{run_id}/export"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("POST", "/api/blog/runs/{run_id}/research/step"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("POST", "/api/blog/runs/{run_id}/visuals"): (TENANT_SCOPED, INTERNAL_ONLY),
+    # PR Writer (a13), 2026-10-27. PARTICIPANT-scoped: the caller's rows are
+    # the runs whose ``participants`` list holds the caller's id (owner, the
+    # card's reviewers at creation, fallback admins named by exact address,
+    # people added by the owner or comms lead). Admins are NOT implicit
+    # readers — ADMIN_EMAILS may hold @domain entries and drafts can be
+    # embargoed — so an admin who is not a participant gets the same 404 as a
+    # stranger. Proven in test_pr_writer_cross_tenant.py.
+    ("GET", "/api/pr/runs"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/pr/runs/{run_id}"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/approve"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/blocks/{block_id}/revise"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/claims/{claim_id}/remove"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/claims/{claim_id}/verify"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/clarify"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/escalation/clear"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/escalation/close"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/escalation/keep-paused"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/escalation/notes"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/escalation/withdraw"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/pr/runs/{run_id}/export"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/participants"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/quotes/{quote_id}/approval"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/review"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/signoffs/{row_id}/ask-changes"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/signoffs/{row_id}/sign-off"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("POST", "/api/pr/runs/{run_id}/steps/{step}"): (TENANT_SCOPED, INTERNAL_ONLY),
+    ("GET", "/api/pr/runs/{run_id}/versions/{version}"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("POST", "/api/creative/runs"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("GET", "/api/creative/runs/{run_id}"): (TENANT_SCOPED, INTERNAL_ONLY),
     ("POST", "/api/creative/runs/{run_id}/acknowledge"): (TENANT_SCOPED, INTERNAL_ONLY),
@@ -372,6 +406,15 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     # below now counts them.
     ("POST", "/api/blog/brands/{brand_id}/inventory"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     ("POST", "/api/blog/brands/{brand_id}/voice"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    # PR Writer (a13), 2026-10-27. The card write changes one team-shared
+    # document every member's next draft reads; the role check (the card's
+    # comms lead, or a workspace admin; creating a card is admin-only) is in
+    # the handler. The member list serves internal members' names and e-mails
+    # to every internal member, for the reviewer and "Add people" pickers
+    # (owner decision 2026-10-27). GEO-only accounts are neither listed nor
+    # able to call it.
+    ("PUT", "/api/pr/brands/{brand_id}/card"): (WORKSPACE_SHARED, INTERNAL_ONLY),
+    ("GET", "/api/pr/members"): (WORKSPACE_SHARED, INTERNAL_ONLY),
     # ``GET /api/agents/health`` was entered here on 2026-09-02 for the hub's
     # per-agent rollup — but the endpoint itself never landed in any router
     # (the frontend's ``agentsHealth`` client is equally unconsumed). The entry
@@ -698,7 +741,14 @@ ROUTE_LEDGER: dict[tuple[str, str], tuple[str, str]] = {
 #: callback, gated only by a signed state) to an authenticated one whose state
 #: must also match the caller. The public route is gone, so the anonymous
 #: surface shrank by one as this count grew by one.
-WORKSPACE_SHARED_BASELINE = 90
+#: 90 → 92 on 2026-10-27: PR Writer (a13). ``PUT /api/pr/brands/{id}/card``
+#: writes the one card per seo_geo brand that every member's next draft reads
+#: (edit gated in the handler to the card's comms lead or an admin), and
+#: ``GET /api/pr/members`` lists internal members' names and e-mails for the
+#: reviewer pickers — a real, small widening of who sees colleagues' addresses,
+#: accepted by the owner on 2026-10-27. Both INTERNAL_ONLY. Every run route is
+#: participant-scoped and counted under TENANT_SCOPED, not here.
+WORKSPACE_SHARED_BASELINE = 92
 
 #: The GEO editor surface, BY NAME. Not a count — a count would let a future
 #: route join the role while another left it and say nothing, and the thing

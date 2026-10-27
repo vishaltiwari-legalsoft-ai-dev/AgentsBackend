@@ -33,7 +33,11 @@ def test_every_index_names_a_collection_and_at_least_two_fields(spec):
         assert len(fields) >= 2, f"a single-field index needs no entry: {index}"
         for field in fields:
             assert field.get("fieldPath")
-            assert field.get("order") in ("ASCENDING", "DESCENDING"), field
+            # An array-contains field carries arrayConfig instead of an order.
+            if "arrayConfig" in field:
+                assert field["arrayConfig"] == "CONTAINS" and "order" not in field, field
+            else:
+                assert field.get("order") in ("ASCENDING", "DESCENDING"), field
 
 
 def test_every_index_says_which_query_needs_it(spec):
@@ -65,6 +69,12 @@ def test_the_composites_the_code_requires_today_are_recorded(spec):
     assert _has(spec, "brand_references", "brand_id", "deleted_at", "created_at"), (
         "firestore_repo.list_references needs this one - two equality filters "
         "(brand_id, deleted_at == null) plus an ordering on created_at")
+    assert _has(spec, "pr_runs", "participants", "updated_at"), (
+        "firestore_repo.list_pr_runs needs this one - participants "
+        "array-contains plus an ordering on updated_at DESC")
+    pr = next(i for i in spec["indexes"] if i["collectionGroup"] == "pr_runs")
+    assert pr["fields"][0].get("arrayConfig") == "CONTAINS"
+    assert pr["fields"][1].get("order") == "DESCENDING"
 
 
 def test_the_mr_read_path_queries_stayed_index_free():

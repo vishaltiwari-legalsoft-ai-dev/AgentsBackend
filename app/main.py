@@ -29,6 +29,7 @@ from app.routers import (
     issues,
     library,
     marketing_research,
+    pr_writer,
     reference_library,
     runs,
     seo_geo,
@@ -153,6 +154,7 @@ for router in (
     runs,
     issues,
     inbox,
+    pr_writer,
 ):
     # The audience wall goes on at INCLUDE time, for every router, which is the
     # only placement where a route added tomorrow is walled off by default. Per

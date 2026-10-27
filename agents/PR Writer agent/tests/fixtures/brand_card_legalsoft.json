@@ -1,0 +1,34 @@
+{
+  "_comment": "TEST FIXTURE. Public facts from the blueprint (legalsoft.com); boilerplate, contact and approval data are placeholders for tests, not approved copy.",
+  "brand_id": "legalsoft",
+  "legal_name": "Legal Soft",
+  "short_name": "Legal Soft",
+  "website": "https://legalsoft.com",
+  "newsroom_url": "https://legalsoft.com/news",
+  "dateline": {"city": "Woodland Hills", "state": "Calif.", "hq": "21731 Ventura Blvd., Suite 100, Woodland Hills, California"},
+  "boilerplate": {
+    "text": "Legal Soft is a law-firm growth company offering virtual legal staffing, including paralegals, case managers, intake specialists, demand writers, lien negotiators and remote attorneys, plus a platform that helps firms grow. The company is headquartered in Woodland Hills, California. Learn more at legalsoft.com.",
+    "approved_at": "2026-10-01",
+    "approver": "Comms Lead (fixture)"
+  },
+  "mission": "Help law firms grow without compromising their professional obligations.",
+  "positioning": "Virtual legal staffing and growth solutions for law firms",
+  "key_messages": [
+    "Firms add trained capacity without adding overhead.",
+    "Staff work under attorney supervision; lawyers practice law.",
+    "Confidentiality and compliance come first."
+  ],
+  "proof_points": [
+    {"text": "Legal Soft runs a HIPAA-compliant virtual assistant program", "source": "legalsoft.com/partners", "url": "https://legalsoft.com/partners", "date": "2026-09-15"}
+  ],
+  "spokespeople": [
+    {"name": "Hamid Kohan", "title": "Founder", "topics": ["law firm growth", "legal staffing"], "quote_style": "practical, growth-minded", "approval_contact": "Comms Lead (fixture)"}
+  ],
+  "products": ["Legal Soft"],
+  "avoid": ["world-class", "unmatched"],
+  "competitor_policy": "Do not name competitors without legal approval.",
+  "media_contact": {"name": "Comms Lead (fixture)", "title": "Communications Lead", "email": "press@example.com", "phone": "555-0100"},
+  "keywords": ["virtual paralegal", "legal staffing", "law firm growth", "legal intake"],
+  "voice_notes": "Practical, growth-minded, ROI-focused. Peer-to-peer with firm owners.",
+  "audience": "Law firm owners and managing partners, from solo to enterprise"
+}

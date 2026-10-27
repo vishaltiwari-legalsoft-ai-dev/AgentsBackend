@@ -45,6 +45,7 @@ _AGENT_MARKERS = (
     ("agents/final geo agent", "geo"),
     ("agents/blog writer agent", "blog"),
     ("agents/inbox triage agent", "inbox"),
+    ("agents/pr writer agent", "pr"),
 )
 
 
