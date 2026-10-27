@@ -1,16 +1,24 @@
-"""SVG logo rasterization must work without the native cairo library.
+"""SVG logo rasterization: cairosvg, or an honest None.
 
-Regression: on hosts without libcairo (most Windows boxes), ``import
-cairocffi`` raises OSError, which knocked out BOTH renderers — cairosvg
-directly, and the svglib fallback indirectly (reportlab's renderPM imports
-rlPyCairo, whose ``except ImportError`` guard doesn't catch cairocffi's
-OSError, so it never fell back to the self-contained pycairo wheel). Stage 4
-then had no logo at all and returned 400. ``app.services.imaging`` now poisons
-the broken cairocffi module so rlPyCairo lands on pycairo.
+The Cloud Run image (python:3.12-slim + libcairo2, see the Dockerfile) renders
+SVG logos with cairosvg. There is no second renderer any more: reportlab >= 5.1
+made renderPM cairo-only (it needs rlPyCairo, which neither the image nor
+constraints.txt carries), so the svglib fallback in ``app.services.imaging``
+can only ever paint on a host that has cairo anyway. The contract pinned here
+is therefore two-sided: with cairo an SVG becomes a real PNG; without it,
+``to_png_logo`` returns None and logs the file name — never a blank or
+fabricated image, because Stage 4 must know it has no logo rather than
+composite a white box and call it the brand mark.
+
+History: on hosts without libcairo ``import cairocffi`` raises OSError, not
+ImportError, which once took the svglib path down with it; ``imaging`` still
+poisons the broken module so the fallback is at least reached.
 """
 
 import io
+import logging
 
+import pytest
 from PIL import Image
 
 from app.services import imaging
@@ -25,12 +33,54 @@ _SVG = (
 )
 
 
-def test_svg_logo_rasterizes_to_png_without_native_cairo():
+def _native_cairo_available() -> bool:
+    """cairosvg imported AND its native library loads (the dlopen is what fails
+    on a Windows box without libcairo-2.dll; ``imaging`` turns that into a
+    poisoned ``cairocffi`` entry, so the import below raises either way)."""
+    if imaging._cairosvg is None:
+        return False
+    try:
+        import cairocffi  # noqa: F401
+    except Exception:  # noqa: BLE001 - OSError (missing DLL) or the poisoned ImportError
+        return False
+    return True
+
+
+def _rlpycairo_available() -> bool:
+    try:
+        import rlPyCairo  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+@pytest.mark.skipif(
+    not _native_cairo_available(),
+    reason="native libcairo is absent on this host; the prod image installs libcairo2 "
+           "(Dockerfile) and takes this path",
+)
+def test_svg_logo_rasterizes_to_png_with_cairosvg():
     png = imaging.to_png_logo(_SVG, file_name="logo.svg", mime="image/svg+xml")
-    assert png is not None, "SVG logo rasterization returned None"
+    assert png is not None, "SVG logo rasterization returned None with cairo present"
     img = Image.open(io.BytesIO(png))
     assert img.format == "PNG"
     assert img.size[0] > 0 and img.size[1] > 0
+
+
+@pytest.mark.skipif(
+    _rlpycairo_available(),
+    reason="this host has rlPyCairo, so reportlab's renderPM could paint the svglib "
+           "fallback; the prod image (constraints.txt) has no rlPyCairo",
+)
+def test_svg_logo_without_cairo_is_an_honest_none_not_a_fake_png(monkeypatch, caplog):
+    # Force the no-cairo path whatever this host has: cairosvg absent, and the
+    # only remaining renderer (reportlab >= 5.1 renderPM) is cairo-only.
+    monkeypatch.setattr(imaging, "_cairosvg", None)
+    with caplog.at_level(logging.WARNING, logger="agentos.imaging"):
+        png = imaging.to_png_logo(_SVG, file_name="logo.svg", mime="image/svg+xml")
+    assert png is None, "no renderer available must be None, not a fabricated image"
+    assert any("logo.svg" in r.getMessage() for r in caplog.records), \
+        "the failure must be logged with the file name so the 400 upstream is traceable"
 
 
 def test_raster_logo_normalizes_to_png():

@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app as fastapi_app
+from app.routers import geo as geo_router
 from app.routers.geo import MIN_BRAND_SECONDS
 from final_geo_agent import geo_engines, geo_poll
 from seo_geo_agent import insights
@@ -225,11 +226,39 @@ def test_brands_are_swept_stalest_first(client, monkeypatch, three_brands):
     assert order == ["never", "stale", "fresh"]
 
 
-def test_each_brand_gets_what_is_left_not_a_fixed_slice(client, monkeypatch, three_brands):
+class _Clock:
+    """A stand-in for the router's ``time`` module whose ``monotonic()`` moves
+    only when a test says so. The budget loop reads the clock once per brand;
+    on a coarse OS timer (CPython 3.12 on Windows ticks every ~16 ms) every
+    read inside one request returns the same value, so a test that relies on
+    wall-clock passing between brands asserts the timer, not the loop."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+    def __getattr__(self, name):          # anything else the router wants: the real module
+        return getattr(time, name)
+
+
+@pytest.fixture()
+def clock(monkeypatch) -> _Clock:
+    fake = _Clock()
+    monkeypatch.setattr(geo_router, "time", fake)
+    return fake
+
+
+def test_each_brand_gets_what_is_left_not_a_fixed_slice(client, monkeypatch, three_brands, clock):
     budgets: list[float] = []
 
     def slow(brand, **kwargs):
         budgets.append(kwargs["budget_seconds"])
+        clock.advance(10.0)                # each sweep costs 10 s of the shared budget
         return {"brand_id": brand["id"], "done": 9, "total": 9, "completed": True}
 
     monkeypatch.setattr(geo_poll, "poll_until_done", slow)
@@ -237,22 +266,21 @@ def test_each_brand_gets_what_is_left_not_a_fixed_slice(client, monkeypatch, thr
 
     client.post("/api/geo/cron/poll", headers={"x-cron-key": CRON_KEY})
 
-    # three brands must not be promised 300s each — that is 900s inside a request
-    # the platform kills at its timeout
-    assert budgets[0] <= 300
-    assert budgets == sorted(budgets, reverse=True)
-    assert sum(budgets) < 900
+    # three brands must not be promised 300 s each — that is 900 s inside a request
+    # the platform kills at its timeout. Each one is handed exactly what the
+    # previous sweeps left of the ONE budget.
+    assert budgets == [300.0, 290.0, 280.0]
 
 
 def test_brands_the_clock_never_reached_are_named_not_silently_skipped(
-    client, monkeypatch, three_brands
+    client, monkeypatch, three_brands, clock
 ):
     # budget leaves room for exactly one brand: the floor is MIN_BRAND_SECONDS,
-    # and the first brand burns just enough wall clock to drop below it
+    # and the first brand burns just enough of the clock to drop below it
     monkeypatch.setenv("GEO_CRON_BUDGET_SECONDS", str(MIN_BRAND_SECONDS + 0.05))
 
     def burn_the_clock(brand, **kwargs):
-        time.sleep(0.1)
+        clock.advance(0.1)
         return {"brand_id": brand["id"], "done": 1, "total": 9, "completed": False}
 
     monkeypatch.setattr(geo_poll, "poll_until_done", burn_the_clock)

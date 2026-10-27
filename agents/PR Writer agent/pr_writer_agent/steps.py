@@ -64,6 +64,13 @@ def _grounded(excerpt: str, sentence: str, pasted: str) -> str | None:
     return None
 
 
+def _restates(excerpt: str, sentence: str) -> bool:
+    """Whether an excerpt taken from the user sentence is most of it (≥ 80%),
+    i.e. the news itself rather than a supporting fact inside it."""
+    e, s = _norm(excerpt).rstrip("."), _norm(sentence).rstrip(".")
+    return bool(e) and bool(s) and e in s and len(e) >= 0.8 * len(s)
+
+
 def _empty(value) -> bool:
     return value in (None, "", [], {})
 
@@ -108,6 +115,11 @@ def merge_intake(sentence: str, stated: dict, pasted: str, model_fields: dict) -
             where = _grounded(raw.get("excerpt", ""), sentence, pasted)
             if where is None:
                 notes.append(f"{name}: dropped {raw.get(key)!r} — not found in the sentence or pasted text")
+                continue
+            if name == "key_facts" and where == "stated" and _restates(raw.get("excerpt", ""), sentence):
+                # The news sentence is already the brief's first evidence item;
+                # counted again as a "key fact" it hid that none was given.
+                notes.append("key_facts: dropped a fact that only restates the news sentence")
                 continue
             if _norm(raw.get(key)) in seen:
                 continue
@@ -253,6 +265,21 @@ def _release_line(model_line: str, intake: dict, ct: cts.ContentType, notes: lis
     return line or ("MEDIA ADVISORY" if ct.id == "media_advisory" else "FOR IMMEDIATE RELEASE")
 
 
+def _miss(text: str, bounds: tuple[int, int] | None) -> int:
+    """How many characters ``text`` is outside ``bounds`` (0 = inside)."""
+    if not bounds:
+        return 0
+    n = len((text or "").strip())
+    return max(bounds[0] - n, n - bounds[1], 0)
+
+
+def _best_option(options: list[dict], bounds: tuple[int, int] | None) -> str:
+    """The model's first option that fits the anatomy, else its closest one.
+    Models rank well but count characters badly: the top headline was 67
+    characters for a 70-100 rule while the second fit (live eval 2026-10-28)."""
+    return min(options, key=lambda o: _miss(o["text"], bounds))["text"]
+
+
 def finalize_draft(payload: dict, ct: cts.ContentType, card: dict, intake: dict,
                    evidence: list[dict], speakers: list[dict]) -> dict:
     c = ev.normalize_card(card)
@@ -260,6 +287,7 @@ def finalize_draft(payload: dict, ct: cts.ContentType, card: dict, intake: dict,
     sp_ids = {s["id"] for s in speakers}
     notes: list[str] = []
     blocks = []
+    allowed = set(ct.allowed_kinds())
     for n, raw in enumerate(payload["blocks"], start=1):
         text, dropped = ev.drop_unknown_cites(raw["text"], known)
         if dropped:
@@ -268,7 +296,16 @@ def finalize_draft(payload: dict, ct: cts.ContentType, card: dict, intake: dict,
         if raw["kind"] == "quote" and speaker not in sp_ids:
             notes.append(f"b{n}: quote attributed to unknown speaker {speaker!r} — left unattributed")
             speaker = None
-        blocks.append({"id": f"b{n}", "kind": raw["kind"], "text": text, "speaker_id": speaker, "history": []})
+        if raw["kind"] not in allowed and raw["kind"] != "quote" and blocks and blocks[-1]["kind"] != "quote":
+            # A prose block of a kind this type does not have (a "cta" in a media
+            # advisory, live eval 2026-10-28) keeps its words in the block before
+            # it instead of failing QA on structure, which no rewrite can fix.
+            blocks[-1]["text"] = f"{blocks[-1]['text'].rstrip()} {text.strip()}"
+            notes.append(f"a {raw['kind']!r} block is not part of a {ct.label.lower()}; "
+                         f"its text was added to {blocks[-1]['id']}")
+            continue
+        blocks.append({"id": f"b{len(blocks) + 1}", "kind": raw["kind"], "text": text, "speaker_id": speaker,
+                       "history": []})
 
     options = [{"text": o["text"].strip(), "rationale": o["rationale"], "chars": len(o["text"].strip())}
                for o in payload["headline_options"]]
@@ -279,9 +316,9 @@ def finalize_draft(payload: dict, ct: cts.ContentType, card: dict, intake: dict,
         "content_type": ct.id,
         "brand_short_name": c["short_name"],
         "release_line": _release_line(payload["release_line"], intake, ct, notes),
-        "headline": options[0]["text"],
+        "headline": _best_option(options, ct.headline_chars),
         "headline_options": options,
-        "subhead": subs[0]["text"] if (subs and ct.subhead_chars) else "",
+        "subhead": _best_option(subs, ct.subhead_chars) if (subs and ct.subhead_chars) else "",
         "subhead_options": subs if ct.subhead_chars else [],
         "dateline": render.dateline(c, timing.get("release_date") if isinstance(timing, dict) else None)
         if ct.dateline else "",
@@ -354,7 +391,18 @@ def run_qa_fix(draft: dict, card: dict, evidence: list[dict], *, primary_keyword
         f"BLOCKS:\n{json.dumps(blocks, ensure_ascii=False, indent=1)}\n\n"
         f"EVIDENCE IDS: {', '.join(ev.index(evidence))}"
     )
-    result = pr_llm.call_json(step, step.system(), user, invoke=invoke)
+    try:
+        result = pr_llm.call_json(step, step.system(), user, invoke=invoke)
+    except (pr_llm.LLMTruncated, pr_llm.LLMOutputInvalid) as exc:
+        # The draft is already complete and checked; a rewrite that ran past its
+        # cap or came back malformed leaves it as written, its findings still
+        # listed for the reviewer. Failing the step instead stranded the run: the
+        # retry repeats the same rewrite (live eval 2026-10-28, b09). A provider
+        # outage (LLMUnavailable) still fails loudly.
+        draft.setdefault("notes", []).append(
+            f"QA fix not applied ({type(exc).__name__}): the draft is shown as written, with its findings")
+        draft["usage"] = {"calls": 0}
+        return draft
     payload, known, notes = result.payload, set(ev.index(evidence)), draft.setdefault("notes", [])
     by_id = {b["id"]: b for b in draft["blocks"]}
     for edit in payload["blocks"]:
@@ -370,9 +418,13 @@ def run_qa_fix(draft: dict, card: dict, evidence: list[dict], *, primary_keyword
         if text != block["text"]:
             block["history"].append(block["text"])
             block["text"] = text
-    if payload.get("headline"):
+    # A rewrite replaces the headline/subhead only if it fits the anatomy at
+    # least as well; a fix that misses by more is a regression, not a fix.
+    if payload.get("headline") and _miss(payload["headline"], ct.headline_chars) <= _miss(
+            draft["headline"], ct.headline_chars):
         draft["headline"] = payload["headline"].strip()
-    if payload.get("subhead") and ct.subhead_chars:
+    if payload.get("subhead") and ct.subhead_chars and _miss(payload["subhead"], ct.subhead_chars) <= _miss(
+            draft.get("subhead", ""), ct.subhead_chars):
         draft["subhead"] = payload["subhead"].strip()
     for u in payload.get("unfixable", []):
         notes.append(f"not fixable without new facts — {u['check']}: {u['why']}")

@@ -603,8 +603,20 @@ def test_no_draft_text_reaches_the_activity_trail_but_model_spend_does(world, as
     trail = [r for r in rows if r.get("agent_id") == "a13" and "usage" in r]
     created = next(r for r in trail if r["action"] == "run_created")
     assert created["usage"]["calls"] == 2 and created["usage"]["models"] == ["fake"]
-    assert created["usage"]["cost_usd"] is None  # not reported by the adapter; never guessed
+    assert created["usage"]["cost_usd"] is None  # the fake reports no provider cost; never guessed
     assert set(created["usage"]) == {"calls", "input_tokens", "output_tokens", "cost_usd", "models"}
+
+
+def test_the_trail_carries_the_provider_reported_cost(world, as_caller):
+    """cost_usd on the trail is OpenRouter's usage.cost summed over the
+    request's calls (intake + screen here), not a price-table estimate."""
+    db, model = world
+    model.cost_usd = 0.0125
+    _create(as_caller)
+    trail = [r for r in _trail_rows(db) if r.get("agent_id") == "a13" and "usage" in r]
+    created = next(r for r in trail if r["action"] == "run_created")
+    assert created["usage"]["calls"] == 2
+    assert created["usage"]["cost_usd"] == pytest.approx(0.025)
 
 
 def test_clarify_answers_are_screened_like_the_brief(world, as_caller):
@@ -772,3 +784,369 @@ def test_a_placeholder_speakers_quote_marker_is_one_marker(world, as_caller):
     inside = [m for m in run["draft"]["markers"] if m["block_id"] == quote_block["id"] and m["kind"] == "verify"
               and quote_block["text"].find(m["token"], start) >= start]
     assert all(quote_block["text"].index(m["token"]) < start for m in inside)  # no marker overlaps the quote chip
+
+
+# --------------------------------------------------------------------------- #
+# Card suggestions from the brand's own website — POST …/card/suggest
+# --------------------------------------------------------------------------- #
+# A self-contained fake world: the brand's site as a dict of pages, a Serper
+# answer with one off-domain and one dead hit, and a one-call model fake whose
+# payload mixes supported items with invented ones. Nothing here reaches the
+# network, a model or Firestore (memory store from ``install``).
+
+import copy  # noqa: E402
+import json  # noqa: E402
+
+from app.routers.tests.pr_writer_fakes import BRAND  # noqa: E402
+from pr_writer_agent import cards  # noqa: E402
+
+SITE = {
+    "https://legalsoft.com/": {
+        "title": "Legal Soft | Virtual legal staffing",
+        "text": ("Legal Soft provides virtual legal assistants and a law firm answering service to law firms across "
+                 "the United States. Our mission is to help law firms grow without adding overhead. Founded in 2008, "
+                 "Legal Soft supports more than 1,200 law firms. Products: Virtual Paralegal and Intake Pro.")},
+    "https://legalsoft.com/about": {
+        "title": "About Legal Soft",
+        "text": ("About Legal Soft. Legal Soft LLC is headquartered in Woodland Hills, California. Legal Soft helps "
+                 "law firms grow with trained virtual staff under attorney supervision. Hamid Kohan, Founder and "
+                 "CEO, leads the company's growth and legal technology strategy.")},
+    "https://legalsoft.com/press": {
+        "title": "Newsroom",
+        "text": ("Newsroom. Press and media inquiries: press@legalsoft.com. Download the media kit at "
+                 "https://legalsoft.com/media-kit.pdf.")},
+    "https://legalsoft.com/contact": {
+        "title": "Contact",
+        "text": "Contact sales at sales@legalsoft.com or call (818) 555-0100."},
+    "https://legalsoft.com/careers": {"title": "Careers", "text": ""},  # loads empty: skipped
+}
+SUGGEST_MARKER = "Brand card suggestions"
+
+
+def _site_fetch(calls: list[str]):
+    def fetch(url: str) -> dict:
+        calls.append(url)
+        page = SITE.get(url)
+        if page is None:
+            raise RuntimeError("dead page")
+        return {"url": url, **page}
+    return fetch
+
+
+def _site_search(_q: str) -> dict:
+    return {"organic": [{"link": "https://legalsoft.com/about"}, {"link": "https://example.org/not-ours"},
+                        {"link": "https://legalsoft.com/careers"}]}
+
+
+class SuggestModel:
+    """The one extraction call. ``invent`` makes every item unsupported."""
+
+    def __init__(self, invent: bool = False, fail: BaseException | None = None):
+        self.invent, self.fail, self.prompts = invent, fail, []
+
+    def __call__(self, system: str, user: str, *, slot: str, timeout_s: float, max_tokens: int,
+                 temperature: float) -> pr_llm.Reply:
+        assert SUGGEST_MARKER in system, "not the card-suggest prompt"
+        assert slot == "fast"
+        self.prompts.append(user)
+        if self.fail is not None:
+            raise self.fail
+        ids = {m.group(2): m.group(1) for m in re.finditer(r"PAGE (pg-\d+) — (\S+)", user)}
+
+        def pg(url: str) -> list[dict]:
+            return [{"page_id": ids.get(url, "pg-9"), "quote": SITE.get(url, {}).get("text", "")[:60]}]
+
+        home, about, press, contact = (f"https://legalsoft.com/{p}" for p in ("", "about", "press", "contact"))
+        if self.invent:
+            payload = {
+                "identity": {"legal_name": "LegalSoft Global Inc.", "short_name": "", "hq_city": "Austin",
+                             "hq_state": "Texas", "newsroom_url": "https://legalsoft.com/blog", "evidence": pg(about)},
+                "boilerplate": {"text": "A leading AI-first legal outsourcer serving Europe and Asia.",
+                                "evidence": pg(home)},
+                "messaging": None, "proof_points": [], "spokespeople": [], "product_names": [], "avoid": None,
+                "media_contact": {"name": "", "title": "", "email": "sales@legalsoft.com", "phone": "",
+                                  "evidence": pg(contact)},
+                "press_kit": [{"label": "Logos", "url": "https://legalsoft.com/logos.zip", "evidence": pg(press)}],
+                "keywords": [{"keyword": "offshore bookkeeping", "evidence": pg(home)}],
+                "injection_notes": [],
+            }
+        else:
+            payload = {
+                "identity": {"legal_name": "Legal Soft LLC", "short_name": "Legal Soft", "hq_city": "Woodland Hills",
+                             "hq_state": "California", "newsroom_url": press, "evidence": pg(about)},
+                "boilerplate": {"text": "Legal Soft helps law firms grow with trained virtual staff under attorney "
+                                        "supervision.", "evidence": pg(about)},
+                "messaging": {"mission": "Help law firms grow without adding overhead",
+                              "positioning": "The leading AI-first legal outsourcer in Europe",
+                              "key_messages": ["Trained virtual staff under attorney supervision"],
+                              "evidence": pg(home) + pg(about)},
+                "proof_points": [
+                    {"claim": "Founded in 2008, Legal Soft supports more than 1,200 law firms", "date": "2008",
+                     "evidence": pg(home)},
+                    {"claim": "Named best legal staffing company by Forbes in 2025", "date": "2025",
+                     "evidence": pg(home)}],
+                "spokespeople": [
+                    {"name": "Hamid Kohan", "title": "Founder and CEO", "topics": "legal technology strategy",
+                     "evidence": pg(about)},
+                    {"name": "Jane Doe", "title": "Chief Marketing Officer", "topics": "", "evidence": pg(about)}],
+                "product_names": [{"name": "Virtual Paralegal", "evidence": pg(home)},
+                                  {"name": "Intake Pro", "evidence": pg(home)},
+                                  {"name": "LegalGPT", "evidence": pg(home)}],
+                "avoid": None,
+                "media_contact": {"name": "", "title": "", "email": "press@legalsoft.com", "phone": "",
+                                  "evidence": pg(press)},
+                "press_kit": [{"label": "Media kit", "url": "https://legalsoft.com/media-kit.pdf",
+                               "evidence": pg(press)},
+                              {"label": "Logos", "url": "https://legalsoft.com/logos.zip", "evidence": pg(press)}],
+                "keywords": [{"keyword": "virtual legal assistants", "evidence": pg(home)},
+                             {"keyword": "robotic process automation", "evidence": pg(home)}],
+                "injection_notes": [],
+            }
+        return pr_llm.Reply(text=json.dumps(payload), finish_reason="stop", model="fake")
+
+
+@pytest.fixture()
+def site(world, monkeypatch):
+    """The PR world plus the brand's website, search and the suggest model."""
+    from app.services import pr_writer as svc
+    from seo_geo_agent import insights
+
+    db, _ = world
+    fetched: list[str] = []
+    model = SuggestModel()
+    monkeypatch.setattr(insights, "list_brands", lambda: [dict(BRAND, seeds=["law firm answering service",
+                                                                               "offshore bookkeeping"])])
+    monkeypatch.setattr(svc, "SEARCH", _site_search)
+    monkeypatch.setattr(svc, "FETCH", _site_fetch(fetched))
+    monkeypatch.setattr(svc, "SITEMAP", lambda domain: [])
+    monkeypatch.setattr(svc, "INVOKE_BASE", model)
+    return db, model, fetched
+
+
+def _cards_snapshot(db) -> dict:
+    return copy.deepcopy({k: v for k, v in db.docs.items() if k.startswith("brand_cards/")})
+
+
+def test_card_suggestions_come_only_from_pages_actually_read(site, as_caller):
+    db, model, fetched = site
+    before = _cards_snapshot(db)
+    _as(as_caller, ADMIN)
+    r = client.post("/api/pr/brands/legalsoft/card/suggest", json={})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert set(out) == {"brand_id", "generated_at", "read_pages", "suggestions"} and out["brand_id"] == "legalsoft"
+    read = [p["url"] for p in out["read_pages"]]
+    assert read == ["https://legalsoft.com/", "https://legalsoft.com/about", "https://legalsoft.com/press",
+                    "https://legalsoft.com/contact"]  # probe order; the dead and off-domain hits never appear
+    assert out["read_pages"][1]["title"] == "About Legal Soft"
+    assert "https://example.org/not-ours" not in fetched  # off-domain Serper hit never fetched
+    assert len(model.prompts) == 1  # ONE extraction call
+    assert '<untrusted kind="web_page" id="pg-1">' in model.prompts[0] and "example.org" not in model.prompts[0]
+
+    s = out["suggestions"]
+    assert "reviewers" not in s and set(s) <= set(cards.SECTIONS) - {"reviewers"}
+    for section in s.values():
+        assert set(section) == {"value", "sources", "confidence", "note"}
+        assert section["confidence"] in ("high", "medium", "low")
+        assert section["sources"] and set(section["sources"]) <= set(read), section
+    ident = s["identity"]["value"]
+    assert ident == {"legal_name": "Legal Soft LLC", "short_name": "Legal Soft", "website": "https://legalsoft.com",
+                     "newsroom_url": "https://legalsoft.com/press", "hq_city": "Woodland Hills",
+                     "hq_state": "California", "dateline": "WOODLAND HILLS, Calif."}
+    assert "https://legalsoft.com/about" in s["identity"]["sources"]
+    assert s["boilerplate"]["value"] == {"text": "Legal Soft helps law firms grow with trained virtual staff under "
+                                                 "attorney supervision."}
+    assert s["boilerplate"]["confidence"] == "high" and s["boilerplate"]["sources"] == ["https://legalsoft.com/about"]
+    msg = s["messaging"]["value"]
+    assert msg["mission"] and msg["positioning"] == "" and msg["key_messages"] == [
+        "Trained virtual staff under attorney supervision"]  # the invented positioning line is gone
+    assert s["messaging"]["note"] == "1 of 3 messaging lines left out: not found on the pages read."
+    assert s["proof_points"]["value"] == [{"claim": "Founded in 2008, Legal Soft supports more than 1,200 law firms",
+                                           "source": "https://legalsoft.com/", "date": "2008"}]
+    assert s["proof_points"]["note"] == "1 of 2 proof points left out: not found on the pages read."
+    assert s["spokespeople"]["value"] == [{"name": "Hamid Kohan", "title": "Founder and CEO",
+                                           "topics": "legal technology strategy", "quote_style": "",
+                                           "approval_contact": ""}]
+    assert s["product_names"]["value"] == ["Virtual Paralegal", "Intake Pro"]
+    assert "avoid" not in s  # nothing found -> omitted, never guessed
+    assert s["media_contact"]["value"] == {"name": "", "title": "", "email": "press@legalsoft.com", "phone": ""}
+    assert s["media_contact"]["sources"] == ["https://legalsoft.com/press"]
+    assert s["press_kit"]["value"] == [{"label": "Media kit", "url": "https://legalsoft.com/media-kit.pdf"}]
+    assert s["keywords"]["value"] == ["law firm answering service", "virtual legal assistants"]  # seed on the site first
+    assert _cards_snapshot(db) == before  # a suggestion writes nothing to the card
+    assert client.get("/api/pr/brands/legalsoft/card").json()["revision"] == 1
+    lease = db.docs["pr_leases/card_suggest__legalsoft"]
+    assert lease["holder"] is None and lease["lease_until"] is None  # released
+
+
+def test_card_suggestions_omit_every_section_the_site_does_not_support(site, as_caller, monkeypatch):
+    from app.services import pr_writer as svc
+
+    db, _, _ = site
+    monkeypatch.setattr(svc, "INVOKE_BASE", SuggestModel(invent=True))
+    _as(as_caller, ADMIN)
+    r = client.post("/api/pr/brands/legalsoft/card/suggest", json={})
+    assert r.status_code == 200, r.text
+    s = r.json()["suggestions"]
+    # Only what the pages themselves carry survives: the website (the homepage
+    # was read) and the one seo_geo seed the homepage actually mentions. The
+    # invented legal name, HQ, boilerplate, the SALES contact, the unseen link
+    # and the seed the site never mentions are all dropped — nothing plausible
+    # is kept.
+    assert set(s) == {"identity", "keywords"}
+    assert s["keywords"]["value"] == ["law firm answering service"]
+    assert s["keywords"]["sources"] == ["https://legalsoft.com/"]
+    assert s["identity"]["value"] == {"legal_name": "", "short_name": "", "website": "https://legalsoft.com",
+                                      "newsroom_url": "https://legalsoft.com/press", "hq_city": "", "hq_state": "",
+                                      "dateline": ""}
+
+
+def test_extra_urls_must_be_on_the_brands_own_domain(site, as_caller):
+    db, model, fetched = site
+    _as(as_caller, ADMIN)
+    for bad in ("https://example.org/about", "http://169.254.169.254/latest/meta-data", "ftp://legalsoft.com/x",
+                "https://legalsoft.com.evil.net/", "not a url"):
+        r = client.post("/api/pr/brands/legalsoft/card/suggest", json={"extra_urls": [bad]})
+        assert r.status_code == 422 and _detail(r)["code"] == "invalid", bad
+        assert _detail(r)["field"] == "extra_urls[0]"
+    assert fetched == [] and model.prompts == []  # refused before anything was read or billed
+    r = client.post("/api/pr/brands/legalsoft/card/suggest",
+                    json={"extra_urls": ["https://legalsoft.com/contact", "https://www.legalsoft.com/about"]})
+    assert r.status_code == 200, r.text
+    assert "https://legalsoft.com/contact" in fetched and "https://www.legalsoft.com/about" in fetched
+    assert len([p for p in r.json()["read_pages"] if p["url"].endswith("/contact")]) == 1  # read once, not twice
+    r = client.post("/api/pr/brands/legalsoft/card/suggest", json={"extra_urls": ["https://legalsoft.com/a"] * 6})
+    assert r.status_code == 422 and _detail(r)["code"] == "too_long"
+
+
+def test_card_suggestions_without_search_are_an_honest_424_and_bill_nothing(site, as_caller, monkeypatch):
+    from app.services import pr_writer as svc
+
+    db, model, fetched = site
+
+    def dry(_q):
+        raise SearchUnavailable("serper search failed: 402", why="the search service is out of credits")
+    monkeypatch.setattr(svc, "SEARCH", dry)
+    _as(as_caller, ADMIN)
+    r = client.post("/api/pr/brands/legalsoft/card/suggest", json={})
+    assert r.status_code == 424 and _detail(r)["code"] == "search_unavailable"
+    assert "402" not in _detail(r)["message"] and "serper" not in _detail(r)["message"].lower()
+    assert fetched == [] and model.prompts == []
+    assert db.docs["pr_leases/card_suggest__legalsoft"]["holder"] is None  # released on failure
+    monkeypatch.setattr(svc, "SEARCH", None)  # no key configured at all
+    monkeypatch.setattr("seo_geo_agent.sources.serper_available", lambda: False)
+    r = client.post("/api/pr/brands/legalsoft/card/suggest", json={})
+    assert r.status_code == 424 and _detail(r)["code"] == "credential_missing"
+
+
+@pytest.mark.parametrize("exc, status, code", [
+    (pr_llm.LLMUnavailable("model call failed (fast slot): APIError: boom"), 424, "model_unavailable"),
+    (pr_llm.LLMOutputInvalid("card_suggest: not valid after one repair"), 502, "model_output_invalid"),
+    (pr_llm.LLMTruncated("card_suggest: cut off"), 502, "model_truncated"),
+])
+def test_card_suggestion_model_failures_are_coded_and_change_nothing(site, as_caller, monkeypatch, exc, status, code):
+    from app.services import pr_writer as svc
+
+    db, _, _ = site
+    before = _cards_snapshot(db)
+    monkeypatch.setattr(svc, "INVOKE_BASE", SuggestModel(fail=exc))
+    _as(as_caller, ADMIN)
+    r = client.post("/api/pr/brands/legalsoft/card/suggest", json={})
+    assert r.status_code == status and _detail(r)["code"] == code
+    assert "boom" not in r.text and "wasn't changed" in _detail(r)["message"]
+    assert _cards_snapshot(db) == before
+    assert db.docs["pr_leases/card_suggest__legalsoft"]["holder"] is None
+
+
+def test_card_suggestions_that_run_out_of_time_are_a_504(site, as_caller, monkeypatch):
+    from pr_writer_agent import pipeline
+
+    db, model, _ = site
+    real = pipeline.Deadline
+    monkeypatch.setattr(pipeline, "Deadline", lambda *a, **k: real(1.0))
+    _as(as_caller, ADMIN)
+    r = client.post("/api/pr/brands/legalsoft/card/suggest", json={})
+    assert r.status_code == 504 and _detail(r)["code"] == "model_timeout"
+    assert model.prompts == []  # the model reserve kept the call from starting
+    monkeypatch.setattr(pipeline, "Deadline", real)
+    assert client.post("/api/pr/brands/legalsoft/card/suggest", json={}).status_code == 200
+
+
+def test_card_suggestions_run_one_at_a_time_per_brand(site, as_caller):
+    db, model, fetched = site
+    repo.lease_pr_brand_task("legalsoft", "card_suggest", user_id=COMMS["id"], lease_s=290)
+    _as(as_caller, ADMIN)
+    r = client.post("/api/pr/brands/legalsoft/card/suggest", json={})
+    assert r.status_code == 409 and _detail(r)["code"] == "suggest_running"
+    assert int(r.headers["Retry-After"]) >= 1 and _detail(r)["retry_after_s"] >= 1
+    assert fetched == [] and model.prompts == []  # the second caller is not billed
+    assert repo.release_pr_brand_task("legalsoft", "card_suggest", user_id=ADMIN["id"]) is False  # not the holder
+    assert repo.release_pr_brand_task("legalsoft", "card_suggest", user_id=COMMS["id"]) is True
+    assert client.post("/api/pr/brands/legalsoft/card/suggest", json={}).status_code == 200
+
+
+def test_card_suggestions_are_gated_exactly_like_the_card_put(site, as_caller):
+    db, model, fetched = site
+    _as(as_caller, STRANGER)  # a signed-in member who is neither admin nor the card's comms lead
+    r = client.post("/api/pr/brands/legalsoft/card/suggest", json={})
+    assert r.status_code == 403 and _detail(r)["code"] == "cannot_edit_card"
+    _as(as_caller, LEGAL)  # a reviewer, but not the comms lead
+    assert client.post("/api/pr/brands/legalsoft/card/suggest", json={}).status_code == 403
+    assert fetched == [] and model.prompts == []
+    _as(as_caller, COMMS)  # the card's comms lead edits content, so may ask
+    assert client.post("/api/pr/brands/legalsoft/card/suggest", json={}).status_code == 200
+    _as(as_caller, ADMIN)
+    r = client.post("/api/pr/brands/nope/card/suggest", json={})
+    assert r.status_code == 404 and _detail(r)["code"] == "brand_not_found"
+    assert client.post("/api/pr/brands/legalsoft/card/suggest").status_code == 200  # an empty body is {}
+
+
+def test_a_brand_with_no_card_lets_only_an_admin_ask_for_suggestions(monkeypatch, as_caller):
+    from app.services import pr_writer as svc
+    from seo_geo_agent import insights
+
+    db, _ = install(monkeypatch)  # no card at all
+    monkeypatch.setattr(insights, "list_brands", lambda: [dict(BRAND)])
+    monkeypatch.setattr(svc, "SEARCH", _site_search)
+    monkeypatch.setattr(svc, "FETCH", _site_fetch([]))
+    monkeypatch.setattr(svc, "SITEMAP", lambda domain: [])
+    monkeypatch.setattr(svc, "INVOKE_BASE", SuggestModel())
+    _as(as_caller, COMMS)
+    assert client.post("/api/pr/brands/legalsoft/card/suggest", json={}).status_code == 403
+    _as(as_caller, ADMIN)
+    r = client.post("/api/pr/brands/legalsoft/card/suggest", json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["suggestions"]["identity"]["value"]["legal_name"] == "Legal Soft LLC"
+    assert not any(k.startswith("brand_cards/") for k in db.docs)  # still no card: the person saves via PUT
+    monkeypatch.setattr(insights, "list_brands", lambda: [dict(BRAND, domain="")])
+    r = client.post("/api/pr/brands/legalsoft/card/suggest", json={})
+    assert r.status_code == 422 and _detail(r)["code"] == "brand_domain_missing"
+
+
+def test_a_geo_only_account_cannot_ask_for_card_suggestions(site, monkeypatch):
+    from app.config import settings
+    from app.routers.tests.pr_writer_fakes import person
+    from app.scopes import SCOPE_REFUSED
+    from app.security import create_token
+
+    geo_only = person("geoonly000000000000000000000000x8", "contractor@aivirtual.com")
+    monkeypatch.setattr(settings, "jwt_secret", "test-secret-for-pr-writer-geo-only-wall-0123", raising=False)
+    monkeypatch.setattr(settings, "allowed_emails", geo_only["email"], raising=False)
+    monkeypatch.setattr(settings, "geo_only_emails", geo_only["email"], raising=False)
+    token = create_token(geo_only["id"], geo_only["email"])
+    r = client.post("/api/pr/brands/legalsoft/card/suggest", json={}, headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 403 and r.json()["detail"] == SCOPE_REFUSED
+
+
+def test_card_suggestions_leave_a_fixed_trail_row_with_spend_and_no_page_text(site, as_caller):
+    db, model, _ = site
+    _as(as_caller, ADMIN)
+    assert client.post("/api/pr/brands/legalsoft/card/suggest", json={}).status_code == 200
+    rows = [r for r in _trail_rows(db) if r.get("agent_id") == "a13" and r.get("action") == "card_suggest"]
+    assert rows  # written (the trail mirrors a row into agent_runs__a13 and runs)
+    for row in rows:
+        assert row["usage"]["calls"] == 1 and row["usage"]["models"] == ["fake"]
+        assert row.get("brand_id") == "legalsoft"
+    blob = json.dumps(_trail_rows(db))
+    for secret in ("Woodland Hills", "press@legalsoft.com", "Hamid", "legalsoft.com/about", "Founded in 2008"):
+        assert secret not in blob, secret

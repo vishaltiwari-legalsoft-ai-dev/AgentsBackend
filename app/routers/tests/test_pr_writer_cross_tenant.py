@@ -21,6 +21,7 @@ from fastapi.routing import APIRoute
 from app.main import app as fastapi_app
 from app.routers import pr_writer as pr_router
 from app.routers.tests.conftest import client
+from app.route_inventory import iter_api_routes
 from app.routers.tests.pr_writer_fakes import (
     ADMIN, BRANDOWNER, COMMS, LEGAL, NEWS, OWNER, REVIEWERS, STRANGER, install, person,
 )
@@ -141,7 +142,8 @@ def test_a_geo_only_account_is_refused_on_every_pr_route(world, monkeypatch):
     token = create_token(GEO_ONLY["id"], GEO_ONLY["email"])
     headers = {"Authorization": f"Bearer {token}"}
     paths = [("GET", "/api/pr/brands"), ("GET", "/api/pr/members"), ("GET", "/api/pr/runs"),
-             ("POST", "/api/pr/runs"), ("GET", "/api/pr/brands/legalsoft/card")]
+             ("POST", "/api/pr/runs"), ("GET", "/api/pr/brands/legalsoft/card"),
+             ("POST", "/api/pr/brands/legalsoft/card/suggest")]
     for method, path in paths:
         r = client.request(method, path, headers=headers, json={"brand_id": "legalsoft", "news": NEWS})
         assert r.status_code == 403 and r.json()["detail"] == SCOPE_REFUSED, (path, r.text)
@@ -212,8 +214,16 @@ def test_only_the_card_comms_lead_or_an_admin_edits_the_card(world, as_caller):
 _ACTOR_WORDS = ("actor", "user_id", "by", "signed_by", "approved_by_id", "owner_id", "agent")
 
 
-def _pr_routes() -> list[APIRoute]:
-    return [r for r in fastapi_app.routes if isinstance(r, APIRoute) and r.endpoint.__module__ == pr_router.__name__]
+def _pr_routes() -> list[tuple[str, APIRoute]]:
+    """``(published path, route)`` for every PR Writer route the app serves.
+
+    Walks the app with ``iter_api_routes`` (the conformance gate's walker):
+    under fastapi 0.141 ``include_router`` leaves wrapped ``_IncludedRouter``
+    entries in ``app.routes``, so a top-level ``isinstance(APIRoute)`` scan
+    finds 0 of the PR routes and every sweep below passes on nothing. The
+    count assertion in ``test_every_pr_route_needs_a_signed_in_person`` is
+    what makes a vacuous pass impossible."""
+    return [(path, r) for path, r in iter_api_routes(fastapi_app) if r.endpoint.__module__ == pr_router.__name__]
 
 
 def _calls(dependant) -> set:
@@ -225,20 +235,21 @@ def _calls(dependant) -> set:
 
 def test_every_pr_route_needs_a_signed_in_person():
     routes = _pr_routes()
-    assert len(routes) == 25, [r.path for r in routes]
-    missing = [r.path for r in routes if get_current_user not in _calls(r.dependant)]
+    assert len(routes) >= 25, [path for path, _ in routes]  # never vacuous: the PR router has 25+ routes
+    assert len(routes) == 26, [path for path, _ in routes]  # 25 + card suggestions (2026-10-28)
+    missing = [path for path, r in routes if get_current_user not in _calls(r.dependant)]
     assert missing == []
 
 
 def test_no_pr_route_takes_an_actor_from_the_body():
     offenders = []
-    for route in _pr_routes():
+    for path, route in _pr_routes():
         body = route.dependant.body_params
         for param in body:
             model = param.type_ if hasattr(param, "type_") else None
             fields = getattr(getattr(param, "field_info", None), "annotation", None) or model
             names = set(getattr(fields, "model_fields", {}) or {})
-            offenders += [f"{route.path}: {n}" for n in names if n in _ACTOR_WORDS]
+            offenders += [f"{path}: {n}" for n in names if n in _ACTOR_WORDS]
     assert offenders == []
     # the body models themselves, read directly
     for name, obj in inspect.getmembers(pr_router, inspect.isclass):
@@ -276,5 +287,5 @@ def test_the_route_set_here_is_the_route_set_mounted():
              "/api/pr/runs/{run_id}/review", "/api/pr/runs/{run_id}/signoffs/{row_id}/sign-off",
              "/api/pr/runs/{run_id}/signoffs/{row_id}/ask-changes", "/api/pr/runs/{run_id}/approve",
              "/api/pr/runs/{run_id}/quotes/{quote_id}/approval", "/api/pr/runs/{run_id}/participants"}
-    mounted = {r.path for r in _pr_routes() if "{run_id}" in r.path}
+    mounted = {path for path, _ in _pr_routes() if "{run_id}" in path}
     assert mounted == swept

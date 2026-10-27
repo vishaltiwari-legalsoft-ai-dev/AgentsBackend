@@ -236,6 +236,15 @@ def brand_store(monkeypatch, tmp_path):
     monkeypatch.setattr(firestore_repo, "_transact", _transact)
     monkeypatch.setattr(firestore_repo, "_brands_cache", None)
     monkeypatch.setattr(firestore_repo, "_references_index_missing_at", None)
+    # A fresh in-memory store numbers brand versions from 0 again, so anything
+    # the previous test left in the version throttles (``firestore_repo`` and
+    # ``registry`` each remember the last version they saw and when, for a
+    # 10 s window) can collide with this store's numbering and serve a pack
+    # built from the OLD store. Start every version observer from nothing.
+    monkeypatch.setattr(firestore_repo, "_brands_version_seen", None)
+    for name in ("_loaded_version", "_version_seen", "_version_checked_at", "_dynamic_failed_at"):
+        monkeypatch.setattr(registry, name, None)
+    monkeypatch.setattr(registry, "_last_dynamic", {})
     monkeypatch.setattr(storage, "is_configured", lambda: True)
     monkeypatch.setattr(settings, "gcs_bucket_name", "test-bucket", raising=False)
     monkeypatch.setattr(storage, "_storage",

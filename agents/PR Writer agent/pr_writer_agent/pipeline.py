@@ -85,16 +85,19 @@ class Deadline:
 
 
 class Meter:
-    """Model spend for one request: calls, tokens and models, summed from
-    every reply (repair calls and concurrent package calls included). Cost is
-    ``None``: ``llm.Reply`` does not carry the provider's cost, and a guessed
-    figure would be a fake one."""
+    """Model spend for one request: calls, tokens, provider cost and models,
+    summed from every reply (repair calls and concurrent package calls
+    included). Cost is the provider-reported ``usage.cost``; it is ``None``
+    when any call lacked one, because a partial sum or a price-table guess
+    would read as the real figure."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.calls = 0
         self.input_tokens = 0
         self.output_tokens = 0
+        self.cost_usd = 0.0
+        self.cost_complete = True
         self.models: set[str] = set()
 
     def add(self, reply: Any) -> None:
@@ -102,12 +105,18 @@ class Meter:
             self.calls += 1
             self.input_tokens += int(getattr(reply, "input_tokens", 0) or 0)
             self.output_tokens += int(getattr(reply, "output_tokens", 0) or 0)
+            cost = getattr(reply, "cost_usd", None)
+            if cost is None:
+                self.cost_complete = False
+            else:
+                self.cost_usd += float(cost)
             if getattr(reply, "model", ""):
                 self.models.add(str(reply.model))
 
     def as_dict(self) -> dict:
+        cost = round(self.cost_usd, 6) if self.calls and self.cost_complete else None
         return {"calls": self.calls, "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
-                "cost_usd": None, "models": sorted(self.models)}
+                "cost_usd": cost, "models": sorted(self.models)}
 
 
 def deadline_invoke(deadline: Deadline, base: Callable[..., Any] | None = None,

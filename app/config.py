@@ -196,9 +196,18 @@ class Settings(BaseSettings):
     # synthesis. A top-tier model is important for faithfully preserving brand
     # detail and making good art-direction calls.
     openrouter_model: str = "anthropic/claude-opus-4.6"
-    # Fast/cheap model for trivial parsing (extracting aspect ratio/brief from
-    # chat, guessing the official website URL). Quality is not critical here.
-    openrouter_fast_model: str = "anthropic/claude-sonnet-4.5"
+    # Fast slot: the model behind every ``fast=True`` call (PR Writer intake,
+    # screen and fact-check, Inbox Triage, GEO and SEO JSON, GD suggestions).
+    # Claude Sonnet 5.5 since 2026-10-28: Sonnet 4.5, the previous default,
+    # retires on the Claude API on 2026-11-30 and 5.5 is Anthropic's named
+    # replacement. It reasons on every call (OpenRouter: reasoning mandatory)
+    # and does not take ``temperature``. Env: OPENROUTER_FAST_MODEL; an admin
+    # override in Firestore app_config/global (per agent or global) outranks it.
+    openrouter_fast_model: str = "anthropic/claude-sonnet-5.5"
+    # Reasoning effort sent with fast-slot calls to a model that thinks by
+    # default (Claude 5 family; see openrouter.fast_reasoning_body). Empty
+    # sends none. Env: OPENROUTER_FAST_REASONING_EFFORT.
+    openrouter_fast_reasoning_effort: str = "low"
     # Image-output model: GD Stage 2 (subject blend), the Stage-4 AI compositor
     # and the Creative Agent rail (carousel Stage 2, brochure backgrounds, blog
     # images). GPT Image 2.5 Sunburst (OpenAI, precision tier), chosen on a live

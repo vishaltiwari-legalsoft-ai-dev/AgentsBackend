@@ -77,3 +77,69 @@ def test_validator(value, errors):
     schema = {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"],
               "additionalProperties": False}
     assert len(pr_llm.validate(value, schema)) == errors
+
+
+# --------------------------------------------------------------------------- #
+# Provider cost: OpenRouter's usage.cost, carried end to end, never guessed
+# --------------------------------------------------------------------------- #
+
+def _msg(cost="absent", text='{"a": "x"}'):
+    from langchain_core.messages import AIMessage
+
+    usage = {"prompt_tokens": 120, "completion_tokens": 30}
+    if cost != "absent":
+        usage["cost"] = cost
+    return AIMessage(content=text, response_metadata={
+        "finish_reason": "stop", "model_name": "anthropic/claude-sonnet-5.5", "token_usage": usage},
+        usage_metadata={"input_tokens": 120, "output_tokens": 30, "total_tokens": 150})
+
+
+def test_default_invoke_asks_for_usage_accounting_and_reads_the_cost(monkeypatch):
+    seen = {}
+
+    class _LLM:
+        model_name = "anthropic/claude-sonnet-5.5"
+
+        def invoke(self, messages, **kw):
+            seen.update(kw)
+            return _msg(0.004321)
+
+    import app.services.openrouter as openrouter
+    monkeypatch.setattr(openrouter, "get_llm", lambda *a, **k: _LLM())
+    reply = pr_llm.default_invoke("s", "u", slot="fast", timeout_s=5, max_tokens=10, temperature=0)
+    assert seen["extra_body"] == {"usage": {"include": True}}
+    assert reply.cost_usd == pytest.approx(0.004321)
+    assert (reply.input_tokens, reply.output_tokens) == (120, 30)
+    assert reply.model == "anthropic/claude-sonnet-5.5"
+
+
+@pytest.mark.parametrize("cost,expected", [("absent", None), (None, None), (True, None), ("0.01", None),
+                                           (0, 0.0), (0.0125, 0.0125)])
+def test_reply_cost_is_only_a_number_the_provider_reported(cost, expected):
+    assert pr_llm.reply_from_message(_msg(cost)).cost_usd == expected
+
+
+def test_result_cost_sums_every_call_including_the_repair(fake):
+    bad = dict(GOOD, audience="everyone")
+    invoke = fake(pr_llm.Reply(text=__import__("json").dumps(bad), finish_reason="stop", cost_usd=0.01),
+                  pr_llm.Reply(text=__import__("json").dumps(GOOD), finish_reason="stop", cost_usd=0.002))
+    assert pr_llm.call_json(STEP, "s", "u", invoke=invoke).usage["cost_usd"] == pytest.approx(0.012)
+
+
+def test_result_cost_is_unknown_when_any_call_did_not_report_one(fake):
+    bad = dict(GOOD, audience="everyone")
+    invoke = fake(pr_llm.Reply(text=__import__("json").dumps(bad), finish_reason="stop", cost_usd=0.01),
+                  GOOD)  # the fake's default reply carries no cost
+    assert pr_llm.call_json(STEP, "s", "u", invoke=invoke).usage["cost_usd"] is None
+
+
+def test_meter_reports_provider_cost_and_never_a_partial_sum():
+    from pr_writer_agent.pipeline import Meter
+
+    m = Meter()
+    assert m.as_dict()["cost_usd"] is None  # no calls, nothing billed to report
+    m.add(pr_llm.Reply(text="", cost_usd=0.02, model="a"))
+    m.add(pr_llm.Reply(text="", cost_usd=0.005, model="b"))
+    assert m.as_dict()["cost_usd"] == pytest.approx(0.025)
+    m.add(pr_llm.Reply(text="", model="c"))  # provider did not report this one
+    assert m.as_dict()["cost_usd"] is None

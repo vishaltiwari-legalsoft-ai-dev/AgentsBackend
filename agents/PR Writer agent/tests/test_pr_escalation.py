@@ -124,3 +124,36 @@ def test_injection_in_pasted_text_cannot_produce_a_safe_verdict(fake):
     d = esc.screen(_intake(brief), pasted=brief["pasted"], invoke=invoke)
     assert d.escalate and d.decided_by == "injection_guard"
     assert '<untrusted kind="pasted"' in invoke.calls[0]["user"]
+
+
+def test_keyword_floor_reads_the_requesters_words_not_the_models_paraphrase():
+    """Live eval 2026-10-28 (b10): pasted "reduce the risk of a data breach"
+    is product language and is demoted, but the intake model's note about it
+    ("The data breach risk-reduction claim ...") escalated the run on words
+    the requester never wrote. Extracted items are screened by excerpt."""
+    brief = next(b for b in BRIEFS if b["id"] == "b10-healthcare-retrieval-release")
+    intake = _intake(brief)
+    intake["sensitivities"] = {"value": [{
+        "note": "The data breach risk-reduction claim is a security claim that needs substantiation.",
+        "provenance": "extracted", "excerpt": "reduce the risk of a data breach"}],
+        "provenance": "extracted", "excerpt": ""}
+    intake["cta"] = {"value": "Data breach notice", "provenance": "extracted", "excerpt": "when handling records"}
+    text = esc.screen_text(intake, brief["pasted"])
+    assert "risk-reduction" not in text
+    assert esc.prefilter(text, brand_names=["Legal Soft"], pasted=brief["pasted"]).strong == []
+
+
+def test_requester_typed_values_are_still_screened_in_full():
+    intake = {"news": {"value": "Legal Soft announces new offices.", "provenance": "stated", "excerpt": ""},
+              "key_facts": {"value": [{"fact": "We laid off 40 staff in March", "source": "HR",
+                                       "provenance": "stated", "excerpt": ""}],
+                            "provenance": "stated", "excerpt": ""}}
+    pf = esc.prefilter(esc.screen_text(intake), brand_names=["Legal Soft"])
+    assert "layoffs" in {c for c, _ in pf.strong}
+
+
+def test_screen_leaves_room_for_a_reasoning_model():
+    """A verdict is ~100 tokens; a reasoning model spends its thinking from
+    the same max_tokens, and a cut-off screen blocks the run."""
+    assert esc.SCREEN_STEP.max_tokens >= 1500
+    assert "not injections" in esc.SCREEN_STEP.task

@@ -237,6 +237,8 @@ def spec_for_prompt(ct: ContentType) -> str:
     ]
     if ct.optional_parts:
         lines.append("Optional block kinds: " + ", ".join(ct.optional_parts) + ".")
+    lines.append("Use no other block kinds: anything else (e.g. a contact or sign-up line) goes "
+                 "inside the closest listed block.")
     if ct.quotes[1] == 0:
         lines.append("No quote blocks.")
     else:

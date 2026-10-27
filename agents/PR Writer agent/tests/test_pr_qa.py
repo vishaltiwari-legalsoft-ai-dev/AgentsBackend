@@ -476,3 +476,65 @@ def test_the_brand_cards_spokesperson_speaks_when_the_brief_names_none():
     speakers, notes = ev.speakers({"spokespeople": {"value": [], "provenance": "missing"}}, card)
     assert [(s["name"], s["title"]) for s in speakers] == [("Dana Whitfield", "CEO")]
     assert speakers[0]["provenance"] == "brand_card" and "[VERIFY" not in speakers[0]["name"]
+
+
+# --------------------------------------------------------------------------- #
+# Live eval 2026-10-28: findings that failed accurate drafts
+# --------------------------------------------------------------------------- #
+
+def _body_words(draft):
+    return sum(qa.word_count(b["text"]) for b in draft["blocks"] if b["kind"] != "bio")
+
+
+def _trim_body_to(draft, target):
+    """Cut the detail block until the body is ``target`` words (± a few)."""
+    d = block(draft, "detail")
+    words = d["text"].split()
+    while _body_words(draft) > target and len(words) > 5:
+        words = words[:-1]
+        d["text"] = " ".join(words) + "."
+
+
+def test_a_body_a_little_short_is_a_warning_not_an_error(golden):
+    """An accurate 360-word release from a thin brief is short, not broken;
+    an error there pushes the QA rewrite toward filler."""
+    _trim_body_to(golden, 360)
+    assert 300 <= _body_words(golden) < 400
+    report = run(golden)
+    assert "body_length" in checks(report, "warning")
+    assert "body_length" not in checks(report, "error")
+
+
+def test_a_body_far_short_or_too_long_is_still_an_error(golden):
+    _trim_body_to(golden, 250)
+    assert _body_words(golden) < 400 * qa.SHORT_BODY_ERROR_SHARE
+    assert "body_length" in checks(run(golden), "error")
+
+
+def test_a_figure_repeated_from_a_cited_sentence_is_grounded(golden):
+    block(golden, "detail")["text"] += " The program serves 1,200 firms [br-1]. Those 1,200 firms span 30 states."
+    found = [f for f in run(golden).findings if f.check == "uncited_number"]
+    assert [f.excerpt for f in found] == ["Those 1,200 firms span 30 states."]  # 30 is new and uncited
+    block(golden, "detail")["text"] = block(golden, "detail")["text"].replace(" span 30 states", " grew")
+    assert "uncited_number" not in checks(run(golden))
+
+
+def test_uncited_number_goes_to_the_qa_fix():
+    assert "uncited_number" in qa.FIXABLE
+
+
+@pytest.mark.parametrize("text,bad", [
+    ("Interviews run Tuesday, Feb. 3, 2027 [br-1].", "Wednesday"),   # live eval: Feb. 3, 2027 is a Wednesday
+    ("Interviews run Wednesday, Feb. 3, 2027 [br-1].", None),
+    ("The summit opens Monday, Sept. 14, 2026 [br-1].", None),
+    ("The summit opens Friday, Sept. 14, 2026 [br-1].", "Monday"),
+    ("Doors open Feb. 3, 2027 [br-1].", None),                       # no weekday, nothing to check
+])
+def test_a_weekday_must_match_its_date(golden, text, bad):
+    block(golden, "detail")["text"] += " " + text
+    found = [f for f in run(golden).findings if f.check == "weekday_mismatch"]
+    if bad is None:
+        assert found == []
+    else:
+        assert len(found) == 1 and found[0].severity == "error" and bad in found[0].message
+    assert "weekday_mismatch" in qa.FIXABLE

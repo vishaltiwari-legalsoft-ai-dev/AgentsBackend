@@ -357,7 +357,12 @@ def _render_pdf_first_page(path: Path) -> tuple[Optional[Image.Image], int]:
     ``(None, 0)`` if neither library can read the file.
     """
     try:
-        import fitz  # PyMuPDF — lazy so the package imports without it
+        # PyMuPDF — lazy so the package imports without it. `pymupdf` is the
+        # package's own name; `fitz` is the deprecated alias (FutureWarning in 2.0).
+        try:
+            import pymupdf as fitz
+        except ImportError:
+            import fitz
     except Exception:  # pragma: no cover - exercised only when PyMuPDF is absent
         # Fall back to pypdf purely for the page count (no raster → no palette).
         try:

@@ -31,6 +31,7 @@ from pr_writer_agent import cards, export, pipeline
 from pr_writer_agent import content_types as cts
 from pr_writer_agent import evidence as ev
 from seo_geo_agent import insights
+from seo_geo_agent.sources import CredentialMissing
 
 logger = logging.getLogger("agentos.pr_writer")
 
@@ -47,9 +48,10 @@ REVISE_LEASE = "revise"  # flow.steps key for the per-run edit lease; not one of
 LIST_PAGES = 4
 _NAME_LOOKUP_TIMEOUT_S = 10.0
 
-# Tests replace these seams; production uses the real search, fetch and model.
+# Tests replace these seams; production uses the real search, fetch, sitemap and model.
 SEARCH: Callable[[str], dict] | None = None
 FETCH: Callable[[str], Any] | None = None
+SITEMAP: Callable[[str], list[str]] | None = None
 INVOKE_BASE: Callable[..., Any] | None = None
 
 
@@ -861,6 +863,116 @@ def save_card(brand_id: str, user: dict, base_revision: int, card_in: Any, appro
         _store(lambda: (_ for _ in ()).throw(exc), what="the brand card")
         raise
     return card_view(brand_id, user, saved | {"brand_id": brand_id}, fresh=False)
+
+
+# --------------------------------------------------------------------------- #
+# Card suggestions from the brand's own website — a pure suggestion, no write
+# --------------------------------------------------------------------------- #
+
+CARD_SUGGEST_TASK = "card_suggest"
+MSG_SUGGEST_RUNNING = "Someone is already reading this brand's site. Wait for their suggestions, then try again."
+#: Contract messages for this route: the step messages speak of "your brief and
+#: research", which a card suggestion does not have.
+_SUGGEST_MESSAGES = {
+    "model_unavailable": "The writing model didn't respond after 3 tries. The card wasn't changed; try again.",
+    "model_timeout": "Reading the site ran out of time before the model finished. The card wasn't changed; try again.",
+    "model_truncated": "The model's answer was cut off, so none of it was used. The card wasn't changed; try again.",
+    "model_refused": "The model declined this request, so nothing was suggested. The card wasn't changed.",
+    "model_output_invalid": "The model's answer wasn't usable after a repair attempt, so none of it was used. "
+                            "The card wasn't changed; try again.",
+    "search_unavailable": "Suggestions couldn't run: the web search service refused the request (out of credit, "
+                          "rate-limited or down). The card wasn't changed. An admin needs to check it.",
+}
+
+
+def _suggest_fail(exc: BaseException) -> PrError:
+    failure = pipeline.classify(exc, step=CARD_SUGGEST_TASK)
+    if failure is None:
+        raise exc
+    logger.warning("pr card suggestion failed: %s", exc, exc_info=True)
+    return PrError(failure.status, failure.code, _SUGGEST_MESSAGES.get(failure.code, failure.message),
+                   step=CARD_SUGGEST_TASK)
+
+
+def _suggest_search() -> Callable[[str], dict]:
+    if SEARCH is not None:
+        return SEARCH
+    from pr_writer_agent import research as pr_research
+
+    try:
+        return pr_research.default_search()
+    except CredentialMissing as exc:
+        raise PrError(424, "credential_missing", "Suggestions couldn't run: web search isn't configured on this "
+                      "server. An admin needs to add the key.", step=CARD_SUGGEST_TASK) from exc
+
+
+def suggest_card(brand_id: str, user: dict, extra_urls: list[str] | None,
+                 meter: pipeline.Meter | None = None) -> dict:
+    """Read the brand's own public pages and suggest card content (contract
+    §5, "Card suggestions"). Same gate as the card PUT; reviewers are never
+    suggested; nothing is written to ``brand_cards``."""
+    from pr_writer_agent import card_suggest
+    from seo_geo_agent import sources as seo_sources
+
+    uid = _uid(user)
+    b = brand(brand_id)
+    stored = _store(lambda: repo.get_brand_card(brand_id), what="the brand card")
+    if not _card_editable(user, stored):
+        raise PrError(403, "cannot_edit_card", "Only this brand's comms lead or a workspace admin can ask for card "
+                      "suggestions." if stored else "Only a workspace admin can start a brand card.")
+    domain = card_suggest.own_domain(b.get("domain") or "")
+    if not domain:
+        raise PrError(422, "brand_domain_missing", "This brand has no website on record, so there is nothing to "
+                      "read. Add its domain in the SEO Analyst first.", field="domain")
+    extras: list[str] = []
+    for i, raw in enumerate(extra_urls or []):
+        url = str(raw or "").strip()
+        if not url:
+            continue
+        if len(url) > cards.STR_CAP:
+            raise PrError(422, "too_long", f"extra_urls[{i}] is longer than {cards.STR_CAP} characters.",
+                          field=f"extra_urls[{i}]", max=cards.STR_CAP)
+        if not card_suggest.on_domain(url, domain):
+            raise PrError(422, "invalid", f"Only pages on {domain} can be read for this brand's card.",
+                          field=f"extra_urls[{i}]")
+        extras.append(url)
+    if len(extras) > card_suggest.MAX_EXTRA_URLS:
+        raise PrError(422, "too_long", f"At most {card_suggest.MAX_EXTRA_URLS} extra pages can be read.",
+                      field="extra_urls", max=card_suggest.MAX_EXTRA_URLS)
+    search = _suggest_search()
+
+    lease = _store(lambda: repo.lease_pr_brand_task(brand_id, CARD_SUGGEST_TASK, user_id=uid,
+                                                   lease_s=pipeline.LEASE_S), what="the brand card")
+    if not lease["acquired"]:
+        retry = int(lease["retry_after_s"])
+        raise PrError(409, "suggest_running", MSG_SUGGEST_RUNNING, headers={"Retry-After": str(retry)},
+                      retry_after_s=retry)
+    try:
+        deadline = pipeline.Deadline()
+        try:
+            gathered = card_suggest.gather(domain, b.get("name") or "", search=search,
+                                           fetch=FETCH or seo_sources.fetch_page,
+                                           sitemap=SITEMAP or seo_sources.fetch_sitemap, extra_urls=extras,
+                                           time_left=deadline.remaining)
+            deadline.check("card extraction")
+            out = card_suggest.run(b, gathered["pages"], seeds=list(b.get("seeds") or []),
+                                   invoke=_invoke(deadline, meter))
+        except PrError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise _suggest_fail(exc) from exc
+    finally:
+        try:
+            repo.release_pr_brand_task(brand_id, CARD_SUGGEST_TASK, user_id=uid)
+        except Exception:  # noqa: BLE001 — the lease expires on its own
+            logger.warning("pr: could not release the card-suggest lease for %s", brand_id, exc_info=True)
+    if out["notes"]:
+        logger.info("pr card suggestion notes for %s: %s", brand_id, "; ".join(out["notes"])[:2000])
+    return {
+        "brand_id": brand_id, "generated_at": _now(),
+        "read_pages": [{"url": p["url"], "title": p["title"]} for p in gathered["pages"]],
+        "suggestions": out["suggestions"],
+    }
 
 
 # --------------------------------------------------------------------------- #

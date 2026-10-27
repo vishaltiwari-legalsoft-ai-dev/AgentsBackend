@@ -22,3 +22,4 @@ agents/Graphics designer agent/graphics_designer_agent/brands/ai-answering/
 # MR local config fallbacks (Firestore is the real store; these are dev copies)
 agents/Marketing Research agent/targets.json
 agents/Marketing Research agent/sources.json
+.venv312/

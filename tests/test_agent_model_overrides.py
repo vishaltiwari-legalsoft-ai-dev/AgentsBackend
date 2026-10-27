@@ -95,12 +95,60 @@ def test_get_llm_agent_without_override_inherits_global(app_config):
     assert llm.model_name == "global/fast-model"
 
 
+# Fast-slot reasoning effort: a Claude 5 model thinks on every call and its
+# thinking counts against max_tokens, so the fast slot asks for low effort.
+# Older models get nothing (an effort would switch their thinking on).
+
+@pytest.mark.parametrize("fast_model,expected", [
+    ("anthropic/claude-sonnet-5.5", {"reasoning": {"effort": "low"}}),
+    ("anthropic/claude-haiku-5.5", {"reasoning": {"effort": "low"}}),
+    ("anthropic/claude-sonnet-4.5", None),
+    ("anthropic/claude-sonnet-4.6", None),
+    ("openai/gpt-4o-mini", None),
+])
+def test_fast_slot_sends_low_effort_only_to_models_that_think_by_default(app_config, fast_model, expected):
+    app_config["openrouter_fast_model"] = fast_model
+    assert openrouter_service.get_llm(fast=True).extra_body == expected
+
+
+def test_main_slot_never_gets_the_fast_effort(app_config):
+    app_config["openrouter_model"] = "anthropic/claude-opus-5.5"
+    assert openrouter_service.get_llm().extra_body is None
+
+
+def test_fast_effort_can_be_switched_off(app_config, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "openrouter_fast_reasoning_effort", "")
+    app_config["openrouter_fast_model"] = "anthropic/claude-sonnet-5.5"
+    assert openrouter_service.get_llm(fast=True).extra_body is None
+
+
+def test_pr_writer_adapter_keeps_the_fast_effort_alongside_usage_accounting(monkeypatch):
+    """A per-call extra_body replaces the model's in LangChain; the adapter
+    merges them so the reasoning effort is not silently dropped."""
+    from pr_writer_agent import llm as pr_llm
+
+    seen: dict = {}
+
+    class _LLM(_StubLLM):
+        extra_body = {"reasoning": {"effort": "low"}}
+
+        def invoke(self, prompt, **kw):
+            seen.update(kw)
+            return super().invoke(prompt)
+
+    monkeypatch.setattr(openrouter_service, "get_llm", lambda *a, **k: _LLM())
+    pr_llm.default_invoke("s", "u", slot="fast", timeout_s=5, max_tokens=10, temperature=0.0)
+    assert seen["extra_body"] == {"reasoning": {"effort": "low"}, "usage": {"include": True}}
+
+
 # --------------------------------------------------------------------------- #
 # Call-site binding: the MR adapter identifies itself.
 # --------------------------------------------------------------------------- #
 
 class _StubLLM:
-    def invoke(self, _prompt):
+    def invoke(self, _prompt, **_kw):  # ChatOpenAI.invoke takes request kwargs
         class R:
             content = "{}"
 
@@ -216,10 +264,10 @@ def test_update_saves_allowed_field(app_config, monkeypatch):
     monkeypatch.setattr(firestore_repo, "set_agent_config", fake_set)
     r = client.post(
         "/api/admin/agents/a6",
-        json={"openrouter_model": "anthropic/claude-sonnet-4.5"},
+        json={"openrouter_model": "anthropic/claude-sonnet-5.5"},
     )
     assert r.status_code == 200, r.text
-    assert written == {"a6": {"openrouter_model": "anthropic/claude-sonnet-4.5"}}
+    assert written == {"a6": {"openrouter_model": "anthropic/claude-sonnet-5.5"}}
 
 
 def test_update_gd_planner_model_saves_without_500(app_config, monkeypatch):

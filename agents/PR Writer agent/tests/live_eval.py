@@ -64,12 +64,10 @@ def _setup(main_model: str | None, fast_model: str | None):
         try:
             llm = get_llm(temperature, fast=(slot == "fast"), model=model, agent_id=pr_llm.AGENT_ID,
                           timeout=timeout_s, max_tokens=max_tokens)
-            msg = llm.invoke([("system", system), ("user", user)])
+            msg = llm.invoke([("system", system), ("user", user)], extra_body=pr_llm.request_extras(llm))
         except Exception as exc:  # noqa: BLE001
             raise pr_llm.LLMUnavailable(f"model call failed ({slot}): {type(exc).__name__}: {exc}") from exc
-        meta, usage = msg.response_metadata or {}, msg.usage_metadata or {}
-        return pr_llm.Reply(str(msg.content), meta.get("finish_reason"), str(meta.get("model_name") or model),
-                            int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0))
+        return pr_llm.reply_from_message(msg, fallback_model=str(model))
 
     return invoke
 
@@ -78,7 +76,20 @@ def _add_usage(total: dict, usage: dict, step: str, seconds: float, timings: dic
     total["calls"] += usage.get("calls", 0)
     total["input_tokens"] += usage.get("input_tokens", 0)
     total["output_tokens"] += usage.get("output_tokens", 0)
-    timings[step] = round(seconds, 1)
+    cost = usage.get("cost_usd")
+    if usage.get("calls") and (cost is None or total["cost_usd"] is None):
+        total["cost_usd"] = None  # one unreported call makes the total unknown, not smaller
+    elif cost is not None:
+        total["cost_usd"] = round(total["cost_usd"] + cost, 6)
+    timings[step] = {"s": round(seconds, 1), "calls": usage.get("calls", 0),
+                     "in": usage.get("input_tokens", 0), "out": usage.get("output_tokens", 0),
+                     "cost_usd": cost}
+
+
+def _errors(draft: dict) -> list[dict]:
+    """The QA errors with the text that tripped them, for diagnosis."""
+    return [{k: f.get(k) for k in ("check", "where", "message", "excerpt")}
+            for f in draft["qa"]["findings"] if f["severity"] == "error"]
 
 
 def run_brief(brief: dict, card: dict, invoke) -> dict:
@@ -87,7 +98,7 @@ def run_brief(brief: dict, card: dict, invoke) -> dict:
     from pr_writer_agent import qa
 
     exp = brief["expect"]
-    usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+    usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
     timings: dict = {}
     out = {"id": brief["id"], "failures": [], "usage": usage, "timings": timings}
 
@@ -133,6 +144,7 @@ def run_brief(brief: dict, card: dict, invoke) -> dict:
     draft = steps.run_draft(intake["intake"], card, evidence, angle["angle"], speakers, today=today, invoke=invoke)
     _add_usage(usage, draft["usage"], "draft", time.monotonic() - t, timings)
     out["qa_first_draft"] = draft["qa"]["counts"]
+    out["qa_first_errors"] = _errors(draft)
 
     t = time.monotonic()
     draft = steps.run_qa_fix(draft, card, evidence, primary_keyword=kw, allowed=allowed, today=today, invoke=invoke)
@@ -161,6 +173,7 @@ def run_brief(brief: dict, card: dict, invoke) -> dict:
         out["failures"].append("QA errors after fix: " + "; ".join(f"{f['check']}@{f['where']}" for f in errors))
     out.update({
         "qa_after_fix": draft["qa"]["counts"],
+        "qa_errors": _errors(draft),
         "fact_rows": len(facts["rows"]),
         "fact_rows_open": sum(1 for r in facts["rows"] if r["status"] != "Verified"),
         "snippet_findings": snippets["qa"],
@@ -206,7 +219,9 @@ def main(argv: list[str] | None = None) -> int:
     passed = sum(1 for r in results if not r["failures"])
     tok_in = sum(r.get("usage", {}).get("input_tokens", 0) for r in results)
     tok_out = sum(r.get("usage", {}).get("output_tokens", 0) for r in results)
-    print(f"\n{passed}/{len(results)} briefs passed; tokens in {tok_in:,} / out {tok_out:,}")
+    costs = [r.get("usage", {}).get("cost_usd") for r in results]
+    cost = "unknown" if any(c is None for c in costs) else f"${sum(costs):.4f}"
+    print(f"\n{passed}/{len(results)} briefs passed; tokens in {tok_in:,} / out {tok_out:,}; provider cost {cost}")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)

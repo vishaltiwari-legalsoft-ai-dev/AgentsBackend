@@ -14,7 +14,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-import fitz  # PyMuPDF — existing backend dependency
+try:
+    import pymupdf as fitz  # PyMuPDF — `fitz` is its deprecated alias (FutureWarning since 2.0)
+except ImportError:  # pragma: no cover - PyMuPDF < 1.24.3 only exposes `fitz`
+    import fitz
 from PIL import Image  # Pillow — existing backend dependency
 
 _HEX_RE = re.compile(r"#([0-9A-Fa-f]{6})\b")

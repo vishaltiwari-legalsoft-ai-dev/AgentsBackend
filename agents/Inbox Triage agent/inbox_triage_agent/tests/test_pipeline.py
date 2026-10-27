@@ -919,7 +919,7 @@ def test_the_model_is_built_as_a12_with_the_caps_and_refuses_offline(monkeypatch
     assert summarise.build_llm() == "llm"
     assert captured == {
         "temperature": 0.0, "fast": True, "agent_id": "a12",
-        "timeout": summarise.OPENROUTER_TIMEOUT_SECONDS, "max_tokens": 400,
+        "timeout": summarise.OPENROUTER_TIMEOUT_SECONDS, "max_tokens": 1000,
     }
 
 
