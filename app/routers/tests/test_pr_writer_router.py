@@ -698,3 +698,77 @@ def test_identical_placeholders_get_distinct_stable_claim_ids(world, as_caller):
     # Reading the old version again gives the same ids (stable across reads).
     old = client.get(f"/api/pr/runs/{run['id']}/versions/0.1").json()
     assert [c["id"] for c in old["claims"]] == ids
+
+
+
+# --------------------------------------------------------------------------- #
+# Live findings 2026-10-28 (staging)
+# --------------------------------------------------------------------------- #
+
+import re  # noqa: E402
+
+
+def test_the_news_angle_never_shows_internal_evidence_ids(world, as_caller, monkeypatch):
+    db, model = world
+    base = model._angle("")
+    monkeypatch.setattr(model, "_angle", lambda user: base | {
+        "angle_paragraph": "Firms get paralegal capacity on Nov. 12, 2026 [br-1], after a pilot [ev-1]."})
+    run = _drive(_create(as_caller))
+    assert not re.search(r"\[(?:br|bc|ev|rv)-\d+", run["draft"]["news_angle"]), run["draft"]["news_angle"]
+    md = client.get(f"/api/pr/runs/{run['id']}/export?format=md").text
+    assert not re.search(r"\[(?:br|bc|ev|rv)-\d+", md)
+
+
+def test_approval_blockers_speak_the_screens_labels(world, as_caller):
+    run = _drive(_create(as_caller))
+    r = client.post(f"/api/pr/runs/{run['id']}/review", json={"version": run["current_version"]})
+    assert r.status_code == 200, r.text
+    locked = r.json()["current_version"]
+    _as(as_caller, COMMS)
+    r = client.post(f"/api/pr/runs/{run['id']}/approve", json={"version": locked})
+    assert r.status_code == 409
+    blockers = r.json()["detail"]["blockers"]
+    text = " ".join(blockers)
+    for v in re.findall(r"\bv(\d+(?:\.\d+)?)\b", text):
+        assert v == locked, f"blocker names v{v}, the screen shows v{locked}: {blockers}"
+    assert not re.search(r"\b(editorial|compliance|brand) sign-off", text), blockers
+    assert "Legal hasn't signed off" in text and "Hamid Kohan's quote is waiting for approval." in text
+    assert not re.search(r"\bb\d+\b", text)  # no raw block ids
+
+
+def test_the_brand_cards_spokesperson_is_quoted_and_not_asked_for(world, as_caller):
+    db, model = world
+    stored = repo.get_brand_card("legalsoft")
+    card = dict(stored["card"], spokespeople=[{"name": "Dana Whitfield", "title": "CEO", "topics": "",
+                                                "quote_style": "", "approval_contact": ""}])
+    repo.save_brand_card("legalsoft", card, expected_revision=stored["revision"], actor_id=ADMIN["id"])
+    model.complete = False  # intake finds no spokesperson in the brief
+    run = _create(as_caller)
+    assert "spokespeople" not in [f["key"] for f in (run["clarify"] or {}).get("fields", [])]
+    client.post(f"/api/pr/runs/{run['id']}/clarify", json={"mode": "placeholders"})
+    run = _drive(client.get(f"/api/pr/runs/{run['id']}").json())
+    quote = run["draft"]["quotes"][0]
+    assert (quote["speaker_name"], quote["speaker_title"]) == ("Dana Whitfield", "CEO")
+    assert "[VERIFY: spokesperson name]" not in " ".join(b["text"] for b in run["draft"]["blocks"])
+
+
+def test_a_placeholder_speakers_quote_marker_is_one_marker(world, as_caller):
+    db, model = world
+    base = model._intake
+
+    def no_speaker(user):
+        payload = base(user)
+        payload["fields"]["spokespeople"] = {"items": []}
+        return payload
+    model._intake = no_speaker
+    run = _create(as_caller)
+    client.post(f"/api/pr/runs/{run['id']}/clarify", json={"mode": "placeholders"})
+    run = _drive(client.get(f"/api/pr/runs/{run['id']}").json())
+    quote_block = next(b for b in run["draft"]["blocks"] if b["kind"] == "quote")
+    pending = [m for m in run["draft"]["markers"] if m["block_id"] == quote_block["id"]
+               and m["kind"] == "quote_pending"]
+    assert len(pending) == 1 and pending[0]["token"].endswith("]") and pending[0]["token"] in quote_block["text"]
+    start = quote_block["text"].index(pending[0]["token"])
+    inside = [m for m in run["draft"]["markers"] if m["block_id"] == quote_block["id"] and m["kind"] == "verify"
+              and quote_block["text"].find(m["token"], start) >= start]
+    assert all(quote_block["text"].index(m["token"]) < start for m in inside)  # no marker overlaps the quote chip

@@ -457,3 +457,22 @@ def test_snippets_cannot_introduce_new_figures_or_hype(golden):
 def test_report_serializes(golden):
     d = run(golden).to_dict()
     assert d["passed"] is True and d["findings"] == [] and "counts" in d
+
+
+
+# Live finding 2026-10-28: a placeholder speaker nests [VERIFY: …] inside the marker.
+def test_pending_quote_marker_is_one_token_when_the_speaker_is_a_placeholder():
+    marker = render.QUOTE_MARKER.format(who="[VERIFY: spokesperson name], [VERIFY: exact title]")
+    m = qa.QUOTE_PENDING.search(marker)
+    assert m is not None and m.group(0) == marker
+    assert m.group(1) == "[VERIFY: spokesperson name], [VERIFY: exact title]"
+    plain = render.QUOTE_MARKER.format(who="Hamid Kohan, Founder")
+    assert qa.QUOTE_PENDING.search(plain).group(1) == "Hamid Kohan, Founder"
+
+
+def test_the_brand_cards_spokesperson_speaks_when_the_brief_names_none():
+    card = load_card() | {"spokespeople": [{"name": "Dana Whitfield", "title": "CEO",
+                                            "approval_contact": "comms@legalsoft.com"}]}
+    speakers, notes = ev.speakers({"spokespeople": {"value": [], "provenance": "missing"}}, card)
+    assert [(s["name"], s["title"]) for s in speakers] == [("Dana Whitfield", "CEO")]
+    assert speakers[0]["provenance"] == "brand_card" and "[VERIFY" not in speakers[0]["name"]

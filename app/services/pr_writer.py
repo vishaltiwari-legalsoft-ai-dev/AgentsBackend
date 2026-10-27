@@ -29,6 +29,7 @@ from app.security import is_geo_only
 from app.services import firestore_repo as repo
 from pr_writer_agent import cards, export, pipeline
 from pr_writer_agent import content_types as cts
+from pr_writer_agent import evidence as ev
 from seo_geo_agent import insights
 
 logger = logging.getLogger("agentos.pr_writer")
@@ -70,6 +71,22 @@ def _today() -> date:
     return datetime.now(timezone.utc).date()
 
 
+def _plain(text: Any) -> str:
+    """Human-facing text without the internal evidence ids (``[br-1]``,
+    ``[ev-3]``). The ids drive the fact-check; a reader never sees them."""
+    return ev.strip_cites(str(text or "")).strip()
+
+
+def _plain_deep(value: Any) -> Any:
+    if isinstance(value, str):
+        return _plain(value)
+    if isinstance(value, list):
+        return [_plain_deep(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _plain_deep(v) for k, v in value.items()}
+    return value
+
+
 def wire_id(run_id: str) -> str:
     return RUN_ID_PREFIX + run_id
 
@@ -96,8 +113,9 @@ def _store(fn: Callable[[], Any], *, what: str = "this draft") -> Any:
     except repo.PrNotFound as exc:
         raise PrError(404, "run_not_found", NOT_FOUND) from exc
     except repo.PrSignoffBlocked as exc:
-        raise PrError(409, "approval_blocked", "This draft can't be marked approved yet.",
-                      blockers=list(exc.blockers)) from exc
+        # The store's own wording names internal version numbers and role
+        # keys; callers that can say it in the screen's words (approve) do.
+        raise PrError(409, "approval_blocked", "This draft can't be marked approved yet.", blockers=[]) from exc
     except repo.PrStaleVersion as exc:
         raise PrError(409, "stale_version", "Someone changed this draft after you opened it. "
                       "Reload to see the current version.") from exc
@@ -456,18 +474,21 @@ def _wire_version(run: dict, doc: dict, names: dict) -> dict:
                          "at": stored.get("attested_at") if approved else None},
             "reset_in_version": None if approved else resets.get(qid),
         })
-    heads = [{"text": draft.get("headline", ""), "chars": len(draft.get("headline", "")), "recommended": True}]
+    headline = _plain(draft.get("headline", ""))
+    heads = [{"text": headline, "chars": len(headline), "recommended": True}]
     for o in draft.get("headline_options") or []:
-        if o.get("text") and o["text"] != draft.get("headline") and len(heads) < 3:
-            heads.append({"text": o["text"], "chars": len(o["text"]), "recommended": False})
-    subs = [s.get("text", "") for s in draft.get("subhead_options") or []]
-    alternate = next((s for s in subs if s and s != draft.get("subhead")), "")
+        text = _plain(o.get("text"))
+        if text and text != headline and len(heads) < 3:
+            heads.append({"text": text, "chars": len(text), "recommended": False})
+    subhead = _plain(draft.get("subhead", ""))
+    subs = [_plain(s.get("text", "")) for s in draft.get("subhead_options") or []]
+    alternate = next((s for s in subs if s and s != subhead), "")
     meta = _version_meta(run, int(doc.get("version") or 0))
     return {
         **_summary_of(meta, names),
         "headlines": heads,
-        "subheadline": {"recommended": draft.get("subhead", ""), "alternate": alternate},
-        "news_angle": _angle(run).get("angle_paragraph", ""),
+        "subheadline": {"recommended": subhead, "alternate": alternate},
+        "news_angle": _plain(_angle(run).get("angle_paragraph", "")),
         "blocks": blocks, "claims": claims, "quotes": quotes, "markers": markers,
     }
 
@@ -477,7 +498,7 @@ def _summary_of(meta: dict, names: dict) -> dict:
     return {
         "version": meta["label"], "created_at": meta.get("created_at") or "",
         "created_by": None if (not by or by == repo.PR_AGENT_ACTOR) else (names.get(by) or {"id": by, "name": ""}),
-        "kind": meta.get("kind") or "revision", "what_changed": meta.get("what_changed") or "",
+        "kind": meta.get("kind") or "revision", "what_changed": _plain(meta.get("what_changed")),
         "quote_resets": [{"quote_id": r["quote_id"], "speaker_name": r.get("speaker_name", "")}
                          for r in meta.get("quote_resets") or []],
         "locked": bool(meta.get("locked")), "locked_at": meta.get("locked_at"),
@@ -560,16 +581,16 @@ def _package_view(run: dict) -> dict | None:
     notes_body = (sections.get("reviewer_notes") or {}).get("body")
     notes = None
     if notes_body:
-        notes = ([{"kind": "assumption", "text": t} for t in notes_body.get("assumptions", [])]
-                 + [{"kind": "open_question", "text": t} for t in notes_body.get("open_questions", [])]
-                 + [{"kind": "risk", "text": t} for t in notes_body.get("risks", [])]
-                 + [{"kind": "checklist", "text": t} for t in notes_body.get("failed_checks", [])])
-    seo = (sections.get("seo") or {}).get("body")
+        notes = ([{"kind": "assumption", "text": _plain(t)} for t in notes_body.get("assumptions", [])]
+                 + [{"kind": "open_question", "text": _plain(t)} for t in notes_body.get("open_questions", [])]
+                 + [{"kind": "risk", "text": _plain(t)} for t in notes_body.get("risks", [])]
+                 + [{"kind": "checklist", "text": _plain(t)} for t in notes_body.get("failed_checks", [])])
     return {
         "based_on_version": _label_of(run, int(flow.get("package_based_on") or 1)),
-        "sections": state, "seo": seo,
-        "distribution": (sections.get("distribution") or {}).get("body"),
-        "snippets": (sections.get("snippets") or {}).get("body"),
+        "sections": state,
+        "seo": _plain_deep((sections.get("seo") or {}).get("body")),
+        "distribution": _plain_deep((sections.get("distribution") or {}).get("body")),
+        "snippets": _plain_deep((sections.get("snippets") or {}).get("body")),
         "reviewer_notes": notes,
     }
 
@@ -900,7 +921,8 @@ def create_run(user: dict, brand_id: str, news: str, facts: str, meter: pipeline
     invoke = _invoke(deadline, meter)
     intake_started = _now()
     try:
-        intake_result = pipeline.run_intake(news, facts, b, known_brands=[b.get("name") or brand_id], invoke=invoke)
+        intake_result = pipeline.run_intake(news, facts, b, known_brands=[b.get("name") or brand_id], invoke=invoke,
+                                            card_agent=card_agent)
     except Exception as exc:  # noqa: BLE001
         raise _fail(exc, "intake") from exc
     intake_result.pop("usage", None)
@@ -1585,12 +1607,49 @@ def approve(run_wire_id: str, user: dict, version: str) -> dict:
         return view(run, user)
     latest = _locked_current(run, version)
     doc = _store(lambda: repo.get_pr_version(run["id"], latest, user_id=uid))
-    blocks = pipeline.wire_blocks(_doc_draft(run, doc)[0], {})
-    if pipeline.count_missing(blocks):
+    missing = pipeline.count_missing(pipeline.wire_blocks(_doc_draft(run, doc)[0], {}))
+    blockers = approval_blockers(run, missing)
+    if blockers:
+        raise PrError(409, "approval_blocked", "This draft can't be marked approved yet.", blockers=blockers)
+    try:
+        repo.record_pr_signoff(run["id"], role="final", actor_id=uid, version=latest, decision="approve")
+    except repo.PrSignoffBlocked as exc:  # something moved since the read: say it in the screen's words
+        fresh = _store(lambda: repo.get_pr_run(run["id"], uid)) or run
         raise PrError(409, "approval_blocked", "This draft can't be marked approved yet.",
-                      blockers=[f"{pipeline.count_missing(blocks)} [MISSING] item(s) still open"])
-    _store(lambda: repo.record_pr_signoff(run["id"], role="final", actor_id=uid, version=latest, decision="approve"))
+                      blockers=approval_blockers(fresh, missing) or ["The draft changed. Reload and try again."]) from exc
+    except Exception as exc:  # noqa: BLE001
+        _store(lambda: (_ for _ in ()).throw(exc))
     return view(_store(lambda: repo.get_pr_run(run["id"], uid)), user)
+
+
+def approval_blockers(run: dict, missing: int = 0) -> list[str]:
+    """What stops approval, in the screen's words: the version label the UI
+    shows (v1.0, not the store's internal number), the reviewer rows by their
+    labels and each pending quote by its speaker. Mirrors
+    ``firestore_repo.pr_final_blockers``, which stays the enforcing check."""
+    latest = int(run.get("latest_version") or 0)
+    if not latest:
+        return ["There is no draft yet."]
+    label = _label_of(run, latest)
+    out: list[str] = []
+    open_verify = int(run.get("open_verify_count") or 0)
+    if open_verify:
+        out.append(f"{open_verify} fact{'s' if open_verify != 1 else ''} still to verify in v{label}.")
+    if missing:
+        out.append(f"{missing} missing detail{'s' if missing != 1 else ''} still open in v{label}.")
+    for q in run.get("quotes") or []:
+        if q.get("status") != "approved":
+            speaker = str(q.get("speaker") or "")
+            out.append("The quote from the speaker still to be named is waiting for approval."
+                       if not speaker or speaker.startswith("[") else f"{speaker}'s quote is waiting for approval.")
+    if _escalation_open(run):
+        out.append("The comms and legal check of this news isn't cleared.")
+    signoffs = run.get("signoffs") or {}
+    for row in ROLE_ROWS:
+        entry = signoffs.get(STORE_ROLE[row]) or {}
+        if entry.get("decision") != "approve" or entry.get("version") != latest:
+            out.append(f"{ROW_LABEL[row]} hasn't signed off v{label}.")
+    return out
 
 
 def approve_quote(run_wire_id: str, quote_id: str, user: dict, evidence: str, text_hash: str) -> dict:
