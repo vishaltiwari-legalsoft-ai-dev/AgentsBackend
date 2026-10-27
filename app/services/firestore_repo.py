@@ -6,12 +6,16 @@ Collections:
 - reference_creatives  user-uploaded reference material
 - brand_references     self-serve GD brand references (one doc each)
 - users                application accounts
+- brand_cards          PR Writer (a13) brand cards, keyed by the seo_geo brand id
+- pr_runs              PR Writer runs (+ versions / events / steps subcollections)
 
 The client is created lazily so the server can boot before GCP is configured.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import re
@@ -21,6 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
+from google.api_core import exceptions as gexc
 from google.cloud import firestore
 
 from app.config import settings
@@ -2130,3 +2135,1212 @@ def delete_inbox_messages(user_id: str) -> int:
     if batch_size > 0:
         batch.commit()
     return deleted
+
+
+# --------------------------------------------------------------------------- #
+# PR Writer (a13): brand cards and PR runs
+# --------------------------------------------------------------------------- #
+# Access patterns — the only reads this section issues:
+#
+#   brand_cards/{brand_id}                get by id (each run start, card editor)
+#   brand_cards/{brand_id}/history/{rev}  newest first on ``revision``
+#   pr_runs/{run_id}                      get by id, then the participant check
+#   pr_runs  where participants array-contains <uid>
+#            order by updated_at DESC, __name__ DESC, limit, start_after
+#                                         THE one composite (firestore.indexes.json)
+#   pr_runs/{id}/versions/{0001..}        get by id; list ordered on ``version``
+#   pr_runs/{id}/events/{000001..}        list ordered on ``seq``
+#   pr_runs/{id}/steps/{v001_<step>}      get by id
+#
+# Subcollection orderings are single-field and served by automatic indexes.
+#
+# Tenancy: ``brand_cards`` is shared workspace config (one card per seo_geo
+# brand id; who may edit is the router's role check). A run's tenant key is
+# ``participants`` — owner + the card's reviewers at creation + people added
+# explicitly. Every read and write here takes the caller's user id and a
+# non-participant is answered exactly as if the run did not exist (``None``
+# from reads, :class:`PrNotFound` from writes; the router says 404). Admins are
+# NOT participants by default (owner decision 2026-10-27).
+#
+# Human-only: a run reaches ``approved`` in exactly one place,
+# :func:`record_pr_signoff`, which takes a human participant's id. The writes
+# the pipeline makes (:func:`create_pr_run`, :func:`complete_pr_step`,
+# :func:`create_pr_version`) cannot set that status, sign-offs, quote
+# approvals, escalation clearance or participants.
+#
+# Denormalised on the run doc, each with ONE writer:
+#   open_verify_count, quotes, latest_version  <- create_pr_version
+#   quotes[].status / attested_by              <- attest_pr_quote
+#   event_count                                <- _append_pr_event (same txn)
+
+BRAND_CARDS = "brand_cards"
+PR_RUNS = "pr_runs"
+_BRAND_CARD_HISTORY = "history"
+_PR_VERSIONS = "versions"
+_PR_EVENTS = "events"
+_PR_STEP_DOCS = "steps"
+
+#: Exactly the AI core's ids (``pr_writer_agent.content_types.CONTENT_TYPES``),
+#: in its order. A literal, not an import: the shared store must not load an
+#: agent package. ``tests/test_pr_writer_store.py`` pins the two equal.
+PR_CONTENT_TYPES = (
+    "press_release", "media_advisory", "product_launch", "partnership",
+    "milestone", "award", "event", "thought_leadership",
+)
+PR_STEPS = ("intake", "research", "angle", "draft", "fact_check", "seo", "distribution", "qa")
+PR_BRIEF_SOURCES = ("stated", "extracted", "missing")
+PR_FACT_STATUSES = ("verified", "needs_confirmation", "removed")
+PR_QUOTE_STATUSES = ("pending", "approved", "rejected")
+PR_REVIEW_ROLES = ("editorial", "brand", "compliance")
+PR_SIGNOFF_ROLES = PR_REVIEW_ROLES + ("final",)
+#: Statuses the pipeline may set. ``approved`` and ``changes_requested`` are
+#: NOT here — only a human sign-off reaches them.
+PR_PIPELINE_STATUSES = ("intake", "in_progress", "needs_input", "escalated", "in_review", "failed")
+_RUN_APPROVED = "approved"
+_RUN_CHANGES_REQUESTED = "changes_requested"
+#: The identity the pipeline writes under. Never accepted as a human actor.
+PR_AGENT_ACTOR = "agent:a13"
+_NON_HUMAN_ACTORS = frozenset({"a13", "agent", "system", "cron", "pr_writer", "pr-writer"})
+_NON_HUMAN_PREFIXES = ("agent:", "system:", "cron:", "service:")
+
+#: Evidence rows kept on the run doc. One research round reads 8 pages
+#: (Blog Writer's READS_PER_ROUND) at ~3-5 claims each; two rounds is ~60,
+#: about twice what a 400-700-word release needs for its fact-check table.
+#: Each row's text fields are clipped (below), so 60 rows stay under ~250 KB
+#: and the run doc keeps headroom under Firestore's 1 MiB with brief, quotes
+#: and sign-offs beside it. Rows past the cap are dropped deterministically
+#: (first 60 kept) and counted in ``evidence_dropped`` — never silently.
+PR_EVIDENCE_CAP = 60
+_PR_EVIDENCE_TEXT_CHARS = 1000
+_PR_EVIDENCE_URL_CHARS = 2048
+_PR_EVIDENCE_KEYS_CAP = 12
+PR_PARTICIPANTS_CAP = 25
+PR_QUOTES_CAP = 20
+PR_FACT_ROWS_CAP = 200
+PR_VERSIONS_CAP = 50
+PR_EVENTS_CAP = 2000
+PR_LIST_PAGE_MAX = 50
+_PR_BRIEF_FIELDS_CAP = 40
+_PR_TEXT_CHARS = 4000
+_PR_TITLE_CHARS = 300
+#: Firestore refuses documents over 1 MiB; refuse ours a little earlier with
+#: an error that says which document, instead of an opaque INVALID_ARGUMENT.
+_PR_DOC_BYTES_CAP = 900_000
+_BRAND_CARD_BYTES_CAP = 200_000
+#: The unordered fallback's ceiling (index not built yet). At the cap the read
+#: reports failure rather than a wrong page — the ``asks`` rule.
+_PR_LIST_SCAN_CAP = 1000
+_PR_IO_TIMEOUT_S = 20.0
+_PR_LIST_FIELDS = (
+    "user_id", "brand_id", "content_type", "title", "status",
+    "latest_version", "open_verify_count", "created_at", "updated_at",
+)
+_PR_BRAND_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,99}$")
+_PR_RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_PR_QUOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: Same shape as the AI core's qa.VERIFY: ``[VERIFY]`` or ``[VERIFY: what]``.
+_PR_VERIFY_RE = re.compile(r"\[VERIFY(?::[^\]]*)?\]")
+_PR_STEP_PATCH_KEYS = frozenset({"title", "content_type", "brief", "evidence", "angle", "status",
+                                 "escalation_reason"})
+
+_pr_runs_index_missing_at: float | None = None
+
+
+class PrStoreError(Exception):
+    """Base for the PR Writer store. Router mapping: :class:`PrNotFound` 404,
+    :class:`PrConflict` (and subclasses) 409, :class:`PrActorRefused` 403,
+    :class:`PrCapReached` 413, ``ValueError`` 422."""
+
+
+class PrNotFound(PrStoreError):
+    """No such run — or the caller is not one of its participants."""
+
+
+class PrConflict(PrStoreError):
+    """The write was refused because the stored state moved or forbids it."""
+
+
+class BrandCardConflict(PrConflict):
+    def __init__(self, brand_id: str, current_revision: int, expected_revision: int):
+        self.brand_id = brand_id
+        self.current_revision = current_revision
+        self.expected_revision = expected_revision
+        super().__init__(
+            f"brand card {brand_id!r} is at revision {current_revision}, "
+            f"not {expected_revision} — reload and re-apply the edit")
+
+
+class PrAlreadyExists(PrConflict):
+    """A create-only document (version, event, step output, card history) is
+    already written; it is never overwritten."""
+
+
+class PrStaleVersion(PrConflict):
+    """The write named a version (or quote text) that is no longer current."""
+
+
+class PrRunLocked(PrConflict):
+    """The run is approved; its locked version is never edited."""
+
+
+class PrStepAlreadyDone(PrConflict):
+    """The step is already checkpointed for this round."""
+
+
+class PrSignoffBlocked(PrConflict):
+    def __init__(self, blockers: list[str]):
+        self.blockers = list(blockers)
+        super().__init__("final sign-off blocked: " + "; ".join(self.blockers))
+
+
+class PrActorRefused(PrStoreError):
+    """The actor is missing or is not a person."""
+
+
+class PrCapReached(PrStoreError):
+    """A size or count cap on the run was reached."""
+
+
+# --- small pure helpers ------------------------------------------------------
+
+def _pr_json_bytes(value: Any) -> int:
+    return len(json.dumps(value, default=str, separators=(",", ":")).encode("utf-8"))
+
+
+def _pr_check_size(what: str, value: Any, cap: int) -> None:
+    size = _pr_json_bytes(value)
+    if size > cap:
+        raise PrCapReached(f"{what} is {size} bytes; the cap is {cap}")
+
+
+def _pr_clip(value: Any, limit: int) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def _pr_require_human(actor_id: Any) -> str:
+    """The id of a signed-in person, or :class:`PrActorRefused`. The pipeline's
+    own identity and any service-ish sentinel are refused by name."""
+    actor = str(actor_id or "").strip()
+    lowered = actor.lower()
+    if not actor or lowered in _NON_HUMAN_ACTORS or lowered.startswith(_NON_HUMAN_PREFIXES):
+        raise PrActorRefused("this action needs a signed-in person's id")
+    return actor
+
+
+def _pr_clean_user_ids(values: Any, what: str) -> list[str]:
+    if values is None:
+        return []
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(f"{what} must be a list of user ids")
+    out: list[str] = []
+    for value in values:
+        uid = str(value or "").strip()
+        if not uid or "/" in uid or len(uid) > 128:
+            raise ValueError(f"{what}: not a user id: {value!r}")
+        if uid not in out:
+            out.append(uid)
+    return out
+
+
+def _pr_content_type(value: Any) -> str:
+    if value not in PR_CONTENT_TYPES:
+        raise ValueError(f"content_type must be one of {PR_CONTENT_TYPES}")
+    return value
+
+
+def _pr_printed(value: Any) -> Any:
+    """``value`` without what is never printed: ``blocks[].last_comment`` (a
+    reviewer's comment on a block). Headline/subhead alternates stay — they
+    are handed to reviewers as part of the package."""
+    if isinstance(value, dict):
+        return {k: ([{bk: bv for bk, bv in b.items() if bk != "last_comment"} if isinstance(b, dict) else b
+                     for b in v] if k == "blocks" and isinstance(v, list) else _pr_printed(v))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_pr_printed(v) for v in value]
+    return value
+
+
+def _pr_brand_id(brand_id: Any) -> str:
+    if not isinstance(brand_id, str) or not _PR_BRAND_ID_RE.match(brand_id):
+        raise ValueError(f"not a brand id: {brand_id!r}")
+    return brand_id
+
+
+def quote_text_hash(text: str) -> str:
+    """sha256 of the quote with whitespace collapsed. Whitespace is the only
+    thing normalised: a changed word, letter case or comma is an edit, and an
+    edited quote goes back to pending (blueprint §7, §11)."""
+    return hashlib.sha256(" ".join(str(text or "").split()).encode("utf-8")).hexdigest()
+
+
+def normalize_pr_brief(brief: Any) -> dict[str, dict[str, Any]]:
+    """``{field: {"value", "source"}}`` with ``source`` one of
+    :data:`PR_BRIEF_SOURCES`. A stated/extracted field with an empty value is
+    stored as ``missing`` — a blank is not an answer."""
+    if brief is None:
+        return {}
+    if not isinstance(brief, dict):
+        raise ValueError("brief must be a mapping of field -> {value, source}")
+    if len(brief) > _PR_BRIEF_FIELDS_CAP:
+        raise ValueError(f"brief has more than {_PR_BRIEF_FIELDS_CAP} fields")
+    out: dict[str, dict[str, Any]] = {}
+    for key, entry in brief.items():
+        if not isinstance(key, str) or not re.match(r"^[a-z][a-z0-9_]{0,63}$", key):
+            raise ValueError(f"brief field name not allowed: {key!r}")
+        if not isinstance(entry, dict) or entry.get("source") not in PR_BRIEF_SOURCES:
+            raise ValueError(f"brief.{key} needs a source in {PR_BRIEF_SOURCES}")
+        source = entry["source"]
+        value = None if source == "missing" else entry.get("value")
+        if value is None or value == "" or value == [] or value == {}:
+            source, value = "missing", None
+        out[key] = {"value": value, "source": source}
+    return out
+
+
+def merge_pr_brief(current: Any, incoming: Any) -> dict[str, dict[str, Any]]:
+    """Fold ``incoming`` into ``current``. A field the user STATED is a hard
+    requirement: only another stated value replaces it, never an extracted
+    guess or a "missing"."""
+    merged = {k: dict(v) for k, v in (current or {}).items()}
+    for key, entry in normalize_pr_brief(incoming).items():
+        held = merged.get(key) or {}
+        if held.get("source") == "stated" and entry["source"] != "stated":
+            continue
+        merged[key] = entry
+    return merged
+
+
+def normalize_pr_evidence(items: Any) -> tuple[list[dict[str, Any]], int]:
+    """Clip each row and keep the first :data:`PR_EVIDENCE_CAP`. Returns
+    ``(rows, dropped)``; the caller stores ``dropped`` so the cap is visible."""
+    if items is None:
+        return [], 0
+    if not isinstance(items, list):
+        raise ValueError("evidence must be a list")
+    rows: list[dict[str, Any]] = []
+    for item in items[:PR_EVIDENCE_CAP]:
+        if not isinstance(item, dict):
+            raise ValueError("each evidence row must be a mapping")
+        row: dict[str, Any] = {}
+        for key in list(item)[:_PR_EVIDENCE_KEYS_CAP]:
+            value = item[key]
+            limit = _PR_EVIDENCE_URL_CHARS if key == "url" else _PR_EVIDENCE_TEXT_CHARS
+            row[str(key)[:64]] = value[:limit] if isinstance(value, str) else (
+                value if isinstance(value, (int, float, bool)) or value is None else str(value)[:limit])
+        rows.append(row)
+    return rows, max(0, len(items) - PR_EVIDENCE_CAP)
+
+
+def normalize_pr_fact_checks(rows: Any) -> list[dict[str, Any]]:
+    """Fact-check rows with ``status`` folded onto :data:`PR_FACT_STATUSES`.
+    Anything unrecognised becomes ``needs_confirmation`` — fail closed, so an
+    odd label can never clear a flag."""
+    if rows is None:
+        return []
+    if not isinstance(rows, list):
+        raise ValueError("fact_checks must be a list")
+    if len(rows) > PR_FACT_ROWS_CAP:
+        raise PrCapReached(f"more than {PR_FACT_ROWS_CAP} fact-check rows")
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("each fact-check row must be a mapping")
+        status = re.sub(r"[\s-]+", "_", str(row.get("status") or "").strip().lower())
+        out.append(dict(row) | {"status": status if status in PR_FACT_STATUSES else "needs_confirmation"})
+    return out
+
+
+def count_open_verify(package: Any, fact_checks: list[dict[str, Any]]) -> int:
+    """Open ``[VERIFY]`` flags: the larger of the rows still needing
+    confirmation and the DISTINCT ``[VERIFY…]`` markers left anywhere in the
+    package. Distinct, because a package carries the same draft more than
+    once (markdown and blocks); a verified row never clears a marker still
+    printed in the draft, and any marker at all keeps the count above 0.
+    A reviewer's ``blocks[].last_comment`` is not printed and is not scanned."""
+    open_rows = sum(1 for r in fact_checks if r.get("status") == "needs_confirmation")
+    text = json.dumps(_pr_printed(package), default=str, ensure_ascii=False)
+    markers = set(_PR_VERIFY_RE.findall(text))
+    if "[VERIFY" in text and not markers:
+        markers = {"[VERIFY"}  # malformed marker: still open
+    return max(open_rows, len(markers))
+
+
+def _pr_normalize_incoming_quotes(quotes: Any) -> list[dict[str, Any]]:
+    if quotes is None:
+        return []
+    if not isinstance(quotes, list):
+        raise ValueError("quotes must be a list")
+    if len(quotes) > PR_QUOTES_CAP:
+        raise PrCapReached(f"more than {PR_QUOTES_CAP} quotes")
+    out, seen = [], set()
+    for q in quotes:
+        if not isinstance(q, dict):
+            raise ValueError("each quote must be a mapping")
+        qid = str(q.get("quote_id") or "")
+        if not _PR_QUOTE_ID_RE.match(qid):
+            raise ValueError(f"quote_id not allowed: {qid!r}")
+        if qid in seen:
+            raise ValueError(f"duplicate quote_id {qid!r}")
+        seen.add(qid)
+        text = str(q.get("text") or "").strip()
+        if not text:
+            raise ValueError(f"quote {qid!r} has no text")
+        out.append({
+            "quote_id": qid,
+            "speaker": _pr_clip(q.get("speaker"), 200),
+            "title": _pr_clip(q.get("title"), 200),
+            "organization": _pr_clip(q.get("organization"), 200),
+            "text": text[:_PR_TEXT_CHARS],
+            "text_hash": quote_text_hash(text[:_PR_TEXT_CHARS]),
+        })
+    return out
+
+
+def reset_changed_quotes(previous: Any, incoming: Any) -> list[dict[str, Any]]:
+    """The quote states for a new version. Deterministic and hash-based: a
+    quote keeps its status/attestation only when the previous state has the
+    same ``quote_id`` AND the same ``text_hash``, speaker, title and
+    organization. Anything else — new quote, edited text, re-attributed — is
+    ``pending`` with no attestation. Quotes absent from ``incoming`` drop."""
+    prev = {str(q.get("quote_id")): q for q in (previous or []) if isinstance(q, dict)}
+    out = []
+    for q in _pr_normalize_incoming_quotes(incoming):
+        old = prev.get(q["quote_id"]) or {}
+        same = old and all(old.get(k) == q[k] for k in ("text_hash", "speaker", "title", "organization"))
+        if same and old.get("status") in PR_QUOTE_STATUSES:
+            carried = {k: old.get(k) for k in ("status", "attested_by", "attested_at", "note")}
+        else:
+            carried = {"status": "pending", "attested_by": None, "attested_at": None, "note": ""}
+        out.append(q | carried)
+    return out
+
+
+def pr_build_round(run: dict[str, Any]) -> int:
+    """The version the pipeline is currently building (latest + 1)."""
+    return int(run.get("latest_version") or 0) + 1
+
+
+def pr_step_done(run: dict[str, Any], step: str) -> bool:
+    """Is ``step`` already checkpointed for the round being built? The pipeline
+    asks this before spending a model call."""
+    return ((run.get("steps") or {}).get(step) or {}).get("round") == pr_build_round(run)
+
+
+def pr_final_blockers(run: dict[str, Any]) -> list[str]:
+    """Why the final sign-off would be refused right now (empty = allowed).
+    Pure, so the UI can show the same list the transaction enforces."""
+    latest = int(run.get("latest_version") or 0)
+    if latest == 0:
+        return ["there is no draft version yet"]
+    blockers = []
+    open_verify = int(run.get("open_verify_count") or 0)
+    if open_verify:
+        blockers.append(f"{open_verify} [VERIFY] flag(s) still open on v{latest}")
+    unapproved = [q.get("quote_id") for q in run.get("quotes") or [] if q.get("status") != "approved"]
+    if unapproved:
+        blockers.append("quote(s) not approved: " + ", ".join(map(str, unapproved)))
+    esc = run.get("escalation") or {}
+    if esc.get("flagged") and not esc.get("cleared_by"):
+        blockers.append("escalation not cleared")
+    signoffs = run.get("signoffs") or {}
+    for role in PR_REVIEW_ROLES:
+        s = signoffs.get(role) or {}
+        if s.get("decision") != "approve" or s.get("version") != latest:
+            blockers.append(f"{role} sign-off missing on v{latest}")
+    return blockers
+
+
+def _pr_encode_cursor(row: dict[str, Any]) -> str:
+    raw = json.dumps([str(row.get("updated_at") or ""), str(row.get("id") or "")])
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _pr_decode_cursor(cursor: str) -> tuple[str, str]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode("utf-8")
+        updated_at, run_id = json.loads(raw)
+    except Exception as exc:
+        raise ValueError("bad cursor") from exc
+    if not isinstance(updated_at, str) or not isinstance(run_id, str) or not _PR_RUN_ID_RE.match(run_id):
+        raise ValueError("bad cursor")
+    return updated_at, run_id
+
+
+# --- brand cards ---------------------------------------------------------------
+
+def _brand_card_ref(brand_id: str):
+    return _db().collection(BRAND_CARDS).document(_pr_brand_id(brand_id))
+
+
+def get_brand_card(brand_id: str) -> Optional[dict[str, Any]]:
+    """``{brand_id, revision, card, created_at, updated_at, updated_by}`` or
+    ``None`` when the brand has no card yet (revision 0). One read."""
+    snap = _brand_card_ref(brand_id).get()
+    return ((snap.to_dict() or {}) | {"brand_id": brand_id}) if snap.exists else None
+
+
+def save_brand_card(
+    brand_id: str, card: dict[str, Any], *, expected_revision: int, actor_id: str
+) -> dict[str, Any]:
+    """Replace the card IF it is still at ``expected_revision`` (0 = create).
+
+    Optimistic concurrency in one transaction: a stale revision raises
+    :class:`BrandCardConflict` (router: 409) and nothing is written or merged.
+    On success the prior revision is copied, create-only, to
+    ``brand_cards/{id}/history/{rev:06d}`` and the card becomes
+    ``revision + 1``. ``card["reviewers"]`` (user ids) is who a new run adds
+    as participants. Validating ``brand_id`` against the seo_geo registry is
+    the caller's job. 1 read + 2 writes (1 on create)."""
+    actor = _pr_require_human(actor_id)
+    if not isinstance(card, dict):
+        raise ValueError("card must be a mapping")
+    if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 0:
+        raise ValueError("expected_revision must be a non-negative integer")
+    card = dict(card) | {"reviewers": _pr_clean_user_ids(card.get("reviewers"), "reviewers")}
+    _pr_check_size("brand card", card, _BRAND_CARD_BYTES_CAP)
+    ref = _brand_card_ref(brand_id)
+
+    def _apply(txn) -> dict[str, Any]:
+        snap = ref.get(transaction=txn)
+        current = (snap.to_dict() or {}) if snap.exists else None
+        current_rev = int((current or {}).get("revision") or 0)
+        if current_rev != expected_revision:
+            raise BrandCardConflict(brand_id, current_rev, expected_revision)
+        now = _now()
+        if current is not None:
+            txn.create(ref.collection(_BRAND_CARD_HISTORY).document(f"{current_rev:06d}"),
+                       current | {"superseded_at": now, "superseded_by": actor})
+        doc = {
+            "brand_id": brand_id,
+            "revision": current_rev + 1,
+            "card": card,
+            "created_at": (current or {}).get("created_at") or now,
+            "updated_at": now,
+            "updated_by": actor,
+        }
+        txn.set(ref, doc)
+        return doc
+
+    return _transact(_apply)
+
+
+def list_brand_card_history(brand_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Prior revisions, newest first (single-field order on ``revision``)."""
+    docs = (_brand_card_ref(brand_id).collection(_BRAND_CARD_HISTORY)
+            .order_by("revision", direction=firestore.Query.DESCENDING)
+            .limit(max(1, min(int(limit), 100))).stream())
+    return [doc.to_dict() or {} for doc in docs]
+
+
+# --- runs ------------------------------------------------------------------------
+
+def _pr_run_ref(run_id: str):
+    if not isinstance(run_id, str) or not _PR_RUN_ID_RE.match(run_id):
+        raise PrNotFound("no such run")
+    return _db().collection(PR_RUNS).document(run_id)
+
+
+def _pr_participant_run(txn, ref, user_id: str) -> dict[str, Any]:
+    """The run as read inside ``txn`` — :class:`PrNotFound` when it does not
+    exist OR ``user_id`` is not a participant (indistinguishable on purpose)."""
+    snap = ref.get(transaction=txn)
+    run = (snap.to_dict() or {}) if snap.exists else None
+    if run is None or not user_id or user_id not in (run.get("participants") or []):
+        raise PrNotFound("no such run")
+    return run | {"id": ref.id}
+
+
+def _pr_refuse_locked(run: dict[str, Any]) -> None:
+    if run.get("status") == _RUN_APPROVED:
+        raise PrRunLocked(f"run is approved (v{run.get('approved_version')}); it is locked")
+
+
+def _pr_refuse_escalated(run: dict[str, Any]) -> None:
+    """Blueprint §8: an escalated topic pauses drafting until a person clears it."""
+    esc = run.get("escalation") or {}
+    if esc.get("flagged") and not esc.get("cleared_by"):
+        raise PrConflict("run is escalated; a person must clear it before drafting continues")
+
+
+def _append_pr_event(txn, run_ref, run: dict[str, Any], kind: str, actor: str, now: str,
+                     **data: Any) -> dict[str, Any]:
+    """Create-only event ``pr_runs/{id}/events/{seq:06d}`` in ``txn``. ``seq``
+    comes from the run's ``event_count`` read in the same transaction, so two
+    racing writers cannot share one. Returns the run patch to merge."""
+    seq = int(run.get("event_count") or 0) + 1
+    if seq > PR_EVENTS_CAP:
+        raise PrCapReached(f"run has {PR_EVENTS_CAP} events")
+    txn.create(run_ref.collection(_PR_EVENTS).document(f"{seq:06d}"),
+               {"seq": seq, "kind": kind, "actor_id": actor, "at": now, **data})
+    return {"event_count": seq}
+
+
+def _pr_commit(fn: Callable[[Any], Any]) -> Any:
+    """``_transact`` with a create that lost a race reported as the store's own
+    conflict rather than a raw API error."""
+    try:
+        return _transact(fn)
+    except gexc.AlreadyExists as exc:
+        raise PrAlreadyExists(str(exc)) from exc
+
+
+def create_pr_run(
+    *, owner_id: str, brand_id: str, content_type: str, title: str,
+    brief: dict[str, Any] | None = None, participants: list[str] | tuple = (),
+) -> dict[str, Any]:
+    """Start a run. ``participants`` = owner + the brand card's ``reviewers``
+    as they stand now + ``participants`` given here. Records which card
+    revision the run started from (0 = no card yet). 1 read + 2 writes."""
+    owner = _pr_require_human(owner_id)
+    _pr_content_type(content_type)
+    title = _pr_clip(title, _PR_TITLE_CHARS)
+    if not title:
+        raise ValueError("a run needs a title (the news in one sentence)")
+    card = get_brand_card(brand_id)
+    reviewers = _pr_clean_user_ids(((card or {}).get("card") or {}).get("reviewers"), "reviewers")
+    members = _pr_clean_user_ids([owner, *reviewers, *list(participants or ())], "participants")
+    if len(members) > PR_PARTICIPANTS_CAP:
+        raise PrCapReached(f"more than {PR_PARTICIPANTS_CAP} participants")
+    run_id = uuid.uuid4().hex
+    ref = _db().collection(PR_RUNS).document(run_id)
+    now = _now()
+    doc: dict[str, Any] = {
+        "user_id": owner,
+        "participants": members,
+        "brand_id": brand_id,
+        "brand_card_revision": int((card or {}).get("revision") or 0),
+        "content_type": content_type,
+        "title": title,
+        "status": "intake",
+        "brief": normalize_pr_brief(brief),
+        "evidence": [],
+        "evidence_dropped": 0,
+        "angle": "",
+        "quotes": [],
+        "signoffs": {},
+        "latest_version": 0,
+        "open_verify_count": 0,
+        "escalation": {"flagged": False, "reason": "", "flagged_at": None,
+                       "cleared_by": None, "cleared_at": None, "note": ""},
+        "steps": {},
+        "event_count": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+    _pr_check_size("run", doc, _PR_DOC_BYTES_CAP)
+
+    def _apply(txn) -> dict[str, Any]:
+        created = doc | _append_pr_event(txn, ref, doc, "run_created", owner, now)
+        txn.create(ref, created)
+        return created | {"id": run_id}
+
+    return _pr_commit(_apply)
+
+
+def get_pr_run(run_id: str, user_id: str) -> Optional[dict[str, Any]]:
+    """The run, or ``None`` when it does not exist or ``user_id`` is not a
+    participant (router: 404 either way). One read."""
+    if not user_id or not isinstance(run_id, str) or not _PR_RUN_ID_RE.match(run_id):
+        return None
+    snap = _db().collection(PR_RUNS).document(run_id).get()
+    run = (snap.to_dict() or {}) if snap.exists else None
+    if run is None or user_id not in (run.get("participants") or []):
+        return None
+    return run | {"id": run_id}
+
+
+def list_pr_runs(
+    user_id: str, *, limit: int = 20, cursor: str | None = None
+) -> Optional[dict[str, Any]]:
+    """The caller's runs (any they participate in), most recently updated
+    first: ``{"runs": [...], "next_cursor": str | None}``. Rows carry only
+    :data:`_PR_LIST_FIELDS` + ``id``. ``None`` means the read failed.
+
+    One query, ``participants array-contains`` + ``updated_at DESC`` (+ the
+    doc id as tie-break) — needs the ``pr_runs`` composite in
+    ``firestore.indexes.json``. Until it is built the refused query falls back
+    to the array-contains filter alone (automatic index), sorted here and
+    capped at :data:`_PR_LIST_SCAN_CAP`. Cost: ``limit + 1`` reads per page
+    (fallback: every one of the caller's runs)."""
+    global _pr_runs_index_missing_at
+    if not user_id:
+        return {"runs": [], "next_cursor": None}
+    limit = max(1, min(int(limit), PR_LIST_PAGE_MAX))
+    after = _pr_decode_cursor(cursor) if cursor else None
+    doc_id = "__name__"  # FieldPath.document_id(); a str cursor value becomes a doc reference
+    scoped = _db().collection(PR_RUNS).where(
+        filter=firestore.FieldFilter("participants", "array_contains", user_id))
+
+    def _page(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        more = len(rows) > limit
+        rows = rows[:limit]
+        return {"runs": rows, "next_cursor": _pr_encode_cursor(rows[-1]) if more and rows else None}
+
+    now = time.monotonic()
+    known_missing = (_pr_runs_index_missing_at is not None
+                     and (now - _pr_runs_index_missing_at) < _RUNS_INDEX_RETRY_SECONDS)
+    if not known_missing:
+        try:
+            query = (scoped.order_by("updated_at", direction=firestore.Query.DESCENDING)
+                     .order_by(doc_id, direction=firestore.Query.DESCENDING))
+            if after:
+                query = query.start_after({"updated_at": after[0], doc_id: after[1]})
+            docs = query.select(list(_PR_LIST_FIELDS)).limit(limit + 1).stream(timeout=_PR_IO_TIMEOUT_S)
+            rows = [(doc.to_dict() or {}) | {"id": doc.id} for doc in docs]
+            _pr_runs_index_missing_at = None
+            return _page(rows)
+        except Exception:
+            _pr_runs_index_missing_at = now
+            logger.warning(
+                "pr_runs: the ordered read was refused — build the composite "
+                "(participants CONTAINS, updated_at DESC). Sorting in process.",
+                exc_info=True)
+    try:
+        docs = scoped.select(list(_PR_LIST_FIELDS)).limit(_PR_LIST_SCAN_CAP).stream(timeout=_PR_IO_TIMEOUT_S)
+        rows = [(doc.to_dict() or {}) | {"id": doc.id} for doc in docs]
+    except Exception:
+        logger.warning("could not read pr_runs", exc_info=True)
+        return None
+    if len(rows) >= _PR_LIST_SCAN_CAP:
+        logger.warning("pr_runs: %s+ runs for one caller; the unordered read reports "
+                       "failure rather than a wrong page — build the index", _PR_LIST_SCAN_CAP)
+        return None
+    key = lambda r: (str(r.get("updated_at") or ""), str(r.get("id") or ""))  # noqa: E731
+    rows.sort(key=key, reverse=True)
+    if after:
+        rows = [r for r in rows if key(r) < after]
+    return _page(rows)
+
+
+def add_pr_participant(run_id: str, *, actor_id: str, user_id: str) -> dict[str, Any]:
+    """A participant adds someone (a quoted executive, a second reviewer).
+    1 read + 2 writes."""
+    actor = _pr_require_human(actor_id)
+    new_uid = _pr_clean_user_ids([user_id], "user_id")[0]
+    ref = _pr_run_ref(run_id)
+
+    def _apply(txn) -> dict[str, Any]:
+        run = _pr_participant_run(txn, ref, actor)
+        members = list(run.get("participants") or [])
+        if new_uid in members:
+            return run
+        if len(members) >= PR_PARTICIPANTS_CAP:
+            raise PrCapReached(f"run already has {PR_PARTICIPANTS_CAP} participants")
+        now = _now()
+        patch = {"participants": members + [new_uid], "updated_at": now}
+        patch |= _append_pr_event(txn, ref, run, "participant_added", actor, now, user_id=new_uid)
+        txn.update(ref, patch)
+        return run | patch
+
+    return _pr_commit(_apply)
+
+
+# --- pipeline writes (the agent's ONLY write paths) ------------------------------
+
+def _pr_apply_step_patch(run: dict[str, Any], patch: dict[str, Any], now: str) -> dict[str, Any]:
+    unknown = set(patch) - _PR_STEP_PATCH_KEYS
+    if unknown:
+        raise ValueError(f"the pipeline cannot write {sorted(unknown)}")
+    out: dict[str, Any] = {}
+    if "title" in patch:
+        title = _pr_clip(patch["title"], _PR_TITLE_CHARS)
+        if not title:
+            raise ValueError("title cannot be blank")
+        out["title"] = title
+    if "brief" in patch:
+        out["brief"] = merge_pr_brief(run.get("brief"), patch["brief"])
+    if "evidence" in patch:
+        out["evidence"], out["evidence_dropped"] = normalize_pr_evidence(patch["evidence"])
+    if "content_type" in patch:
+        out["content_type"] = _pr_content_type(patch["content_type"])
+    if "angle" in patch:
+        out["angle"] = _pr_clip(patch["angle"], _PR_TEXT_CHARS)
+    if "status" in patch:
+        if patch["status"] not in PR_PIPELINE_STATUSES:
+            raise ValueError(f"the pipeline may only set status to one of {PR_PIPELINE_STATUSES}")
+        out["status"] = patch["status"]
+    if patch.get("escalation_reason"):
+        out["escalation"] = {"flagged": True, "reason": _pr_clip(patch["escalation_reason"], _PR_TEXT_CHARS),
+                             "flagged_at": now, "cleared_by": None, "cleared_at": None, "note": ""}
+        out["status"] = "escalated"
+    return out
+
+
+def complete_pr_step(
+    run_id: str, step: str, *, user_id: str, output: Any = None,
+    patch: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Checkpoint ``step`` for the round being built, once.
+
+    In one transaction: if the step is already done this round, nothing is
+    written and ``(run, False)`` comes back — a retried request never re-runs
+    or re-writes it. Otherwise ``output`` (if any) is created at
+    ``steps/v{round:03d}_{step}``, the allow-listed ``patch`` fields
+    (title, brief, evidence, angle, pipeline status, escalation_reason) land on
+    the run, and ``(run, True)`` returns. ``user_id`` is the participant whose
+    request drives the pipeline. 1 read + 1-2 writes."""
+    if step not in PR_STEPS:
+        raise ValueError(f"step must be one of {PR_STEPS}")
+    if output is not None:
+        _pr_check_size(f"{step} output", output, _PR_DOC_BYTES_CAP)
+    ref = _pr_run_ref(run_id)
+
+    def _apply(txn) -> tuple[dict[str, Any], bool]:
+        run = _pr_participant_run(txn, ref, user_id)
+        _pr_refuse_locked(run)
+        if pr_step_done(run, step):
+            return run, False
+        _pr_refuse_escalated(run)
+        now = _now()
+        rnd = pr_build_round(run)
+        update = _pr_apply_step_patch(run, patch or {}, now)
+        update["steps"] = dict(run.get("steps") or {}) | {step: {"round": rnd, "at": now}}
+        update["updated_at"] = now
+        _pr_check_size("run", run | update, _PR_DOC_BYTES_CAP)
+        if output is not None:
+            txn.create(ref.collection(_PR_STEP_DOCS).document(f"v{rnd:03d}_{step}"),
+                       {"step": step, "round": rnd, "output": output, "at": now})
+        txn.update(ref, update)
+        return run | update, True
+
+    return _pr_commit(_apply)
+
+
+def get_pr_step_output(
+    run_id: str, step: str, *, user_id: str, round: int | None = None
+) -> Optional[dict[str, Any]]:
+    """A checkpointed step's stored output (default: the round being built).
+    ``None`` when absent or the caller is not a participant. 2 reads."""
+    run = get_pr_run(run_id, user_id)
+    if run is None or step not in PR_STEPS:
+        return None
+    rnd = int(round or pr_build_round(run))
+    snap = (_db().collection(PR_RUNS).document(run_id).collection(_PR_STEP_DOCS)
+            .document(f"v{rnd:03d}_{step}").get())
+    return (snap.to_dict() or {}) if snap.exists else None
+
+
+def create_pr_version(
+    run_id: str, *, user_id: str, version: int, package: dict[str, Any],
+    fact_checks: list[dict[str, Any]], qa: Any, changes: list[Any],
+    quotes: list[dict[str, Any]], created_by: str = PR_AGENT_ACTOR,
+    label: str = "", close_step: str | None = None,
+) -> dict[str, Any]:
+    """Write ``pr_runs/{id}/versions/{version:04d}`` — create-only.
+
+    ``version`` must be exactly ``latest_version + 1`` (else
+    :class:`PrStaleVersion`); a version doc that already exists raises
+    :class:`PrAlreadyExists` and is never overwritten. In the same transaction
+    the run gets ``latest_version``, ``open_verify_count`` (computed here from
+    the rows and the package's ``[VERIFY`` markers — never trusted from the
+    caller), the quote states from :func:`reset_changed_quotes`, sign-offs
+    cleared (they were for the previous version), status ``in_review``, and
+    ``close_step`` checkpointed. Refused on an approved run. ``label`` is the
+    blueprint's display version (``v1.1``); the integer is the identity.
+    1-2 reads + 3 writes."""
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ValueError("version must be a positive integer")
+    if version > PR_VERSIONS_CAP:
+        raise PrCapReached(f"a run holds at most {PR_VERSIONS_CAP} versions")
+    if not isinstance(package, dict):
+        raise ValueError("package must be a mapping")
+    if close_step is not None and close_step not in PR_STEPS:
+        raise ValueError(f"close_step must be one of {PR_STEPS}")
+    rows = normalize_pr_fact_checks(fact_checks)
+    incoming_quotes = _pr_normalize_incoming_quotes(quotes)
+    if not isinstance(changes, list):
+        raise ValueError("changes must be a list")
+    open_verify = count_open_verify(package, rows)
+    ref = _pr_run_ref(run_id)
+    version_ref = ref.collection(_PR_VERSIONS).document(f"{version:04d}")
+    created_by = _pr_clip(created_by, 128) or PR_AGENT_ACTOR
+
+    def _apply(txn) -> dict[str, Any]:
+        run = _pr_participant_run(txn, ref, user_id)
+        _pr_refuse_locked(run)
+        _pr_refuse_escalated(run)
+        latest = int(run.get("latest_version") or 0)
+        if version != latest + 1:
+            raise PrStaleVersion(f"run is at v{latest}; the next version is {latest + 1}, not {version}")
+        if version_ref.get(transaction=txn).exists:
+            raise PrAlreadyExists(f"version {version} already exists")
+        if close_step and pr_step_done(run, close_step):
+            raise PrStepAlreadyDone(f"{close_step} is already done for v{version}")
+        now = _now()
+        doc = {
+            "run_id": run_id, "version": version, "label": _pr_clip(label, 40) or f"v{version}",
+            "package": package, "fact_checks": rows, "open_verify_count": open_verify,
+            "qa": qa, "changes": changes, "quotes": incoming_quotes,
+            "created_by": created_by, "created_at": now,
+        }
+        _pr_check_size(f"version {version}", doc, _PR_DOC_BYTES_CAP)
+        update: dict[str, Any] = {
+            "latest_version": version,
+            "open_verify_count": open_verify,
+            "quotes": reset_changed_quotes(run.get("quotes"), quotes),
+            "signoffs": {},
+            "status": "in_review",
+            "updated_at": now,
+        }
+        if close_step:
+            update["steps"] = dict(run.get("steps") or {}) | {close_step: {"round": version, "at": now}}
+        txn.create(version_ref, doc)
+        update |= _append_pr_event(txn, ref, run, "version_created", created_by, now,
+                                   version=version, open_verify_count=open_verify)
+        txn.update(ref, update)
+        return doc
+
+    return _pr_commit(_apply)
+
+
+def get_pr_version(run_id: str, version: int, *, user_id: str) -> Optional[dict[str, Any]]:
+    """One version, participant-scoped. 2 reads."""
+    if get_pr_run(run_id, user_id) is None or not isinstance(version, int) or version < 1:
+        return None
+    snap = (_db().collection(PR_RUNS).document(run_id).collection(_PR_VERSIONS)
+            .document(f"{version:04d}").get())
+    return (snap.to_dict() or {}) if snap.exists else None
+
+
+def list_pr_versions(run_id: str, *, user_id: str) -> Optional[list[dict[str, Any]]]:
+    """Version summaries oldest first (no package bodies). 1 + N reads."""
+    if get_pr_run(run_id, user_id) is None:
+        return None
+    docs = (_db().collection(PR_RUNS).document(run_id).collection(_PR_VERSIONS)
+            .order_by("version").select(["version", "label", "open_verify_count", "created_by", "created_at"])
+            .limit(PR_VERSIONS_CAP).stream())
+    return [doc.to_dict() or {} for doc in docs]
+
+
+# --- human actions -----------------------------------------------------------------
+
+def list_pr_events(
+    run_id: str, *, user_id: str, after_seq: int = 0, limit: int = 200
+) -> Optional[list[dict[str, Any]]]:
+    """The run's event trail in order, participant-scoped. 1 + N reads."""
+    if get_pr_run(run_id, user_id) is None:
+        return None
+    docs = (_db().collection(PR_RUNS).document(run_id).collection(_PR_EVENTS)
+            .order_by("seq").start_after({"seq": int(after_seq)})
+            .limit(max(1, min(int(limit), 500))).stream())
+    return [doc.to_dict() or {} for doc in docs]
+
+
+def add_pr_comment(
+    run_id: str, *, actor_id: str, text: str, version: int | None = None
+) -> dict[str, Any]:
+    """Append a comment event. 1 read + 2 writes."""
+    actor = _pr_require_human(actor_id)
+    body = _pr_clip(text, _PR_TEXT_CHARS)
+    if not body:
+        raise ValueError("a comment needs text")
+    ref = _pr_run_ref(run_id)
+
+    def _apply(txn) -> dict[str, Any]:
+        run = _pr_participant_run(txn, ref, actor)
+        now = _now()
+        patch = _append_pr_event(txn, ref, run, "comment", actor, now, text=body, version=version)
+        patch["updated_at"] = now
+        txn.update(ref, patch)
+        return {"seq": patch["event_count"], "kind": "comment", "actor_id": actor,
+                "at": now, "text": body, "version": version}
+
+    return _pr_commit(_apply)
+
+
+def attest_pr_quote(
+    run_id: str, quote_id: str, *, actor_id: str, text_hash: str,
+    decision: str = "approved", note: str = "",
+) -> dict[str, Any]:
+    """A person records a quote's approval or rejection (e.g. "approved by
+    email 11-02"). ``text_hash`` is the hash the person was shown: if the quote
+    changed since, :class:`PrStaleVersion` — nobody approves text they did not
+    see. 1 read + 2 writes."""
+    actor = _pr_require_human(actor_id)
+    if decision not in ("approved", "rejected"):
+        raise ValueError("decision must be 'approved' or 'rejected'")
+    ref = _pr_run_ref(run_id)
+
+    def _apply(txn) -> dict[str, Any]:
+        run = _pr_participant_run(txn, ref, actor)
+        _pr_refuse_locked(run)
+        quotes = [dict(q) for q in run.get("quotes") or []]
+        target = next((q for q in quotes if q.get("quote_id") == quote_id), None)
+        if target is None:
+            raise PrNotFound(f"no quote {quote_id!r} on the current version")
+        if target.get("text_hash") != text_hash:
+            raise PrStaleVersion(f"quote {quote_id!r} changed since it was shown")
+        now = _now()
+        target.update(status=decision, attested_by=actor, attested_at=now, note=_pr_clip(note, 1000))
+        patch = {"quotes": quotes, "updated_at": now}
+        patch |= _append_pr_event(txn, ref, run, f"quote_{decision}", actor, now,
+                                  quote_id=quote_id, text_hash=text_hash,
+                                  version=run.get("latest_version"), note=target["note"])
+        txn.update(ref, patch)
+        return run | patch
+
+    return _pr_commit(_apply)
+
+
+def clear_pr_escalation(run_id: str, *, actor_id: str, note: str) -> dict[str, Any]:
+    """A person (comms lead / legal) clears a flagged escalation so drafting
+    may continue. 1 read + 2 writes."""
+    actor = _pr_require_human(actor_id)
+    note = _pr_clip(note, _PR_TEXT_CHARS)
+    if not note:
+        raise ValueError("clearing an escalation needs a note")
+    ref = _pr_run_ref(run_id)
+
+    def _apply(txn) -> dict[str, Any]:
+        run = _pr_participant_run(txn, ref, actor)
+        _pr_refuse_locked(run)
+        esc = dict(run.get("escalation") or {})
+        if not esc.get("flagged") or esc.get("cleared_by"):
+            raise PrConflict("there is no open escalation on this run")
+        now = _now()
+        esc.update(cleared_by=actor, cleared_at=now, note=note)
+        patch = {"escalation": esc, "updated_at": now,
+                 "status": "in_review" if run.get("latest_version") else "in_progress"}
+        patch |= _append_pr_event(txn, ref, run, "escalation_cleared", actor, now, note=note)
+        txn.update(ref, patch)
+        return run | patch
+
+    return _pr_commit(_apply)
+
+
+def record_pr_signoff(
+    run_id: str, *, role: str, actor_id: str, version: int,
+    decision: str = "approve", note: str = "",
+) -> dict[str, Any]:
+    """Record one human sign-off on the CURRENT version, transactionally.
+
+    ``version`` must be ``latest_version`` (else :class:`PrStaleVersion`).
+    ``reject`` records the rejection and moves the run to
+    ``changes_requested``. ``approve`` on a review role records it; on
+    ``final`` it runs :func:`pr_final_blockers` inside the transaction — open
+    ``[VERIFY]`` flags, any quote not approved, an uncleared escalation, or a
+    review role not approved on this version raises
+    :class:`PrSignoffBlocked` and nothing is written. Otherwise the run is
+    ``approved`` and locked. This is the ONLY writer of ``approved``; it
+    requires a human participant's id. 1 read + 2 writes."""
+    actor = _pr_require_human(actor_id)
+    if role not in PR_SIGNOFF_ROLES:
+        raise ValueError(f"role must be one of {PR_SIGNOFF_ROLES}")
+    if decision not in ("approve", "reject"):
+        raise ValueError("decision must be 'approve' or 'reject'")
+    note = _pr_clip(note, _PR_TEXT_CHARS)
+    ref = _pr_run_ref(run_id)
+
+    def _apply(txn) -> dict[str, Any]:
+        run = _pr_participant_run(txn, ref, actor)
+        _pr_refuse_locked(run)
+        latest = int(run.get("latest_version") or 0)
+        if latest == 0:
+            raise PrSignoffBlocked(["there is no draft version yet"])
+        if version != latest:
+            raise PrStaleVersion(f"sign-off names v{version}; the current version is v{latest}")
+        now = _now()
+        entry = {"decision": decision, "actor_id": actor, "version": version, "at": now, "note": note}
+        patch: dict[str, Any] = {"signoffs": dict(run.get("signoffs") or {}) | {role: entry},
+                                 "updated_at": now}
+        if decision == "reject":
+            patch["status"] = _RUN_CHANGES_REQUESTED
+            kind = "rejection"
+        else:
+            kind = "signoff"
+            if role == "final":
+                blockers = pr_final_blockers(run)
+                if blockers:
+                    raise PrSignoffBlocked(blockers)
+                patch.update(status=_RUN_APPROVED, approved_version=version,
+                             approved_by=actor, approved_at=now)
+        patch |= _append_pr_event(txn, ref, run, kind, actor, now,
+                                  role=role, version=version, note=note)
+        txn.update(ref, patch)
+        return run | patch
+
+    return _pr_commit(_apply)
+
+
+# --------------------------------------------------------------------------- #
+# PR Writer (a13): the router's flow state — step leases and the run's ``flow``
+# --------------------------------------------------------------------------- #
+# Added by senior-python-backend for the HTTP contract (docs/pr-writer-api.md).
+# Everything here writes ONE field the section above never reads or writes:
+# ``pr_runs/{id}.flow`` — the step lease/failure table, the clarify card, the
+# escalation record (category, excerpt, notes, close/withdraw), the reviewer
+# snapshot by role, the package sections and the version metadata the UI
+# lists. Status, sign-offs, quote approvals, the escalation flag/clearance,
+# evidence, versions and participants stay with the functions above, so the
+# human-only invariants there are untouched: nothing here can approve,
+# attest, sign off or clear.
+
+_PR_FLOW_BYTES_CAP = 400_000
+
+
+def _pr_flow_of(run: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(run.get("flow") or {}, default=str))
+
+
+def _pr_iso_after(seconds: float) -> str:
+    return datetime.fromtimestamp(time.time() + seconds, timezone.utc).isoformat()
+
+
+def lease_pr_step(run_id: str, step: str, *, user_id: str, lease_s: float) -> dict[str, Any]:
+    """Take the lease on ``step`` so only ONE request spends model calls on it.
+
+    In one transaction, against ``flow.steps[step]``:
+
+    * ``done`` already                        -> ``{"done": True}``, nothing written;
+    * ``running`` with a lease still in force -> ``{"acquired": False,
+      "retry_after_s": n}``, nothing written;
+    * anything else (pending, failed, partial, an expired lease) -> the lease
+      is taken: ``state="running"``, ``lease_until`` = now + ``lease_s``, the
+      previous error cleared.
+
+    Returns ``{"run", "acquired", "done", "retry_after_s"}``. ``lease_s`` must
+    cover the step's whole server deadline, so a lease never expires under a
+    request that is still working. 1 read + 0-1 write."""
+    if not step or not re.match(r"^[a-z_]{1,32}$", step):
+        raise ValueError(f"not a step id: {step!r}")
+    if lease_s <= 0:
+        raise ValueError("lease_s must be positive")
+    ref = _pr_run_ref(run_id)
+
+    def _apply(txn) -> dict[str, Any]:
+        run = _pr_participant_run(txn, ref, user_id)
+        flow = _pr_flow_of(run)
+        entry = dict((flow.get("steps") or {}).get(step) or {})
+        now = _now()
+        if entry.get("state") == "done":
+            return {"run": run, "acquired": False, "done": True, "retry_after_s": 0}
+        lease_until = str(entry.get("lease_until") or "")
+        if entry.get("state") == "running" and lease_until > now:
+            left = datetime.fromisoformat(lease_until) - datetime.fromisoformat(now)
+            return {"run": run, "acquired": False, "done": False,
+                    "retry_after_s": max(1, int(left.total_seconds()) + 1)}
+        entry.update(state="running", lease_until=_pr_iso_after(lease_s), started_at=now,
+                     holder=user_id, error=None)
+        flow.setdefault("steps", {})[step] = entry
+        patch = {"flow": flow, "updated_at": now}
+        txn.update(ref, patch)
+        return {"run": run | patch, "acquired": True, "done": False, "retry_after_s": 0}
+
+    return _pr_commit(_apply)
+
+
+def finish_pr_step(
+    run_id: str, step: str, *, user_id: str, state: str, result: Any = None,
+    error: dict[str, Any] | None = None, flow_patch: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Release the lease on ``step`` with its outcome (``done``, ``partial`` or
+    ``failed``) and merge ``flow_patch`` (top-level keys of ``flow``, never
+    ``steps``) in the same write. 1 read + 1 write."""
+    if state not in ("done", "partial", "failed", "pending"):
+        raise ValueError("state must be done, partial, failed or pending")
+    if flow_patch and "steps" in flow_patch:
+        raise ValueError("flow_patch cannot replace the step table")
+    ref = _pr_run_ref(run_id)
+
+    def _apply(txn) -> dict[str, Any]:
+        run = _pr_participant_run(txn, ref, user_id)
+        flow = _pr_flow_of(run)
+        entry = dict((flow.get("steps") or {}).get(step) or {})
+        now = _now()
+        entry.update(state=state, lease_until=None, holder=None,
+                     finished_at=now if state in ("done", "partial") else entry.get("finished_at"),
+                     result=result if result is not None else entry.get("result"),
+                     error=error)
+        flow.setdefault("steps", {})[step] = entry
+        flow.update(flow_patch or {})
+        _pr_check_size("run flow", flow, _PR_FLOW_BYTES_CAP)
+        patch = {"flow": flow, "updated_at": now}
+        txn.update(ref, patch)
+        return run | patch
+
+    return _pr_commit(_apply)
+
+
+def update_pr_flow(
+    run_id: str, *, actor_id: str, mutate: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]],
+    event_kind: str | None = None, event_data: dict[str, Any] | None = None,
+    require_human: bool = True,
+) -> dict[str, Any]:
+    """Read-modify-write ``flow`` in one transaction. ``mutate(run, flow)``
+    returns the new flow (it may raise to refuse; nothing is written then).
+    ``actor_id`` must be a participant and, unless ``require_human`` is
+    False (the router's own bookkeeping after a pipeline write), a person.
+    ``event_kind`` appends one create-only event in the same transaction.
+    When the new flow names a ``content_type`` the run doc's ``content_type``
+    is set to it in the SAME write (unknown id -> ``ValueError``, nothing
+    written), so the run doc and ``flow`` never disagree. 1 read + 1-2 writes."""
+    actor = _pr_require_human(actor_id) if require_human else str(actor_id or "")
+    if event_kind is not None and not re.match(r"^[a-z_]{1,48}$", event_kind):
+        raise ValueError(f"event kind not allowed: {event_kind!r}")
+    ref = _pr_run_ref(run_id)
+
+    def _apply(txn) -> dict[str, Any]:
+        run = _pr_participant_run(txn, ref, actor)
+        flow = mutate(run, _pr_flow_of(run))
+        if not isinstance(flow, dict):
+            raise ValueError("mutate must return the flow mapping")
+        _pr_check_size("run flow", flow, _PR_FLOW_BYTES_CAP)
+        now = _now()
+        patch: dict[str, Any] = {"flow": flow, "updated_at": now}
+        if flow.get("content_type") is not None:
+            patch["content_type"] = _pr_content_type(flow["content_type"])
+        if event_kind is not None:
+            patch |= _append_pr_event(txn, ref, run, event_kind, actor, now, **(event_data or {}))
+        txn.update(ref, patch)
+        return run | patch
+
+    return _pr_commit(_apply)
+
+
+def get_pr_runs_by_ids(run_ids: list[str], *, user_id: str) -> list[dict[str, Any]]:
+    """The full run docs for ``run_ids`` in ONE batched read, keeping only the
+    ones ``user_id`` participates in, in the order asked. Absent = no access.
+    Used after :func:`list_pr_runs` (whose rows carry list fields only)."""
+    ids = [rid for rid in dict.fromkeys(run_ids) if isinstance(rid, str) and _PR_RUN_ID_RE.match(rid)]
+    if not ids or not user_id:
+        return []
+    col = _db().collection(PR_RUNS)
+    found: dict[str, dict[str, Any]] = {}
+    for snap in _db().get_all([col.document(rid) for rid in ids]):
+        data = (snap.to_dict() or {}) if snap.exists else None
+        if data is not None and user_id in (data.get("participants") or []):
+            found[snap.id] = data | {"id": snap.id}
+    return [found[rid] for rid in ids if rid in found]
+
+
+def flag_pr_escalation(run_id: str, *, actor_id: str, reason: str) -> dict[str, Any]:
+    """Pause a run for comms and legal AFTER intake — when the owner's clarify
+    answers screen as sensitive. :func:`complete_pr_step` can only raise the
+    flag with a step that is not yet done, and by then the intake step is.
+
+    Raise-only: it sets ``escalation.flagged`` (and status ``escalated``) and
+    can never clear, approve or sign anything — clearing stays
+    :func:`clear_pr_escalation`'s, by a person. An escalation that is already
+    open is left as it is. Refused on an approved run. 1 read + 2 writes."""
+    actor = _pr_require_human(actor_id)
+    reason = _pr_clip(reason, _PR_TEXT_CHARS) or "escalated"
+    ref = _pr_run_ref(run_id)
+
+    def _apply(txn) -> dict[str, Any]:
+        run = _pr_participant_run(txn, ref, actor)
+        _pr_refuse_locked(run)
+        esc = run.get("escalation") or {}
+        if esc.get("flagged") and not esc.get("cleared_by"):
+            return run
+        now = _now()
+        patch: dict[str, Any] = {
+            "escalation": {"flagged": True, "reason": reason, "flagged_at": now, "cleared_by": None,
+                           "cleared_at": None, "note": ""},
+            "status": "escalated", "updated_at": now,
+        }
+        patch |= _append_pr_event(txn, ref, run, "escalation_flagged", actor, now, reason=reason)
+        txn.update(ref, patch)
+        return run | patch
+
+    return _pr_commit(_apply)

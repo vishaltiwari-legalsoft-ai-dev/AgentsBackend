@@ -127,6 +127,7 @@ def record_activity(
     status: str = "completed",
     usage_action: Optional[str] = "generate",
     count: int = 1,
+    usage: Optional[dict] = None,
 ) -> None:
     """Log one unit of agent work: who did it, on which agent, and what task.
 
@@ -140,6 +141,10 @@ def record_activity(
 
     Routers reach this through :class:`ActivityTrail` rather than calling it
     directly, so that the decision to record lives on the route declaration.
+
+    ``usage`` is the model spend behind this unit, when the agent measures it:
+    only numbers and model ids are kept (:func:`clean_usage`), never prompt or
+    output text.
     """
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
@@ -165,6 +170,8 @@ def record_activity(
         "brand_id": brand_id,
         "status": status,
     }
+    if usage:
+        doc["usage"] = clean_usage(usage)
     try:
         _db = firestore_repo._db  # late-bound so tests can stub it
         _db().collection(firestore_repo.agent_runs_collection(agent_id)).document(
@@ -189,6 +196,22 @@ def record_activity(
         count=count,
         brand=brand,
     )
+
+
+def clean_usage(usage: dict) -> dict:
+    """The model-spend fields a trail row may carry: call and token counts,
+    the cost when the provider reported one (else ``None`` — never a guess),
+    and the model ids. Anything else in ``usage`` is dropped."""
+    out: dict = {}
+    for key in ("calls", "input_tokens", "output_tokens"):
+        try:
+            out[key] = int(usage.get(key) or 0)
+        except (TypeError, ValueError):
+            out[key] = 0
+    cost = usage.get("cost_usd")
+    out["cost_usd"] = float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None
+    out["models"] = [str(m)[:120] for m in (usage.get("models") or [])][:10]
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -217,6 +240,7 @@ class Activity:
         self.run_id: Optional[str] = None
         self.status = "completed"
         self.count = 1
+        self.usage: Optional[dict] = None
         self._skipped: Optional[str] = None
 
     def note(
@@ -229,6 +253,7 @@ class Activity:
         run_id: Optional[str] = None,
         status: Optional[str] = None,
         count: Optional[int] = None,
+        usage: Optional[dict] = None,
     ) -> None:
         """Fill in what this particular request turned out to be.
 
@@ -250,6 +275,8 @@ class Activity:
             self.status = status
         if count is not None:
             self.count = int(count)
+        if usage is not None:
+            self.usage = usage
 
     def skip(self, reason: str) -> None:
         """Record nothing for this request, deliberately.
@@ -277,6 +304,7 @@ class Activity:
             status=self.status,
             usage_action=_UNIT_USAGE[self.unit],
             count=self.count,
+            usage=self.usage,
         )
 
     def _flush(self) -> None:

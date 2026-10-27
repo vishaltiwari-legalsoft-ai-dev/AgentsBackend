@@ -220,6 +220,18 @@ AGENTS: list[dict[str, str | bool | list[str]]] = [
         # anthropic/claude-haiku-4.5 is in TEXT_MODELS above.
         "fields": ["openrouter_fast_model"],
     },
+    {
+        "id": "a13",
+        "name": "PR Writer",
+        "role": "Press releases & bylines",
+        "category": "copy",
+        "live": True,
+        # pr_writer_agent.llm stamps agent_id="a13" on every call. Drafting,
+        # angle, QA fix and revisions run on the main slot; intake, the
+        # escalation screen, evidence extraction, fact-check, SEO,
+        # distribution, snippets and reviewer notes on the fast slot.
+        "fields": ["openrouter_model", "openrouter_fast_model"],
+    },
 ]
 
 AGENT_IDS = {str(a["id"]) for a in AGENTS}

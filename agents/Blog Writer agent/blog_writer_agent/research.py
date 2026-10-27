@@ -147,7 +147,7 @@ def _dedupe_key(item: dict) -> str:
     return item.get("claim", "").strip().lower()
 
 
-def _extract(page: dict, topic: str, llm) -> list[dict]:
+def extract(page: dict, topic: str, llm) -> list[dict]:
     text = (page.get("text") or "")[:6000]
     if not text.strip():
         return []
@@ -171,7 +171,7 @@ def _extract(page: dict, topic: str, llm) -> list[dict]:
     return kept
 
 
-def _bank(run: dict, extracted: list[dict]) -> int:
+def bank(run: dict, extracted: list[dict]) -> int:
     """Dedupe against the ledger and append; returns how many were new."""
     seen = {_dedupe_key(i) for i in run["ledger"]}
     added = 0
@@ -186,9 +186,16 @@ def _bank(run: dict, extracted: list[dict]) -> int:
     return added
 
 
-def _run_queries(run: dict, queries: list[dict], reads_cap: int, *, search, fetch, llm) -> tuple[list, list, int]:
-    """Search each query, read unseen hits, extract evidence. Returns (query records, read urls, added)."""
-    already = _read_urls(run)
+def gather_pages(queries: list[dict], reads_cap: int, already: set[str] | frozenset = frozenset(),
+                 *, search, fetch) -> tuple[list, list[dict]]:
+    """Search each query and fetch up to ``reads_cap`` unseen hits.
+
+    Returns ``(query records, pages)``; each page is the fetched page as a dict
+    with ``url`` set to the address it was read from. A dead page is skipped,
+    not fatal. Search errors (``SearchUnavailable``) propagate. Shared with PR
+    Writer (a13), which extracts from all pages in one model call instead of
+    one call per page.
+    """
     records, candidates = [], []
     for q in queries:
         serp = search(q["q"])
@@ -196,16 +203,26 @@ def _run_queries(run: dict, queries: list[dict], reads_cap: int, *, search, fetc
         records.append({"angle": q["angle"], "q": q["q"], "hits": len(hits)})
         candidates.extend(h for h in hits if h not in already and h not in candidates)
 
-    read, extracted = [], []
+    pages = []
     for url in candidates[:reads_cap]:
         try:
             page = fetch(url)
         except Exception:  # noqa: BLE001 — a dead page is skipped, not fatal
             continue
-        page = page if isinstance(page, dict) else page.__dict__
-        read.append(url)
-        extracted.extend(_extract(page, run["topic"], llm))
-    return records, read, _bank(run, extracted)
+        page = dict(page if isinstance(page, dict) else page.__dict__)
+        page["read_url"] = url
+        pages.append(page)
+    return records, pages
+
+
+def run_queries(run: dict, queries: list[dict], reads_cap: int, *, search, fetch, llm) -> tuple[list, list, int]:
+    """Search each query, read unseen hits, extract evidence. Returns (query records, read urls, added)."""
+    records, pages = gather_pages(queries, reads_cap, _read_urls(run), search=search, fetch=fetch)
+    read, extracted = [], []
+    for page in pages:
+        read.append(page.pop("read_url"))
+        extracted.extend(extract(page, run["topic"], llm))
+    return records, read, bank(run, extracted)
 
 
 def research_step(run: dict, *, search=None, fetch=None, llm=None) -> dict:
@@ -218,7 +235,7 @@ def research_step(run: dict, *, search=None, fetch=None, llm=None) -> dict:
     else:
         queries = [{"angle": "gap", "q": g} for g in run["gaps"][:QUERIES_PER_ROUND]]
 
-    records, read, added = _run_queries(run, queries, READS_PER_ROUND, search=search, fetch=fetch, llm=llm)
+    records, read, added = run_queries(run, queries, READS_PER_ROUND, search=search, fetch=fetch, llm=llm)
 
     ledger_lines = "\n".join(
         f"- [{i['id']}] ({i.get('source_class', '?')}) {i['claim']}" for i in run["ledger"]
@@ -247,7 +264,7 @@ def mini_research(run: dict, queries: list[str], *, search=None, fetch=None, llm
     llm = llm or bw_llm.llm_json
 
     before = len(run["ledger"])
-    _run_queries(
+    run_queries(
         run,
         [{"angle": "targeted", "q": q} for q in queries[:MINI_READS]],
         MINI_READS,

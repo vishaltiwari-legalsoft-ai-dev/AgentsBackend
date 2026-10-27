@@ -83,6 +83,15 @@
         { "fieldPath": "deleted_at", "order": "ASCENDING" },
         { "fieldPath": "created_at", "order": "DESCENDING" }
       ]
+    },
+    {
+      "_why": "firestore_repo.list_pr_runs (PR Writer a13, 2026-10-27) - where(participants array-contains <uid>) + order_by(updated_at DESC, __name__ DESC) + start_after + limit: the run list, participants-only. REQUIRED before the a13 router ships; NOT yet built in any database. Until it is, the code falls back to the array-contains filter alone (automatic index), sorted in process and capped at 1000 runs per caller. __name__ is implicit in the index (same direction as the last field).",
+      "collectionGroup": "pr_runs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "participants", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "updated_at", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

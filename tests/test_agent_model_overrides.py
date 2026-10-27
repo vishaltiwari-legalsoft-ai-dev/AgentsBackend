@@ -140,6 +140,22 @@ def test_blog_llm_adapter_passes_a9(monkeypatch):
     assert seen == ["a9"]
 
 
+def test_pr_writer_llm_adapter_passes_a13_on_both_slots(monkeypatch):
+    from pr_writer_agent import llm as pr_llm
+
+    seen: list[tuple[str | None, bool]] = []
+
+    def fake_get_llm(*_a, **kw):
+        seen.append((kw.get("agent_id"), bool(kw.get("fast"))))
+        return _StubLLM()
+
+    monkeypatch.setattr(openrouter_service, "get_llm", fake_get_llm)
+    for slot in ("main", "fast"):
+        pr_llm.default_invoke("system", "prompt", slot=slot, timeout_s=5, max_tokens=10,
+                              temperature=0.0)
+    assert seen == [("a13", False), ("a13", True)]
+
+
 # --------------------------------------------------------------------------- #
 # Admin endpoints: panel lists only live agents, each with its real fields.
 # --------------------------------------------------------------------------- #
@@ -150,7 +166,7 @@ def test_agents_payload_lists_only_live_agents_with_their_fields(app_config):
     body = r.json()
 
     by_id = {a["id"]: a for a in body["agents"]}
-    assert set(by_id) == {"a1", "a6", "a9", "a10", "a12"}
+    assert set(by_id) == {"a1", "a6", "a9", "a10", "a12", "a13"}
     assert all(a["live"] for a in body["agents"])
 
     assert by_id["a6"]["fields"] == ["openrouter_model"]
@@ -159,6 +175,8 @@ def test_agents_payload_lists_only_live_agents_with_their_fields(app_config):
     assert by_id["a10"]["fields"] == ["openrouter_fast_model"]
     # Inbox Triage classifies one email per call — parsing-grade, fast model only.
     assert by_id["a12"]["fields"] == ["openrouter_fast_model"]
+    # PR Writer drafts on the main slot and parses on the fast slot.
+    assert by_id["a13"]["fields"] == ["openrouter_model", "openrouter_fast_model"]
     # GD keeps its full set, its planner included. Every field an agent declares
     # must be one a Creator is allowed to override.
     assert set(by_id["a1"]["fields"]) == {
